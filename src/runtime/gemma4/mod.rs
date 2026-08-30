@@ -240,7 +240,9 @@ where
         let query = backend.linear(&normed, &weights.attention.query)?;
         let query = backend.gemma_rmsnorm_heads(&query, &weights.attention.query_norm, geometry.num_heads, geometry.head_dim, config.rms_eps)?;
         let query = backend.rope_prefix(&query, geometry.num_heads, attention.rope.rotary_dim(), crate::attention::rope::RotaryLayout::SplitHalf, position, &rope.cos, &rope.sin)?;
-        match visible_ends.filter(|_| matches!(attention.window, CausalWindow::Sliding { .. })) {
+        // 图像 soft-token 块在所有层都必须双向可见；官方 non-causal image
+        // chunk 同时覆盖 full 与 sliding attention，不能只给滑窗层传 mask。
+        match visible_ends {
             Some(ends) => backend.gqa_prefill_attention_cached_from_visible(cache, source_layer, position, &query, &gqa_spec(attention), ends)?,
             None => backend.gqa_prefill_attention_cached_from(cache, source_layer, position, &query, &gqa_spec(attention))?,
         }
@@ -317,7 +319,7 @@ where
                 }
             }
         };
-        match visible_ends.filter(|_| matches!(attention.window, CausalWindow::Sliding { .. })) {
+        match visible_ends {
             Some(ends) => backend.gqa_prefill_attention_cached_visible(cache, layer, position, &query, &key, &value, &gqa_spec(attention), ends, spec.retain_full_kv)?,
             None => backend.gqa_prefill_attention_cached(cache, layer, position, &query, &key, &value, &gqa_spec(attention), spec.retain_full_kv)?,
         }

@@ -280,7 +280,9 @@ impl Gemma4MetalSession {
             let chunk = &input.token_ids[position..end];
             let embedding = gemma4_embedding_rows(&self.weights, &input.embedding_token_ids[position..end], cfg.hidden_size, self.embedding_scale)?;
             let chunk_hidden = gemma4_multimodal_embedding(self.context(), cfg, multimodal_model, input, &embedding, position..end).map_err(|error| format!("Gemma4 multimodal embedding: {error:?}"))?;
-            let per_layer_inputs = gemma4_metal_per_layer_inputs(self.context(), cfg, &self.weights, self.per_layer_model.as_ref(), &chunk_hidden, chunk)?;
+            // 外部视觉 embedding 没有对应的语言 token；官方 Gemma4 对这些行
+            // 使用 pad token 的 per-layer embedding，与主 embedding 替换规则一致。
+            let per_layer_inputs = gemma4_metal_per_layer_inputs(self.context(), cfg, &self.weights, self.per_layer_model.as_ref(), &chunk_hidden, &input.embedding_token_ids[position..end])?;
             sequence.hidden = if input.chunk_has_visual_visibility(position..end) {
                 gemma4_prefill_hidden_with_visibility(self.context(), &mut sequence.cache, &self.model, &self.layers, &self.rope, chunk_hidden, per_layer_inputs.as_deref(), position, &input.visible_ends[position..end])
             } else {

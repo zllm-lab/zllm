@@ -83,8 +83,8 @@ pub fn run(config: StageProcessConfig) -> Result<(), Box<dyn std::error::Error>>
                 }
                 engine.reset().map_err(backend_error)?;
                 active = Some(frame.request_id);
-                // MTP 只有在 head 显式发送 MtpContext 时才启用；多模态
-                // checkpoint 的 head 不发送该消息，因此始终走主模型解码。
+                // MTP 只有在 head 显式发送 MtpContext 时才启用；图文请求
+                // 不发送该消息，因此走主模型解码。
                 speculative = Speculative::disabled();
                 mtp_prompt = None;
                 link.send_ready(frame.request_id, 0)?;

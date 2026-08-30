@@ -394,6 +394,20 @@ pub(crate) fn pillow_bicubic_resize(source: &image::RgbImage, width: u32, height
     image::RgbImage::from_raw(width as u32, height as u32, output).expect("BICUBIC 输出大小已验证")
 }
 
+/// 等比缩放到目标框后居中补黑。Gemma 4 等动态分辨率视觉预处理器先按
+/// patch 预算确定目标框，再用这种 PAD_CEIL 语义避免拉伸原图。
+pub(crate) fn pillow_bicubic_resize_contain(source: &image::RgbImage, width: u32, height: u32) -> image::RgbImage {
+    let scale = (width as f32 / source.width() as f32).min(height as f32 / source.height() as f32);
+    let resized_width = ((source.width() as f32 * scale).ceil() as u32).min(width);
+    let resized_height = ((source.height() as f32 * scale).ceil() as u32).min(height);
+    let resized = pillow_bicubic_resize(source, resized_width, resized_height);
+    let offset_x = (width - resized_width) / 2;
+    let offset_y = (height - resized_height) / 2;
+    let mut output = image::RgbImage::new(width, height);
+    image::imageops::replace(&mut output, &resized, i64::from(offset_x), i64::from(offset_y));
+    output
+}
+
 fn smart_resize(height: usize, width: usize, factor: usize, min_pixels: usize, max_pixels: usize, max_aspect_ratio: f64) -> Result<(usize, usize), String> {
     let ratio = height.max(width) as f64 / height.min(width) as f64;
     if ratio > max_aspect_ratio {
@@ -439,6 +453,17 @@ mod tests {
         let image = image::RgbImage::from_raw(4, 3, (0..36).collect()).unwrap();
         let resized = pillow_bicubic_resize(&image, 2, 2);
         assert_eq!(resized.into_raw(), vec![6, 7, 8, 11, 12, 13, 22, 23, 24, 27, 28, 29]);
+    }
+
+    #[test]
+    fn bicubic_contain_preserves_ratio_and_centers_black_padding() {
+        let image = image::RgbImage::from_pixel(4, 8, image::Rgb([255, 128, 64]));
+        let resized = pillow_bicubic_resize_contain(&image, 6, 6);
+        assert_eq!(resized.dimensions(), (6, 6));
+        assert_eq!(resized.get_pixel(0, 0).0, [0, 0, 0]);
+        assert_eq!(resized.get_pixel(1, 0).0, [255, 128, 64]);
+        assert_eq!(resized.get_pixel(3, 5).0, [255, 128, 64]);
+        assert_eq!(resized.get_pixel(5, 5).0, [0, 0, 0]);
     }
 
     #[test]

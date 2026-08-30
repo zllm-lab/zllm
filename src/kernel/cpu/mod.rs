@@ -92,9 +92,35 @@ pub(crate) fn set_current_thread_affinity(cpu_list: &str) -> Result<(), String> 
     Ok(())
 }
 
+/// 临时绑定当前线程执行初始化，使大块常驻内存按执行 CPU 的 NUMA 节点首次触碰；
+/// 初始化完成后恢复调用线程原有 mask，避免把 GPU/runtime 主线程永久限在 CPU team。
+#[cfg(target_os = "linux")]
+pub(crate) fn with_current_thread_affinity<T>(cpu_list: &str, run: impl FnOnce() -> T) -> Result<T, String> {
+    unsafe extern "C" {
+        fn sched_getaffinity(pid: i32, cpusetsize: usize, mask: *mut std::ffi::c_void) -> i32;
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const std::ffi::c_void) -> i32;
+    }
+    let mut previous = [0_usize; 16];
+    if unsafe { sched_getaffinity(0, std::mem::size_of_val(&previous), previous.as_mut_ptr().cast()) } != 0 {
+        return Err(format!("读取当前 CPU affinity: {}", std::io::Error::last_os_error()));
+    }
+    set_current_thread_affinity(cpu_list)?;
+    let output = run();
+    if unsafe { sched_setaffinity(0, std::mem::size_of_val(&previous), previous.as_ptr().cast()) } != 0 {
+        return Err(format!("恢复 CPU affinity: {}", std::io::Error::last_os_error()));
+    }
+    Ok(output)
+}
+
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
 pub(crate) fn set_current_thread_affinity(cpu_list: &str) -> Result<(), String> {
+    Err(format!("当前平台不支持 CPU affinity: {cpu_list}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub(crate) fn with_current_thread_affinity<T>(cpu_list: &str, _run: impl FnOnce() -> T) -> Result<T, String> {
     Err(format!("当前平台不支持 CPU affinity: {cpu_list}"))
 }
 

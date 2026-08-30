@@ -573,8 +573,12 @@ impl Glm52Engine {
                 return Err("dspark_backend=cpu 当前要求 dspark_weight_quantization=q8g128".into());
             }
             let started = Instant::now();
-            let runtime = CpuDsparkRuntime::load(&CpuContext, root, max_seq_len, options.dspark_draft_tokens, options.dspark_confidence_threshold, lm_head_quantization, options.dspark_weight_quantization)
-                .map_err(|error| -> DynError { format!("准备 CPU DSpark: {error:?}").into() })?;
+            let load = || CpuDsparkRuntime::load(&CpuContext, root, max_seq_len, options.dspark_draft_tokens, options.dspark_confidence_threshold, lm_head_quantization, options.dspark_weight_quantization);
+            let runtime = match options.dspark_cpu_affinity.as_deref() {
+                Some(cpu_list) => crate::kernel::cpu::with_current_thread_affinity(cpu_list, load).map_err(|error| -> DynError { format!("准备 CPU DSpark NUMA 放置: {error}").into() })?,
+                None => load(),
+            }
+            .map_err(|error| -> DynError { format!("准备 CPU DSpark: {error:?}").into() })?;
             eprintln!("[glm52-dspark-cpu-resident] drafts={} wall={:.3}s", options.dspark_draft_tokens, started.elapsed().as_secs_f64());
             Some(CpuDsparkExecutor::new(runtime, options.dspark_cpu_affinity.as_deref()).map_err(|error| -> DynError { error.into() })?)
         } else {

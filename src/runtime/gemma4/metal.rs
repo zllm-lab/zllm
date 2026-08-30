@@ -101,7 +101,7 @@ pub fn run(
             (Some(input), Some(model)) => gemma4_multimodal_embedding(ctx, cfg, model, input, &embedding, position..end).map_err(|error| format!("Gemma4 multimodal embedding: {error:?}"))?,
             _ => ctx.tensor_from_f32(&embedding, chunk.len(), cfg.hidden_size).map_err(|error| format!("上传 Gemma4 embedding: {error}"))?,
         };
-        let per_layer_inputs = gemma4_metal_per_layer_inputs(ctx, cfg, &weights, per_layer_model.as_ref(), &chunk_hidden, chunk)?;
+        let per_layer_inputs = gemma4_metal_per_layer_inputs(ctx, cfg, &weights, per_layer_model.as_ref(), &chunk_hidden, embedding_tokens)?;
         let visual_visibility = multimodal.as_ref().filter(|input| input.chunk_has_visual_visibility(position..end));
         hidden = Some(
             match visual_visibility {

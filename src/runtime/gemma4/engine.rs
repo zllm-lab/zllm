@@ -54,18 +54,12 @@ impl Gemma4Engine {
         let mtp_requested = execution.mtp_weights.is_some();
         let mut session =
             Gemma4MetalSession::load(model_path, max_seq_len, execution.prefill_chunk_size, lm_head_quantization, execution.mtp_weights, execution.mtp_draft_tokens, execution.replay).map_err(|error| -> DynError { error.into() })?;
-        // 带视觉权重的多模态模型禁止装载 MTP：drafter 不具备视觉状态，且其
-        // 常驻转录资源会污染图文主模型 decode。纯文本 checkpoint 才允许 MTP。
-        if session.accepts_images() {
-            if mtp_requested {
-                eprintln!("[gemma4] 检测到视觉权重，MTP 已禁用");
-            }
-        } else {
-            // MTP 是引擎常驻资源，装载后再拍 session admission 基线，不能把它算进 KV 可用容量。
-            session.ensure_mtp().map_err(|error| -> DynError { error.into() })?;
-        }
         if session.accepts_images() {
             session.prepare_multimodal_resources().map_err(|error| -> DynError { error.into() })?;
+        }
+        if mtp_requested {
+            // MTP 是引擎常驻资源，装载后再拍 session admission 基线，不能把它算进 KV 可用容量。
+            session.ensure_mtp().map_err(|error| -> DynError { error.into() })?;
         }
         let snapshot_resources = metal_session::Gemma4SnapshotResources { context: session.context_handle(), hybrid_gqa: session.hybrid_gqa_spec(), max_seq_len };
         let swap = persist_kv_cache
@@ -184,9 +178,9 @@ impl Gemma4Engine {
             return Err("会话已没有可用的生成位置".to_owned());
         }
         let mut output = GenerationOutput::new(&stops);
-        // 多模态 checkpoint 禁止投机解码：MTP drafter 不接收视觉 soft-token，
-        // 不能复现主模型的图文状态；即使本次请求只有文本也不能装载或复用。
-        let use_mtp = !self.session.accepts_images();
+        // 图文请求禁止投机解码：MTP drafter 不接收视觉 soft-token，不能复现
+        // 主模型的图文状态。纯文本请求仍保留 MTP。
+        let use_mtp = multimodal.is_none();
         // 请求级计时不触碰 GPU 同步；逐步算子统计会 reset/read GPU stats，
         // 必须单独显式开启，避免 profiling 本身把 decode 吞吐压低。
         let profile_request = std::env::var_os("ZLLM_GEMMA4_PROFILE").is_some();
@@ -198,6 +192,9 @@ impl Gemma4Engine {
         let replay_growth_before = (!self.session.replay_resources_prepared()).then(|| self.session.context_handle().device.current_allocated_size());
         // 重放引擎首请求录制/后续请求绑定 KV cache;必须在 session 不可变借用(emit 闭包)之前完成。
         let replay_decode = self.session.replay_decode_available();
+        if profile_request {
+            eprintln!("[gemma4-request-route] multimodal={} mtp={} replay={}", multimodal.is_some(), use_mtp && self.session.mtp_available(), replay_decode);
+        }
         if replay_decode {
             self.session.ensure_replay(&sequence.cache)?;
         }

@@ -331,7 +331,7 @@ pub fn text_content(content: Option<&Value>) -> Result<String, String> {
     }
 }
 
-pub fn local_image_paths(content: &str) -> Vec<&str> {
+fn local_image_matches(content: &str) -> Vec<(usize, usize, &str)> {
     fn is_local_image(reference: &str) -> bool {
         let path = reference.strip_prefix("mm_file://").or_else(|| reference.strip_prefix("file://")).unwrap_or(reference);
         let extension = Path::new(path).extension().and_then(|value| value.to_str()).unwrap_or_default();
@@ -345,8 +345,9 @@ pub fn local_image_paths(content: &str) -> Vec<&str> {
             let start = offset + open + open_delimiter.len_utf8();
             let Some(close) = content[start..].find(close_delimiter) else { break };
             let end = start + close;
-            if is_local_image(&content[start..end]) {
-                candidates.push((start, &content[start..end]));
+            let reference = content[start..end].trim();
+            if is_local_image(reference) {
+                candidates.push((offset + open, end + close_delimiter.len_utf8(), reference));
             }
             offset = end + close_delimiter.len_utf8();
         }
@@ -356,13 +357,14 @@ pub fn local_image_paths(content: &str) -> Vec<&str> {
         let start = offset + content[offset..].find(word).expect("split_whitespace 片段必须来自原文");
         offset = start + word.len();
         if is_local_image(word) {
-            candidates.push((start, word));
+            candidates.push((start, start + word.len(), word));
             continue;
         }
         let trimmed =
             word.trim_matches(|character: char| matches!(character, '`' | '"' | '\'' | '“' | '”' | '‘' | '’' | '[' | ']' | '(' | ')' | '{' | '}' | '<' | '>' | ',' | '.' | ':' | ';' | '!' | '?' | '，' | '。' | '：' | '；' | '！' | '？'));
         if is_local_image(trimmed) {
-            candidates.push((start + word.find(trimmed).unwrap_or(0), trimmed));
+            let path_start = start + word.find(trimmed).unwrap_or(0);
+            candidates.push((path_start, path_start + trimmed.len(), trimmed));
             continue;
         }
         for (inner, _) in trimmed.match_indices('/') {
@@ -370,14 +372,21 @@ pub fn local_image_paths(content: &str) -> Vec<&str> {
             let end = suffix.find([',', ':', ';', '!', '?', '，', '。', '：', '；', '！', '？', '`', '"', '\'', '“', '”', '‘', '’']).unwrap_or(suffix.len());
             let path = &suffix[..end];
             if is_local_image(path) {
-                candidates.push((start + word.find(trimmed).unwrap_or(0) + inner, path));
+                let path_start = start + word.find(trimmed).unwrap_or(0) + inner;
+                candidates.push((path_start, path_start + path.len(), path));
                 break;
             }
         }
     }
-    candidates.sort_by_key(|(position, _)| *position);
+    // 同一路径可能同时被“成对引号”和“词片段”命中；起点相同时优先保留
+    // 覆盖整段引号的范围，split 时才能连同引号内误粘贴的空白一起移除。
+    candidates.sort_by_key(|(start, end, _)| (*start, std::cmp::Reverse(end - start)));
+    candidates
+}
+
+pub fn local_image_paths(content: &str) -> Vec<&str> {
     let mut images = Vec::new();
-    for (_, path) in candidates {
+    for (_, _, path) in local_image_matches(content) {
         if !images.contains(&path) {
             images.push(path);
         }
@@ -386,14 +395,21 @@ pub fn local_image_paths(content: &str) -> Vec<&str> {
 }
 
 pub fn split_local_images(content: &str) -> (String, Vec<&str>) {
-    let images = local_image_paths(content);
-    let mut text = content.to_owned();
-    for path in &images {
-        for (open_delimiter, close_delimiter) in [('`', '`'), ('"', '"'), ('\'', '\''), ('“', '”'), ('‘', '’')] {
-            text = text.replace(&format!("{open_delimiter}{path}{close_delimiter}"), "");
+    let matches = local_image_matches(content);
+    let mut images = Vec::new();
+    let mut text = String::with_capacity(content.len());
+    let mut copied = 0usize;
+    for (start, end, path) in matches {
+        if !images.contains(&path) {
+            images.push(path);
         }
-        text = text.replace(path, "");
+        if start < copied {
+            continue;
+        }
+        text.push_str(&content[copied..start]);
+        copied = end;
     }
+    text.push_str(&content[copied..]);
     (text, images)
 }
 
@@ -749,7 +765,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("zllm-session-image-{}.png", std::process::id()));
         std::fs::write(&path, b"image placeholder").unwrap();
         let path = path.to_string_lossy();
-        for input in [format!("`{path}`"), format!("\"{path}\""), format!("“{path}”"), format!("‘{path}’")] {
+        for input in [format!("`{path}`"), format!("\"{path}\""), format!("“{path}”"), format!("‘{path}’"), format!("\" {path} \""), format!("“ {path} ”")] {
             let (text, images) = split_local_images(&input);
             assert_eq!(images, [path.as_ref()]);
             assert!(text.is_empty());

@@ -81,7 +81,7 @@ impl Qwen36Engine {
             lm_head_quantization,
         )
         .map_err(|error| -> DynError { error.into() })?;
-        if execution.mtp && !session.vision_available() && !session.mtp_available() {
+        if execution.mtp && !session.mtp_available() {
             return Err("qwen36 model.execution.mtp=true 但 GGUF 不含 nextn MTP 块".into());
         }
         let mtp = session.mtp_available();
@@ -242,9 +242,9 @@ impl Qwen36Engine {
         let mut step = 0usize;
         // MTP 长上下文降级标记:verify 双行扫描超过接受收益后转普通单行循环
         let mut degrade_to_plain = false;
-        // 多模态 checkpoint 禁止投机解码：MTP/DSpark drafter 不接收视觉
-        // soft-token 与 M-RoPE 状态；即使本次请求只有文本也不能启用。
-        let speculative_allowed = !self.session.vision_available();
+        // 图文请求禁止投机解码：MTP/DSpark drafter 不接收视觉 soft-token
+        // 与 M-RoPE 状态；纯文本请求仍保留投机解码。
+        let speculative_allowed = image_urls.is_empty();
         // 单 token 的流式 emit(stop 命中/UTF-8 边界)。返回 false 表示已到终态,
         // output 已更新,调用方直接跳出。
         macro_rules! emit_token {

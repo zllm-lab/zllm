@@ -171,19 +171,11 @@ impl Qwen36MetalSession {
             cfg.vision.max_pixels = cfg.vision.max_pixels.min(max_pixels);
             eprintln!("[qwen36-node-vision] max_tokens={max_tokens} max_pixels={}", cfg.vision.max_pixels);
         }
-        // 模型同目录的 mmproj-*.gguf 提供视觉塔；多模态 checkpoint 不装载
-        // MTP/DSpark，避免不具备视觉状态的 drafter 污染主模型 decode。
+        // 模型同目录的 mmproj-*.gguf 提供视觉塔；没有则节点保持纯文本。
         let model_directory = if model_path.is_dir() { Some(model_path) } else { model_path.parent() };
         let mmproj = model_directory.and_then(|directory| {
             std::fs::read_dir(directory).ok()?.filter_map(Result::ok).map(|entry| entry.path()).find(|path| path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("mmproj") && name.ends_with(".gguf")))
         });
-        let speculative_allowed = mmproj.is_none();
-        if !speculative_allowed && (want_mtp || mtp_draft_vocabulary.is_some() || dspark_directory.is_some()) {
-            eprintln!("[qwen36-node-vision] 检测到视觉权重，MTP/DSpark 已禁用");
-        }
-        let want_mtp = want_mtp && speculative_allowed;
-        let mtp_draft_vocabulary = if speculative_allowed { mtp_draft_vocabulary } else { None };
-        let dspark_directory = if speculative_allowed { dspark_directory } else { None };
         crate::runtime::validate_max_sequence_length("Qwen3.6", max_seq_len, cfg.max_position_embeddings)?;
         let weights = match MlxAffineSource::open(model_path) {
             Ok(source) => Qwen36NodeWeights::Mlx { weights: Qwen36Weights::new(source, cfg.clone()).map_err(|error| format!("加载 Qwen3.6 MLX affine 权重: {error}"))?, bytes: directory_bytes(model_path) },

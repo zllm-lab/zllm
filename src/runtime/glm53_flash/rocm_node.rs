@@ -115,9 +115,9 @@ impl Glm53FlashNodeEngine {
         }
 
         let generated = (|| {
-            // 多模态 checkpoint 禁止投机解码：MTP drafter 不接收视觉 soft-token
-            // 与图像位置状态；即使本次请求只有文本也不能启用。
-            let mtp_active = self.mtp && !self.accepts_images;
+            // 图文请求禁止投机解码：MTP drafter 不接收视觉 soft-token
+            // 与图像位置状态；纯文本请求仍保留 MTP。
+            let mtp_active = self.mtp && input.images.is_empty();
             let overlay = if input.images.is_empty() {
                 None
             } else {
