@@ -247,6 +247,17 @@ impl Gemma4MetalSession {
         gemma4_multimodal_input_from_parts(&self.tokenizer, self.model.config(), parts)
     }
 
+    /// 视觉 checkpoint 必须先装视觉常驻资源再录制 decode replay；反向顺序会
+    /// 让转录期临时资源占住视觉 prefill 的 buffer 生命周期，首 token 随之漂移。
+    pub fn prepare_multimodal_resources(&mut self) -> Result<(), String> {
+        if !self.accepts_images || self.multimodal_model.is_some() {
+            return Ok(());
+        }
+        let source = self.weights.load_multimodal_weights().map_err(|error| format!("加载 Gemma4 multimodal 权重: {error}"))?;
+        self.multimodal_model = Some(prepare_gemma4_multimodal_model(self.context(), self.model.config(), &source).map_err(|error| format!("准备 Gemma4 multimodal 权重: {error:?}"))?);
+        Ok(())
+    }
+
     /// 图文请求的 prefill:chunk 边界对齐 soft-token 区间,图像行用视觉塔输出
     /// 替换文本 embedding,图像区间内双向可见。多模态权重首个图文请求惰性加载。
     pub fn prefill_multimodal(&mut self, input: &Gemma4MultimodalInput) -> Result<Gemma4Sequence, String> {
@@ -256,10 +267,7 @@ impl Gemma4MetalSession {
         if input.token_ids.len() >= self.max_seq_len {
             return Err(format!("Gemma4 prompt {} tokens 超过 max_seq_len {}", input.token_ids.len(), self.max_seq_len));
         }
-        if self.multimodal_model.is_none() {
-            let source = self.weights.load_multimodal_weights().map_err(|error| format!("加载 Gemma4 multimodal 权重: {error}"))?;
-            self.multimodal_model = Some(prepare_gemma4_multimodal_model(self.context(), self.model.config(), &source).map_err(|error| format!("准备 Gemma4 multimodal 权重: {error:?}"))?);
-        }
+        self.prepare_multimodal_resources()?;
         let multimodal_model = self.multimodal_model.as_ref().expect("multimodal model 已加载");
         let cfg = self.model.config();
         let cache = MetalKvCache::new_hybrid_gqa(self.context(), self.model.hybrid_gqa().clone(), self.max_seq_len).map_err(|error| format!("Gemma4 hybrid KV cache: {error}"))?;
@@ -363,21 +371,8 @@ impl Gemma4MetalSession {
         self.replay_decode && self.embedding_source.is_some() && per_layer_ready
     }
 
-    /// 在对外报告 KV capacity 前录制所有长期 replay 资源。临时 cache 只提供与
-    /// 真实 session 相同的布局和绑定目标，录制完成后释放；后续请求只做 bind。
-    pub fn prepare_replay_resources(&mut self) -> Result<(), String> {
-        if !self.replay_decode_available() && !self.mtp_enabled() {
-            return Ok(());
-        }
-        let cache = MetalKvCache::new_hybrid_gqa(self.context(), self.model.hybrid_gqa().clone(), self.max_seq_len).map_err(|error| format!("Gemma4 replay 临时 KV cache: {error}"))?;
-        if self.replay_decode_available() {
-            self.ensure_replay(&cache)?;
-        }
-        if self.mtp_enabled() {
-            self.ensure_mtp_replay(&cache)?;
-            self.ensure_verify_replay(&cache, self.mtp_draft_tokens() + 1)?;
-        }
-        Ok(())
+    pub fn replay_resources_prepared(&self) -> bool {
+        (!self.replay_decode_available() || self.replay.is_some()) && (!self.mtp_enabled() || self.mtp_replay.is_some() && self.verify_replay.is_some())
     }
 
     /// 首个请求时录制 A/B 命令表(一次 ~20ms);cache 必须与后续请求同规格,

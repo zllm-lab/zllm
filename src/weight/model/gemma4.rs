@@ -138,6 +138,35 @@ pub struct Gemma4MultimodalWeights {
     pub audio: Option<Gemma4AudioWeights>,
 }
 
+/// llama.cpp 为卷积式读取把 Gemma4V patch 权重从 HF 的 HWC 列顺序改成
+/// `[out, channel, y, x]`；zLLM 运行时统一消费 HF HWC patch，GGUF 在权重边界还原。
+fn gemma4v_patch_chw_to_hwc(mut tensor: TensorData, patch_size: usize) -> Result<TensorData, String> {
+    let columns = patch_size.checked_mul(patch_size).and_then(|value| value.checked_mul(3)).ok_or("Gemma4V patch columns 溢出")?;
+    if tensor.shape.len() != 2 || tensor.shape[1] != columns {
+        return Err(format!("{} shape {:?} 不能按 patch_size={patch_size} 从 CHW 转 HWC", tensor.name, tensor.shape));
+    }
+    let element_bytes = match tensor.dtype.as_str() {
+        "F16" | "BF16" => 2,
+        "F32" => 4,
+        dtype => return Err(format!("{} dtype={dtype} 不支持 Gemma4V patch 重排", tensor.name)),
+    };
+    let row_bytes = columns.checked_mul(element_bytes).ok_or("Gemma4V patch row bytes 溢出")?;
+    let mut reordered = vec![0u8; tensor.data.len()];
+    for (source_row, target_row) in tensor.data.chunks_exact(row_bytes).zip(reordered.chunks_exact_mut(row_bytes)) {
+        for y in 0..patch_size {
+            for x in 0..patch_size {
+                for channel in 0..3 {
+                    let source = (channel * patch_size * patch_size + y * patch_size + x) * element_bytes;
+                    let target = ((y * patch_size + x) * 3 + channel) * element_bytes;
+                    target_row[target..target + element_bytes].copy_from_slice(&source_row[source..source + element_bytes]);
+                }
+            }
+        }
+    }
+    tensor.data = reordered;
+    Ok(tensor)
+}
+
 pub enum Gemma4OutputWeight {
     Dense(TensorData),
     Quantized(QuantizedMatrix),
@@ -970,7 +999,7 @@ fn load_mmproj_weights(config: &Gemma4Config, gguf_path: &Path) -> Result<Gemma4
             Ok::<Gemma4VisionEncoderWeights, String>(Gemma4VisionEncoderWeights {
                 // GGUF 保留卷积核四维 shape [out, channel, height, width]；
                 // patch 提取后等价于行主序 dense [out, channel*height*width]。
-                patch_embedding: dense_flattened("v.patch_embd.weight", vision_config.embedding_size, patch_columns)?,
+                patch_embedding: gemma4v_patch_chw_to_hwc(dense_flattened("v.patch_embd.weight", vision_config.embedding_size, patch_columns)?, vision_config.patch_size)?,
                 position_embedding: {
                     let values = reader.read_tensor_f32("v.position_embd.weight")?;
                     let expected = 2 * vision_config.position_embedding_size * vision_config.embedding_size;
@@ -1040,6 +1069,14 @@ mod tests {
         assert_eq!(config.backbone_hidden_size, 3840);
     }
     use super::*;
+
+    #[test]
+    fn gemma4v_gguf_patch权重从chw还原为hwc() {
+        let values = [0.0f32, 1.0, 2.0, 3.0, 10.0, 11.0, 12.0, 13.0, 20.0, 21.0, 22.0, 23.0];
+        let tensor = TensorData { name: "patch".to_owned(), dtype: "F32".to_owned(), shape: vec![1, 12], data: values.into_iter().flat_map(f32::to_le_bytes).collect() };
+        let reordered = gemma4v_patch_chw_to_hwc(tensor, 2).unwrap().to_f32().unwrap();
+        assert_eq!(reordered, [0.0, 10.0, 20.0, 1.0, 11.0, 21.0, 2.0, 12.0, 22.0, 3.0, 13.0, 23.0]);
+    }
 
     /// 真实 GGUF smoke：`ZLLM_GEMMA4_GGUF=/path/to/gemma4.gguf cargo test --lib gguf_smoke -- --nocapture`。
     /// 无权重时跳过，保持 cargo test --lib 永远绿。

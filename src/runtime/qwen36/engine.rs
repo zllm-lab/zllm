@@ -81,7 +81,7 @@ impl Qwen36Engine {
             lm_head_quantization,
         )
         .map_err(|error| -> DynError { error.into() })?;
-        if execution.mtp && !session.mtp_available() {
+        if execution.mtp && !session.vision_available() && !session.mtp_available() {
             return Err("qwen36 model.execution.mtp=true 但 GGUF 不含 nextn MTP 块".into());
         }
         let mtp = session.mtp_available();
@@ -242,6 +242,9 @@ impl Qwen36Engine {
         let mut step = 0usize;
         // MTP 长上下文降级标记:verify 双行扫描超过接受收益后转普通单行循环
         let mut degrade_to_plain = false;
+        // 多模态 checkpoint 禁止投机解码：MTP/DSpark drafter 不接收视觉
+        // soft-token 与 M-RoPE 状态；即使本次请求只有文本也不能启用。
+        let speculative_allowed = !self.session.vision_available();
         // 单 token 的流式 emit(stop 命中/UTF-8 边界)。返回 false 表示已到终态,
         // output 已更新,调用方直接跳出。
         macro_rules! emit_token {
@@ -264,7 +267,8 @@ impl Qwen36Engine {
                 }
             }};
         }
-        let dspark_active = self.dspark && self.session.dspark_ready(&sequence);
+        let dspark_active = speculative_allowed && self.dspark && self.session.dspark_ready(&sequence);
+        let mtp_active = speculative_allowed && self.mtp;
         if dspark_active {
             // DSpark 投机解码:drafter 整块出 k 个候选,主干一次 k+1 行 verify,
             // greedy 逐 token 校验(构造上无损);部分接受时回滚 GDN/KV 游标并
@@ -413,7 +417,7 @@ impl Qwen36Engine {
                 token = self.session.token_output(&sequence)?;
                 step = output.completion_tokens();
             }
-        } else if self.mtp {
+        } else if mtp_active {
             // MTP 投机解码(nextn 链):pending 是待 emit 且待前向的 token,
             // hidden_prev 是主干对 pending 前一 token 的输出。每轮 K 步链式
             // draft(EAGLE 式自回归,MTP slot 逐 token 推进),主干一次 K+1 行
@@ -539,7 +543,7 @@ impl Qwen36Engine {
                 step = output.completion_tokens();
             }
         }
-        if degrade_to_plain || (!dspark_active && !self.mtp) {
+        if degrade_to_plain || (!dspark_active && !mtp_active) {
             while step < max_tokens {
                 if cancellation.load(Ordering::Acquire) {
                     output.cancel();

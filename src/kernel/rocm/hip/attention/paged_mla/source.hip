@@ -4962,12 +4962,33 @@ extern "C" __global__ void mla_project_value_ct(
         const unsigned int lane = threadIdx.x & 15u;
         if (value < value_dim) {
             float sum = 0.0f;
-            for (unsigned int column = lane; column < latent_dim; column += 16u) {
-                sum += zllm_bf16_to_f32(
-                    weighted_latent[(unsigned long long)head * latent_dim + column])
-                    * paged_weight(
-                        packed, scales, head * kv_head_dim + nope_dim + value,
-                        column, latent_dim, group_size, scale_dtype, bits);
+            const unsigned int weight_row = head * kv_head_dim + nope_dim + value;
+            if (bits == 4u && group_size == 128u && (latent_dim & 127u) == 0u) {
+                const unsigned int packed_columns = latent_dim >> 3u;
+                const unsigned int groups = latent_dim >> 7u;
+                #pragma unroll
+                for (unsigned int group = 0; group < groups; ++group) {
+                    const unsigned int group_base = group << 7u;
+                    const float scale = zllm_scale(
+                        scales, (unsigned long long)weight_row * groups + group, scale_dtype);
+                    for (unsigned int local = lane; local < 128u; local += 16u) {
+                        const unsigned int column = group_base + local;
+                        const unsigned int word = packed[
+                            (unsigned long long)weight_row * packed_columns + (column >> 3u)];
+                        const int code = (int)((word >> ((column & 7u) * 4u)) & 15u) - 8;
+                        sum += zllm_bf16_to_f32(
+                            weighted_latent[(unsigned long long)head * latent_dim + column])
+                            * ((float)code * scale);
+                    }
+                }
+            } else {
+                for (unsigned int column = lane; column < latent_dim; column += 16u) {
+                    sum += zllm_bf16_to_f32(
+                        weighted_latent[(unsigned long long)head * latent_dim + column])
+                        * paged_weight(
+                            packed, scales, weight_row, column, latent_dim,
+                            group_size, scale_dtype, bits);
+                }
             }
             for (unsigned int offset = 8u; offset > 0u; offset >>= 1u)
                 sum += __shfl_down(sum, offset, 16);

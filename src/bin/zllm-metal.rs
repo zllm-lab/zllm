@@ -352,7 +352,12 @@ mod run {
     fn node_model_config(plan: &Plan) -> NodeModelConfig {
         match &plan.model {
             DetectedModel::Gemma4 { .. } => {
-                let mtp_weights = find_gemma_mtp(&plan.weights_directory);
+                let mtp_weights = if has_mmproj(&plan.weights_directory) {
+                    eprintln!("[zllm-metal] 检测到视觉权重，Gemma4 MTP 已禁用");
+                    None
+                } else {
+                    find_gemma_mtp(&plan.weights_directory)
+                };
                 if let Some(path) = &mtp_weights {
                     eprintln!("[zllm-metal] 自动启用 Gemma4 MTP: {}", path.display());
                 }
@@ -360,7 +365,7 @@ mod run {
                     weights_directory: plan.weights_directory.clone(),
                     lm_head_quantization: Default::default(),
                     max_sequence_length: plan.max_seq_len,
-                    execution: Gemma4ExecutionConfig { mtp_weights, ..Default::default() },
+                    execution: Gemma4ExecutionConfig { mtp_weights, replay: true, ..Default::default() },
                 })
             }
             DetectedModel::Qwen36 { variant, .. } => NodeModelConfig::Qwen36(Qwen36NodeModelConfig {
@@ -408,6 +413,18 @@ mod run {
             (!preferred, name)
         });
         candidates.into_iter().next()
+    }
+
+    fn has_mmproj(model_path: &Path) -> bool {
+        let Some(directory) = (if model_path.is_dir() { Some(model_path) } else { model_path.parent() }) else {
+            return false;
+        };
+        std::fs::read_dir(directory).is_ok_and(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let path = entry.path();
+                path.is_file() && path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("mmproj") && name.ends_with(".gguf"))
+            })
+        })
     }
 
     fn load_with_retry(plan: &mut Plan) -> Result<Engine, String> {
@@ -502,6 +519,9 @@ mod run {
     /// 文件/图片即粘贴路径,这一层让两种粘贴都直接可用。
     pub fn message_content(content: &str) -> Value {
         let (mut text, images) = split_local_images(content);
+        if !images.is_empty() && text.trim_matches(|character: char| character.is_whitespace() || character == '>').is_empty() {
+            text = if images.len() == 1 { "请描述这张图片".to_owned() } else { "请描述这些图片".to_owned() };
+        }
         let mut inlined = false;
         for word in content.split_whitespace() {
             let lowered = word.to_lowercase();
@@ -902,6 +922,7 @@ mod tests {
         assert_eq!(pieces[0]["type"], "image_url");
         assert_eq!(pieces[0]["image_url"]["url"], image.to_string_lossy().as_ref());
         assert!(!pieces[1]["text"].as_str().unwrap().contains("demo image.png"));
+        assert_eq!(pieces[1]["text"], "请描述这张图片");
         // 二进制(全零)与不存在的路径:不内联、原样字符串。
         assert_eq!(message_content(&format!("{} {}", binary.display(), missing.display())), json!(format!("{} {}", binary.display(), missing.display())));
         let _ = std::fs::remove_dir_all(&directory);

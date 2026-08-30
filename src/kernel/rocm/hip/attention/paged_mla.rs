@@ -2934,6 +2934,118 @@ mod tests {
 
     #[test]
     #[ignore = "需要 ROCm GPU"]
+    fn mla_project_value_w4g128_matches_cpu_oracle_and_reports_latency() {
+        const DEVICE_ID: i32 = 0;
+        const HEAD_COUNT: usize = 64;
+        const Q_HEAD_DIM: usize = 256;
+        const KV_HEAD_DIM: usize = 448;
+        const LATENT_DIM: usize = 512;
+        const ROPE_DIM: usize = 64;
+        const GROUP_SIZE: usize = 128;
+        const REPEATS: usize = 20;
+
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        let input_bits = (0..HEAD_COUNT * LATENT_DIM)
+            .map(|index| {
+                let value = ((index * 29 % 257) as f32 - 128.0) * (1.0 / 512.0);
+                (value.to_bits() >> 16) as u16
+            })
+            .collect::<Vec<_>>();
+        let packed_columns = LATENT_DIM / 8;
+        let weight_rows = HEAD_COUNT * KV_HEAD_DIM;
+        let packed = (0..weight_rows * packed_columns)
+            .map(|word_index| {
+                let row = word_index / packed_columns;
+                let column_base = word_index % packed_columns * 8;
+                (0..8).fold(0u32, |word, element| {
+                    let code = ((row * 17 + column_base + element * 13) % 16) as u32;
+                    word | (code << (element * 4))
+                })
+            })
+            .collect::<Vec<_>>();
+        let groups = LATENT_DIM / GROUP_SIZE;
+        let scale_bits = (0..weight_rows * groups)
+            .map(|index| {
+                let value = ((index * 7 % 5 + 1) as f32) * (1.0 / 512.0);
+                (value.to_bits() >> 16) as u16
+            })
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::upload(DEVICE_ID, as_bytes(&input_bits)).unwrap();
+        let packed_device = DeviceBuffer::upload(DEVICE_ID, as_bytes(&packed)).unwrap();
+        let scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&scale_bits)).unwrap();
+        let output = DeviceBuffer::allocate(DEVICE_ID, HEAD_COUNT * Q_HEAD_DIM * 4).unwrap();
+        let functions = paged_mla_functions(DEVICE_ID).unwrap();
+        let mut d_input = input.pointer;
+        let mut d_packed = packed_device.pointer;
+        let mut d_scales = scales.pointer;
+        let mut d_output = output.pointer;
+        let mut rows = 1u32;
+        let mut heads = HEAD_COUNT as u32;
+        let mut q_head = Q_HEAD_DIM as u32;
+        let mut kv_head = KV_HEAD_DIM as u32;
+        let mut latent = LATENT_DIM as u32;
+        let mut rope = ROPE_DIM as u32;
+        let mut group = GROUP_SIZE as u32;
+        let mut scale_dtype = 0u32;
+        let mut bits = 4u32;
+        let mut args = [
+            (&mut d_input as *mut *mut c_void).cast(),
+            (&mut d_packed as *mut *mut c_void).cast(),
+            (&mut d_scales as *mut *mut c_void).cast(),
+            (&mut d_output as *mut *mut c_void).cast(),
+            (&mut rows as *mut u32).cast(),
+            (&mut heads as *mut u32).cast(),
+            (&mut q_head as *mut u32).cast(),
+            (&mut kv_head as *mut u32).cast(),
+            (&mut latent as *mut u32).cast(),
+            (&mut rope as *mut u32).cast(),
+            (&mut group as *mut u32).cast(),
+            (&mut scale_dtype as *mut u32).cast(),
+            (&mut bits as *mut u32).cast(),
+        ];
+        let value_dim = KV_HEAD_DIM - (Q_HEAD_DIM - ROPE_DIM);
+        let grid = (HEAD_COUNT * value_dim.div_ceil(16)) as u32;
+        launch_moe_kernel(functions.project_value, grid, 1, 256, 0, &mut args, "HIP MLA W4G128 project oracle warmup").unwrap();
+        super::super::synchronize_device(DEVICE_ID, "HIP MLA W4G128 project oracle warmup").unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..REPEATS {
+            launch_moe_kernel(functions.project_value, grid, 1, 256, 0, &mut args, "HIP MLA W4G128 project oracle").unwrap();
+        }
+        super::super::synchronize_device(DEVICE_ID, "HIP MLA W4G128 project oracle").unwrap();
+        let project_ms = started.elapsed().as_secs_f64() * 1e3 / REPEATS as f64;
+
+        let input_host = input_bits.iter().map(|bits| f32::from_bits(u32::from(*bits) << 16)).collect::<Vec<_>>();
+        let scale_host = scale_bits.iter().map(|bits| f32::from_bits(u32::from(*bits) << 16)).collect::<Vec<_>>();
+        let mut expected = vec![0.0f32; HEAD_COUNT * Q_HEAD_DIM];
+        for head in 0..HEAD_COUNT {
+            for value in 0..value_dim {
+                let weight_row = head * KV_HEAD_DIM + Q_HEAD_DIM - ROPE_DIM + value;
+                let mut sum = 0.0f32;
+                for column in 0..LATENT_DIM {
+                    let word = packed[weight_row * packed_columns + column / 8];
+                    let code = ((word >> ((column & 7) * 4)) & 15) as i32 - 8;
+                    sum += input_host[head * LATENT_DIM + column] * code as f32 * scale_host[weight_row * groups + column / GROUP_SIZE];
+                }
+                expected[head * Q_HEAD_DIM + value] = sum;
+            }
+        }
+        let mut actual = vec![0.0f32; expected.len()];
+        output.copy_to_host(as_bytes_mut(&mut actual)).unwrap();
+        let mut max_abs = 0.0f32;
+        let mut max_index = 0usize;
+        for (index, (reference, value)) in expected.iter().zip(&actual).enumerate() {
+            let error = (reference - value).abs();
+            if error > max_abs {
+                max_abs = error;
+                max_index = index;
+            }
+        }
+        println!("[mla-project-w4g128-oracle] project_ms={project_ms:.3} max_abs={max_abs:.6e} max_index={max_index} reference={:.6e} actual={:.6e}", expected[max_index], actual[max_index]);
+        assert!(max_abs <= 2.0e-5, "max_abs={max_abs} index={max_index}");
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
     fn mla_decode_split_matches_serial_and_reports_latency() {
         const DEVICE_ID: i32 = 0;
         const HEAD_COUNT: usize = 64;

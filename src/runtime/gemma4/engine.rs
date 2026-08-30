@@ -51,11 +51,22 @@ impl Gemma4Engine {
         compute_steps: Arc<AtomicCounterU64>,
     ) -> Result<Self, DynError> {
         let cache_identity = crate::runtime::session::model_cache_identity(model_path, &format!("gemma4-terminal-v3|max_seq_len={max_seq_len}|execution={execution:?}|lm_head={lm_head_quantization:?}"))?;
+        let mtp_requested = execution.mtp_weights.is_some();
         let mut session =
             Gemma4MetalSession::load(model_path, max_seq_len, execution.prefill_chunk_size, lm_head_quantization, execution.mtp_weights, execution.mtp_draft_tokens, execution.replay).map_err(|error| -> DynError { error.into() })?;
-        // MTP 是引擎常驻资源，装载后再拍 session admission 基线，不能把它算进 KV 可用容量。
-        session.ensure_mtp().map_err(|error| -> DynError { error.into() })?;
-        session.prepare_replay_resources().map_err(|error| -> DynError { error.into() })?;
+        // 带视觉权重的多模态模型禁止装载 MTP：drafter 不具备视觉状态，且其
+        // 常驻转录资源会污染图文主模型 decode。纯文本 checkpoint 才允许 MTP。
+        if session.accepts_images() {
+            if mtp_requested {
+                eprintln!("[gemma4] 检测到视觉权重，MTP 已禁用");
+            }
+        } else {
+            // MTP 是引擎常驻资源，装载后再拍 session admission 基线，不能把它算进 KV 可用容量。
+            session.ensure_mtp().map_err(|error| -> DynError { error.into() })?;
+        }
+        if session.accepts_images() {
+            session.prepare_multimodal_resources().map_err(|error| -> DynError { error.into() })?;
+        }
         let snapshot_resources = metal_session::Gemma4SnapshotResources { context: session.context_handle(), hybrid_gqa: session.hybrid_gqa_spec(), max_seq_len };
         let swap = persist_kv_cache
             .then(|| {
@@ -173,20 +184,34 @@ impl Gemma4Engine {
             return Err("会话已没有可用的生成位置".to_owned());
         }
         let mut output = GenerationOutput::new(&stops);
+        // 多模态 checkpoint 禁止投机解码：MTP drafter 不接收视觉 soft-token，
+        // 不能复现主模型的图文状态；即使本次请求只有文本也不能装载或复用。
+        let use_mtp = !self.session.accepts_images();
         // 请求级计时不触碰 GPU 同步；逐步算子统计会 reset/read GPU stats，
         // 必须单独显式开启，避免 profiling 本身把 decode 吞吐压低。
         let profile_request = std::env::var_os("ZLLM_GEMMA4_PROFILE").is_some();
         let profile_step = std::env::var_os("ZLLM_GEMMA4_PROFILE_STEPS").is_some();
         let mut first_token_at = None;
         let mut decode_50_at = None;
+        // replay 必须在首次真实 prefill 后录制；启动期提前录制会污染随后分配的
+        // prefill buffer。惰性常驻增长在本次成功分配后永久扣减后续 session 容量。
+        let replay_growth_before = (!self.session.replay_resources_prepared()).then(|| self.session.context_handle().device.current_allocated_size());
         // 重放引擎首请求录制/后续请求绑定 KV cache;必须在 session 不可变借用(emit 闭包)之前完成。
-        if self.session.replay_decode_available() {
+        let replay_decode = self.session.replay_decode_available();
+        if replay_decode {
             self.session.ensure_replay(&sequence.cache)?;
         }
-        self.session.ensure_mtp()?;
-        if self.session.mtp_enabled() {
+        if use_mtp {
+            self.session.ensure_mtp()?;
+        }
+        if use_mtp && self.session.mtp_enabled() {
             self.session.ensure_mtp_replay(&sequence.cache)?;
             self.session.ensure_verify_replay(&sequence.cache, self.session.mtp_draft_tokens() + 1)?;
+        }
+        if let Some(before) = replay_growth_before {
+            let growth = self.session.context_handle().device.current_allocated_size().saturating_sub(before) as usize;
+            self.residency.consume_engine_growth(growth);
+            self.refresh_runtime();
         }
         let session = &self.session;
         // 消费一个已采样 token:EOS / stop 词判定与流式发射；false 表示生成停止。
@@ -211,8 +236,6 @@ impl Gemma4Engine {
         }
         // 最后一次采样的 token:length 截断时它尚未前向,retain 时作为 pending 留给续写。
         let mut last_token: Option<u32> = None;
-        // 诊断:ZLLM_GEMMA4_SYNC_DECODE=1 强制回落同步逐 token 路径(A/B 对测)。
-        let replay_decode = session.replay_decode_available();
         let async_decode = replay_decode;
         // 重放路径自管 CB(每步一个独立 CB),不能进 deferred batch 窗口
         // (窗口内 ctx.command_buffer() 返回共享 batch CB,与重放的独立 commit 冲突)。
@@ -222,7 +245,7 @@ impl Gemma4Engine {
         let loop_result = (|| -> Result<(), String> {
             // MTP 投机:官方 4 层 draft 头 + 主干多行 verify。接受判定走模型无关的
             // runtime::speculative::verify_samples(qwen36/glm52 同款),draft 读主干 KV。
-            if session.mtp_available() {
+            if use_mtp && session.mtp_available() {
                 let mtp = session.mtp();
                 let context = session.context();
                 let draft_tokens = session.mtp_draft_tokens().max(1);

@@ -83,13 +83,15 @@ pub fn run(config: StageProcessConfig) -> Result<(), Box<dyn std::error::Error>>
                 }
                 engine.reset().map_err(backend_error)?;
                 active = Some(frame.request_id);
-                speculative = if mtp { Speculative { enabled: true, ..Speculative::disabled() } } else { Speculative::disabled() };
+                // MTP 只有在 head 显式发送 MtpContext 时才启用；多模态
+                // checkpoint 的 head 不发送该消息，因此始终走主模型解码。
+                speculative = Speculative::disabled();
                 mtp_prompt = None;
                 link.send_ready(frame.request_id, 0)?;
             }
             StageMessage::MtpContext { prompt_tokens, max_decode, draft_tokens } => {
                 require_active(active, frame.request_id)?;
-                if !speculative.enabled {
+                if !mtp {
                     return Err("GLM-5.3-Flash tail 未启用 MTP 却收到 MtpContext".into());
                 }
                 if mtp_prompt.is_some() {
@@ -98,6 +100,7 @@ pub fn run(config: StageProcessConfig) -> Result<(), Box<dyn std::error::Error>>
                 if max_decode == 0 || draft_tokens != mtp_draft_tokens {
                     return Err(format!("GLM-5.3-Flash MTP context max_decode={max_decode} drafts={draft_tokens}，配置 drafts={mtp_draft_tokens}").into());
                 }
+                speculative.enabled = true;
                 speculative.draft_tokens = draft_tokens;
                 mtp_prompt = Some(prompt_tokens);
             }

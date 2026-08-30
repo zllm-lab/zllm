@@ -115,6 +115,9 @@ impl Glm53FlashNodeEngine {
         }
 
         let generated = (|| {
+            // 多模态 checkpoint 禁止投机解码：MTP drafter 不接收视觉 soft-token
+            // 与图像位置状态；即使本次请求只有文本也不能启用。
+            let mtp_active = self.mtp && !self.accepts_images;
             let overlay = if input.images.is_empty() {
                 None
             } else {
@@ -130,7 +133,7 @@ impl Glm53FlashNodeEngine {
                 submitted = end;
             }
             let cols = self.engine.boundary_cols();
-            if self.mtp {
+            if mtp_active {
                 // tail 需要 prompt tokens 做 MTP 移位 embedding，并校验两端递归深度一致。
                 self.link.send_mtp_context(stage_id, &prompt_tokens, max_tokens, self.mtp_draft_tokens).map_err(|msg| format!("发送 MtpContext: {msg}"))?;
             }
@@ -145,7 +148,7 @@ impl Glm53FlashNodeEngine {
             }
             self.link.send_prefill_done(stage_id, prompt_tokens.len())?;
             let mut output = GenerationOutput::new(&stops);
-            if self.mtp {
+            if mtp_active {
                 // speculative 主循环:verify [anchor, drafts...] K+1 行，tail 判定连续接受前缀；
                 // tail 已先提交本机状态，head 在发送下一轮前按 retained_rows 对齐。
                 let (mut pending, _retained, mut drafts, mut pending_eos) = recv_speculative(&mut self.link, stage_id)?;
