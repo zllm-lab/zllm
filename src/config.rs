@@ -623,6 +623,9 @@ pub struct Glm52NodeExecutionConfig {
     /// 只把独立 proposal 计算移出 16 卡流水线。
     #[serde(default)]
     pub dspark_backend: Glm52DsparkExecutionBackend,
+    /// CPU DSpark worker 的 Linux CPU list（如 `0-31`）；其固定 team 继承同一 mask。
+    #[serde(default)]
+    pub dspark_cpu_affinity: Option<String>,
     #[serde(default = "default_dspark_draft_tokens")]
     pub dspark_draft_tokens: usize,
     /// 仅显式配置时启用 confidence head，并剪掉首个低置信 token 及其后缀。
@@ -664,6 +667,7 @@ impl Default for Glm52NodeExecutionConfig {
             mtp: false,
             dspark_directory: None,
             dspark_backend: Glm52DsparkExecutionBackend::default(),
+            dspark_cpu_affinity: None,
             dspark_draft_tokens: default_dspark_draft_tokens(),
             dspark_confidence_threshold: None,
             dspark_weight_quantization: ResidentWeightQuantization::Native,
@@ -1842,6 +1846,9 @@ fn validate_glm52(model: &Glm52NodeModelConfig, backend: &RocmBackendConfig) -> 
     if model.execution.dspark_confidence_threshold.is_some_and(|threshold| !threshold.is_finite() || !(0.0..=1.0).contains(&threshold)) {
         return Err(ConfigError::Invalid("GLM-5.2 dspark_confidence_threshold 必须在 [0,1]".to_owned()));
     }
+    if model.execution.dspark_cpu_affinity.as_ref().is_some_and(|affinity| affinity.trim().is_empty()) {
+        return Err(ConfigError::Invalid("GLM-5.2 dspark_cpu_affinity 不能为空".to_owned()));
+    }
     validate_scheduling(&model.execution.scheduling)?;
     let weight_overrides = [model.compressed_tensors_directory.is_some(), model.nvfp4_directory.is_some(), model.gguf_directory.is_some()].into_iter().filter(|configured| *configured).count();
     if weight_overrides > 1 {
@@ -2276,12 +2283,15 @@ mod tests {
         assert_eq!(execution.thinking_token_budget, None);
         assert!(!execution.tail_sampling);
         assert_eq!(execution.dspark_backend, Glm52DsparkExecutionBackend::Rocm);
+        assert_eq!(execution.dspark_cpu_affinity, None);
         assert_eq!(execution.dspark_weight_quantization, ResidentWeightQuantization::Native);
         assert_eq!(execution.dspark_confidence_threshold, None);
         let execution: Glm52NodeExecutionConfig = serde_yaml::from_str("dspark_weight_quantization: q8g128\n").unwrap();
         assert_eq!(execution.dspark_weight_quantization, ResidentWeightQuantization::Q8g128);
         let execution: Glm52NodeExecutionConfig = serde_yaml::from_str("dspark_backend: cpu\n").unwrap();
         assert_eq!(execution.dspark_backend, Glm52DsparkExecutionBackend::Cpu);
+        let execution: Glm52NodeExecutionConfig = serde_yaml::from_str("dspark_cpu_affinity: 0-31\n").unwrap();
+        assert_eq!(execution.dspark_cpu_affinity.as_deref(), Some("0-31"));
         let execution: Glm52NodeExecutionConfig = serde_yaml::from_str("dspark_confidence_threshold: 0.7\n").unwrap();
         assert_eq!(execution.dspark_confidence_threshold, Some(0.7));
         let stage = Glm52StageExecutionConfig::default();

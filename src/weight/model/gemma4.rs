@@ -617,18 +617,90 @@ impl Gemma4Weights {
             }
             weights.position_embedding = blocked;
         }
+        let vision_encoder = match (&self.source, self.config.vision) {
+            (Gemma4Source::MlxAffine(source), Some(vision_config)) if vision_config.encoder.is_some() => {
+                let encoder = vision_config.encoder.expect("已筛选 encoder");
+                let embedding_size = vision_config.embedding_size;
+                let head_dim = embedding_size / encoder.num_heads;
+                let dense = |name: &str, shape: &[usize]| -> Result<TensorData, String> {
+                    let tensor = source.load_tensor(name)?;
+                    tensor.expect_shape(shape)?;
+                    if !matches!(tensor.dtype.as_str(), "BF16" | "F16" | "F32") {
+                        return Err(format!("{name} dtype={}，期望 dense BF16/F16/F32", tensor.dtype));
+                    }
+                    Ok(tensor)
+                };
+                let vector = |name: &str, len: usize| -> Result<Vec<f32>, String> {
+                    let tensor = source.load_tensor(name)?;
+                    if tensor.shape.iter().product::<usize>() != len {
+                        return Err(format!("{name} shape {:?}，期望 {len} 个元素", tensor.shape));
+                    }
+                    tensor.to_f32()
+                };
+                let clipped = |name: &str, rows: usize, cols: usize| -> Result<Gemma4VisionClippedLinearWeights, String> {
+                    let scalar = |suffix: &str| -> Result<f32, String> {
+                        let full = format!("{name}.{suffix}");
+                        vector(&full, 1)?.first().copied().ok_or_else(|| format!("{full} 为空"))
+                    };
+                    Ok(Gemma4VisionClippedLinearWeights {
+                        weight: dense(&format!("{name}.linear.weight"), &[rows, cols])?,
+                        input_min: scalar("input_min")?,
+                        input_max: scalar("input_max")?,
+                        output_min: scalar("output_min")?,
+                        output_max: scalar("output_max")?,
+                    })
+                };
+                let layers = (0..encoder.layer_count)
+                    .map(|layer| {
+                        let prefix = format!("vision_tower.encoder.layers.{layer}");
+                        Ok(Gemma4VisionEncoderLayerWeights {
+                            input_norm: vector(&format!("{prefix}.input_layernorm.weight"), embedding_size)?,
+                            query: clipped(&format!("{prefix}.self_attn.q_proj"), embedding_size, embedding_size)?,
+                            query_norm: vector(&format!("{prefix}.self_attn.q_norm.weight"), head_dim)?,
+                            key: clipped(&format!("{prefix}.self_attn.k_proj"), embedding_size, embedding_size)?,
+                            key_norm: vector(&format!("{prefix}.self_attn.k_norm.weight"), head_dim)?,
+                            value: clipped(&format!("{prefix}.self_attn.v_proj"), embedding_size, embedding_size)?,
+                            output: clipped(&format!("{prefix}.self_attn.o_proj"), embedding_size, embedding_size)?,
+                            attention_post_norm: vector(&format!("{prefix}.post_attention_layernorm.weight"), embedding_size)?,
+                            ffn_norm: vector(&format!("{prefix}.pre_feedforward_layernorm.weight"), embedding_size)?,
+                            gate: clipped(&format!("{prefix}.mlp.gate_proj"), encoder.intermediate_size, embedding_size)?,
+                            up: clipped(&format!("{prefix}.mlp.up_proj"), encoder.intermediate_size, embedding_size)?,
+                            down: clipped(&format!("{prefix}.mlp.down_proj"), embedding_size, encoder.intermediate_size)?,
+                            ffn_post_norm: vector(&format!("{prefix}.post_feedforward_layernorm.weight"), embedding_size)?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let patch_columns = vision_config.patch_size.checked_mul(vision_config.patch_size).and_then(|value| value.checked_mul(3)).ok_or("Gemma 4 vision patch columns 溢出")?;
+                let position_embedding = source.load_tensor("vision_tower.patch_embedder.position_embedding_table")?.to_f32()?;
+                let expected_positions = 2usize.checked_mul(vision_config.position_embedding_size).and_then(|value| value.checked_mul(embedding_size)).ok_or("Gemma 4 vision position embedding 大小溢出")?;
+                if position_embedding.len() != expected_positions {
+                    return Err(format!("vision_tower.patch_embedder.position_embedding_table 元素数 {}，期望 {expected_positions}", position_embedding.len()));
+                }
+                let projection_name = "embed_vision.embedding_projection";
+                let projection = source.load_matrix(projection_name)?;
+                if projection.rows != self.config.hidden_size || projection.cols != embedding_size {
+                    return Err(format!("{projection_name} shape=[{},{}]，期望 [{},{}]", projection.rows, projection.cols, self.config.hidden_size, embedding_size));
+                }
+                let projection = TensorData { name: projection_name.to_owned(), dtype: "F32".to_owned(), shape: vec![self.config.hidden_size, embedding_size], data: projection.decode()?.into_iter().flat_map(f32::to_le_bytes).collect() };
+                Some(Gemma4VisionEncoderWeights { patch_embedding: dense("vision_tower.patch_embedder.input_proj.weight", &[embedding_size, patch_columns])?, position_embedding, layers, projection })
+            }
+            _ => None,
+        };
         let audio = self
             .config
             .audio
             .map(|config| Ok::<Gemma4AudioWeights, String>(Gemma4AudioWeights { projection: self.load_dense_tensor("model.embed_audio.embedding_projection.weight", &[self.config.hidden_size, config.embedding_size])? }))
             .transpose()?;
-        Ok(Gemma4MultimodalWeights { vision, vision_encoder: None, audio })
+        Ok(Gemma4MultimodalWeights { vision, vision_encoder, audio })
     }
 
     /// 能力上报只看当前权重是否真的存在兼容视觉塔，不能由模型族规格代替。
     pub fn has_vision_weights(&self) -> bool {
         match &self.source {
             Gemma4Source::Gguf { path, .. } => locate_mmproj(&self.config, path).ok().flatten().is_some(),
+            Gemma4Source::MlxAffine(source) if self.config.vision.is_some_and(|vision| vision.encoder.is_some()) => {
+                source.has_tensor("vision_tower.patch_embedder.input_proj.weight") && source.has_matrix("embed_vision.embedding_projection")
+            }
             _ if self.config.vision.is_some_and(|vision| vision.encoder.is_some()) => false,
             _ => self.has("model.vision_embedder.patch_dense"),
         }

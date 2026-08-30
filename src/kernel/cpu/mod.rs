@@ -40,6 +40,64 @@ pub(crate) fn allowed_parallelism() -> usize {
     std::thread::available_parallelism().map_or(1, usize::from)
 }
 
+#[cfg(target_os = "linux")]
+fn parse_cpu_list_mask(cpu_list: &str) -> Result<[usize; 16], String> {
+    let mut mask = [0_usize; 16];
+    let mut count = 0usize;
+    for part in cpu_list.split(',').map(str::trim) {
+        if part.is_empty() {
+            return Err(format!("CPU list 含空项: {cpu_list}"));
+        }
+        let (begin, end) = match part.split_once('-') {
+            Some((begin, end)) => {
+                let begin = begin.parse::<usize>().map_err(|_| format!("CPU list 起点非法: {part}"))?;
+                let end = end.parse::<usize>().map_err(|_| format!("CPU list 终点非法: {part}"))?;
+                if begin > end {
+                    return Err(format!("CPU list 范围倒置: {part}"));
+                }
+                (begin, end)
+            }
+            None => {
+                let cpu = part.parse::<usize>().map_err(|_| format!("CPU 编号非法: {part}"))?;
+                (cpu, cpu)
+            }
+        };
+        for cpu in begin..=end {
+            let word = cpu / usize::BITS as usize;
+            if word >= mask.len() {
+                return Err(format!("CPU 编号 {cpu} 超出当前 1024 CPU mask"));
+            }
+            let bit = 1_usize << (cpu % usize::BITS as usize);
+            count += usize::from(mask[word] & bit == 0);
+            mask[word] |= bit;
+        }
+    }
+    if count == 0 {
+        return Err("CPU list 不能为空".to_owned());
+    }
+    Ok(mask)
+}
+
+/// 只绑定当前线程；它随后创建的固定 CPU team 会继承该 mask，进程内其他线程不受影响。
+#[cfg(target_os = "linux")]
+pub(crate) fn set_current_thread_affinity(cpu_list: &str) -> Result<(), String> {
+    unsafe extern "C" {
+        fn sched_setaffinity(pid: i32, cpusetsize: usize, mask: *const std::ffi::c_void) -> i32;
+    }
+    let mask = parse_cpu_list_mask(cpu_list)?;
+    let result = unsafe { sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr().cast()) };
+    if result != 0 {
+        return Err(format!("设置 CPU affinity {cpu_list}: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+pub(crate) fn set_current_thread_affinity(cpu_list: &str) -> Result<(), String> {
+    Err(format!("当前平台不支持 CPU affinity: {cpu_list}"))
+}
+
 pub(crate) fn sigmoid(value: f32) -> f32 {
     if value >= 0.0 {
         1.0 / (1.0 + (-value).exp())
@@ -142,5 +200,20 @@ impl CpuTensor {
     }
     pub fn row_mut(&mut self, r: usize) -> &mut [f32] {
         &mut self.data[r * self.cols..(r + 1) * self.cols]
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod affinity_tests {
+    use super::parse_cpu_list_mask;
+
+    #[test]
+    fn cpu_list_supports_ranges_and_rejects_invalid_masks() {
+        let mask = parse_cpu_list_mask("0-2,8,64").unwrap();
+        assert_eq!(mask[0] & 0x107, 0x107);
+        assert_eq!(mask[1] & 1, 1);
+        assert!(parse_cpu_list_mask("3-1").is_err());
+        assert!(parse_cpu_list_mask("").is_err());
+        assert!(parse_cpu_list_mask("1024").is_err());
     }
 }

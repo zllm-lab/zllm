@@ -196,14 +196,23 @@ fn preprocess_image(image: &RgbImage, config: &Gemma4VisionConfig, max_soft_toke
     let mut positions = Vec::with_capacity(input_rows);
     for y_block in 0..grid_height {
         for x_block in 0..grid_width {
-            // 像素平面布局(CHW):每个 patch 是 R/G/B 三个行主序平面拼接,
-            // 对应 llama.cpp gemma4uv 从 planar inp_raw 的 im2col 提取顺序
-            for channel in 0..3 {
+            if config.encoder.is_some() {
+                // E4B Gemma4ImageProcessor 的 patch 布局是 [y, x, channel]；
+                // patch embedder 内部再把 [0,1] 映射到 [-1,1]，这里直接等价展开。
                 for y in 0..patch {
                     for x in 0..patch {
                         let pixel = resized.get_pixel((x_block * patch + x) as u32, (y_block * patch + y) as u32);
-                        let value = pixel.0[channel] as f32 / 255.0;
-                        data.push(if config.encoder.is_some() { value.mul_add(2.0, -1.0) } else { value });
+                        data.extend(pixel.0.into_iter().map(|value| (value as f32 / 255.0).mul_add(2.0, -1.0)));
+                    }
+                }
+            } else {
+                // unified mmproj 保持 llama.cpp planar inp_raw 的 CHW im2col 顺序。
+                for channel in 0..3 {
+                    for y in 0..patch {
+                        for x in 0..patch {
+                            let pixel = resized.get_pixel((x_block * patch + x) as u32, (y_block * patch + y) as u32);
+                            data.push(pixel.0[channel] as f32 / 255.0);
+                        }
                     }
                 }
             }
@@ -570,6 +579,10 @@ mod tests {
         assert_eq!(input.cols, 16 * 16 * 3);
         assert_eq!(input.data.len(), input.positions.len() * input.cols);
         assert!(input.data.iter().all(|value| *value == 1.0));
+
+        let red = RgbImage::new(96, 96, [255, 0, 0].repeat(96 * 96)).unwrap();
+        let red = preprocess_image(&red, &config, 280).unwrap();
+        assert_eq!(&red.data[..6], &[1.0, -1.0, -1.0, 1.0, -1.0, -1.0]);
     }
 
     #[test]

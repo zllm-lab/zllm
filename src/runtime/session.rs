@@ -339,16 +339,16 @@ pub fn local_image_paths(content: &str) -> Vec<&str> {
     }
 
     let mut candidates = Vec::new();
-    for delimiter in ['`', '"', '\''] {
+    for (open_delimiter, close_delimiter) in [('`', '`'), ('"', '"'), ('\'', '\''), ('“', '”'), ('‘', '’')] {
         let mut offset = 0usize;
-        while let Some(open) = content[offset..].find(delimiter) {
-            let start = offset + open + delimiter.len_utf8();
-            let Some(close) = content[start..].find(delimiter) else { break };
+        while let Some(open) = content[offset..].find(open_delimiter) {
+            let start = offset + open + open_delimiter.len_utf8();
+            let Some(close) = content[start..].find(close_delimiter) else { break };
             let end = start + close;
             if is_local_image(&content[start..end]) {
                 candidates.push((start, &content[start..end]));
             }
-            offset = end + delimiter.len_utf8();
+            offset = end + close_delimiter.len_utf8();
         }
     }
     let mut offset = 0usize;
@@ -359,14 +359,15 @@ pub fn local_image_paths(content: &str) -> Vec<&str> {
             candidates.push((start, word));
             continue;
         }
-        let trimmed = word.trim_matches(|character: char| matches!(character, '`' | '"' | '\'' | '[' | ']' | '(' | ')' | '{' | '}' | '<' | '>' | ',' | '.' | ':' | ';' | '!' | '?' | '，' | '。' | '：' | '；' | '！' | '？'));
+        let trimmed =
+            word.trim_matches(|character: char| matches!(character, '`' | '"' | '\'' | '“' | '”' | '‘' | '’' | '[' | ']' | '(' | ')' | '{' | '}' | '<' | '>' | ',' | '.' | ':' | ';' | '!' | '?' | '，' | '。' | '：' | '；' | '！' | '？'));
         if is_local_image(trimmed) {
             candidates.push((start + word.find(trimmed).unwrap_or(0), trimmed));
             continue;
         }
         for (inner, _) in trimmed.match_indices('/') {
             let suffix = &trimmed[inner..];
-            let end = suffix.find([',', ':', ';', '!', '?', '，', '。', '：', '；', '！', '？', '`', '"', '\'']).unwrap_or(suffix.len());
+            let end = suffix.find([',', ':', ';', '!', '?', '，', '。', '：', '；', '！', '？', '`', '"', '\'', '“', '”', '‘', '’']).unwrap_or(suffix.len());
             let path = &suffix[..end];
             if is_local_image(path) {
                 candidates.push((start + word.find(trimmed).unwrap_or(0) + inner, path));
@@ -388,8 +389,8 @@ pub fn split_local_images(content: &str) -> (String, Vec<&str>) {
     let images = local_image_paths(content);
     let mut text = content.to_owned();
     for path in &images {
-        for delimiter in ['`', '"', '\''] {
-            text = text.replace(&format!("{delimiter}{path}{delimiter}"), "");
+        for (open_delimiter, close_delimiter) in [('`', '`'), ('"', '"'), ('\'', '\''), ('“', '”'), ('‘', '’')] {
+            text = text.replace(&format!("{open_delimiter}{path}{close_delimiter}"), "");
         }
         text = text.replace(path, "");
     }
@@ -742,6 +743,19 @@ pub fn activate_terminal_append<S: crate::kv_cache::terminal_cache::TerminalSnap
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 本地图片路径支持中英文成对引号() {
+        let path = std::env::temp_dir().join(format!("zllm-session-image-{}.png", std::process::id()));
+        std::fs::write(&path, b"image placeholder").unwrap();
+        let path = path.to_string_lossy();
+        for input in [format!("`{path}`"), format!("\"{path}\""), format!("“{path}”"), format!("‘{path}’")] {
+            let (text, images) = split_local_images(&input);
+            assert_eq!(images, [path.as_ref()]);
+            assert!(text.is_empty());
+        }
+        std::fs::remove_file(path.as_ref()).unwrap();
+    }
 
     #[test]
     fn 固定整块session容量不允许半块拼接() {

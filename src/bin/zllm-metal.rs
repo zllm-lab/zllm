@@ -418,7 +418,7 @@ mod run {
             let load_started = Instant::now();
             match Engine::load(node_model_config(plan), backend.clone(), session.clone()) {
                 Ok(engine) => {
-                    eprintln!("[zllm-metal] 模型加载完成({:.1}s),直接输入消息开始对话;消息中的本地图片路径自动作为图像输入(需模型带 mmproj),行尾 \\ 续行;/exit 退出,/compact 手动压缩,/stats 查看资源", load_started.elapsed().as_secs_f32());
+                    eprintln!("[zllm-metal] 模型加载完成({:.1}s),直接输入消息开始对话;消息中的本地图片路径自动作为图像输入(需模型带视觉权重),行尾 \\ 续行;/exit 退出,/compact 手动压缩,/stats 查看资源", load_started.elapsed().as_secs_f32());
                     return Ok(engine);
                 }
                 // 预估偏乐观(工作集口径/滑窗近似误差)时降上下文重试,而不是直接失败。
@@ -892,6 +892,12 @@ mod tests {
         assert!(text.contains("fn main()"));
         // 图片路径由公共消息层识别；反引号保留带空格路径并编码成标准 image_url part。
         let multimodal = message_content(&format!("请描述 `{}`。", image.display()));
+        let pieces = multimodal.as_array().unwrap();
+        assert_eq!(pieces[0]["type"], "image_url");
+        assert_eq!(pieces[0]["image_url"]["url"], image.to_string_lossy().as_ref());
+        assert!(!pieces[1]["text"].as_str().unwrap().contains("demo image.png"));
+        // macOS/聊天界面常把路径包成中文弯引号；引用符和路径都不能泄漏给文本模型。
+        let multimodal = message_content(&format!("> “{}”", image.display()));
         let pieces = multimodal.as_array().unwrap();
         assert_eq!(pieces[0]["type"], "image_url");
         assert_eq!(pieces[0]["image_url"]["url"], image.to_string_lossy().as_ref());

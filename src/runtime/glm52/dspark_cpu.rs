@@ -117,8 +117,9 @@ pub(super) struct CpuDsparkExecutor {
 }
 
 impl CpuDsparkExecutor {
-    pub(super) fn new(runtime: CpuDsparkRuntime) -> Result<Self, String> {
+    pub(super) fn new(runtime: CpuDsparkRuntime, cpu_affinity: Option<&str>) -> Result<Self, String> {
         let runtime = Arc::new(runtime);
+        let cpu_affinity = cpu_affinity.map(Arc::<str>::from);
         let (event_tx, event_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
         let mut worker_senders: Vec<mpsc::Sender<CpuDsparkWorkerCommand>> = Vec::with_capacity(CPU_DSPARK_WORKERS);
@@ -127,7 +128,16 @@ impl CpuDsparkExecutor {
             let (worker_tx, worker_rx) = mpsc::channel();
             let runtime = Arc::clone(&runtime);
             let event_tx = event_tx.clone();
-            let handle = match thread::Builder::new().name(format!("glm52-dspark-cpu-{worker}")).spawn(move || cpu_dspark_worker(worker, runtime, worker_rx, event_tx)) {
+            let cpu_affinity = cpu_affinity.clone();
+            let (startup_tx, startup_rx) = mpsc::sync_channel(0);
+            let handle = match thread::Builder::new().name(format!("glm52-dspark-cpu-{worker}")).spawn(move || {
+                let affinity = cpu_affinity.as_deref().map_or(Ok(()), crate::kernel::cpu::set_current_thread_affinity);
+                let ready = affinity.is_ok();
+                let _ = startup_tx.send(affinity);
+                if ready {
+                    cpu_dspark_worker(worker, runtime, worker_rx, event_tx);
+                }
+            }) {
                 Ok(handle) => handle,
                 Err(error) => {
                     for sender in &worker_senders {
@@ -139,8 +149,21 @@ impl CpuDsparkExecutor {
                     return Err(format!("启动 CPU DSpark worker {worker}: {error}"));
                 }
             };
+            if let Err(error) = startup_rx.recv().map_err(|_| "CPU DSpark worker 未报告启动状态".to_owned())? {
+                for sender in &worker_senders {
+                    let _ = sender.send(CpuDsparkWorkerCommand::Shutdown);
+                }
+                for handle in workers {
+                    let _ = handle.join();
+                }
+                let _ = handle.join();
+                return Err(format!("启动 CPU DSpark worker {worker}: {error}"));
+            }
             worker_senders.push(worker_tx);
             workers.push(handle);
+        }
+        if let Some(cpu_affinity) = cpu_affinity.as_deref() {
+            eprintln!("[glm52-dspark-cpu-affinity] cpus={cpu_affinity}");
         }
         let coordinator = match thread::Builder::new().name("glm52-dspark-cpu-scheduler".to_owned()).spawn(move || cpu_dspark_coordinator(event_rx, result_tx, worker_senders, workers)) {
             Ok(handle) => handle,

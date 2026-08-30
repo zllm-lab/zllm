@@ -242,7 +242,7 @@ impl Gemma4MetalSession {
     /// 图文混排 parts → soft-token 编排(图像就地展开,与一次性执行器同一套预处理)。
     pub fn multimodal_input(&self, parts: &[crate::vision::ContentPart<'_>]) -> Result<Gemma4MultimodalInput, String> {
         if !self.accepts_images {
-            return Err("Gemma4 当前权重没有兼容的 dense mmproj 视觉塔".to_owned());
+            return Err("Gemma4 当前权重没有兼容的视觉塔".to_owned());
         }
         gemma4_multimodal_input_from_parts(&self.tokenizer, self.model.config(), parts)
     }
