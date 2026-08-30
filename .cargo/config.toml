@@ -1,0 +1,13 @@
+# zllm cargo 配置。
+#
+# CUDA 后端:链接 libnvrtc(用于 backend/cuda/context.rs 的 NVRTC FFI)。
+# 库由 CUDA Toolkit 提供。Linux 装在 /usr/local/cuda/lib64;
+# Windows 装在 <CUDA>\lib\x64。
+# 这里按 target 加 -L 搜索路径,确保 rustc 链接器能找到 nvrtc 导入库。
+# 只在 zllm 显式启用 `with-cuda` feature 后才会被引用,不影响其他 target。
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-L", "/usr/local/cuda/lib64"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-L", "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/lib/x64"]

@@ -1,0 +1,27 @@
+/target
+/target-rocm-*/
+/out/
+/output/
+.zcode/
+.rocprofv3/
+*.bin
+tokenizer.json
+
+# macOS metadata
+.DS_Store
+
+# Local build/runtime artifacts
+/artifacts/
+/cache/
+/config/cache/
+
+# 开发过程补丁与本地实验目录
+.codex-*.patch
+.hvigor/
+.research/
+outpaint_compare/
+__pycache__/
+*.omc
+
+# Huawei/OHOS 探针工程暂留本地，后续确定独立归属后再迁移。
+/tools/ohos_nnrt_probe/

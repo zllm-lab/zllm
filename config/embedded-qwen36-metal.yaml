@@ -1,0 +1,23 @@
+version: 1
+
+session:
+  cache_directory: ./cache/qwen36
+  persist_kv_cache: true
+  resident_cache_entries: 1
+
+model:
+  architecture: qwen36
+  weights_directory: ./models/Qwen3.8-27B-UD-Q3_K_XL
+  lm_head_quantization: native
+  max_sequence_length: 65536
+  variant: qwen38
+  execution:
+    precise_gqa_prefill: false
+    kv_cache_format: q8g64
+    prefill_chunk_size: 2048
+    vision_max_tokens: 1024
+    mtp: false
+
+backend:
+  kind: metal
+  device: default

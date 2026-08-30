@@ -1,0 +1,122 @@
+[package]
+name = "zllm"
+version = "0.8.0"
+edition = "2024"
+description = "跨平台跨模型的高性能 LLM 推理引擎"
+license = "Apache-2.0"
+repository = "https://github.com/zllm-lab/zllm"
+keywords = ["llm", "inference", "metal", "cuda", "rocm"]
+categories = ["science", "hardware-support"]
+exclude = ["zola", "zola.tar.gz", "outputs/", "docs/assets/"]
+autobins = false
+
+[workspace]
+resolver = "3"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = []
+with-cuda = ["dep:cudarc"]
+with-rocm = []
+with-vulkan = ["dep:pollster", "dep:wgpu"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
+
+[dependencies]
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+serde_yaml = "0.9"
+axum = { version = "0.8.9", features = ["ws"] }
+iroh = "1.0.3"
+iroh-tickets = "1.0.0"
+# CUDA 后端:跨平台 dynamic-loading 模式,编译期不要求系统库存在。
+# cudarc 0.19 feature 组合:driver + nvrtc + cublas + dynamic-loading,匹配 zllm 远程部署(锁定 CUDA 13.2 API)。
+# Linux: 运行时由 libcuda.so / libnvrtc.so / libcublas.so 提供;NVIDIA driver >= 580。
+# Windows: 运行时由 nvcuda.dll / nvrtc64_130_0.dll / cublas64_13.dll 提供(来自 CUDA Toolkit 13.0)。
+cudarc = { version = "0.19", default-features = false, features = ["driver", "nvrtc", "cublas", "std", "dynamic-loading", "f16", "cuda-13020"], optional = true }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
+half = "2"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+rayon = "1"
+regex-automata = "0.4"
+thiserror = "2"
+unicode-general-category = "1"
+unicode-normalization = "0.1"
+url = "2"
+# 跨平台 SIMD 向量类型(aarch64→NEON, x86_64→AVX)。
+wide = "0.7"
+fjall = "3.1.8"
+# chat template 渲染：GGUF `tokenizer.chat_template` 是完整 Jinja。只保留 macros(模板含
+# macro)/multi_template(命名模板)/serde(serde_json 直转 Value)/builtins(range/namespace
+# 等内建全局),裁掉 loader/json/fuel 等。
+minijinja = { version = "2.24", default-features = false, features = ["builtins", "macros", "multi_template", "serde"] }
+# chat 模板常写 Python 风格方法(dict.get / str.split),minijinja 原生不支持;
+# pycompat 的 unknown_method_callback 按 Jinja2 语义补齐,不需要改模板。
+minijinja-contrib = { version = "2.24", default-features = false, features = ["pycompat"] }
+# ROCm HIP 通过 dlopen 加载驱动与按需编译的 kernel。
+libloading = "0.8"
+
+[dev-dependencies]
+# server ws 端点的 loopback 集成测试客户端。
+tokio-tungstenite = { version = "0.28", features = ["connect"] }
+futures-util = "0.3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+objc2 = "0.6.4"
+objc2-foundation = "0.3.2"
+objc2-metal = { version = "0.3.2", features = ["MTLIndirectCommandBuffer", "MTLComputePipeline", "MTLLibrary"] }
+objc2-metal-performance-shaders = "0.3.2"
+rustyline = "18.0.1"
+
+# Android 移动 GPU 后端：WGSL 在运行时编译为厂商 Vulkan shader，避免依赖手机端 shader compiler。
+[target.'cfg(target_os = "android")'.dependencies]
+pollster = { version = "0.4", optional = true }
+wgpu = { version = "30", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }
+
+[[bin]]
+name = "zllm-server"
+path = "src/bin/zllm-server.rs"
+
+[[bin]]
+name = "zllm-rt-metal"
+path = "src/bin/runtime/metal.rs"
+
+[[bin]]
+name = "zllm-metal"
+path = "src/bin/zllm-metal.rs"
+
+[[bin]]
+name = "zllm-rt-cpu"
+path = "src/bin/runtime/cpu.rs"
+
+[[bin]]
+name = "zllm-rt-cuda"
+path = "src/bin/runtime/cuda.rs"
+required-features = ["with-cuda"]
+
+[[bin]]
+name = "zllm-fedora-cuda"
+path = "src/bin/zllm-fedora-cuda.rs"
+required-features = ["with-cuda"]
+
+[[bin]]
+name = "zllm-windows-cuda"
+path = "src/bin/zllm-windows-cuda.rs"
+required-features = ["with-cuda"]
+
+[[bin]]
+name = "zllm-rt-rocm"
+path = "src/bin/runtime/rocm.rs"
+required-features = ["with-rocm"]
+
+[[bin]]
+name = "zllm-rt-vulkan"
+path = "src/bin/runtime/vulkan.rs"
+required-features = ["with-vulkan"]

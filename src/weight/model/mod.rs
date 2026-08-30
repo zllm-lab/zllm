@@ -1,0 +1,19 @@
+//! 模型权重映射：张量命名、shape 校验与模型级装配。
+
+pub mod deepseek_v4;
+pub mod deepseek_v4_dspark;
+pub mod gemma4;
+pub mod glm52;
+pub mod glm52_dspark;
+pub mod glm53_flash;
+pub mod h3;
+pub mod h3_vae;
+pub mod kimi_k3;
+pub mod minicpm5;
+pub mod minimax_m3;
+pub mod mistral;
+pub mod qwen3;
+pub mod qwen36;
+pub mod qwen36_dspark;
+pub mod qwen3_vl;
+pub mod vision;

@@ -1,0 +1,20 @@
+version: 1
+
+session:
+  cache_directory: ./cache/gemma4
+  persist_kv_cache: true
+  resident_cache_entries: 1
+
+model:
+  architecture: gemma4
+  # E4B Q4_K_M 文本权重；同目录 mmproj-F16.gguf 自动接通 Gemma4V 图像编码器。
+  weights_directory: ./models/gemma-4-E4B-it-Q4_K_M.gguf
+  lm_head_quantization: native
+  max_sequence_length: 131072
+  execution:
+    prefill_chunk_size: 2048
+    mtp_weights: ./models/mtp-gemma-4-E4B-it-Q4_0.gguf
+
+backend:
+  kind: metal
+  device: default

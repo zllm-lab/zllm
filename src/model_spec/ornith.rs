@@ -1,0 +1,30 @@
+//! Ornith 模型架构配置。
+
+#[derive(Debug, Clone)]
+pub struct OrnithConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub layer_count: usize,
+    pub mtp_layer_count: usize,
+    pub full_attention_interval: usize,
+    pub full_attention_layers: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub rope_dim: usize,
+    pub rope_theta: f32,
+    pub rms_eps: f32,
+    pub use_qk_norm: bool,
+    pub linear_key_heads: usize,
+    pub linear_value_heads: usize,
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+    pub linear_conv_kernel: usize,
+    pub expert_intermediate_size: usize,
+    pub shared_intermediate_size: usize,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub num_shared_experts: usize,
+    pub routed_scaling_factor: f32,
+    pub eos_token_ids: Vec<u32>,
+}

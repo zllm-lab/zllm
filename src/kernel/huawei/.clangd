@@ -1,0 +1,8 @@
+# 这些 .cpp 只在具备 DDK_PATH/ascendebug 的机器上由 compile_*_kirin9010.sh
+# 编译,本机无 CANN 环境,clangd 报 kernel_operator.h 缺失属预期,全部抑制。
+# 若要恢复补全与类型检查,可从 DDK 机器拷贝 AscendC include 目录并改为
+# CompileFlags.Add: [-I, <该目录>]。
+CompileFlags:
+  Add: [-ferror-limit=0]
+Diagnostics:
+  Suppress: ["*"]
