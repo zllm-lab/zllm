@@ -4,6 +4,7 @@ version = "0.8.0"
 edition = "2024"
 description = "跨平台跨模型的高性能 LLM 推理引擎"
 license = "Apache-2.0"
+readme = "README.md"
 repository = "https://github.com/zllm-lab/zllm"
 keywords = ["llm", "inference", "metal", "cuda", "rocm"]
 categories = ["science", "hardware-support"]
