@@ -402,20 +402,13 @@ mod transcribe_tests {
 
         let direct = mlx::mlx_affine_matmul_tensor_resident(&ctx, &input, &packed, &scales, &biases, 0, 4, group, rows, cols).unwrap();
 
-        use crate::backend::metal::api::Transcriber;
-        Transcriber::begin_flat().unwrap();
-        let transcribed = mlx::mlx_affine_matmul_tensor_resident(&ctx, &input, &packed, &scales, &biases, 0, 4, group, rows, cols).unwrap();
-        let transcriber = Transcriber::end_flat().expect("平铺转录器应在进行");
-        let list = transcriber.into_command_list().unwrap();
-        assert_eq!(list.ops.len(), 1, "gemv dispatch 应恰好记为一条命令");
+        let (plan, transcribed) =
+            crate::backend::metal::replay::ReplayPlan::record(|| mlx::mlx_affine_matmul_tensor_resident(&ctx, &input, &packed, &scales, &biases, 0, 4, group, rows, cols).map_err(|msg| crate::backend::BackendError::Compute { msg }))
+                .unwrap();
+        assert_eq!(plan.command_count(), 1, "gemv dispatch 应恰好记为一条命令");
 
-        let command = ctx.command_buffer();
-        let encoder = command.new_compute_command_encoder();
-        for op in &list.ops {
-            encoder.encode_recorded(op);
-        }
-        encoder.end_encoding();
-        ctx.commit_and_wait(&command);
+        let command = plan.submit(&ctx);
+        command.wait_until_completed();
 
         let direct_values = ctx.read_f16_to_f32(&direct.buffer, rows);
         let replay_values = ctx.read_f16_to_f32(&transcribed.buffer, rows);

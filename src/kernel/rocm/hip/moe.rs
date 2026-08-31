@@ -173,6 +173,46 @@ pub(crate) struct RocmMoeRoute {
     pub(crate) len: usize,
 }
 
+/// 固定地址 graph 使用的 route workspace。普通 eager 路径继续使用 deferred
+/// workspace；这里的三块 buffer 由 graph owner 独占并跨 token 保持地址稳定。
+pub(crate) struct MoeRouteGraphBuffers {
+    logits: DeviceBuffer,
+    expert_ids: DeviceBuffer,
+    weights: DeviceBuffer,
+    len: usize,
+}
+
+impl MoeRouteGraphBuffers {
+    pub(crate) fn new(device_id: i32, rows: usize, experts: usize, top_k: usize) -> Result<Self, String> {
+        if rows == 0 || experts == 0 || top_k == 0 || top_k > experts || top_k > 16 {
+            return Err("ROCm graph route shape 非法".to_owned());
+        }
+        // 录制前完成 HIPRTC，graph 段内不得触发 module load 或 allocation。
+        let _ = moe_prefill_functions(device_id)?;
+        let logits_bytes = rows.checked_mul(experts).and_then(|n| n.checked_mul(4)).ok_or("ROCm graph logits 字节溢出")?;
+        let len = rows.checked_mul(top_k).ok_or("ROCm graph route 数溢出")?;
+        let route_bytes = len.checked_mul(4).ok_or("ROCm graph route 字节溢出")?;
+        Ok(Self { logits: DeviceBuffer::allocate(device_id, logits_bytes)?, expert_ids: DeviceBuffer::allocate(device_id, route_bytes)?, weights: DeviceBuffer::allocate(device_id, route_bytes)?, len })
+    }
+
+    pub(crate) fn expert_ids(&self) -> &DeviceBuffer {
+        &self.expert_ids
+    }
+
+    pub(crate) fn weights(&self) -> &DeviceBuffer {
+        &self.weights
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch(&self, device_id: i32, input: &DeviceBuffer, weight: &DeviceBuffer, bias: &DeviceBuffer, rows: usize, columns: usize, experts: usize, top_k: usize, scoring: u32, scaling: f32) -> Result<(), String> {
+        let len = launch_moe_route_resident_device_f32(device_id, input, weight, bias, rows, columns, experts, top_k, scoring, scaling, &self.logits, &self.expert_ids, &self.weights)?;
+        if len != self.len {
+            return Err(format!("ROCm graph route 数变化: {len}/{}", self.len));
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn launch_moe_route_resident_device_f32(
     device_id: i32,
@@ -853,6 +893,33 @@ pub fn try_moe_router_selected_resident_f32(
     Ok(output)
 }
 
+/// cooperative MoE 会在路由 consumer 内切换设备，不能把 route buffer 的
+/// 生命周期交给只在单卡 stream 尾部记录 event 的 deferred workspace。
+/// 这里返回拥有所有权的 device buffer，由调用方在双卡消费全部提交后释放。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_moe_route_selected_resident_device_f32(
+    device_id: i32,
+    input: &DeviceBuffer,
+    weight: &DeviceBuffer,
+    selected_experts: &[u32],
+    rows: usize,
+    columns: usize,
+    expert_count: usize,
+    top_k: usize,
+    scaling: f32,
+) -> Result<RocmMoeRoute, String> {
+    let route_count = rows.checked_mul(top_k).ok_or("ROCm selected route 数溢出")?;
+    if selected_experts.len() != route_count {
+        return Err(format!("ROCm selected route ids={} 期望 {route_count}", selected_experts.len()));
+    }
+    let route_bytes = route_count.checked_mul(4).ok_or("ROCm selected route 字节溢出")?;
+    let ids = DeviceBuffer::allocate_peer(device_id, route_bytes)?;
+    let weights = DeviceBuffer::allocate_peer(device_id, route_bytes)?;
+    ids.copy_from_host(unsafe { std::slice::from_raw_parts(selected_experts.as_ptr().cast(), route_bytes) })?;
+    launch_moe_router_selected_resident_f32(device_id, input, weight, &ids, &weights, rows, columns, expert_count, top_k, scaling)?;
+    Ok(RocmMoeRoute { expert_ids: ids, weights, len: route_count })
+}
+
 /// 固定专家 decode 路由保持在设备侧；selected ids 与 route weights 共用
 /// deferred route workspace，生命周期覆盖后续 consumer kernel。
 #[allow(clippy::too_many_arguments)]
@@ -939,8 +1006,10 @@ pub(crate) fn try_moe_route_resident_device_f32(
     let logits_bytes = rows.checked_mul(experts).and_then(|elements| elements.checked_mul(4)).ok_or("ROCm MoE logits 字节溢出")?;
     let route_bytes = rows.checked_mul(top_k).and_then(|elements| elements.checked_mul(4)).ok_or("ROCm MoE route 字节溢出")?;
     let logits = DeviceBuffer::allocate(device_id, logits_bytes)?;
-    let ids = DeviceBuffer::allocate(device_id, route_bytes)?;
-    let weights = DeviceBuffer::allocate(device_id, route_bytes)?;
+    // cooperative consumer 会跨卡读取路由；直接写入显式池，避免先写
+    // stream-ordered 临时块再 deferred D2D 时源生命周期与 peer event 交错。
+    let ids = DeviceBuffer::allocate_peer(device_id, route_bytes)?;
+    let weights = DeviceBuffer::allocate_peer(device_id, route_bytes)?;
     let len = launch_moe_route_resident_device_f32(device_id, input, weight, bias, rows, columns, experts, top_k, scoring, scaling, &logits, &ids, &weights)?;
     Ok(RocmMoeRoute { expert_ids: ids, weights, len })
 }

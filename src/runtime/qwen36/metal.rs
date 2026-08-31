@@ -86,7 +86,7 @@ pub fn run(
     }
 
     println!("backend: Metal, model: Qwen3.6-27B, prompt: {} tokens", tokens.len());
-    let ctx_owner = MetalContext::new_default().map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
+    let ctx_owner = MetalContext::new_default_with_replay(backend.replay).map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
     let ctx = &ctx_owner;
 
     let prepare_started = std::time::Instant::now();

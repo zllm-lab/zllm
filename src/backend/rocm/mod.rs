@@ -587,6 +587,11 @@ fn device_tensor_with_dtype(buffer: ops::hip::DeviceBuffer, rows: usize, cols: u
     RocmTensor { data: Vec::new(), rows, cols, dtype, layout: RocmTensorLayout::RowMajor, device: Some(Arc::new(buffer)) }
 }
 
+fn device_tensor_with_arc(buffer: Arc<ops::hip::DeviceBuffer>, rows: usize, cols: usize, dtype: RocmTensorDType) -> RocmTensor {
+    debug_assert_eq!(buffer.bytes(), rows.saturating_mul(cols).saturating_mul(dtype.element_bytes()));
+    RocmTensor { data: Vec::new(), rows, cols, dtype, layout: RocmTensorLayout::RowMajor, device: Some(buffer) }
+}
+
 fn device_tensor_f32(buffer: ops::hip::DeviceBuffer, rows: usize, cols: usize) -> RocmTensor {
     device_tensor_with_dtype(buffer, rows, cols, RocmTensorDType::F32)
 }

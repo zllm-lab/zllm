@@ -304,6 +304,163 @@ extern "C" __global__ void paged_cache_transform_q8_hadamard(
         = (signed char)fmaxf(-127.0f, fminf(127.0f, code));
 }
 
+// HISA profile shadow：直接从生产 raw-Q8 key 计算 block mean，再量化成
+// Q8G summary。summary 只服务粗筛，原始 cache 与生产 selection 均不改变。
+extern "C" __global__ void dsa_mean_pool_q8(
+    const signed char* keys,
+    const unsigned short* key_scales,
+    const unsigned int* block_table,
+    signed char* pooled_keys,
+    unsigned short* pooled_scales,
+    const unsigned int* pool_block_table,
+    unsigned int first_pool,
+    unsigned int pool_rows,
+    unsigned int context_rows,
+    unsigned int columns,
+    unsigned int group_size,
+    unsigned int pool_size,
+    unsigned int block_size)
+{
+    const unsigned int groups_per_row = columns / group_size;
+    const unsigned int local_pool = blockIdx.x / groups_per_row;
+    const unsigned int group = blockIdx.x - local_pool * groups_per_row;
+    const unsigned int lane = threadIdx.x;
+    if (local_pool >= pool_rows || lane >= group_size || pool_size == 0u) return;
+    const unsigned int pool = first_pool + local_pool;
+    const unsigned int first_token = pool * pool_size;
+    if (first_token >= context_rows) return;
+    const unsigned int valid = min(pool_size, context_rows - first_token);
+    const unsigned int column = group * group_size + lane;
+    float total = 0.0f;
+    for (unsigned int slot = 0u; slot < valid; ++slot) {
+        const unsigned int token = first_token + slot;
+        const unsigned long long physical = paged_row(block_table, token, block_size);
+        const float scale = zllm_bf16_to_f32(
+            key_scales[physical * groups_per_row + group]);
+        total += (float)keys[physical * columns + column] * scale;
+    }
+    const float pooled = total / (float)valid;
+    __shared__ float maxima[256];
+    __shared__ float quant_scale;
+    maxima[lane] = fabsf(pooled);
+    __syncthreads();
+    for (unsigned int offset = group_size >> 1; offset > 0; offset >>= 1) {
+        if (lane < offset) maxima[lane] = fmaxf(maxima[lane], maxima[lane + offset]);
+        __syncthreads();
+    }
+    const unsigned long long pooled_physical = paged_row(pool_block_table, pool, block_size);
+    if (lane == 0u) {
+        const float scale = maxima[0] == 0.0f ? 1.0f : maxima[0] * (1.0f / 127.0f);
+        const unsigned short encoded = zllm_f32_to_bf16(scale);
+        pooled_scales[pooled_physical * groups_per_row + group] = encoded;
+        quant_scale = zllm_bf16_to_f32(encoded);
+    }
+    __syncthreads();
+    const float quantized = nearbyintf(pooled / quant_scale);
+    pooled_keys[pooled_physical * columns + column]
+        = (signed char)fmaxf(-127.0f, fminf(127.0f, quantized));
+}
+
+// exact-pruning profile shadow：保存每个 token block、每个 key 维度在生产
+// BF16 WMMA 输入域中的 min/max。F32 summary 避免端点量化向内收缩。
+extern "C" __global__ void dsa_interval_pool_q8(
+    const signed char* keys,
+    const unsigned short* key_scales,
+    const unsigned int* block_table,
+    float* lower,
+    float* upper,
+    unsigned int first_pool,
+    unsigned int pool_rows,
+    unsigned int context_rows,
+    unsigned int columns,
+    unsigned int group_size,
+    unsigned int pool_size,
+    unsigned int block_size)
+{
+    const unsigned int groups_per_row = columns / group_size;
+    const unsigned int local_pool = blockIdx.x / groups_per_row;
+    const unsigned int group = blockIdx.x - local_pool * groups_per_row;
+    const unsigned int lane = threadIdx.x;
+    if (local_pool >= pool_rows || lane >= group_size || pool_size == 0u) return;
+    const unsigned int pool = first_pool + local_pool;
+    const unsigned int first_token = pool * pool_size;
+    if (first_token >= context_rows) return;
+    const unsigned int valid = min(pool_size, context_rows - first_token);
+    const unsigned int column = group * group_size + lane;
+    float minimum = 3.402823466e+38F;
+    float maximum = -3.402823466e+38F;
+    for (unsigned int slot = 0u; slot < valid; ++slot) {
+        const unsigned int token = first_token + slot;
+        const unsigned long long physical = paged_row(block_table, token, block_size);
+        const float scale = zllm_bf16_to_f32(
+            key_scales[physical * groups_per_row + group]);
+        const float value = zllm_bf16_to_f32(zllm_f32_to_bf16(
+            (float)keys[physical * columns + column] * scale));
+        minimum = fminf(minimum, value);
+        maximum = fmaxf(maximum, value);
+    }
+    const unsigned long long output = (unsigned long long)pool * columns + column;
+    lower[output] = minimum;
+    upper[output] = maximum;
+}
+
+// 根据 axis-aligned block interval 计算 DSA score 上界。逐 head 的 ReLU
+// 与 signed head weight 都按区间方向处理；误差项覆盖 BF16 WMMA/F32 归约。
+extern "C" __global__ void dsa_interval_score_bounds(
+    const float* lower,
+    const float* upper,
+    const float* query,
+    const float* head_weights,
+    float* bounds,
+    unsigned int pool_rows,
+    unsigned int head_count,
+    unsigned int head_dim)
+{
+    const unsigned int pool = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    if (pool >= pool_rows || lane >= head_dim) return;
+    __shared__ float lows[256];
+    __shared__ float highs[256];
+    __shared__ float magnitudes[256];
+    float score_upper = 0.0f;
+    float score_magnitude = 0.0f;
+    for (unsigned int head = 0u; head < head_count; ++head) {
+        const float q = zllm_bf16_to_f32(zllm_f32_to_bf16(
+            query[(unsigned long long)head * head_dim + lane]));
+        const unsigned long long index = (unsigned long long)pool * head_dim + lane;
+        const float left = q * lower[index];
+        const float right = q * upper[index];
+        lows[lane] = fminf(left, right);
+        highs[lane] = fmaxf(left, right);
+        magnitudes[lane] = fmaxf(fabsf(left), fabsf(right));
+        __syncthreads();
+        for (unsigned int offset = head_dim >> 1u; offset > 0u; offset >>= 1u) {
+            if (lane < offset) {
+                lows[lane] += lows[lane + offset];
+                highs[lane] += highs[lane + offset];
+                magnitudes[lane] += magnitudes[lane + offset];
+            }
+            __syncthreads();
+        }
+        if (lane == 0u) {
+            // gamma_128 < 7.7e-6；留出 2.0e-5 覆盖 WMMA 的分段归约。
+            const float dot_error = magnitudes[0] * 2.0e-5f + 1.0e-6f;
+            const float relu_lower = fmaxf(lows[0] - dot_error, 0.0f);
+            const float relu_upper = fmaxf(highs[0] + dot_error, 0.0f);
+            const float weight = head_weights[head];
+            const float term = weight >= 0.0f
+                ? weight * relu_upper : weight * relu_lower;
+            score_upper += term;
+            score_magnitude += fabsf(weight)
+                * fmaxf(fabsf(relu_lower), fabsf(relu_upper));
+        }
+        __syncthreads();
+    }
+    if (lane == 0u) {
+        bounds[pool] = score_upper + score_magnitude * 1.0e-5f + 1.0e-5f;
+    }
+}
+
 // glm5_next kpool:原始 key 保持 Q8G 常驻，每个完整池在当前 kernel 内
 // 解码 4 行、用 gate+APE 逐维 softmax 池化，再直接量化成池 key。
 // 不生成 BF16/F32 全量权重或 key shadow。
@@ -430,6 +587,7 @@ extern "C" __global__ void paged_cache_append_mla_f32_q8_bf16(
     unsigned short* rope_cache,
     const unsigned int* block_table,
     unsigned int position,
+    unsigned int rope_position,
     unsigned int rows,
     unsigned int latent_columns,
     unsigned int rope_columns,
@@ -459,8 +617,8 @@ extern "C" __global__ void paged_cache_append_mla_f32_q8_bf16(
             const unsigned int imag_column = split_half ? start + half + pair : real_column + 1;
             const float real = rope_input[(unsigned long long)row * rope_columns + real_column];
             const float imaginary = rope_input[(unsigned long long)row * rope_columns + imag_column];
-            const float c = cosine[(unsigned long long)(position + row) * half + pair];
-            const float s = sine[(unsigned long long)(position + row) * half + pair];
+            const float c = cosine[(unsigned long long)(rope_position + row) * half + pair];
+            const float s = sine[(unsigned long long)(rope_position + row) * half + pair];
             value = column == real_column ? real * c - imaginary * s : imaginary * c + real * s;
         }
         rope_cache[physical * rope_columns + column] = zllm_f32_to_bf16(value);
@@ -491,6 +649,40 @@ extern "C" __global__ void paged_cache_append_mla_f32_q8_bf16(
     const float quantized = nearbyintf(value / quant_scale);
     latent_cache[physical * latent_columns + column]
         = (signed char)fmaxf(-127.0f, fminf(127.0f, quantized));
+}
+
+// CPU 全历史只上传本轮缺失行；slot 是 GPU hot cache 中的精确落点。
+extern "C" __global__ void mla_hot_scatter_q8(
+    const signed char* source_latent,
+    const unsigned short* source_scales,
+    const unsigned short* source_rope,
+    const unsigned int* slots,
+    signed char* target_latent,
+    unsigned short* target_scales,
+    unsigned short* target_rope,
+    unsigned int rows,
+    unsigned int latent_columns,
+    unsigned int scale_columns,
+    unsigned int rope_columns,
+    unsigned int target_rows)
+{
+    const unsigned int row = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    if (row >= rows) return;
+    const unsigned int slot = slots[row];
+    if (slot >= target_rows) return;
+    for (unsigned int column = lane; column < latent_columns; column += blockDim.x) {
+        target_latent[(unsigned long long)slot * latent_columns + column]
+            = source_latent[(unsigned long long)row * latent_columns + column];
+    }
+    for (unsigned int column = lane; column < scale_columns; column += blockDim.x) {
+        target_scales[(unsigned long long)slot * scale_columns + column]
+            = source_scales[(unsigned long long)row * scale_columns + column];
+    }
+    for (unsigned int column = lane; column < rope_columns; column += blockDim.x) {
+        target_rope[(unsigned long long)slot * rope_columns + column]
+            = source_rope[(unsigned long long)row * rope_columns + column];
+    }
 }
 
 __device__ __forceinline__ unsigned int dsa_ordered_score(float score)

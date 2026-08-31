@@ -26,7 +26,7 @@ pub fn run(model_path: &Path, prompt: &str, max_seq_len: usize, decode_steps: us
     }
 
     println!("backend: Metal, model: Ornith, prompt: {} tokens", tokens.len());
-    let ctx_owner = MetalContext::new_default().map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
+    let ctx_owner = MetalContext::new_default_with_replay(backend.replay).map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
     let ctx = &ctx_owner;
     let prepare_started = std::time::Instant::now();
     let layers = ornith::prepare_ornith_layers(ctx, weights.as_ref()).map_err(|error| format!("准备 Ornith Metal 层: {error:?}"))?;

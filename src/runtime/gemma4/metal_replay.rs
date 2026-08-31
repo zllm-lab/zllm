@@ -5,8 +5,9 @@
 //!
 //! M5(AGXG17G)实测(2026-08):ICB 形态(录制 436s/重放 337s/驱动疑似丢弃上下文)
 //! 不可用——两处病态均为 ICB 驱动开销,非捕获-重放概念本身。2026-08-25 起改为
-//! 平铺转录(Transcriber::begin_flat):dispatch 记为调用表,重放用普通 encoder
-//! 重编码,完全绕开 ICB。瓶颈背景:decode 为 GPU-bound,重放的收益在 CPU 编码
+//! 平铺转录由 `backend::metal::replay::ReplayPlan` 统一管理：dispatch
+//! 记为调用表，重放用普通 encoder 重编码，完全绕开 ICB。瓶颈背景:
+//! decode 为 GPU-bound，重放的收益在 CPU 编码
 //! 61ms -> ~3ms 与静态操作表,为深融合/投机解码留空间,wall 提升有限。
 
 use crate::{
@@ -18,8 +19,8 @@ use crate::{
         Backend, BackendError, GqaPrefillBackend,
         metal::{
             MetalContext, MetalKvCache, MetalTensor, MetalWeight,
-            api::{Buffer, Transcriber},
-            replay::{DualReplay, ReplayStep},
+            api::Buffer,
+            replay::{DualReplay, ReplayPlan, ReplayStep},
         },
     },
     kernel::metal::{attention as metal_attention, shape as metal_shape},
@@ -78,7 +79,7 @@ pub struct Gemma4DecodeReplay<'a> {
     model: &'a Gemma4,
     weights: &'a Gemma4Weights,
     cache: &'a mut MetalKvCache,
-    commands: crate::backend::metal::api::CommandList,
+    commands: ReplayPlan,
     decode_state: Buffer,
     input: MetalTensor,
     token_inputs: Option<MetalTensor>,
@@ -106,23 +107,19 @@ impl<'a> Gemma4DecodeReplay<'a> {
         let rope_sliding = upload_rope_table(ctx, &rope.sliding).map_err(compute_error)?;
         let rope_full = upload_rope_table(ctx, &rope.full).map_err(compute_error)?;
 
-        // 平铺转录:整层序列记为普通调用表(无 ICB 依赖,记录成本 ~µs/op)
-        Transcriber::begin_flat().map_err(compute_error)?;
-        let recorded = record_round(ctx, cache, model, layers, per_layer_model, output_head, &input, token_inputs.as_ref(), &decode_state, &rope_sliding, &rope_full);
-        let transcriber = Transcriber::end().expect("转录器应在进行");
-        let commands = transcriber.into_command_list().map_err(compute_error)?;
-        recorded?;
+        // 平铺录制的生命周期由 Metal backend 统一管理。
+        let (commands, ()) = ReplayPlan::record(|| record_round(ctx, cache, model, layers, per_layer_model, output_head, &input, token_inputs.as_ref(), &decode_state, &rope_sliding, &rope_full))?;
         let embedding_scale = bf16::from_f32(cfg.embedding_scale()).to_f32();
         Ok(Self { ctx, model, weights, cache, commands, decode_state, input, token_inputs, embedding_scale })
     }
 
     pub fn command_count(&self) -> usize {
-        self.commands.ops.len()
+        self.commands.command_count()
     }
 
     /// 静态命令表(消融/诊断用)。
     pub fn ops(&self) -> &[crate::backend::metal::api::RecordedComputeOp] {
-        &self.commands.ops
+        self.commands.ops()
     }
 
     /// 一个 decode token:写输入与 kv 状态 → 重放 → 读回 argmax 结果。
@@ -162,16 +159,7 @@ impl<'a> Gemma4DecodeReplay<'a> {
             slot[1] = retained.end as u32;
             slot[2] = retained.start as u32;
         }
-        // 重放:普通 encoder 按录制顺序重编码(encoder 序即执行序,无 ICB 依赖)
-        let command = self.ctx.command_buffer();
-        let encoder = command.new_compute_command_encoder();
-        for op in &self.commands.ops {
-            if keep(op) {
-                encoder.encode_recorded(op);
-            }
-        }
-        encoder.end_encoding();
-        command.commit();
+        let command = self.commands.submit_filtered(self.ctx, keep);
         command.wait_until_completed();
         let readback = self.ctx.token_readback_buffer();
         Ok(unsafe { *readback.contents().cast::<u32>() })
@@ -432,7 +420,7 @@ fn record_layer(
 /// 与 48 层 state 槽,重编码一个 CB 提交;verify 138ms → 预期 ~65ms
 /// (消 48 个 CB 边界与逐算子 Rust 准备,GPU 贴带宽)。
 pub struct Gemma4VerifyReplay {
-    commands: crate::backend::metal::api::CommandList,
+    commands: ReplayPlan,
     input: MetalTensor,
     token_inputs: Option<MetalTensor>,
     state: Buffer,
@@ -478,8 +466,7 @@ impl Gemma4VerifyReplay {
         let rope_full = upload_rope_table(ctx, &rope.full).map_err(compute_error)?;
         let excluded = vec![cfg.end_image_token_id, cfg.end_audio_token_id];
 
-        crate::backend::metal::api::Transcriber::begin_flat().map_err(compute_error)?;
-        let recorded = (|| -> Result<MetalTensor, BackendError> {
+        let (commands, normed) = ReplayPlan::record(|| -> Result<MetalTensor, BackendError> {
             let per_layer_inputs = gemma4_per_layer_inputs(ctx, cfg, per_layer_model, &input, token_inputs.clone())?;
             let per_layer_inputs = per_layer_inputs.as_deref();
             let mut hidden = input.clone();
@@ -505,15 +492,12 @@ impl Gemma4VerifyReplay {
                 crate::kernel::metal::moe::argmax_tensor_into_offset(ctx, &row_logits, &plan.excluded_tokens, &readback, (row * 4) as u64).map_err(compute_error)?;
             }
             Ok(normed)
-        })();
-        let transcriber = crate::backend::metal::api::Transcriber::end().ok_or_else(|| compute_error("verify 重放转录器未在进行"))?;
-        let commands = transcriber.into_command_list().map_err(compute_error)?;
-        let normed = recorded?;
+        })?;
         Ok(Self { commands, input, token_inputs, state, readback, normed, current_cache: cache.buffer().clone(), layer_count, rows, kv_layers, kv_source })
     }
 
     pub fn command_count(&self) -> usize {
-        self.commands.ops.len()
+        self.commands.command_count()
     }
 
     pub fn rows(&self) -> usize {
@@ -577,15 +561,7 @@ impl Gemma4VerifyReplay {
             slot[1] = retained.end as u32;
             slot[2] = retained.start as u32;
         }
-        let command = ctx.command_buffer();
-        {
-            let encoder = command.new_compute_command_encoder();
-            for op in &self.commands.ops {
-                encoder.encode_recorded(op);
-            }
-            encoder.end_encoding();
-        }
-        command.commit();
+        let command = self.commands.submit(ctx);
         command.wait_until_completed();
         if std::env::var_os("ZLLM_GEMMA4_MTP_TRACE").is_some() {
             eprintln!("[mtp-gpu] verify step rows={} gpu={:.3}ms", self.rows, (command.gpu_end_time() - command.gpu_start_time()) * 1.0e3);

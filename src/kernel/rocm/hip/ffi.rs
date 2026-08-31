@@ -77,25 +77,23 @@ pub(super) type HipGraphNode = *mut c_void;
 pub(super) type HipGraphCreate = unsafe extern "C" fn(*mut HipGraph, u32) -> HipError;
 pub(super) type HipGraphAddKernelNode = unsafe extern "C" fn(*mut HipGraphNode, HipGraph, *const HipGraphNode, usize, *const HipKernelNodeParams) -> HipError;
 pub(super) type HipGraphInstantiateWithFlags = unsafe extern "C" fn(*mut HipGraphExec, HipGraph, u32) -> HipError;
-pub(super) type HipGraphGetNodes = unsafe extern "C" fn(HipGraph, *mut HipGraphNode, *mut usize) -> HipError;
 pub(super) type HipGraphLaunch = unsafe extern "C" fn(HipGraphExec, *mut c_void) -> HipError;
-pub(super) type HipGraphExecKernelNodeSetParams = unsafe extern "C" fn(HipGraphExec, HipGraphNode, *const HipKernelNodeParams) -> HipError;
 pub(super) type HipGraphDestroy = unsafe extern "C" fn(HipGraph) -> HipError;
 pub(super) type HipGraphExecDestroy = unsafe extern "C" fn(HipGraphExec) -> HipError;
 
 /// 与 HIP runtime 的 hipKernelNodeParams 布局一致。
 #[repr(C)]
 pub(super) struct HipKernelNodeParams {
+    pub block_dim_x: u32,
+    pub block_dim_y: u32,
+    pub block_dim_z: u32,
+    pub extra: *mut *mut c_void,
     pub func: *mut c_void,
     pub grid_dim_x: u32,
     pub grid_dim_y: u32,
     pub grid_dim_z: u32,
-    pub block_dim_x: u32,
-    pub block_dim_y: u32,
-    pub block_dim_z: u32,
-    pub shared_mem_bytes: u32,
     pub kernel_params: *mut *mut c_void,
-    pub extra: *mut *mut c_void,
+    pub shared_mem_bytes: u32,
 }
 
 pub(super) type HiprtcProgram = *mut c_void;
@@ -110,12 +108,29 @@ pub(super) type HiprtcDestroyProgram = unsafe extern "C" fn(*mut HiprtcProgram) 
 
 pub(super) const HIPRTC_SUCCESS: HiprtcResult = 0;
 
+#[cfg(test)]
+mod tests {
+    use super::HipKernelNodeParams;
+
+    #[test]
+    fn hip_kernel_node_params_matches_rocm_10_abi() {
+        assert_eq!(std::mem::size_of::<HipKernelNodeParams>(), 64);
+        assert_eq!(std::mem::offset_of!(HipKernelNodeParams, block_dim_x), 0);
+        assert_eq!(std::mem::offset_of!(HipKernelNodeParams, extra), 16);
+        assert_eq!(std::mem::offset_of!(HipKernelNodeParams, func), 24);
+        assert_eq!(std::mem::offset_of!(HipKernelNodeParams, grid_dim_x), 32);
+        assert_eq!(std::mem::offset_of!(HipKernelNodeParams, kernel_params), 48);
+        assert_eq!(std::mem::offset_of!(HipKernelNodeParams, shared_mem_bytes), 56);
+    }
+}
+
 pub(super) struct RocmRuntime {
     pub(super) hip: Library,
 }
 
 static INDEPENDENT_COMPUTE_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
 static BACKGROUND_STAGE_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
+static COOPERATIVE_PEER_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
 
 fn low_priority_compute_stream(device_id: i32, registry: &'static OnceLock<Mutex<HashMap<i32, usize>>>, label: &'static str) -> Result<usize, String> {
     let mut streams = registry.get_or_init(|| Mutex::new(HashMap::new())).lock().map_err(|_| format!("ROCm {label} stream 注册表已损坏"))?;
@@ -153,6 +168,12 @@ pub(crate) fn independent_compute_stream(device_id: i32) -> Result<usize, String
 /// target prefill 与 DSpark 必须使用不同队列，否则两种后台工作的依赖会互相串行。
 pub(crate) fn background_stage_stream(device_id: i32) -> Result<usize, String> {
     low_priority_compute_stream(device_id, &BACKGROUND_STAGE_STREAMS, "stage-prefill")
+}
+
+/// 同一张卡自己的 pipeline stage 与替邻卡执行的 MoE 不能共用 stream：双向
+/// event handoff 会形成环，也会把本应并发的两份计算重新串行。
+pub(crate) fn cooperative_peer_stream(device_id: i32) -> Result<usize, String> {
+    low_priority_compute_stream(device_id, &COOPERATIVE_PEER_STREAMS, "cooperative-peer")
 }
 
 pub(crate) fn initialized_background_stage_stream(device_id: i32) -> Option<usize> {
@@ -255,9 +276,7 @@ impl RocmRuntime {
     cached_hip_symbol!(graph_create, HipGraphCreate, "hipGraphCreate");
     cached_hip_symbol!(graph_add_kernel_node, HipGraphAddKernelNode, "hipGraphAddKernelNode");
     cached_hip_symbol!(graph_instantiate_with_flags, HipGraphInstantiateWithFlags, "hipGraphInstantiateWithFlags");
-    cached_hip_symbol!(graph_get_nodes, HipGraphGetNodes, "hipGraphGetNodes");
     cached_hip_symbol!(graph_launch, HipGraphLaunch, "hipGraphLaunch");
-    cached_hip_symbol!(graph_exec_kernel_node_set_params, HipGraphExecKernelNodeSetParams, "hipGraphExecKernelNodeSetParams");
     cached_hip_symbol!(graph_destroy, HipGraphDestroy, "hipGraphDestroy");
     cached_hip_symbol!(graph_exec_destroy, HipGraphExecDestroy, "hipGraphExecDestroy");
 

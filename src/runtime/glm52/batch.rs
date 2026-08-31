@@ -43,8 +43,10 @@ pub(super) struct Glm52BatchTask {
     pub(super) dspark_cpu_target_cache: DsparkTargetCache<CpuTensor>,
     pub(super) dspark_cpu_pending: Option<u64>,
     /// CPU proposal 计算期间，anchor verifier 已经先进入 target 流水线。
-    /// proposal 返回后只追加 draft suffix，尾端仍按完整 verify 一次验收。
+    /// proposal 返回后只追加当前有界窗口，验收通过才继续下一段。
     pub(super) dspark_cpu_anchor_in_flight: bool,
+    pub(super) dspark_cpu_window: usize,
+    pub(super) dspark_cpu_flight: Option<Glm52DsparkCpuFlight>,
     pub(super) dspark_verify_inputs: Vec<u32>,
     pub(super) dspark_verify_hidden: Vec<RocmTensor>,
     pub(super) dspark_verify_aux: Vec<RocmTensor>,
@@ -84,6 +86,44 @@ pub(super) struct Glm52TailOutcome {
     pub(super) drafts: Vec<u32>,
     pub(super) eos: bool,
     pub(super) hard_loop: Option<LoopKind>,
+    pub(super) continue_dspark: bool,
+}
+
+/// CPU drafter 一次生成的候选块。target 只按 `window` 行逐段提交，
+/// 未经验收的后缀不进入 16-stage，因此失配时不需要跨卡撤销。
+pub(super) struct Glm52DsparkCpuFlight {
+    anchor: u32,
+    drafts: Vec<u32>,
+    input_start: usize,
+    window: usize,
+}
+
+impl Glm52DsparkCpuFlight {
+    pub(super) fn new(anchor: u32, drafts: Vec<u32>, window: usize) -> Self {
+        Self { anchor, drafts, input_start: 0, window: window.max(1) }
+    }
+
+    pub(super) fn inputs(&self) -> Vec<u32> {
+        let end = self.input_start.saturating_add(self.window).min(self.drafts.len().saturating_add(1));
+        (self.input_start..end).map(|index| if index == 0 { self.anchor } else { self.drafts[index - 1] }).collect()
+    }
+
+    pub(super) fn expected(&self, rows: usize) -> Vec<u32> {
+        let end = self.input_start.saturating_add(rows).min(self.drafts.len());
+        self.drafts[self.input_start.min(end)..end].to_vec()
+    }
+
+    pub(super) fn terminal(&self, rows: usize) -> bool {
+        self.input_start.saturating_add(rows) >= self.drafts.len().saturating_add(1)
+    }
+
+    pub(super) fn depth(&self) -> usize {
+        self.input_start
+    }
+
+    pub(super) fn advance(&mut self, rows: usize) {
+        self.input_start = self.input_start.saturating_add(rows).min(self.drafts.len().saturating_add(1));
+    }
 }
 
 pub(super) struct Glm52PendingTask {
@@ -129,5 +169,28 @@ impl Glm52SwapPrefetch {
             Self::Ready(result) => Some(result),
             Self::Loading(receiver) => Some(receiver.recv().unwrap_or_else(|_| Err("GLM-5.2 SSD prefetch 线程提前退出".to_owned()))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Glm52DsparkCpuFlight;
+
+    #[test]
+    fn cpu_dspark_flight_splits_inputs_and_expected_tokens() {
+        let mut flight = Glm52DsparkCpuFlight::new(10, vec![11, 12, 13, 14, 15], 2);
+        assert_eq!(flight.inputs(), [10, 11]);
+        assert_eq!(flight.expected(2), [11, 12]);
+        assert!(!flight.terminal(2));
+
+        flight.advance(2);
+        assert_eq!(flight.inputs(), [12, 13]);
+        assert_eq!(flight.expected(2), [13, 14]);
+        assert!(!flight.terminal(2));
+
+        flight.advance(2);
+        assert_eq!(flight.inputs(), [14, 15]);
+        assert_eq!(flight.expected(2), [15]);
+        assert!(flight.terminal(2));
     }
 }

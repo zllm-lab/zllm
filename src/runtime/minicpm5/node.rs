@@ -3,31 +3,31 @@
 #[cfg(target_os = "macos")]
 use std::sync::Arc;
 
+#[cfg(not(target_os = "macos"))]
+use crate::{config::MiniCpm5NodeModelConfig, server::node::DynError};
 #[cfg(target_os = "macos")]
 use crate::{
-    config::MiniCpm5NodeModelConfig,
+    config::{MiniCpm5NodeModelConfig, NodeMetalBackendConfig},
     kv_cache::terminal_cache::TerminalInfo as CacheInfo,
     runtime::session::{GenerationSummary, NodeCapabilities},
     server::node::{DynError, NodeEngine},
 };
-#[cfg(not(target_os = "macos"))]
-use crate::{config::MiniCpm5NodeModelConfig, server::node::DynError};
 
 #[cfg(target_os = "macos")]
 use super::engine::MiniCpm5Engine;
 
 #[cfg(target_os = "macos")]
-pub async fn run(model: MiniCpm5NodeModelConfig, config: crate::server::node::NodeConfig) -> Result<(), DynError> {
+pub async fn run(model: MiniCpm5NodeModelConfig, backend: NodeMetalBackendConfig, config: crate::server::node::NodeConfig) -> Result<(), DynError> {
     let model_path = model.weights_directory;
     let max_seq_len = model.max_sequence_length;
     let kv_f16 = model.execution.kv_cache_format == crate::config::KvCacheFormat::F16;
     let lm_head_quantization = model.lm_head_quantization;
-    let factory = Box::new(move |runtime, compute_steps| MiniCpm5Engine::load(&model_path, max_seq_len, kv_f16, lm_head_quantization, runtime, compute_steps).map(|engine| Box::new(engine) as Box<dyn NodeEngine>));
+    let factory = Box::new(move |runtime, compute_steps| MiniCpm5Engine::load(&model_path, max_seq_len, kv_f16, backend.replay, lm_head_quantization, runtime, compute_steps).map(|engine| Box::new(engine) as Box<dyn NodeEngine>));
     crate::server::node::run_node(config, factory).await
 }
 
 #[cfg(not(target_os = "macos"))]
-pub async fn run(_model: MiniCpm5NodeModelConfig, _config: crate::server::node::NodeConfig) -> Result<(), DynError> {
+pub async fn run(_model: MiniCpm5NodeModelConfig, _backend: crate::config::NodeMetalBackendConfig, _config: crate::server::node::NodeConfig) -> Result<(), DynError> {
     Err("MiniCPM5 Metal Node 需要 macOS".into())
 }
 

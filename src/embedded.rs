@@ -110,13 +110,14 @@ impl Engine {
         #[cfg(target_os = "macos")]
         let (runtime, compute_steps) = (Arc::new(Mutex::new(crate::runtime::session::RuntimeStatus::default())), Arc::new(crate::runtime::session::AtomicCounterU64::new(0)));
         match (model, backend) {
-            (NodeModelConfig::Gemma4(model), NodeBackendConfig::Metal(_)) => {
+            (NodeModelConfig::Gemma4(model), NodeBackendConfig::Metal(metal)) => {
                 #[cfg(target_os = "macos")]
                 {
                     let engine = crate::runtime::gemma4::engine::Gemma4Engine::load(
                         &model.weights_directory,
                         model.max_sequence_length,
                         model.execution,
+                        metal.replay,
                         model.lm_head_quantization,
                         session.cache_directory,
                         session.persist_kv_cache,
@@ -129,12 +130,12 @@ impl Engine {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = (model, session);
+                    let _ = (model, metal, session);
                     Err("Gemma4 Metal 嵌入式引擎只支持 macOS".to_owned())
                 }
             }
             (NodeModelConfig::Gemma4(_), _) => Err("Gemma4 嵌入式引擎第一阶段只支持 Metal backend".to_owned()),
-            (NodeModelConfig::Qwen36(model), NodeBackendConfig::Metal(_)) => {
+            (NodeModelConfig::Qwen36(model), NodeBackendConfig::Metal(metal)) => {
                 #[cfg(target_os = "macos")]
                 {
                     let engine = crate::runtime::qwen36::engine::Qwen36Engine::load(
@@ -142,6 +143,7 @@ impl Engine {
                         model.max_sequence_length,
                         model.variant,
                         model.execution,
+                        metal.replay,
                         model.lm_head_quantization,
                         session.cache_directory,
                         session.persist_kv_cache,
@@ -154,12 +156,12 @@ impl Engine {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = (model, session);
+                    let _ = (model, metal, session);
                     Err("Qwen3.6/Qwen3.8 Metal 嵌入式引擎只支持 macOS".to_owned())
                 }
             }
             (NodeModelConfig::Qwen36(_), _) => Err("Qwen3.6/Qwen3.8 嵌入式引擎第一阶段只支持 Metal backend".to_owned()),
-            (NodeModelConfig::MiniCpm5(model), NodeBackendConfig::Metal(_)) => {
+            (NodeModelConfig::MiniCpm5(model), NodeBackendConfig::Metal(metal)) => {
                 #[cfg(target_os = "macos")]
                 {
                     if session.persist_kv_cache || session.resident_cache_entries != 1 {
@@ -169,6 +171,7 @@ impl Engine {
                         &model.weights_directory,
                         model.max_sequence_length,
                         model.execution.kv_cache_format == crate::config::KvCacheFormat::F16,
+                        metal.replay,
                         model.lm_head_quantization,
                         runtime,
                         compute_steps,
@@ -178,12 +181,12 @@ impl Engine {
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = (model, session);
+                    let _ = (model, metal, session);
                     Err("MiniCPM5 Metal 嵌入式引擎只支持 macOS".to_owned())
                 }
             }
             (NodeModelConfig::MiniCpm5(_), _) => Err("MiniCPM5 嵌入式引擎第一阶段只支持 Metal backend".to_owned()),
-            (NodeModelConfig::Ornith(model), NodeBackendConfig::Metal(_)) => {
+            (NodeModelConfig::Ornith(model), NodeBackendConfig::Metal(metal)) => {
                 #[cfg(target_os = "macos")]
                 {
                     if session.persist_kv_cache {
@@ -191,29 +194,31 @@ impl Engine {
                     }
                     let mut options = crate::runtime::ornith::options::OrnithOptions::from(model.execution);
                     options.terminal_cache_entries = session.resident_cache_entries;
-                    let engine = crate::runtime::ornith::node::OrnithEngine::load(&model.weights_directory, model.max_sequence_length, options, model.lm_head_quantization, runtime, compute_steps).map_err(|error| error.to_string())?;
+                    let engine =
+                        crate::runtime::ornith::node::OrnithEngine::load(&model.weights_directory, model.max_sequence_length, options, metal.replay, model.lm_head_quantization, runtime, compute_steps).map_err(|error| error.to_string())?;
                     Ok(Self { inner: EngineInner::Ornith(Box::new(engine)) })
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = (model, session);
+                    let _ = (model, metal, session);
                     Err("Ornith Metal 嵌入式引擎只支持 macOS".to_owned())
                 }
             }
             (NodeModelConfig::Ornith(_), _) => Err("Ornith 嵌入式引擎当前只支持 Metal backend".to_owned()),
-            (NodeModelConfig::Mistral(model), NodeBackendConfig::Metal(_)) => {
+            (NodeModelConfig::Mistral(model), NodeBackendConfig::Metal(metal)) => {
                 #[cfg(target_os = "macos")]
                 {
                     if session.persist_kv_cache {
                         return Err("Mistral embedded 尚未实现 terminal cache，仅支持 persist_kv_cache=false".to_owned());
                     }
                     let kv_f16 = model.execution.kv_cache_format == crate::config::KvCacheFormat::F16;
-                    let engine = crate::runtime::mistral::node::MistralEngine::load(&model.weights_directory, model.max_sequence_length, kv_f16, model.lm_head_quantization, runtime, compute_steps).map_err(|error| error.to_string())?;
+                    let engine =
+                        crate::runtime::mistral::node::MistralEngine::load(&model.weights_directory, model.max_sequence_length, kv_f16, metal.replay, model.lm_head_quantization, runtime, compute_steps).map_err(|error| error.to_string())?;
                     Ok(Self { inner: EngineInner::Mistral(Box::new(engine)) })
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = (model, session);
+                    let _ = (model, metal, session);
                     Err("Mistral Metal 嵌入式引擎只支持 macOS".to_owned())
                 }
             }
@@ -330,5 +335,38 @@ impl Drop for Engine {
         if let Err(error) = result {
             eprintln!("[zllm-embedded] 优雅退出持久化失败: {error}");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod real_model_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// 真实 `zllm::Engine` 回归：不启动 server，直接从 embedded YAML
+    /// 装载并跑一次结构化请求。没有本地模型环境变量时自动跳过。
+    #[test]
+    fn embedded_gemma4_real_request() {
+        let Some(config) = std::env::var_os("ZLLM_EMBEDDED_GEMMA4_CONFIG").map(std::path::PathBuf::from) else { return };
+        let prompt = std::env::var_os("ZLLM_EMBEDDED_PROMPT_FILE").map(std::path::PathBuf::from).map(|path| std::fs::read_to_string(path).expect("读取 embedded prompt")).unwrap_or_else(|| "Reply with one short sentence.".to_owned());
+        let max_tokens = std::env::var("ZLLM_EMBEDDED_MAX_TOKENS").ok().and_then(|value| value.parse::<usize>().ok()).filter(|value| *value > 0).unwrap_or(8);
+        let mut engine = Engine::from_config(config).expect("加载 embedded Gemma4");
+        let request = json!({
+            "model": "gemma4",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": 0
+        });
+        let mut output = String::new();
+        let cancellation = engine.cancellation();
+        let result = engine
+            .generate(&request, &cancellation, |_, text| {
+                output.push_str(text);
+                true
+            })
+            .expect("embedded Gemma4 生成");
+        println!("[embedded-real] prompt={} completion={} finish={} cache={:?} output={output:?}", result.prompt_tokens, result.completion_tokens, result.finish_reason, result.cache_id);
+        assert!(result.prompt_tokens > 0);
+        assert!(result.completion_tokens > 0);
     }
 }

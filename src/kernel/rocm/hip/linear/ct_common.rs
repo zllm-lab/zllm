@@ -63,6 +63,9 @@ pub(super) struct CtFunctions {
     pub(super) gguf_grouped_down: usize,
     pub(super) gguf_fused_gate_up: usize,
     pub(super) gguf_fused_down: usize,
+    pub(super) cooperative_merge_activation: usize,
+    pub(super) cooperative_sharded_down: usize,
+    pub(super) cooperative_partial_join: usize,
 }
 
 pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, String> {
@@ -130,8 +133,11 @@ pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, Stri
             "ct_quantized_matmul_bf16_w4_rows8",
             "ct_quantized_matmul_bf16_w4_rows2",
             "ct_quantized_dual_gemv_bf16_w4_rows8",
+            "ct_cooperative_merge_activation_bf16",
+            "ct_cooperative_sharded_down_bf16",
+            "ct_cooperative_partial_join_f32",
         ];
-        let mut handles = [ptr::null_mut(); 45];
+        let mut handles = [ptr::null_mut(); 48];
         for (handle, name) in handles.iter_mut().zip(names) {
             let name = CString::new(name).unwrap();
             let status = unsafe { module_get_function(handle, module, name.as_ptr()) };
@@ -197,6 +203,9 @@ pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, Stri
                 gguf_grouped_down: handles[31] as usize,
                 gguf_fused_gate_up: handles[32] as usize,
                 gguf_fused_down: handles[33] as usize,
+                cooperative_merge_activation: handles[45] as usize,
+                cooperative_sharded_down: handles[46] as usize,
+                cooperative_partial_join: handles[47] as usize,
             },
         ))
     })();

@@ -958,7 +958,9 @@ fn try_rmsnorm_resident_weight(device_id: i32, input: &DeviceBuffer, weight: &De
     validate_resident(weight, device_id, cols.checked_mul(4).ok_or("resident weight RMSNorm 参数字节溢出")?, "resident weight RMSNorm weight")?;
     set_device(device_id)?;
     let output = DeviceBuffer::allocate_reusable(device_id, output_bytes)?;
-    let quantized = matches!(output_kind, RmsnormOutput::F32AndBf16).then(|| DeviceBuffer::allocate_reusable(device_id, bf16_bytes)).transpose()?;
+    // dual RMSNorm 的 BF16 分支会被 cooperative MoE 直接跨卡消费；从源头
+    // 放入显式池，避免 async allocation 再 deferred D2D 的跨 stream 可见性窗口。
+    let quantized = matches!(output_kind, RmsnormOutput::F32AndBf16).then(|| DeviceBuffer::allocate_peer(device_id, bf16_bytes)).transpose()?;
     let functions = tensor_functions(device_id)?;
     let mut d_input = input.pointer;
     let mut d_weight = weight.pointer;

@@ -1423,6 +1423,205 @@ extern "C" __global__ void ct_decode_down_bf16(
     }
 }
 
+__device__ __forceinline__ const unsigned short* zllm_cooperative_sharded_input(
+    const unsigned short* low_input,
+    const unsigned short* high_input,
+    const unsigned int* route_to_grouped,
+    unsigned int route,
+    unsigned int low_columns,
+    unsigned int high_columns,
+    unsigned int column)
+{
+    const unsigned int grouped = route_to_grouped[route];
+    return column < low_columns
+        ? low_input + (unsigned long long)grouped * low_columns + column
+        : high_input + (unsigned long long)grouped * high_columns
+            + column - low_columns;
+}
+
+// 两卡 activation 已按同一份 device route 紧凑为相同 expert-grouped 顺序。
+// down WMMA 需要每条 route 的 intermediate 连续，先用一次顺序带宽 kernel
+// 合并两半；相比让矩阵 kernel 在 K 维维护双指针，这里保持成熟 WMMA 主体不变。
+extern "C" __global__ void ct_cooperative_merge_activation_bf16(
+    const unsigned short* low_input,
+    const unsigned short* high_input,
+    unsigned short* output,
+    unsigned int route_count,
+    unsigned int low_columns,
+    unsigned int high_columns)
+{
+    const unsigned int columns = low_columns + high_columns;
+    const unsigned long long index =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long elements =
+        (unsigned long long)route_count * columns;
+    if (index >= elements) return;
+    const unsigned int column = index % columns;
+    const unsigned int route = index / columns;
+    output[index] = column < low_columns
+        ? low_input[(unsigned long long)route * low_columns + column]
+        : high_input[(unsigned long long)route * high_columns
+            + column - low_columns];
+}
+
+// gate/up 的输出行在两卡各占一半；down 的每个输出行仍在一张卡上按完整
+// intermediate 维度和完整 route 顺序累计。只改变 activation 的物理分段，
+// 不改变原 kernel 的 packed-word、scale、FMA 与 subgroup reduction 顺序。
+template <bool Bf16Scale>
+__device__ __forceinline__ float zllm_cooperative_sharded_down_dot(
+    const unsigned short* low_input,
+    const unsigned short* high_input,
+    const unsigned int* route_to_grouped,
+    unsigned int low_columns,
+    unsigned int high_columns,
+    unsigned int route,
+    float route_weight,
+    const ZllmCtWeightMeta& weight,
+    unsigned int output_row,
+    unsigned int lane,
+    float sum)
+{
+    const unsigned int input_columns = low_columns + high_columns;
+    const unsigned int* packed = (const unsigned int*)weight.packed;
+    const unsigned char* scales = (const unsigned char*)weight.scales;
+    const unsigned int packed_columns = (input_columns + 7u) / 8u;
+    const unsigned int groups = input_columns / weight.group_size;
+    const unsigned int words_per_group = weight.group_size / 8u;
+    unsigned int group = 0u;
+    if (words_per_group == 16u) {
+        for (; group + 4u <= groups; group += 4u) {
+            unsigned int words[4];
+            float scale_values[4];
+            const unsigned short* word_inputs[4];
+            for (unsigned int j = 0u; j < 4u; ++j) {
+                const unsigned long long scale_index =
+                    (unsigned long long)output_row * groups + group + j;
+                scale_values[j] = (
+                    Bf16Scale
+                        ? zllm_bf16_to_f32(((const unsigned short*)scales)[scale_index])
+                        : zllm_scale(scales, scale_index, weight.scale_dtype)) * route_weight;
+                const unsigned int packed_index = (group + j) * 16u + lane;
+                words[j] = packed[
+                    (unsigned long long)output_row * packed_columns + packed_index];
+                word_inputs[j] = zllm_cooperative_sharded_input(
+                    low_input, high_input, route_to_grouped, route,
+                    low_columns, high_columns,
+                    packed_index * 8u);
+            }
+            for (unsigned int j = 0u; j < 4u; ++j) {
+                sum = zllm_grouped_down_decode_word(
+                    word_inputs[j], words[j], scale_values[j], sum);
+            }
+        }
+    }
+    for (; group < groups; ++group) {
+        const unsigned long long scale_index =
+            (unsigned long long)output_row * groups + group;
+        const float scale_value = (
+            Bf16Scale
+                ? zllm_bf16_to_f32(((const unsigned short*)scales)[scale_index])
+                : zllm_scale(scales, scale_index, weight.scale_dtype)) * route_weight;
+        const unsigned int word_base = group * words_per_group;
+        for (unsigned int word_index = lane;
+             word_index < words_per_group;
+             word_index += 16u) {
+            const unsigned int packed_index = word_base + word_index;
+            const unsigned int word = packed[
+                (unsigned long long)output_row * packed_columns + packed_index];
+            const unsigned int column = packed_index * 8u;
+            sum = zllm_grouped_down_decode_word(
+                zllm_cooperative_sharded_input(
+                    low_input, high_input, route_to_grouped, route,
+                    low_columns, high_columns,
+                    column),
+                word, scale_value, sum);
+        }
+    }
+    return sum;
+}
+
+extern "C" __global__ void ct_cooperative_sharded_down_bf16(
+    const unsigned short* low_input,
+    const unsigned short* high_input,
+    const unsigned int* route_ids,
+    const float* route_weights,
+    const unsigned int* route_to_grouped,
+    const ZllmCtExpertMeta* experts,
+    float* output,
+    unsigned int low_columns,
+    unsigned int high_columns,
+    unsigned int output_rows,
+    unsigned int route_count,
+    unsigned int top_k,
+    unsigned int expert_count)
+{
+    const unsigned int token = blockIdx.y;
+    const unsigned int route_base = token * top_k;
+    if (top_k == 0u || top_k > 16u || route_base + top_k > route_count
+        || low_columns == 0u
+        || low_columns % 8u != 0u) return;
+    __shared__ unsigned int sorted_slots[16];
+    if (threadIdx.x == 0u) {
+        for (unsigned int slot = 0u; slot < top_k; ++slot) {
+            unsigned int position = slot;
+            while (position > 0u
+                && route_ids[route_base + sorted_slots[position - 1u]] > route_ids[route_base + slot]) {
+                sorted_slots[position] = sorted_slots[position - 1u];
+                --position;
+            }
+            sorted_slots[position] = slot;
+        }
+    }
+    __syncthreads();
+
+    const unsigned int lane = threadIdx.x & 15u;
+    const unsigned int subgroup = threadIdx.x >> 4u;
+    const unsigned int output_row = blockIdx.x * 16u + subgroup;
+    if (output_row >= output_rows) return;
+    float sum = 0.0f;
+    for (unsigned int rank = 0u; rank < top_k; ++rank) {
+        const unsigned int route = route_base + sorted_slots[rank];
+        const unsigned int expert = route_ids[route];
+        if (expert >= expert_count) continue;
+        const ZllmCtWeightMeta& weight = experts[expert].down;
+        if (weight.format != 0u || weight.group_size == 0u
+            || (low_columns + high_columns) % weight.group_size != 0u) continue;
+        if (weight.scale_dtype == 0u) {
+            sum = zllm_cooperative_sharded_down_dot<true>(
+                low_input, high_input, route_to_grouped, low_columns,
+                high_columns, route, route_weights[route], weight,
+                output_row, lane, sum);
+        } else {
+            sum = zllm_cooperative_sharded_down_dot<false>(
+                low_input, high_input, route_to_grouped, low_columns,
+                high_columns, route, route_weights[route], weight,
+                output_row, lane, sum);
+        }
+    }
+    for (unsigned int offset = 8u; offset; offset >>= 1u)
+        sum += __shfl_down(sum, offset, 16);
+    if (lane == 0u)
+        output[(unsigned long long)token * output_rows + output_row] = sum;
+}
+
+// down K 维两半各自产生完整 hidden partial；owner 完成一次 all-reduce 与
+// shared/residual epilogue。partial 先相加，明确固定跨卡归约顺序。
+extern "C" __global__ void ct_cooperative_partial_join_f32(
+    const float* local_partial,
+    const float* peer_partial,
+    const float* shared,
+    const float* residual,
+    float* output,
+    unsigned int input_rows,
+    unsigned int hidden_size)
+{
+    const unsigned long long index =
+        (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= (unsigned long long)input_rows * hidden_size) return;
+    const float routed = local_partial[index] + peer_partial[index];
+    output[index] = residual[index] + (shared[index] + routed);
+}
+
 // MTP L78 的 compressed-tensors expert 是逐行 scale 的 W8。单路直接消费
 // device route，用两个 kernel 完成全部 top-k expert，避免逐 expert 反复 launch。
 __device__ __forceinline__ ZllmDecodeGateUpSums zllm_decode_gate_up_w8_dot(

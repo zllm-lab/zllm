@@ -40,7 +40,7 @@ pub fn run(model: Glm52StandaloneModelConfig, backend: MetalBackendConfig) -> Re
         }
     }
 
-    let ctx_owner = MetalContext::new_default().map_err(|e| format!("MetalContext 初始化失败: {e}"))?;
+    let ctx_owner = MetalContext::new_default_with_replay(backend.replay).map_err(|e| format!("MetalContext 初始化失败: {e}"))?;
     let ctx = &ctx_owner;
 
     let model_dir = PathBuf::from(&model_dir);

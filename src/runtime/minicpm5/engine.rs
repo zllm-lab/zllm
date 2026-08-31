@@ -95,8 +95,16 @@ impl crate::kv_cache::terminal_cache::TerminalSnapshot for MiniCpm5TerminalState
 
 #[cfg(target_os = "macos")]
 impl MiniCpm5Engine {
-    pub fn load(model_path: &Path, max_seq_len: usize, kv_f16: bool, lm_head_quantization: crate::weight::LmHeadQuantization, runtime: Arc<Mutex<NodeRuntime>>, compute_steps: Arc<AtomicCounterU64>) -> Result<Self, DynError> {
-        let session = MiniCpm5MetalSession::load(model_path, max_seq_len, kv_f16, lm_head_quantization).map_err(|error| -> DynError { error.into() })?;
+    pub fn load(
+        model_path: &Path,
+        max_seq_len: usize,
+        kv_f16: bool,
+        replay_enabled: bool,
+        lm_head_quantization: crate::weight::LmHeadQuantization,
+        runtime: Arc<Mutex<NodeRuntime>>,
+        compute_steps: Arc<AtomicCounterU64>,
+    ) -> Result<Self, DynError> {
+        let session = MiniCpm5MetalSession::load_with_replay(model_path, max_seq_len, kv_f16, replay_enabled, lm_head_quantization).map_err(|error| -> DynError { error.into() })?;
         let session_resident_bytes = session.session_capacity_bytes();
         let available = crate::backend::metal::available_residency_bytes(session.context()) as usize;
         let engine_resident_bytes = session.context().device.current_allocated_size() as usize;
@@ -522,7 +530,7 @@ mod tests {
         }
         let runtime = std::sync::Arc::new(std::sync::Mutex::new(NodeRuntime::default()));
         let compute_steps = std::sync::Arc::new(crate::runtime::session::AtomicCounterU64::new(0));
-        let mut engine = MiniCpm5Engine::load(Path::new(WEIGHTS), 8192, false, crate::weight::LmHeadQuantization::Native, runtime, compute_steps).expect("engine");
+        let mut engine = MiniCpm5Engine::load(Path::new(WEIGHTS), 8192, false, true, crate::weight::LmHeadQuantization::Native, runtime, compute_steps).expect("engine");
         let cancellation = std::sync::atomic::AtomicBool::new(false);
         let mut history: Vec<(String, String)> = Vec::new();
         let mut cache_id: Option<String> = None;
@@ -547,7 +555,7 @@ mod tests {
         // 对照:同一形状但不带 cache_id(引擎走 LCP 前缀复用/全量),新引擎隔离终态。
         let runtime = std::sync::Arc::new(std::sync::Mutex::new(NodeRuntime::default()));
         let compute_steps = std::sync::Arc::new(crate::runtime::session::AtomicCounterU64::new(0));
-        let mut engine = MiniCpm5Engine::load(Path::new(WEIGHTS), 8192, false, crate::weight::LmHeadQuantization::Native, runtime, compute_steps).expect("engine");
+        let mut engine = MiniCpm5Engine::load(Path::new(WEIGHTS), 8192, false, true, crate::weight::LmHeadQuantization::Native, runtime, compute_steps).expect("engine");
         let mut history: Vec<(String, String)> = Vec::new();
         let mut no_cache_answers: Vec<String> = Vec::new();
         for turn in ["我住的 city 是北京,请记住", "好的", "我住哪个 city?只回答城市名"] {
@@ -569,7 +577,7 @@ mod tests {
         // 第二对照:开思考(官方默认形态)验证模型多轮记忆本身是否正常。
         let runtime = std::sync::Arc::new(std::sync::Mutex::new(NodeRuntime::default()));
         let compute_steps = std::sync::Arc::new(crate::runtime::session::AtomicCounterU64::new(0));
-        let mut engine = MiniCpm5Engine::load(Path::new(WEIGHTS), 8192, false, crate::weight::LmHeadQuantization::Native, runtime, compute_steps).expect("engine");
+        let mut engine = MiniCpm5Engine::load(Path::new(WEIGHTS), 8192, false, true, crate::weight::LmHeadQuantization::Native, runtime, compute_steps).expect("engine");
         let mut history: Vec<(String, String)> = Vec::new();
         let mut thinking_answers: Vec<String> = Vec::new();
         for turn in ["我住的 city 是北京,请记住", "好的", "我住哪个 city?只回答城市名"] {

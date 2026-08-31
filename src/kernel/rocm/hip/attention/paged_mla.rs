@@ -24,9 +24,13 @@ struct PagedMlaFunctions {
     cache_append_dsa_prologue_q8: usize,
     cache_append_q8_hadamard: usize,
     cache_transform_q8_hadamard: usize,
+    dsa_mean_pool: usize,
+    dsa_interval_pool: usize,
+    dsa_interval_bounds: usize,
     dsa_kpool_compress: usize,
     cache_copy_q8_pair: usize,
     cache_append_mla_q8_bf16: usize,
+    mla_hot_scatter_q8: usize,
     dsa_clear: usize,
     dsa_score: usize,
     dsa_quantize_query_i8: usize,
@@ -314,6 +318,175 @@ pub fn try_paged_cache_transform_q8_hadamard(
     launch_tensor_kernel(functions.cache_transform_q8_hadamard, rows, columns, &mut arguments, "HIP paged raw-Q8 to Hadamard-Q8")
 }
 
+/// 从生产 raw-Q8/G cache 生成 HISA mean-pooled Q8/G block summary。
+/// 该算子只负责布局转换；调用方决定 summary 的生命周期与是否参与 selection。
+#[allow(clippy::too_many_arguments)]
+pub fn try_dsa_mean_pool_q8(
+    device_id: i32,
+    keys: &DeviceBuffer,
+    key_scales: &DeviceBuffer,
+    block_table: &DeviceBuffer,
+    pooled_keys: &DeviceBuffer,
+    pooled_scales: &DeviceBuffer,
+    pool_block_table: &DeviceBuffer,
+    first_pool: usize,
+    pool_rows: usize,
+    context_rows: usize,
+    columns: usize,
+    group_size: usize,
+    pool_size: usize,
+    block_size: usize,
+) -> Result<(), String> {
+    if pool_rows == 0 || context_rows == 0 || columns == 0 || group_size == 0 || group_size > 256 || !group_size.is_power_of_two() || !columns.is_multiple_of(group_size) || pool_size == 0 || block_size == 0 {
+        return Err("DSA HISA mean pool shape 非法".to_owned());
+    }
+    let total_pool_rows = context_rows.div_ceil(pool_size);
+    if first_pool.checked_add(pool_rows).is_none_or(|end| end > total_pool_rows) {
+        return Err(format!("DSA HISA mean pool range={first_pool}+{pool_rows} 超过 {total_pool_rows}"));
+    }
+    let groups_per_row = columns / group_size;
+    validate_resident(keys, device_id, context_rows.checked_mul(columns).ok_or("DSA HISA raw keys 大小溢出")?, "DSA HISA raw keys")?;
+    validate_resident(key_scales, device_id, context_rows.checked_mul(groups_per_row).and_then(|n| n.checked_mul(2)).ok_or("DSA HISA raw scales 大小溢出")?, "DSA HISA raw scales")?;
+    validate_resident(block_table, device_id, context_rows.div_ceil(block_size).checked_mul(4).ok_or("DSA HISA raw table 大小溢出")?, "DSA HISA raw table")?;
+    validate_resident(pooled_keys, device_id, total_pool_rows.checked_mul(columns).ok_or("DSA HISA pooled keys 大小溢出")?, "DSA HISA pooled keys")?;
+    validate_resident(pooled_scales, device_id, total_pool_rows.checked_mul(groups_per_row).and_then(|n| n.checked_mul(2)).ok_or("DSA HISA pooled scales 大小溢出")?, "DSA HISA pooled scales")?;
+    validate_resident(pool_block_table, device_id, total_pool_rows.div_ceil(block_size).checked_mul(4).ok_or("DSA HISA pool table 大小溢出")?, "DSA HISA pool table")?;
+    let functions = paged_mla_functions(device_id)?;
+    let mut d_keys = keys.pointer;
+    let mut d_scales = key_scales.pointer;
+    let mut d_table = block_table.pointer;
+    let mut d_pooled_keys = pooled_keys.pointer;
+    let mut d_pooled_scales = pooled_scales.pointer;
+    let mut d_pool_table = pool_block_table.pointer;
+    let mut first_pool = u32::try_from(first_pool).map_err(|_| "DSA HISA first_pool 超过 u32")?;
+    let mut pool_rows = u32::try_from(pool_rows).map_err(|_| "DSA HISA pool_rows 超过 u32")?;
+    let mut context_rows = u32::try_from(context_rows).map_err(|_| "DSA HISA context 超过 u32")?;
+    let mut columns = u32::try_from(columns).map_err(|_| "DSA HISA columns 超过 u32")?;
+    let mut group_size = u32::try_from(group_size).map_err(|_| "DSA HISA group 超过 u32")?;
+    let mut pool_size = u32::try_from(pool_size).map_err(|_| "DSA HISA pool_size 超过 u32")?;
+    let mut block_size = u32::try_from(block_size).map_err(|_| "DSA HISA block_size 超过 u32")?;
+    let mut arguments = [
+        (&mut d_keys as *mut *mut c_void).cast(),
+        (&mut d_scales as *mut *mut c_void).cast(),
+        (&mut d_table as *mut *mut c_void).cast(),
+        (&mut d_pooled_keys as *mut *mut c_void).cast(),
+        (&mut d_pooled_scales as *mut *mut c_void).cast(),
+        (&mut d_pool_table as *mut *mut c_void).cast(),
+        (&mut first_pool as *mut u32).cast(),
+        (&mut pool_rows as *mut u32).cast(),
+        (&mut context_rows as *mut u32).cast(),
+        (&mut columns as *mut u32).cast(),
+        (&mut group_size as *mut u32).cast(),
+        (&mut pool_size as *mut u32).cast(),
+        (&mut block_size as *mut u32).cast(),
+    ];
+    let groups = pool_rows.checked_mul(columns / group_size).ok_or("DSA HISA mean pool grid 溢出")?;
+    launch_tensor_kernel(functions.dsa_mean_pool, groups, group_size, &mut arguments, "HIP DSA HISA mean pool Q8G")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_dsa_interval_pool_q8(
+    device_id: i32,
+    keys: &DeviceBuffer,
+    key_scales: &DeviceBuffer,
+    block_table: &DeviceBuffer,
+    lower: &DeviceBuffer,
+    upper: &DeviceBuffer,
+    first_pool: usize,
+    pool_rows: usize,
+    context_rows: usize,
+    columns: usize,
+    group_size: usize,
+    pool_size: usize,
+    block_size: usize,
+) -> Result<(), String> {
+    if pool_rows == 0 || context_rows == 0 || columns == 0 || group_size == 0 || group_size > 256 || !group_size.is_power_of_two() || !columns.is_multiple_of(group_size) || pool_size == 0 || block_size == 0 {
+        return Err("DSA interval pool shape 非法".to_owned());
+    }
+    let total_pool_rows = context_rows.div_ceil(pool_size);
+    if first_pool.checked_add(pool_rows).is_none_or(|end| end > total_pool_rows) {
+        return Err(format!("DSA interval pool range={first_pool}+{pool_rows} 超过 {total_pool_rows}"));
+    }
+    let groups_per_row = columns / group_size;
+    validate_resident(keys, device_id, context_rows.checked_mul(columns).ok_or("DSA interval raw keys 大小溢出")?, "DSA interval raw keys")?;
+    validate_resident(key_scales, device_id, context_rows.checked_mul(groups_per_row).and_then(|n| n.checked_mul(2)).ok_or("DSA interval raw scales 大小溢出")?, "DSA interval raw scales")?;
+    validate_resident(block_table, device_id, context_rows.div_ceil(block_size).checked_mul(4).ok_or("DSA interval raw table 大小溢出")?, "DSA interval raw table")?;
+    let summary_bytes = total_pool_rows.checked_mul(columns).and_then(|n| n.checked_mul(4)).ok_or("DSA interval summary 大小溢出")?;
+    validate_resident(lower, device_id, summary_bytes, "DSA interval lower")?;
+    validate_resident(upper, device_id, summary_bytes, "DSA interval upper")?;
+    let functions = paged_mla_functions(device_id)?;
+    let mut d_keys = keys.pointer;
+    let mut d_scales = key_scales.pointer;
+    let mut d_table = block_table.pointer;
+    let mut d_lower = lower.pointer;
+    let mut d_upper = upper.pointer;
+    let mut first_pool = u32::try_from(first_pool).map_err(|_| "DSA interval first_pool 超过 u32")?;
+    let mut pool_rows = u32::try_from(pool_rows).map_err(|_| "DSA interval pool_rows 超过 u32")?;
+    let mut context_rows = u32::try_from(context_rows).map_err(|_| "DSA interval context 超过 u32")?;
+    let mut columns = u32::try_from(columns).map_err(|_| "DSA interval columns 超过 u32")?;
+    let mut group_size = u32::try_from(group_size).map_err(|_| "DSA interval group 超过 u32")?;
+    let mut pool_size = u32::try_from(pool_size).map_err(|_| "DSA interval pool_size 超过 u32")?;
+    let mut block_size = u32::try_from(block_size).map_err(|_| "DSA interval block_size 超过 u32")?;
+    let mut arguments = [
+        (&mut d_keys as *mut *mut c_void).cast(),
+        (&mut d_scales as *mut *mut c_void).cast(),
+        (&mut d_table as *mut *mut c_void).cast(),
+        (&mut d_lower as *mut *mut c_void).cast(),
+        (&mut d_upper as *mut *mut c_void).cast(),
+        (&mut first_pool as *mut u32).cast(),
+        (&mut pool_rows as *mut u32).cast(),
+        (&mut context_rows as *mut u32).cast(),
+        (&mut columns as *mut u32).cast(),
+        (&mut group_size as *mut u32).cast(),
+        (&mut pool_size as *mut u32).cast(),
+        (&mut block_size as *mut u32).cast(),
+    ];
+    let groups = pool_rows.checked_mul(u32::try_from(groups_per_row).map_err(|_| "DSA interval pool group 数超过 u32")?).ok_or("DSA interval pool grid 溢出")?;
+    launch_tensor_kernel(functions.dsa_interval_pool, groups, group_size, &mut arguments, "HIP DSA interval pool Q8G")
+}
+
+pub fn try_dsa_interval_score_bounds(
+    device_id: i32,
+    lower: &DeviceBuffer,
+    upper: &DeviceBuffer,
+    query: &DeviceBuffer,
+    head_weights: &DeviceBuffer,
+    bounds: &DeviceBuffer,
+    pool_rows: usize,
+    head_count: usize,
+    head_dim: usize,
+) -> Result<(), String> {
+    if pool_rows == 0 || head_count == 0 || head_dim == 0 || head_dim > 256 || !head_dim.is_power_of_two() {
+        return Err("DSA interval bound shape 非法".to_owned());
+    }
+    let summary_bytes = pool_rows.checked_mul(head_dim).and_then(|n| n.checked_mul(4)).ok_or("DSA interval bound summary 大小溢出")?;
+    validate_resident(lower, device_id, summary_bytes, "DSA interval bound lower")?;
+    validate_resident(upper, device_id, summary_bytes, "DSA interval bound upper")?;
+    validate_resident(query, device_id, head_count.checked_mul(head_dim).and_then(|n| n.checked_mul(4)).ok_or("DSA interval bound query 大小溢出")?, "DSA interval bound query")?;
+    validate_resident(head_weights, device_id, head_count.checked_mul(4).ok_or("DSA interval bound weights 大小溢出")?, "DSA interval bound weights")?;
+    validate_resident(bounds, device_id, pool_rows.checked_mul(4).ok_or("DSA interval bounds 大小溢出")?, "DSA interval bounds")?;
+    let functions = paged_mla_functions(device_id)?;
+    let mut d_lower = lower.pointer;
+    let mut d_upper = upper.pointer;
+    let mut d_query = query.pointer;
+    let mut d_weights = head_weights.pointer;
+    let mut d_bounds = bounds.pointer;
+    let mut pool_rows = u32::try_from(pool_rows).map_err(|_| "DSA interval pool_rows 超过 u32")?;
+    let mut head_count = u32::try_from(head_count).map_err(|_| "DSA interval head_count 超过 u32")?;
+    let mut head_dim = u32::try_from(head_dim).map_err(|_| "DSA interval head_dim 超过 u32")?;
+    let mut arguments = [
+        (&mut d_lower as *mut *mut c_void).cast(),
+        (&mut d_upper as *mut *mut c_void).cast(),
+        (&mut d_query as *mut *mut c_void).cast(),
+        (&mut d_weights as *mut *mut c_void).cast(),
+        (&mut d_bounds as *mut *mut c_void).cast(),
+        (&mut pool_rows as *mut u32).cast(),
+        (&mut head_count as *mut u32).cast(),
+        (&mut head_dim as *mut u32).cast(),
+    ];
+    launch_tensor_kernel(functions.dsa_interval_bounds, pool_rows, head_dim, &mut arguments, "HIP DSA interval score bounds")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn try_dsa_kpool_compress_q8(
     device_id: i32,
@@ -474,7 +647,7 @@ fn try_paged_cache_append_mla_f32_q8_bf16_inner(
     rope_columns: usize,
     group_size: usize,
     block_size: usize,
-    rope_rotation: Option<(usize, RotaryLayout, &[f32], &[f32])>,
+    rope_rotation: Option<(usize, usize, RotaryLayout, &[f32], &[f32])>,
 ) -> Result<(), String> {
     if group_size == 0 || group_size > 256 || !group_size.is_power_of_two() || !latent_columns.is_multiple_of(group_size) {
         return Err(format!("paged MLA Q8 cache group_size={group_size} latent_columns={latent_columns} 非法"));
@@ -493,13 +666,14 @@ fn try_paged_cache_append_mla_f32_q8_bf16_inner(
     validate_resident(rope_cache, device_id, end.checked_mul(rope_columns).and_then(|n| n.checked_mul(2)).ok_or("paged MLA rope cache 大小溢出")?, "paged MLA rope cache")?;
     validate_resident(block_table, device_id, end.div_ceil(block_size).checked_mul(4).ok_or("paged MLA block table 大小溢出")?, "paged MLA block table")?;
     let resident_rotation = match rope_rotation {
-        Some((rotary_dim, layout, cos, sin)) => {
+        Some((rope_position, rotary_dim, layout, cos, sin)) => {
             if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) || rotary_dim > rope_columns {
                 return Err(format!("paged MLA fused RoPE dim={rotary_dim} rope_columns={rope_columns} 非法"));
             }
             let half = rotary_dim / 2;
-            let tables = super::super::tensor::resident_rope_tables(device_id, cos, sin, half, position..end)?;
-            Some((tables, rotary_dim, layout))
+            let rope_end = rope_position.checked_add(rows).ok_or("paged MLA RoPE position 溢出")?;
+            let tables = super::super::tensor::resident_rope_tables(device_id, cos, sin, half, rope_position..rope_end)?;
+            Some((tables, rope_position, rotary_dim, layout))
         }
         None => None,
     };
@@ -508,16 +682,17 @@ fn try_paged_cache_append_mla_f32_q8_bf16_inner(
     let mut d_latent_cache = latent_cache.pointer;
     let mut d_latent_scales = latent_scales.pointer;
     let mut d_rope_input = rope_input.pointer;
-    let mut d_cosine = resident_rotation.as_ref().map_or(std::ptr::null_mut(), |((cosine, _), _, _)| cosine.pointer);
-    let mut d_sine = resident_rotation.as_ref().map_or(std::ptr::null_mut(), |((_, sine), _, _)| sine.pointer);
+    let mut d_cosine = resident_rotation.as_ref().map_or(std::ptr::null_mut(), |((cosine, _), _, _, _)| cosine.pointer);
+    let mut d_sine = resident_rotation.as_ref().map_or(std::ptr::null_mut(), |((_, sine), _, _, _)| sine.pointer);
     let mut d_rope_cache = rope_cache.pointer;
     let mut d_table = block_table.pointer;
     let mut position = u32::try_from(position).map_err(|_| "paged MLA cache position 超过 u32")?;
+    let mut rope_position = u32::try_from(resident_rotation.as_ref().map_or(position as usize, |(_, rope_position, _, _)| *rope_position)).map_err(|_| "paged MLA RoPE position 超过 u32")?;
     let mut rows = u32::try_from(rows).map_err(|_| "paged MLA cache rows 超过 u32")?;
     let mut latent_columns = u32::try_from(latent_columns).map_err(|_| "paged MLA latent columns 超过 u32")?;
     let mut rope_columns = u32::try_from(rope_columns).map_err(|_| "paged MLA rope columns 超过 u32")?;
-    let mut rotary_dim = u32::try_from(resident_rotation.as_ref().map_or(0, |(_, rotary_dim, _)| *rotary_dim)).map_err(|_| "paged MLA RoPE dim 超过 u32")?;
-    let mut split_half = u32::from(resident_rotation.as_ref().is_some_and(|(_, _, layout)| *layout == RotaryLayout::SplitHalf));
+    let mut rotary_dim = u32::try_from(resident_rotation.as_ref().map_or(0, |(_, _, rotary_dim, _)| *rotary_dim)).map_err(|_| "paged MLA RoPE dim 超过 u32")?;
+    let mut split_half = u32::from(resident_rotation.as_ref().is_some_and(|(_, _, _, layout)| *layout == RotaryLayout::SplitHalf));
     let mut group_size = u32::try_from(group_size).map_err(|_| "paged MLA Q8 group_size 超过 u32")?;
     let mut block_size = u32::try_from(block_size).map_err(|_| "paged MLA block_size 超过 u32")?;
     let mut arguments = [
@@ -530,6 +705,7 @@ fn try_paged_cache_append_mla_f32_q8_bf16_inner(
         (&mut d_rope_cache as *mut *mut c_void).cast(),
         (&mut d_table as *mut *mut c_void).cast(),
         (&mut position as *mut u32).cast(),
+        (&mut rope_position as *mut u32).cast(),
         (&mut rows as *mut u32).cast(),
         (&mut latent_columns as *mut u32).cast(),
         (&mut rope_columns as *mut u32).cast(),
@@ -594,8 +770,103 @@ pub fn try_paged_cache_append_mla_rope_f32_q8_bf16(
         rope_columns,
         group_size,
         block_size,
-        Some((rotary_dim, layout, cos, sin)),
+        Some((position, rotary_dim, layout, cos, sin)),
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_paged_cache_append_mla_rope_at_f32_q8_bf16(
+    device_id: i32,
+    latent_input: &DeviceBuffer,
+    latent_cache: &DeviceBuffer,
+    latent_scales: &DeviceBuffer,
+    rope_input: &DeviceBuffer,
+    rope_cache: &DeviceBuffer,
+    block_table: &DeviceBuffer,
+    cache_position: usize,
+    rope_position: usize,
+    rows: usize,
+    latent_columns: usize,
+    rope_columns: usize,
+    rotary_dim: usize,
+    layout: RotaryLayout,
+    group_size: usize,
+    block_size: usize,
+    cos: &[f32],
+    sin: &[f32],
+) -> Result<(), String> {
+    try_paged_cache_append_mla_f32_q8_bf16_inner(
+        device_id,
+        latent_input,
+        latent_cache,
+        latent_scales,
+        rope_input,
+        rope_cache,
+        block_table,
+        cache_position,
+        rows,
+        latent_columns,
+        rope_columns,
+        group_size,
+        block_size,
+        Some((rope_position, rotary_dim, layout, cos, sin)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_mla_hot_scatter_q8(
+    device_id: i32,
+    source_latent: &DeviceBuffer,
+    source_scales: &DeviceBuffer,
+    source_rope: &DeviceBuffer,
+    slots: &DeviceBuffer,
+    target_latent: &DeviceBuffer,
+    target_scales: &DeviceBuffer,
+    target_rope: &DeviceBuffer,
+    rows: usize,
+    latent_columns: usize,
+    scale_columns: usize,
+    rope_columns: usize,
+    target_rows: usize,
+) -> Result<(), String> {
+    if rows == 0 || latent_columns == 0 || scale_columns == 0 || rope_columns == 0 || target_rows == 0 {
+        return Err("MLA hot scatter shape 非法".to_owned());
+    }
+    validate_resident(source_latent, device_id, rows.checked_mul(latent_columns).ok_or("MLA hot latent 大小溢出")?, "MLA hot source latent")?;
+    validate_resident(source_scales, device_id, rows.checked_mul(scale_columns).and_then(|n| n.checked_mul(2)).ok_or("MLA hot scales 大小溢出")?, "MLA hot source scales")?;
+    validate_resident(source_rope, device_id, rows.checked_mul(rope_columns).and_then(|n| n.checked_mul(2)).ok_or("MLA hot rope 大小溢出")?, "MLA hot source rope")?;
+    validate_resident(slots, device_id, rows.checked_mul(4).ok_or("MLA hot slots 大小溢出")?, "MLA hot slots")?;
+    validate_resident(target_latent, device_id, target_rows.checked_mul(latent_columns).ok_or("MLA hot target latent 大小溢出")?, "MLA hot target latent")?;
+    validate_resident(target_scales, device_id, target_rows.checked_mul(scale_columns).and_then(|n| n.checked_mul(2)).ok_or("MLA hot target scales 大小溢出")?, "MLA hot target scales")?;
+    validate_resident(target_rope, device_id, target_rows.checked_mul(rope_columns).and_then(|n| n.checked_mul(2)).ok_or("MLA hot target rope 大小溢出")?, "MLA hot target rope")?;
+    let functions = paged_mla_functions(device_id)?;
+    let mut d_source_latent = source_latent.pointer;
+    let mut d_source_scales = source_scales.pointer;
+    let mut d_source_rope = source_rope.pointer;
+    let mut d_slots = slots.pointer;
+    let mut d_target_latent = target_latent.pointer;
+    let mut d_target_scales = target_scales.pointer;
+    let mut d_target_rope = target_rope.pointer;
+    let mut rows = u32::try_from(rows).map_err(|_| "MLA hot rows 超过 u32")?;
+    let mut latent_columns = u32::try_from(latent_columns).map_err(|_| "MLA hot latent columns 超过 u32")?;
+    let mut scale_columns = u32::try_from(scale_columns).map_err(|_| "MLA hot scale columns 超过 u32")?;
+    let mut rope_columns = u32::try_from(rope_columns).map_err(|_| "MLA hot rope columns 超过 u32")?;
+    let mut target_rows = u32::try_from(target_rows).map_err(|_| "MLA hot target rows 超过 u32")?;
+    let mut arguments = [
+        (&mut d_source_latent as *mut *mut c_void).cast(),
+        (&mut d_source_scales as *mut *mut c_void).cast(),
+        (&mut d_source_rope as *mut *mut c_void).cast(),
+        (&mut d_slots as *mut *mut c_void).cast(),
+        (&mut d_target_latent as *mut *mut c_void).cast(),
+        (&mut d_target_scales as *mut *mut c_void).cast(),
+        (&mut d_target_rope as *mut *mut c_void).cast(),
+        (&mut rows as *mut u32).cast(),
+        (&mut latent_columns as *mut u32).cast(),
+        (&mut scale_columns as *mut u32).cast(),
+        (&mut rope_columns as *mut u32).cast(),
+        (&mut target_rows as *mut u32).cast(),
+    ];
+    launch_tensor_kernel(functions.mla_hot_scatter_q8, rows, 256, &mut arguments, "HIP MLA hot scatter Q8+BF16")
 }
 
 #[derive(Default)]
@@ -686,9 +957,8 @@ pub fn try_download_last_dsa_score_keys(device_id: i32, elements: usize) -> Resu
     Ok(values)
 }
 
-/// profile-only guarded-rerank cost oracle。候选由 coarse path 给出；本函数只用
-/// 生产 raw-Q8 K + BF16 Q 重算候选，并在 candidate-local score 上做稳定 exact top-k。
-/// 调用方仍决定是否采用结果，当前生产 selection 不会走这里。
+/// 候选域 exact rerank：用生产 raw-Q8 K + BF16 Q 重算候选，并在
+/// candidate-local score 上做稳定 Top-K。候选必须按原 token 顺序传入。
 #[allow(clippy::too_many_arguments)]
 pub fn try_dsa_rerank_paged_q8_candidates(
     device_id: i32,
@@ -739,8 +1009,11 @@ pub fn try_dsa_rerank_paged_q8_candidates(
     let slots = DeviceBuffer::allocate(device_id, selection_bytes)?;
     let selection = DeviceBuffer::allocate_reusable(device_id, selection_bytes)?;
 
-    super::synchronize_device(device_id, "hipDeviceSynchronize DSA candidate rerank boundary")?;
-    let score_started = std::time::Instant::now();
+    let profile = super::options().profile_dsa;
+    if profile {
+        super::synchronize_device(device_id, "hipDeviceSynchronize DSA candidate rerank boundary")?;
+    }
+    let score_started = profile.then(std::time::Instant::now);
     let mut d_keys = keys.pointer;
     let mut d_key_scales = key_scales.pointer;
     let mut d_table = block_table.pointer;
@@ -786,10 +1059,12 @@ pub fn try_dsa_rerank_paged_q8_candidates(
         (&mut candidate_local as *mut u32).cast(),
     ];
     launch_moe_kernel(functions.dsa_score_selected_native_wmma, candidate_capacity.div_ceil(128), rows, 256, 0, &mut score_args, "HIP DSA raw candidate rerank score")?;
-    super::synchronize_device(device_id, "hipDeviceSynchronize DSA candidate rerank score")?;
-    let score_ms = score_started.elapsed().as_secs_f64() * 1e3;
+    if profile {
+        super::synchronize_device(device_id, "hipDeviceSynchronize DSA candidate rerank score")?;
+    }
+    let score_ms = score_started.map_or(0.0, |started| started.elapsed().as_secs_f64() * 1e3);
 
-    let select_started = std::time::Instant::now();
+    let select_started = profile.then(std::time::Instant::now);
     let mut d_slots = slots.pointer;
     let mut candidate_start = candidate_capacity - 1;
     let mut top_k = u32::try_from(top_k).map_err(|_| "DSA rerank top_k 超过 u32")?;
@@ -813,10 +1088,28 @@ pub fn try_dsa_rerank_paged_q8_candidates(
         (&mut top_k as *mut u32).cast(),
     ];
     launch_tensor_kernel(functions.dsa_map_candidate_selection, elements.div_ceil(256), 256, &mut map_args, "HIP DSA map candidate exact selection")?;
-    super::synchronize_device(device_id, "hipDeviceSynchronize DSA candidate rerank select")?;
-    let select_ms = select_started.elapsed().as_secs_f64() * 1e3;
-    eprintln!("[dsa-rerank-profile] device={device_id} rows={query_rows} context={context_rows} candidates={candidate_count} top_k={} score_ms={score_ms:.3} select_ms={select_ms:.3} total_ms={:.3}", top_k, score_ms + select_ms,);
+    if profile {
+        super::synchronize_device(device_id, "hipDeviceSynchronize DSA candidate rerank select")?;
+        let select_ms = select_started.expect("DSA rerank profile timer 已创建").elapsed().as_secs_f64() * 1e3;
+        eprintln!("[dsa-rerank-profile] device={device_id} rows={query_rows} context={context_rows} candidates={candidate_count} top_k={} score_ms={score_ms:.3} select_ms={select_ms:.3} total_ms={:.3}", top_k, score_ms + select_ms,);
+    }
     Ok(selection)
+}
+
+const PARALLEL_SELECT_TILE_ROWS: usize = 1024;
+const PARALLEL_SELECT_MEDIUM_TILE_ROWS: usize = 2048;
+const PARALLEL_SELECT_LONG_TILE_ROWS: usize = 4096;
+const PARALLEL_SELECT_MEDIUM_CONTEXT: usize = 60 * PARALLEL_SELECT_MEDIUM_TILE_ROWS;
+const PARALLEL_SELECT_LONG_CONTEXT: usize = 60 * PARALLEL_SELECT_LONG_TILE_ROWS;
+
+fn parallel_select_tile_rows(context_rows: usize, prefer_medium: bool) -> usize {
+    if context_rows >= PARALLEL_SELECT_LONG_CONTEXT {
+        PARALLEL_SELECT_LONG_TILE_ROWS
+    } else if prefer_medium && context_rows >= PARALLEL_SELECT_MEDIUM_CONTEXT {
+        PARALLEL_SELECT_MEDIUM_TILE_ROWS
+    } else {
+        PARALLEL_SELECT_TILE_ROWS
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -835,6 +1128,7 @@ pub fn try_dsa_select_paged_q8(
     head_count: usize,
     head_dim: usize,
     top_k: usize,
+    prefer_medium_select_tile: bool,
     block_size: usize,
 ) -> Result<DeviceBuffer, String> {
     if query_rows == 0
@@ -866,10 +1160,7 @@ pub fn try_dsa_select_paged_q8(
     const PREFIX_CONTEXT_THRESHOLD: usize = 256 * 1024;
     let prefix_select = use_native_wmma && compact_select && query_rows >= 8 && context_rows >= PREFIX_CONTEXT_THRESHOLD;
     const PARALLEL_SELECT_CONTEXT_THRESHOLD: usize = 32 * 1024;
-    const PARALLEL_SELECT_TILE_ROWS: usize = 1024;
-    const PARALLEL_SELECT_LONG_TILE_ROWS: usize = 4096;
-    // 4K tile 至少保留 60 个 CTA，覆盖 W7900 的 60 CU；128K 仍走 1K tile。
-    const PARALLEL_SELECT_LONG_CONTEXT: usize = 60 * PARALLEL_SELECT_LONG_TILE_ROWS;
+    // 中档只在 stage 已观察到至少三路 decode 时启用；C1/C2 保持 1K tile。
     // 当前 stage 不能跨 verify 行等待形成 DSA-only cohort；长上下文 decode
     // 改为单行内部按 history tile 并行，selection 集合与稳定顺序都不变。
     let parallel_select = compact_select && !prefix_select && query_rows <= 4 && context_rows >= PARALLEL_SELECT_CONTEXT_THRESHOLD;
@@ -1246,9 +1537,8 @@ pub fn try_dsa_select_paged_q8(
             ];
             launch_tensor_kernel(functions.dsa_select_prefix, current_rows_u32, 256, &mut prefix_select_args, "HIP DSA prefix radix select top-k")?;
         } else if parallel_select {
-            // 240K 起 4K tile 至少有 60 个 CTA，可填满 60 CU 并减少一半以上
-            // 的 block/scan 元数据；较短上下文保持 1K，避免 128K 欠占用。
-            let select_tile_rows = if batch_context_rows >= PARALLEL_SELECT_LONG_CONTEXT { PARALLEL_SELECT_LONG_TILE_ROWS } else { PARALLEL_SELECT_TILE_ROWS };
+            // 240K 起 4K tile；128K 只有高并发才用 2K，避免 C1/C2 欠占用。
+            let select_tile_rows = parallel_select_tile_rows(batch_context_rows, prefer_medium_select_tile);
             let mut select_tile_count_u32 = u32::try_from(batch_score_stride.div_ceil(select_tile_rows)).map_err(|_| "DSA parallel select tile count 超过 u32")?;
             let mut select_tile_rows_u32 = u32::try_from(select_tile_rows).map_err(|_| "DSA parallel select tile rows 超过 u32")?;
             let mut clear_rows = current_rows_u32;
@@ -2200,6 +2490,14 @@ pub(crate) fn try_paged_mla_attention_ct_into(
 mod tests {
     use super::*;
 
+    #[test]
+    fn parallel_select_medium_tile_requires_decode_parallelism_hint() {
+        assert_eq!(parallel_select_tile_rows(128 * 1024, false), 1024);
+        assert_eq!(parallel_select_tile_rows(128 * 1024, true), 2048);
+        assert_eq!(parallel_select_tile_rows(119 * 1024, true), 1024);
+        assert_eq!(parallel_select_tile_rows(256 * 1024, false), 4096);
+    }
+
     fn ordered_score(score: f32) -> u32 {
         let bits = score.to_bits();
         bits ^ if bits & 0x8000_0000 != 0 { 0xffff_ffff } else { 0x8000_0000 }
@@ -2211,6 +2509,45 @@ mod tests {
 
     fn as_bytes_mut<T>(values: &mut [T]) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast(), std::mem::size_of_val(values)) }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn mla_hot_scatter_preserves_exact_rows() {
+        const DEVICE_ID: i32 = 0;
+        const ROWS: usize = 3;
+        const TARGET_ROWS: usize = 5;
+        const LATENT_COLUMNS: usize = 7;
+        const SCALE_COLUMNS: usize = 2;
+        const ROPE_COLUMNS: usize = 3;
+
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        let latent = (0..ROWS * LATENT_COLUMNS).map(|value| value as u8 + 1).collect::<Vec<_>>();
+        let scales = (0..ROWS * SCALE_COLUMNS).map(|value| value as u16 + 101).collect::<Vec<_>>();
+        let rope = (0..ROWS * ROPE_COLUMNS).map(|value| value as u16 + 201).collect::<Vec<_>>();
+        let slots = [4_u32, 1, 3];
+        let source_latent = DeviceBuffer::upload(DEVICE_ID, &latent).unwrap();
+        let source_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&scales)).unwrap();
+        let source_rope = DeviceBuffer::upload(DEVICE_ID, as_bytes(&rope)).unwrap();
+        let slots_device = DeviceBuffer::upload(DEVICE_ID, as_bytes(&slots)).unwrap();
+        let target_latent = DeviceBuffer::upload(DEVICE_ID, &vec![0_u8; TARGET_ROWS * LATENT_COLUMNS]).unwrap();
+        let target_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&vec![0_u16; TARGET_ROWS * SCALE_COLUMNS])).unwrap();
+        let target_rope = DeviceBuffer::upload(DEVICE_ID, as_bytes(&vec![0_u16; TARGET_ROWS * ROPE_COLUMNS])).unwrap();
+        try_mla_hot_scatter_q8(DEVICE_ID, &source_latent, &source_scales, &source_rope, &slots_device, &target_latent, &target_scales, &target_rope, ROWS, LATENT_COLUMNS, SCALE_COLUMNS, ROPE_COLUMNS, TARGET_ROWS).unwrap();
+        super::super::synchronize_device(DEVICE_ID, "HIP MLA hot scatter oracle").unwrap();
+
+        let mut actual_latent = vec![0_u8; TARGET_ROWS * LATENT_COLUMNS];
+        let mut actual_scales = vec![0_u16; TARGET_ROWS * SCALE_COLUMNS];
+        let mut actual_rope = vec![0_u16; TARGET_ROWS * ROPE_COLUMNS];
+        target_latent.copy_to_host(&mut actual_latent).unwrap();
+        target_scales.copy_to_host(as_bytes_mut(&mut actual_scales)).unwrap();
+        target_rope.copy_to_host(as_bytes_mut(&mut actual_rope)).unwrap();
+        for (source, &slot) in slots.iter().enumerate() {
+            let slot = slot as usize;
+            assert_eq!(&actual_latent[slot * LATENT_COLUMNS..(slot + 1) * LATENT_COLUMNS], &latent[source * LATENT_COLUMNS..(source + 1) * LATENT_COLUMNS]);
+            assert_eq!(&actual_scales[slot * SCALE_COLUMNS..(slot + 1) * SCALE_COLUMNS], &scales[source * SCALE_COLUMNS..(source + 1) * SCALE_COLUMNS]);
+            assert_eq!(&actual_rope[slot * ROPE_COLUMNS..(slot + 1) * ROPE_COLUMNS], &rope[source * ROPE_COLUMNS..(source + 1) * ROPE_COLUMNS]);
+        }
     }
 
     fn compare_compact_topk(context_rows: usize) -> Result<(), String> {
@@ -2306,7 +2643,7 @@ mod tests {
         let block_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&block_table))?;
         let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query))?;
         let head_weights = DeviceBuffer::upload(DEVICE_ID, as_bytes(&head_weights))?;
-        let compact = try_dsa_select_paged_q8(DEVICE_ID, &keys, &scales, KEY_GROUP_SIZE, false, &block_table, &query, &head_weights, query_rows, context_rows, query_start, HEAD_COUNT, HEAD_DIM, selection_width, BLOCK_SIZE)?;
+        let compact = try_dsa_select_paged_q8(DEVICE_ID, &keys, &scales, KEY_GROUP_SIZE, false, &block_table, &query, &head_weights, query_rows, context_rows, query_start, HEAD_COUNT, HEAD_DIM, selection_width, false, BLOCK_SIZE)?;
 
         let functions = paged_mla_functions(DEVICE_ID)?;
         let use_native_wmma = functions.dense_wmma && options().native_dsa_wmma;
@@ -2436,6 +2773,107 @@ mod tests {
 
     #[test]
     #[ignore = "需要 ROCm GPU"]
+    fn dsa_mean_pool_q8_gpu_matches_constant_block_oracle() {
+        const DEVICE_ID: i32 = 0;
+        const COLUMNS: usize = 128;
+        const GROUP_SIZE: usize = 128;
+        const POOL_SIZE: usize = 128;
+        const BLOCK_SIZE: usize = 128;
+        const CONTEXT_ROWS: usize = POOL_SIZE * 2 + 7;
+        let expected = [2.0_f32, -4.0, 6.0];
+        let keys = (0..CONTEXT_ROWS)
+            .flat_map(|row| {
+                let code = if row < POOL_SIZE {
+                    2_i8
+                } else if row < POOL_SIZE * 2 {
+                    -4_i8
+                } else {
+                    6_i8
+                };
+                std::iter::repeat_n(code, COLUMNS)
+            })
+            .collect::<Vec<_>>();
+        let scales = vec![0x3f80_u16; CONTEXT_ROWS];
+        let table = (0..CONTEXT_ROWS.div_ceil(BLOCK_SIZE) as u32).collect::<Vec<_>>();
+        let pool_rows = CONTEXT_ROWS.div_ceil(POOL_SIZE);
+        let pool_table = vec![0_u32];
+        let keys = DeviceBuffer::upload(DEVICE_ID, as_bytes(&keys)).unwrap();
+        let scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&scales)).unwrap();
+        let table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&table)).unwrap();
+        let pool_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&pool_table)).unwrap();
+        let pooled_keys = DeviceBuffer::allocate(DEVICE_ID, pool_rows * COLUMNS).unwrap();
+        let pooled_scales = DeviceBuffer::allocate(DEVICE_ID, pool_rows * 2).unwrap();
+
+        try_dsa_mean_pool_q8(DEVICE_ID, &keys, &scales, &table, &pooled_keys, &pooled_scales, &pool_table, 0, pool_rows, CONTEXT_ROWS, COLUMNS, GROUP_SIZE, POOL_SIZE, BLOCK_SIZE).unwrap();
+        super::super::synchronize_device(DEVICE_ID, "HIP DSA HISA mean pool oracle").unwrap();
+
+        let mut codes = vec![0_i8; pool_rows * COLUMNS];
+        let mut scale_bits = vec![0_u16; pool_rows];
+        pooled_keys.copy_to_host(as_bytes_mut(&mut codes)).unwrap();
+        pooled_scales.copy_to_host(as_bytes_mut(&mut scale_bits)).unwrap();
+        for pool in 0..pool_rows {
+            let scale = half::bf16::from_bits(scale_bits[pool]).to_f32();
+            for column in 0..COLUMNS {
+                let actual = codes[pool * COLUMNS + column] as f32 * scale;
+                assert!((actual - expected[pool]).abs() < 0.03, "pool={pool} column={column} actual={actual} expected={}", expected[pool]);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn dsa_interval_bounds_gpu_cover_constant_block_oracle() {
+        const DEVICE_ID: i32 = 0;
+        const HEAD_DIM: usize = 128;
+        const HEAD_COUNT: usize = 2;
+        const GROUP_SIZE: usize = 128;
+        const POOL_SIZE: usize = 128;
+        const BLOCK_SIZE: usize = 128;
+        const CONTEXT_ROWS: usize = POOL_SIZE * 2 + 7;
+        let values = [2_i8, -4, 6];
+        let expected_scores = [256.0_f32, -256.0, 768.0];
+        let keys = (0..CONTEXT_ROWS)
+            .flat_map(|row| {
+                let pool = (row / POOL_SIZE).min(values.len() - 1);
+                std::iter::repeat_n(values[pool], HEAD_DIM)
+            })
+            .collect::<Vec<_>>();
+        let scales = vec![0x3f80_u16; CONTEXT_ROWS];
+        let table = (0..CONTEXT_ROWS.div_ceil(BLOCK_SIZE) as u32).collect::<Vec<_>>();
+        let pool_rows = CONTEXT_ROWS.div_ceil(POOL_SIZE);
+        let query = [vec![1.0_f32; HEAD_DIM], vec![-1.0_f32; HEAD_DIM]].concat();
+        let weights = [1.0_f32, -0.5];
+        let keys = DeviceBuffer::upload(DEVICE_ID, as_bytes(&keys)).unwrap();
+        let scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&scales)).unwrap();
+        let table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&table)).unwrap();
+        let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query)).unwrap();
+        let weights = DeviceBuffer::upload(DEVICE_ID, as_bytes(&weights)).unwrap();
+        let lower = DeviceBuffer::allocate(DEVICE_ID, pool_rows * HEAD_DIM * 4).unwrap();
+        let upper = DeviceBuffer::allocate(DEVICE_ID, pool_rows * HEAD_DIM * 4).unwrap();
+        let bounds = DeviceBuffer::allocate(DEVICE_ID, pool_rows * 4).unwrap();
+
+        try_dsa_interval_pool_q8(DEVICE_ID, &keys, &scales, &table, &lower, &upper, 0, pool_rows, CONTEXT_ROWS, HEAD_DIM, GROUP_SIZE, POOL_SIZE, BLOCK_SIZE).unwrap();
+        try_dsa_interval_score_bounds(DEVICE_ID, &lower, &upper, &query, &weights, &bounds, pool_rows, HEAD_COUNT, HEAD_DIM).unwrap();
+        super::super::synchronize_device(DEVICE_ID, "HIP DSA interval oracle").unwrap();
+
+        let mut lower_host = vec![0.0_f32; pool_rows * HEAD_DIM];
+        let mut upper_host = vec![0.0_f32; pool_rows * HEAD_DIM];
+        let mut bound_host = vec![0.0_f32; pool_rows];
+        lower.copy_to_host(as_bytes_mut(&mut lower_host)).unwrap();
+        upper.copy_to_host(as_bytes_mut(&mut upper_host)).unwrap();
+        bounds.copy_to_host(as_bytes_mut(&mut bound_host)).unwrap();
+        for pool in 0..pool_rows {
+            for column in 0..HEAD_DIM {
+                assert_eq!(lower_host[pool * HEAD_DIM + column], values[pool] as f32);
+                assert_eq!(upper_host[pool * HEAD_DIM + column], values[pool] as f32);
+            }
+            assert!(bound_host[pool] >= expected_scores[pool], "pool={pool} bound={} expected={}", bound_host[pool], expected_scores[pool]);
+            assert!(bound_host[pool] - expected_scores[pool] < 0.2, "pool={pool} bound={} expected={}", bound_host[pool], expected_scores[pool]);
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
     fn dsa_compact_topk_matches_radix_at_long_boundaries() {
         for context_rows in [1023, 1024, 1025, 32_774, 256_006, 400_006] {
             compare_compact_topk(context_rows).unwrap();
@@ -2479,7 +2917,7 @@ mod tests {
         try_paged_cache_transform_q8_hadamard(DEVICE_ID, &raw_key_cache, &raw_key_scales, &key_cache, &key_scales, &table, 0, CONTEXT_ROWS, HEAD_DIM, BLOCK_SIZE).unwrap();
         let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query)).unwrap();
         let weights = DeviceBuffer::upload(DEVICE_ID, as_bytes(&head_weights)).unwrap();
-        let raw_selection = try_dsa_select_paged_q8(DEVICE_ID, &raw_key_cache, &raw_key_scales, HEAD_DIM, false, &table, &query, &weights, QUERY_ROWS, CONTEXT_ROWS, QUERY_START, HEAD_COUNT, HEAD_DIM, TOP_K, BLOCK_SIZE).unwrap();
+        let raw_selection = try_dsa_select_paged_q8(DEVICE_ID, &raw_key_cache, &raw_key_scales, HEAD_DIM, false, &table, &query, &weights, QUERY_ROWS, CONTEXT_ROWS, QUERY_START, HEAD_COUNT, HEAD_DIM, TOP_K, false, BLOCK_SIZE).unwrap();
         let mut raw_selected = vec![0_u32; QUERY_ROWS * TOP_K];
         raw_selection.copy_to_host(as_bytes_mut(&mut raw_selected)).unwrap();
         // rerank oracle 当前只覆盖单 query row；用 raw exact 成员加稳定 token 补位
@@ -2505,7 +2943,7 @@ mod tests {
         let mut reranked_selected = vec![0_u32; TOP_K];
         reranked.copy_to_host(as_bytes_mut(&mut reranked_selected)).unwrap();
         assert_eq!(reranked_selected, raw_selected[..TOP_K], "raw candidate rerank 与全量 exact selection 不一致");
-        let selection = try_dsa_select_paged_q8(DEVICE_ID, &key_cache, &key_scales, HEAD_DIM, true, &table, &query, &weights, QUERY_ROWS, CONTEXT_ROWS, QUERY_START, HEAD_COUNT, HEAD_DIM, TOP_K, BLOCK_SIZE).unwrap();
+        let selection = try_dsa_select_paged_q8(DEVICE_ID, &key_cache, &key_scales, HEAD_DIM, true, &table, &query, &weights, QUERY_ROWS, CONTEXT_ROWS, QUERY_START, HEAD_COUNT, HEAD_DIM, TOP_K, false, BLOCK_SIZE).unwrap();
         super::super::synchronize_device(DEVICE_ID, "HIP DSA Hadamard i8 oracle").unwrap();
 
         let mut key_codes = vec![0_i8; CONTEXT_ROWS * HEAD_DIM];

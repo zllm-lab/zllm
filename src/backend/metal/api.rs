@@ -8,10 +8,10 @@ use objc2::runtime::ProtocolObject;
 use objc2_foundation::NSRange;
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBlitCommandEncoder as NativeBlitCommandEncoder, MTLBuffer as NativeBuffer, MTLCommandBuffer as NativeCommandBuffer, MTLCommandEncoder as NativeCommandEncoder, MTLCommandQueue as NativeCommandQueue,
+    MTLBlitCommandEncoder as NativeBlitCommandEncoder, MTLBuffer as NativeBuffer, MTLCommandBuffer as NativeCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder as NativeCommandEncoder, MTLCommandQueue as NativeCommandQueue,
     MTLCompileOptions as NativeCompileOptions, MTLComputeCommandEncoder as NativeComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineState as NativeComputePipelineState, MTLDevice as NativeDevice,
     MTLFence as NativeFence, MTLFunction as NativeFunction, MTLFunctionConstantValues as NativeFunctionConstantValues, MTLIndirectCommandBuffer as NativeIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectCommandType,
-    MTLIndirectComputeCommand as NativeIndirectComputeCommand, MTLLibrary as NativeLibrary, MTLPipelineOption, MTLResource as NativeResource,
+    MTLIndirectComputeCommand as NativeIndirectComputeCommand, MTLLanguageVersion, MTLLibrary as NativeLibrary, MTLPipelineOption, MTLResource as NativeResource,
 };
 
 pub use objc2_metal::{MTLDataType, MTLResourceOptions};
@@ -210,6 +210,10 @@ impl CommandBuffer {
         self.0.GPUEndTime()
     }
 
+    pub fn is_completed(&self) -> bool {
+        matches!(self.0.status(), MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error)
+    }
+
     pub(crate) fn raw(&self) -> &ProtocolObject<dyn NativeCommandBuffer> {
         &self.0
     }
@@ -375,6 +379,11 @@ impl ComputePipelineState {
         self.0.threadExecutionWidth() as u64
     }
 
+    /// pipeline 声明的静态 threadgroup memory；用于真机资源审计，不代表动态分配。
+    pub fn static_threadgroup_memory_length(&self) -> u64 {
+        self.0.staticThreadgroupMemoryLength() as u64
+    }
+
     /// 是否同一 pipeline 实例(ctx 按名缓存,同名 kernel 共享实例;消融分组用)。
     pub fn same_handle(&self, other: &ComputePipelineState) -> bool {
         std::ptr::eq(&*self.0 as *const ProtocolObject<dyn NativeComputePipelineState>, &*other.0 as *const ProtocolObject<dyn NativeComputePipelineState>)
@@ -386,6 +395,12 @@ pub struct CompileOptions(Retained<NativeCompileOptions>);
 impl CompileOptions {
     pub fn new() -> Self {
         Self(NativeCompileOptions::new())
+    }
+
+    pub fn metal4() -> Self {
+        let options = Self::new();
+        options.0.setLanguageVersion(MTLLanguageVersion::Version4_0);
+        options
     }
 }
 

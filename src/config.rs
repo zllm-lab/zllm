@@ -608,6 +608,9 @@ pub struct Glm52NodeExecutionConfig {
     pub kv_reservation_page_tokens: usize,
     #[serde(default = "default_true")]
     pub preload_experts: bool,
+    /// 同机相邻卡共享 routed expert 计算；当前只用于单行 decode 实验。
+    #[serde(default)]
+    pub cooperative_expert_pairs: bool,
     #[serde(default)]
     pub preload_layers_per_device: Option<usize>,
     #[serde(default = "default_memory_reserve_bytes")]
@@ -661,6 +664,7 @@ impl Default for Glm52NodeExecutionConfig {
             terminal_cache_entries: default_unlimited_entries(),
             kv_reservation_page_tokens: default_kv_reservation_page_tokens(),
             preload_experts: true,
+            cooperative_expert_pairs: false,
             preload_layers_per_device: None,
             memory_reserve_bytes: default_memory_reserve_bytes(),
             kv_admission_layers_per_device: 0,
@@ -914,6 +918,9 @@ pub struct Glm52StageExecutionConfig {
     pub kv_cache_format: KvCacheFormat,
     #[serde(default = "default_true")]
     pub preload_experts: bool,
+    /// 同机相邻卡共享 routed expert 计算；当前只用于单行 decode 实验。
+    #[serde(default)]
+    pub cooperative_expert_pairs: bool,
     #[serde(default)]
     pub preload_layers_per_device: Option<usize>,
     #[serde(default = "default_stage_max_concurrency")]
@@ -943,6 +950,7 @@ impl Default for Glm52StageExecutionConfig {
             prefill_chunk_size: default_stage_prefill_chunk_size(),
             kv_cache_format: KvCacheFormat::Q8g64,
             preload_experts: true,
+            cooperative_expert_pairs: false,
             preload_layers_per_device: None,
             max_concurrency: default_stage_max_concurrency(),
             mtp: false,
@@ -1096,9 +1104,6 @@ pub struct Gemma4ExecutionConfig {
     /// 每轮链式 draft 候选数(verify 行数 = 该值 + 1)。
     #[serde(default = "default_gemma4_mtp_draft_tokens")]
     pub mtp_draft_tokens: usize,
-    /// decode 走平铺转录重放(整步命令表 + encoder 重编码),默认顺序路径。
-    #[serde(default)]
-    pub replay: bool,
     /// 重放模式下执行算子消融计时分解(输出无效,仅测量)。
     #[serde(default)]
     pub replay_ablation: bool,
@@ -1114,7 +1119,7 @@ fn default_gemma4_mtp_draft_tokens() -> usize {
 
 impl Default for Gemma4ExecutionConfig {
     fn default() -> Self {
-        Self { prefill_chunk_size: default_metal_prefill_chunk_size(), mtp_weights: None, mtp_draft_tokens: default_gemma4_mtp_draft_tokens(), replay: false, replay_ablation: false }
+        Self { prefill_chunk_size: default_metal_prefill_chunk_size(), mtp_weights: None, mtp_draft_tokens: default_gemma4_mtp_draft_tokens(), replay_ablation: false }
     }
 }
 
@@ -1221,6 +1226,9 @@ pub enum NodeBackendConfig {
 pub struct NodeMetalBackendConfig {
     #[serde(default = "default_metal_device")]
     pub device: String,
+    /// 静态 decode/verify 平铺录制重放；Metal 后端默认开启。
+    #[serde(default = "default_true")]
+    pub replay: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1235,6 +1243,9 @@ pub struct CpuBackendConfig {
 pub struct MetalBackendConfig {
     #[serde(default = "default_metal_device")]
     pub device: String,
+    /// 静态 decode/verify 平铺录制重放；Metal 后端默认开启。
+    #[serde(default = "default_true")]
+    pub replay: bool,
     #[serde(default)]
     pub profile_prefill_gpu: bool,
     #[serde(default)]
@@ -1285,6 +1296,9 @@ pub struct RocmBackendConfig {
     pub kernel_sync: bool,
     #[serde(default)]
     pub kernel_profile: bool,
+    /// 单行 integrated MoE 使用固定地址 HIP Graph；诊断模式下自动回退 eager。
+    #[serde(default)]
+    pub decode_graph: bool,
     /// MoE router：true=F32 权重精确打分；false=BF16 驻留快速路径（近并列路由可能翻转）。
     #[serde(default = "default_true")]
     pub precise_router: bool,
@@ -1297,6 +1311,15 @@ pub struct RocmBackendConfig {
     /// 仅 kernel_profile 下对每个 DSA 层采样多少行 Hadamard 粗排；不改变 exact selection。
     #[serde(default)]
     pub dsa_hadamard_shadow_samples: usize,
+    /// 仅 kernel_profile 下对每个 DSA 层采样多少行 HISA block 粗排；不改变 exact selection。
+    #[serde(default)]
+    pub dsa_hisa_shadow_samples: usize,
+    /// 单行 decode 由 CPU 全历史 DSA 产生候选，GPU 精确重排；MLA cache 仍由 GPU 本地读取。
+    #[serde(default)]
+    pub dsa_cpu_select: bool,
+    /// CPU 保存全量 MLA，GPU 每层只保留固定行数的精确 hot cache；0 表示关闭。
+    #[serde(default)]
+    pub mla_cpu_hot_rows: usize,
     /// prefill grouped-down 先写 route-major F32，再按固定路由顺序归约。
     #[serde(default)]
     pub grouped_down_route_buffer: bool,
@@ -1457,7 +1480,7 @@ fn validate_node_model_backend(model: &NodeModelConfig, backend: &NodeBackendCon
         // Ornith 只使用 full-attention cached GQA，ROCm 已有设备 prefill/decode 实现。
         (NodeModelConfig::Ornith(model), NodeBackendConfig::Rocm(backend)) => validate_ornith_rocm(model, backend),
         (NodeModelConfig::Ornith(_), _) => Err(ConfigError::Invalid("Ornith Node 当前支持 Metal/CUDA/ROCm backend".to_owned())),
-        (NodeModelConfig::Gemma4(model), NodeBackendConfig::Metal(_)) => validate_gemma4(model),
+        (NodeModelConfig::Gemma4(model), NodeBackendConfig::Metal(backend)) => validate_gemma4_metal(model, backend),
         (NodeModelConfig::Gemma4(model), NodeBackendConfig::Cuda(_)) => validate_gemma4_cuda(model),
         (NodeModelConfig::Qwen36(model), NodeBackendConfig::Metal(_)) => validate_qwen36(model),
         // CUDA 走 safetensors MLX affine,无 nextn 权重;GGUF 在 CUDA 上显存不可行,故不支持 MTP。
@@ -1652,7 +1675,10 @@ fn validate_standalone_backend(model: &StandaloneModelConfig, backend: &BackendC
         return Err(ConfigError::Invalid("Qwen3.6 ROCm 的部分 cached GQA 路径尚需 CPU reference，必须显式设置 backend.allow_cpu_reference_fallback: true".to_owned()));
     }
     match (model, backend) {
-        (StandaloneModelConfig::Gemma4(_), BackendConfig::Metal(_) | BackendConfig::Cuda(_)) => Ok(()),
+        (StandaloneModelConfig::Gemma4(model), BackendConfig::Metal(backend)) if model.execution.replay_ablation && !backend.replay => Err(ConfigError::Invalid("Gemma 4 replay_ablation 必须与 backend.replay 一起启用".to_owned())),
+        (StandaloneModelConfig::Gemma4(_), BackendConfig::Metal(_)) => Ok(()),
+        (StandaloneModelConfig::Gemma4(model), BackendConfig::Cuda(_)) if model.execution.mtp_weights.is_some() || model.execution.replay_ablation => Err(ConfigError::Invalid("Gemma 4 CUDA 当前不支持 Metal MTP/replay 选项".to_owned())),
+        (StandaloneModelConfig::Gemma4(_), BackendConfig::Cuda(_)) => Ok(()),
         (StandaloneModelConfig::Gemma4(_), _) => Err(ConfigError::Invalid("Gemma 4 standalone 当前支持 Metal/CUDA backend".to_owned())),
         (StandaloneModelConfig::Glm52(model), BackendConfig::Cpu(_) | BackendConfig::Metal(_)) if model.prefill_layer_ends.is_none() => Ok(()),
         (StandaloneModelConfig::Glm52(model), BackendConfig::Rocm(backend)) => {
@@ -1722,15 +1748,20 @@ fn validate_gemma4(model: &Gemma4NodeModelConfig) -> Result<(), ConfigError> {
     if !(1..=4).contains(&model.execution.mtp_draft_tokens) {
         return Err(ConfigError::Invalid("Gemma 4 execution.mtp_draft_tokens 必须在 1..=4".to_owned()));
     }
-    if model.execution.replay_ablation && !model.execution.replay {
-        return Err(ConfigError::Invalid("Gemma 4 replay_ablation 必须与 replay 一起启用".to_owned()));
+    Ok(())
+}
+
+fn validate_gemma4_metal(model: &Gemma4NodeModelConfig, backend: &NodeMetalBackendConfig) -> Result<(), ConfigError> {
+    validate_gemma4(model)?;
+    if model.execution.replay_ablation && !backend.replay {
+        return Err(ConfigError::Invalid("Gemma 4 replay_ablation 必须与 backend.replay 一起启用".to_owned()));
     }
     Ok(())
 }
 
 fn validate_gemma4_cuda(model: &Gemma4NodeModelConfig) -> Result<(), ConfigError> {
     validate_gemma4(model)?;
-    if model.execution.mtp_weights.is_some() || model.execution.replay || model.execution.replay_ablation {
+    if model.execution.mtp_weights.is_some() || model.execution.replay_ablation {
         return Err(ConfigError::Invalid("Gemma 4 CUDA 当前不支持 Metal MTP/replay 选项".to_owned()));
     }
     Ok(())
@@ -1869,8 +1900,16 @@ fn validate_glm52(model: &Glm52NodeModelConfig, backend: &RocmBackendConfig) -> 
     if model.head.downstream.ticket.trim().is_empty() {
         return Err(ConfigError::Invalid("model.head.downstream.ticket 不能为空".to_owned()));
     }
-    if model.head.layer_ends.len() != backend.devices.len() || model.head.layer_ends.last().copied() != Some(model.head.stage_end - 1) || model.head.layer_ends.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(ConfigError::Invalid("GLM-5.2 head.layer_ends 必须与 backend.devices 一一对应、严格递增，最后等于 stage_end-1".to_owned()));
+    let logical_stage_count = if model.execution.cooperative_expert_pairs {
+        if backend.devices.len() % 2 != 0 {
+            return Err(ConfigError::Invalid("GLM-5.2 cooperative_expert_pairs 要求偶数张设备".to_owned()));
+        }
+        backend.devices.len() / 2
+    } else {
+        backend.devices.len()
+    };
+    if model.head.layer_ends.len() != logical_stage_count || model.head.layer_ends.last().copied() != Some(model.head.stage_end - 1) || model.head.layer_ends.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(ConfigError::Invalid("GLM-5.2 head.layer_ends 必须与逻辑 stage 一一对应、严格递增，最后等于 stage_end-1；cooperative 模式每两张设备为一个 stage".to_owned()));
     }
     Ok(())
 }
@@ -1923,12 +1962,20 @@ fn validate_stage_glm52(model: &Glm52StageModelConfig, backend: &RocmBackendConf
     if layers.start >= layers.end || layers.end > GLM52_LAYER_COUNT {
         return Err(ConfigError::Invalid(format!("Stage layers 必须满足 0 <= start < end <= {GLM52_LAYER_COUNT}")));
     }
-    if layers.device_layer_ends.len() != backend.devices.len()
+    let logical_stage_count = if model.execution.cooperative_expert_pairs {
+        if backend.devices.len() % 2 != 0 {
+            return Err(ConfigError::Invalid("GLM-5.2 cooperative_expert_pairs 要求偶数张设备".to_owned()));
+        }
+        backend.devices.len() / 2
+    } else {
+        backend.devices.len()
+    };
+    if layers.device_layer_ends.len() != logical_stage_count
         || layers.device_layer_ends.last().copied() != Some(layers.end - 1)
         || layers.device_layer_ends.windows(2).any(|pair| pair[0] >= pair[1])
         || layers.device_layer_ends.first().is_some_and(|end| *end < layers.start)
     {
-        return Err(ConfigError::Invalid("Stage device_layer_ends 必须与 backend.devices 一一对应并覆盖完整层区间".to_owned()));
+        return Err(ConfigError::Invalid("Stage device_layer_ends 必须与逻辑 stage 一一对应并覆盖完整层区间；cooperative 模式每两张设备为一个 stage".to_owned()));
     }
     if model.max_sequence_length == 0 {
         return Err(ConfigError::Invalid("Stage max_sequence_length 必须大于 0".to_owned()));
@@ -2176,6 +2223,21 @@ mod tests {
     }
 
     #[test]
+    fn metal_replay_is_a_backend_capability_and_defaults_on() {
+        let backend: NodeMetalBackendConfig = serde_yaml::from_str("{}").unwrap();
+        assert!(backend.replay);
+        let disabled: NodeMetalBackendConfig = serde_yaml::from_str("replay: false\n").unwrap();
+        assert!(!disabled.replay);
+
+        let mut model = Gemma4NodeModelConfig { weights_directory: PathBuf::from("./model.gguf"), lm_head_quantization: LmHeadQuantization::default(), max_sequence_length: 8192, execution: Gemma4ExecutionConfig::default() };
+        validate_gemma4_metal(&model, &backend).unwrap();
+        validate_gemma4_cuda(&model).unwrap();
+
+        model.execution.replay_ablation = true;
+        assert!(validate_gemma4_metal(&model, &disabled).is_err());
+    }
+
+    #[test]
     fn terminal_cache_prefix_rounds_defaults_to_four_and_accepts_legacy_name() {
         let defaults: NodeServiceConfig = serde_yaml::from_str("cache_directory: /tmp/zllm\n").unwrap();
         assert_eq!(defaults.terminal_cache_prefix_rounds, 4);
@@ -2375,6 +2437,7 @@ mod tests {
             hiprtc_cache_directory: PathBuf::from("./hiprtc"),
             kernel_sync: false,
             kernel_profile: false,
+            decode_graph: false,
             precise_router: true,
             allow_cpu_reference_fallback: false,
             memory_pool: true,
@@ -2385,6 +2448,9 @@ mod tests {
             mla_decode_split_threshold: 1,
             dsa_hadamard_i8: false,
             dsa_hadamard_shadow_samples: 0,
+            dsa_hisa_shadow_samples: 0,
+            dsa_cpu_select: false,
+            mla_cpu_hot_rows: 0,
             grouped_down_route_buffer: false,
         }
     }

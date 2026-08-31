@@ -248,7 +248,7 @@ impl StageListener {
         let Self { runtime, endpoint, expected } = self;
         let listener_connections = start_listener(&runtime, endpoint.clone(), expected);
         let (connection, send, recv) = listener_connections.recv().map_err(|_| "stage accept 任务已经退出".to_owned())?;
-        let recv = start_receiver(&runtime, recv);
+        let recv = start_receiver(&runtime, connection.clone(), recv);
         Ok(StageTransport { runtime, _endpoint: endpoint, _connection: connection, send, recv, listener_connections: Some(listener_connections), pending_listener_connection: None, downstream: None })
     }
 }
@@ -331,7 +331,7 @@ impl StageTransport {
             send.flush().await.map_err(|error| format!("flush stage stream opener: {error}"))?;
             Ok::<_, String>((endpoint, connection, send, recv))
         })?;
-        let recv = start_receiver(&runtime, recv);
+        let recv = start_receiver(&runtime, connection.clone(), recv);
         Ok(Self { runtime, _endpoint: endpoint, _connection: connection, send, recv, listener_connections: None, pending_listener_connection: None, downstream: Some(downstream) })
     }
 
@@ -356,9 +356,9 @@ impl StageTransport {
             Ok::<_, String>((connection, send, recv))
         })?;
         self._connection.close(0u32.into(), b"downstream reconnect");
-        self._connection = connection;
+        self._connection = connection.clone();
         self.send = send;
-        self.recv = start_receiver(&self.runtime, recv);
+        self.recv = start_receiver(&self.runtime, connection.clone(), recv);
         eprintln!("[stage-downstream-reconnected] 新连接已建立");
         Ok(())
     }
@@ -376,9 +376,9 @@ impl StageTransport {
         }
         self._connection.close(0u32.into(), b"superseded by new upstream");
         let (connection, send, recv) = next;
-        self._connection = connection;
+        self._connection = connection.clone();
         self.send = send;
-        self.recv = start_receiver(&self.runtime, recv);
+        self.recv = start_receiver(&self.runtime, connection.clone(), recv);
         eprintln!("[stage-upstream-takeover] 新上游已接管");
         Ok(())
     }
@@ -565,33 +565,7 @@ impl StageTransport {
     }
 
     pub fn connection_diagnostics(&self) -> String {
-        let stats = self._connection.stats();
-        let paths = self
-            ._connection
-            .paths()
-            .iter()
-            .map(|path| {
-                let stats = path.stats();
-                format!(
-                    "selected={} direct={} remote={:?} rtt_ms={:.3} cwnd={} congestion={} spurious={} lost_packets={} lost_bytes={} mtu={}",
-                    path.is_selected(),
-                    path.is_ip(),
-                    path.remote_addr(),
-                    path.rtt().as_secs_f64() * 1000.0,
-                    stats.cwnd,
-                    stats.congestion_events,
-                    stats.spurious_congestion_events,
-                    stats.lost_packets,
-                    stats.lost_bytes,
-                    stats.current_mtu,
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(";");
-        format!(
-            "lost_packets={} lost_bytes={} stream_blocked_tx={} stream_blocked_rx={} max_stream_data_tx={} max_stream_data_rx={} paths=[{paths}]",
-            stats.lost_packets, stats.lost_bytes, stats.frame_tx.stream_data_blocked, stats.frame_rx.stream_data_blocked, stats.frame_tx.max_stream_data, stats.frame_rx.max_stream_data,
-        )
+        connection_diagnostics(&self._connection)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -662,12 +636,41 @@ impl StageTransport {
     }
 }
 
-fn start_receiver(runtime: &Runtime, recv: RecvStream) -> mpsc::Receiver<Result<(StageFrame, Instant), String>> {
+fn connection_diagnostics(connection: &Connection) -> String {
+    let stats = connection.stats();
+    let paths = connection
+        .paths()
+        .iter()
+        .map(|path| {
+            let stats = path.stats();
+            format!(
+                "selected={} direct={} remote={:?} rtt_ms={:.3} cwnd={} congestion={} spurious={} lost_packets={} lost_bytes={} mtu={}",
+                path.is_selected(),
+                path.is_ip(),
+                path.remote_addr(),
+                path.rtt().as_secs_f64() * 1000.0,
+                stats.cwnd,
+                stats.congestion_events,
+                stats.spurious_congestion_events,
+                stats.lost_packets,
+                stats.lost_bytes,
+                stats.current_mtu,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    format!(
+        "lost_packets={} lost_bytes={} stream_blocked_tx={} stream_blocked_rx={} max_stream_data_tx={} max_stream_data_rx={} paths=[{paths}]",
+        stats.lost_packets, stats.lost_bytes, stats.frame_tx.stream_data_blocked, stats.frame_rx.stream_data_blocked, stats.frame_tx.max_stream_data, stats.frame_rx.max_stream_data,
+    )
+}
+
+fn start_receiver(runtime: &Runtime, connection: Connection, recv: RecvStream) -> mpsc::Receiver<Result<(StageFrame, Instant), String>> {
     let (frames, receiver) = mpsc::channel();
     runtime.spawn(async move {
         let mut recv = recv;
         loop {
-            let frame = receive_frame(&mut recv).await.map(|frame| (frame, Instant::now()));
+            let frame = receive_frame(&mut recv).await.map(|frame| (frame, Instant::now())).map_err(|error| format!("{error}; close_reason={:?}; {}", connection.close_reason(), connection_diagnostics(&connection)));
             let failed = frame.is_err();
             if frames.send(frame).is_err() || failed {
                 break;

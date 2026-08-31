@@ -953,11 +953,20 @@ pub fn glm52_moe_prefill_layer<B: ExpertPrefillBackend + DsaPrefillBackend>(
     backend.begin_batch();
     backend.profile_device_operator("glm_attention")?;
     let begin_micros = mark_phase();
-    let (normed, q_a, kv_a) = if weights.indexer.is_none() && backend.token_rows(hidden) == 1 {
+    let single_row = backend.token_rows(hidden) == 1;
+    let (normed, q_a, kv_a) = if weights.indexer.is_none() && single_row {
         // 单行 IndexShare 层不消费 normed 本身，直接让两路量化投影共享 BF16
         // RMSNorm 结果，避免先写 F32、再分别转换给 q/kv 投影。
         let (q_a, kv_a) = backend.rmsnorm_dual_linear(hidden, &weights.input_norm, cfg.rms_eps, &weights.q_a_proj, &weights.kv_a_proj)?;
         (None, q_a, kv_a)
+    } else if weights.indexer.is_some()
+        && single_row
+        && let Some((precise, quantized)) = backend.rmsnorm_quantized_pair(hidden, &weights.input_norm, cfg.rms_eps)?
+    {
+        // Full-indexer 同时需要精确 F32 输入做 DSA，以及 BF16 输入做 W4 q/kv
+        // 双投影；由同一次 RMSNorm 写出两种表示，避免 dual_linear 再量化一次。
+        let (q_a, kv_a) = backend.dual_linear(&quantized, &weights.q_a_proj, &weights.kv_a_proj)?;
+        (Some(precise), q_a, kv_a)
     } else {
         let normed = backend.rmsnorm_quantized(hidden, &weights.input_norm, cfg.rms_eps)?;
         let (q_a, kv_a) = backend.dual_linear(&normed, &weights.q_a_proj, &weights.kv_a_proj)?;
@@ -1399,7 +1408,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn decode_select<B: DecodeBackend>(
+pub fn decode_select_begin<B: DecodeBackend>(
     backend: &B,
     state: &mut B::DsaState,
     hidden: &B::Tensor,
@@ -1410,9 +1419,9 @@ pub fn decode_select<B: DecodeBackend>(
     cos: &[f32],
     sin: &[f32],
     spec: &DsaSpec,
-) -> Result<(), BackendError> {
+) -> Result<bool, BackendError> {
     if !backend.dsa_can_append(state, layer, position, spec) {
-        return Ok(());
+        return Ok(false);
     }
     let (key, head_weights) = if position < spec.top_k {
         (backend.linear(hidden, weights.wk)?, None)
@@ -1426,11 +1435,12 @@ pub fn decode_select<B: DecodeBackend>(
         backend.append_dsa_keys(state, layer, position, &key, spec)?;
     }
     if position < spec.top_k {
-        return Ok(());
+        return Ok(false);
     }
     let query = backend.linear(q_lora, weights.wq_b)?;
     let query = backend.rope_prefix(&query, spec.num_heads, spec.rope_dim, spec.rotary_layout, position, cos, sin)?;
-    backend.dsa_select_topk(state, layer, &query, &head_weights.expect("DSA head weights 已准备"), spec)
+    backend.dsa_select_topk_begin(state, layer, &query, &head_weights.expect("DSA head weights 已准备"), spec)?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1489,21 +1499,44 @@ pub fn mla_decode<B: DecodeBackend>(
     sin: &[f32],
     eps: f32,
 ) -> Result<B::Tensor, BackendError> {
-    let (query, kv_a) = if let Some(dsa_weights) = dsa_weights {
+    let (query, kv_a, dsa_started) = if let Some(dsa_weights) = dsa_weights {
         let normed = backend.rmsnorm(hidden, weights.input_norm, eps)?;
         let (q_a, kv_a) = backend.dual_linear(&normed, weights.q_a_proj, weights.kv_a_proj)?;
         let q_a = backend.rmsnorm(&q_a, weights.q_a_norm, eps)?;
-        decode_select(backend, dsa_state, &normed, &q_a, dsa_weights, layer, position, cos, sin, dsa_spec)?;
-        (backend.linear(&q_a, weights.q_b_proj)?, kv_a)
+        let dsa_started = decode_select_begin(backend, dsa_state, &normed, &q_a, dsa_weights, layer, position, cos, sin, dsa_spec)?;
+        let query = match backend.linear(&q_a, weights.q_b_proj) {
+            Ok(query) => query,
+            Err(error) => {
+                if dsa_started {
+                    let _ = backend.dsa_select_topk_finish(dsa_state);
+                }
+                return Err(error);
+            }
+        };
+        (query, kv_a, dsa_started)
     } else {
         let (q_a, kv_a) = backend.rmsnorm_dual_linear(hidden, weights.input_norm, eps, weights.q_a_proj, weights.kv_a_proj)?;
-        (backend.rmsnorm_linear(&q_a, weights.q_a_norm, eps, weights.q_b_proj)?, kv_a)
+        (backend.rmsnorm_linear(&q_a, weights.q_a_norm, eps, weights.q_b_proj)?, kv_a, false)
     };
-    let (latent, k_rope) = backend.split_columns(&kv_a, spec.kv_lora_rank)?;
-    let latent = backend.rmsnorm(&latent, weights.kv_a_norm, eps)?;
-    let query = backend.rope(&query, spec.num_heads, spec.qk_rope_head_dim, spec.rotary_layout, position, cos, sin)?;
-
-    backend.append_mla_rope(cache, layer, &latent, &k_rope, spec.qk_rope_head_dim, spec.rotary_layout, position, cos, sin)?;
+    let prepared = (|| {
+        let (latent, k_rope) = backend.split_columns(&kv_a, spec.kv_lora_rank)?;
+        let latent = backend.rmsnorm(&latent, weights.kv_a_norm, eps)?;
+        let query = backend.rope(&query, spec.num_heads, spec.qk_rope_head_dim, spec.rotary_layout, position, cos, sin)?;
+        backend.append_mla_rope(cache, layer, &latent, &k_rope, spec.qk_rope_head_dim, spec.rotary_layout, position, cos, sin)?;
+        Ok(query)
+    })();
+    let query = match prepared {
+        Ok(query) => query,
+        Err(error) => {
+            if dsa_started {
+                let _ = backend.dsa_select_topk_finish(dsa_state);
+            }
+            return Err(error);
+        }
+    };
+    if dsa_started {
+        backend.dsa_select_topk_finish(dsa_state)?;
+    }
     let attention = backend.mla_decode_attention_selected(&query, cache, weights.kv_b_proj, layer, position + 1, spec, dsa_spec, dsa_state)?;
     let projected = backend.linear(&attention, weights.o_proj)?;
     backend.add(hidden, &projected)

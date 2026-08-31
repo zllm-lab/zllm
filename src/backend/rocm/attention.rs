@@ -140,6 +140,41 @@ fn paged_mla_attention_into(
     let query_device = query.device.as_deref().ok_or_else(|| compute_error("ROCm paged MLA query 缺少 device buffer"))?;
     let table = cache.block_table.buffer().ok_or_else(|| compute_error("ROCm paged MLA 缺少 block table"))?;
     let query_start = cached.rows - query.rows;
+    if let Some(hot) = &cached.cpu_hot {
+        if query.rows != 1 || cached.committed_rows <= 2048 {
+            return Err(compute_error(format!("L{layer} ROCm MLA hot query_rows={} hot_rows={} 非法", query.rows, cached.committed_rows)));
+        }
+        let state = dsa_state.ok_or_else(|| compute_error(format!("L{layer} ROCm MLA hot 缺少 DSA selection")))?;
+        let host_selection = state.host_selection(1, query_start).ok_or_else(|| compute_error(format!("L{layer} ROCm MLA hot 缺少 host selection: start={query_start}")))?;
+        let mut hot = hot.lock().map_err(|_| compute_error(format!("L{layer} ROCm MLA hot 锁中毒")))?;
+        let selection = hot.prepare_selection(context.device_id, layer, host_selection, &cached.latent, cached.latent_scales.as_deref().expect("Q8 MLA hot 必有 scales"), &cached.rope)?;
+        ops::hip::try_paged_mla_attention_ct_into(
+            context.device_id,
+            query_device,
+            &cached.latent,
+            cached.latent_scales.as_deref(),
+            cached.latent_group_size,
+            &cached.rope,
+            table,
+            Some(&selection),
+            ct_mla_weight(kv_b)?,
+            1,
+            cached.committed_rows,
+            cached.committed_rows - 1,
+            spec.q_projection_size,
+            spec.num_heads,
+            spec.qk_rope_head_dim,
+            host_selection.len(),
+            ROCM_KV_BLOCK_SIZE,
+            output,
+            None,
+        )
+        .map_err(compute_error)?;
+        if ops::hip::options().kernel_sync {
+            ops::hip::synchronize_device(context.device_id, &format!("L{layer} ROCm paged MLA hot synchronize")).map_err(compute_error)?;
+        }
+        return Ok(());
+    }
     let selection = dsa_state.and_then(|state| state.device_selection(query.rows, query_start));
     let selection_width = if selection.is_some() { dsa_state.map_or(top_k, RocmDsaState::selection_width) } else { top_k };
     ops::hip::try_paged_mla_attention_ct_into(
@@ -344,6 +379,17 @@ impl DecodeBackend for RocmContext {
             return state.select_kpool(self, layer, query, head_weights, spec.kpool);
         }
         state.select(self, layer, query, head_weights)
+    }
+
+    fn dsa_select_topk_begin(&self, state: &mut Self::DsaState, layer: usize, query: &Self::Tensor, head_weights: &Self::Tensor, spec: &crate::attention::dsa::DsaSpec) -> Result<(), BackendError> {
+        if spec.kpool > 0 {
+            return state.select_kpool(self, layer, query, head_weights, spec.kpool);
+        }
+        state.select_begin(self, layer, query, head_weights)
+    }
+
+    fn dsa_select_topk_finish(&self, state: &mut Self::DsaState) -> Result<(), BackendError> {
+        state.select_finish(self)
     }
 
     fn mla_decode_attention_selected(

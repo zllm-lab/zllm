@@ -2810,6 +2810,172 @@ kernel void gguf_gemm_q6k_fused_f16(
         if (first_col + 3 < N) output[ulong(in_row) * N + first_col + 3] = finite_f16(sums[3]);
     }
 }
+
+// Fused IQ4_NL GEMM：64×64 output tile，每个 K=32 tile 只反量化一次权重到
+// threadgroup，4 个 simdgroup 用 8×8 MMA 复用。不能按 input row 扩 GEMV：那会
+// 让长 prompt 为每行重读整份权重，虽数值正确却比 dequant+MPS 更慢。
+#if __METAL_VERSION__ >= 400
+// M5 Metal 4 cooperative tensor 路径。逻辑矩阵为 weight[N,K] × input[K,M]，
+// 物理输出仍是 zLLM 行优先 output[M,N]。每组覆盖 64 个权重行 × 128 个
+// token；量化权重 tile 反量化进 threadgroup，input 直接从 device tensor 读取。
+kernel void gguf_gemm_iq4nl_mpp_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *weight [[buffer(1)]],
+    device const ulong *iq2s_grid [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant uint &input_rows [[buffer(4)]],
+    constant uint &weight_rows [[buffer(5)]],
+    constant uint &K [[buffer(6)]],
+    constant uint &row_bytes [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    constexpr int TILE_WEIGHT_ROWS = 64;
+    constexpr int TILE_INPUT_ROWS = 128;
+    constexpr int TILE_K = 32;
+    constexpr int SIMD_GROUPS = 4;
+    threadgroup half stage_weight[TILE_WEIGHT_ROWS * TILE_K];
+    const int weight_base = int(group.y) * TILE_WEIGHT_ROWS;
+    const int input_base = int(group.x) * TILE_INPUT_ROWS;
+
+    auto staged = tensor(stage_weight, dextents<int32_t, 2>(TILE_K, TILE_WEIGHT_ROWS));
+    device half *input_mut = const_cast<device half *>(input);
+    auto input_tensor = tensor(input_mut, dextents<int32_t, 2>(int(K), int(input_rows)), array<int, 2>({1, int(K)}));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            TILE_INPUT_ROWS,
+            TILE_WEIGHT_ROWS,
+            static_cast<int>(dynamic_extent),
+            false,
+            true,
+            true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<SIMD_GROUPS>> multiply;
+    auto accumulator = multiply.get_destination_cooperative_tensor<decltype(input_tensor), decltype(staged), float>();
+
+    for (int k_base = 0; k_base < int(K); k_base += TILE_K) {
+        // 128 threads：每线程负责一个权重行的半个 IQ4_NL block（16 值）。
+        const int local_weight_row = int(thread_index) >> 1;
+        const int half_block = int(thread_index) & 1;
+        const int out_row = weight_base + local_weight_row;
+        const int local_k = half_block * 16;
+        if (out_row < int(weight_rows)) {
+            device const uchar *block = weight + ulong(out_row) * row_bytes + ulong(k_base >> 5) * 18;
+            const float scale = float(as_type<half>(*(device const ushort *)block));
+            for (int i = 0; i < 16; ++i) {
+                const uchar packed = block[2 + i];
+                const uint code = half_block == 0 ? packed & 15 : packed >> 4;
+                stage_weight[local_weight_row * TILE_K + local_k + i] = half(scale * float(kvalues_iq4nl[code]));
+            }
+        } else {
+            for (int i = 0; i < 16; ++i) {
+                stage_weight[local_weight_row * TILE_K + local_k + i] = 0.0h;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int k_extent = min(TILE_K, int(K) - k_base);
+        auto weight_tile = tensor(stage_weight, dextents<int32_t, 2>(k_extent, TILE_WEIGHT_ROWS), array<int, 2>({1, TILE_K}));
+        auto input_tile = tensor(input_mut + k_base + ulong(input_base) * K, dextents<int32_t, 2>(k_extent, int(input_rows) - input_base), array<int, 2>({1, int(K)}));
+        multiply.run(input_tile, weight_tile, accumulator);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    auto destination = tensor(output, dextents<int32_t, 2>(int(weight_rows), int(input_rows)), array<int, 2>({1, int(weight_rows)}));
+    accumulator.store(destination.slice(weight_base, input_base));
+}
+#endif
+
+kernel void gguf_gemm_iq4nl_fused_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *weight [[buffer(1)]],
+    device const ulong *iq2s_grid [[buffer(2)]],
+    device half *output [[buffer(3)]],
+    constant uint &M [[buffer(4)]],
+    constant uint &N [[buffer(5)]],
+    constant uint &K [[buffer(6)]],
+    constant uint &row_bytes [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    threadgroup half stage_a[64 * 32];
+    threadgroup half stage_b[32 * 64];
+    threadgroup float result[64 * 64];
+    const uint row_base = group.y * 64;
+    const uint col_base = group.x * 64;
+    const uint gi = simd_index & 1;
+    const uint gj = simd_index >> 1;
+    simdgroup_float8x8 acc[4][4];
+    for (uint mi = 0; mi < 4; ++mi) {
+        for (uint nj = 0; nj < 4; ++nj) {
+            acc[mi][nj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    for (uint k_base = 0; k_base < K; k_base += 32) {
+        for (uint index = thread_index; index < (64 * 32) / 4; index += 128) {
+            const uint local_row = (index * 4) >> 5;
+            const uint local_k = (index * 4) & 31;
+            half4 value = 0.0h;
+            if (row_base + local_row < M) {
+                value = *(device const half4 *)(input + ulong(row_base + local_row) * K + k_base + local_k);
+            }
+            *(threadgroup half4 *)(stage_a + local_row * 32 + local_k) = value;
+        }
+        for (uint index = thread_index; index < (32 * 64) / 4; index += 128) {
+            const uint flat = index * 4;
+            #pragma unroll
+            for (uint item = 0; item < 4; ++item) {
+                const uint element = flat + item;
+                const uint local_k = element >> 6;
+                const uint local_n = element & 63;
+                const uint out_col = col_base + local_n;
+                half value = 0.0h;
+                if (out_col < N) {
+                    const uint k = k_base + local_k;
+                    device const uchar *block = weight + ulong(out_col) * row_bytes + ulong(k >> 5) * 18;
+                    const float d = float(as_type<half>(*(device const ushort *)block));
+                    const uchar packed = block[2 + (k & 15)];
+                    const uint code = (k & 16) == 0 ? packed & 15 : packed >> 4;
+                    value = half(d * float(kvalues_iq4nl[code]));
+                }
+                stage_b[local_k * 64 + local_n] = value;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 32; k += 8) {
+            simdgroup_half8x8 a[4];
+            simdgroup_half8x8 b[4];
+            for (uint mi = 0; mi < 4; ++mi) {
+                simdgroup_load(a[mi], stage_a + (gi * 32 + mi * 8) * 32 + k, 32);
+            }
+            for (uint nj = 0; nj < 4; ++nj) {
+                simdgroup_load(b[nj], stage_b + k * 64 + gj * 32 + nj * 8, 64);
+            }
+            for (uint mi = 0; mi < 4; ++mi) {
+                for (uint nj = 0; nj < 4; ++nj) {
+                    simdgroup_multiply_accumulate(acc[mi][nj], a[mi], b[nj], acc[mi][nj]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint mi = 0; mi < 4; ++mi) {
+        for (uint nj = 0; nj < 4; ++nj) {
+            simdgroup_store(acc[mi][nj], result + (gi * 32 + mi * 8) * 64 + gj * 32 + nj * 8, 64);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint index = thread_index; index < 64 * 64; index += 128) {
+        const uint local_row = index >> 6;
+        const uint local_col = index & 63;
+        if (row_base + local_row < M && col_base + local_col < N) {
+            output[ulong(row_base + local_row) * N + col_base + local_col] = finite_f16(result[index]);
+        }
+    }
+}
 "#;
 
 use crate::backend::metal::api as metal;

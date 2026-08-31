@@ -2040,6 +2040,580 @@ kernel void gqa_decode_attention_f16_position(
     }
 }
 
+// replay/position 专用 grouped-GQA split-KV：同一 KV head 的至多 4 个 query
+// head 在一个 threadgroup 内协作，一次 K/V 读取同时服务多个 query。旧的
+// per-query-head kernel 在 Gemma4 global attention(16Q:1KV)会把 5K+ 上下文的
+// K/V 流量放大 16 倍；这里沿用常规 decode split-KV 的分块 softmax 数学，只把
+// source_rows/first_visible 改为从 decode_state 动态读取，并用 max_block_count
+// 保持 replay 录制后的 scratch stride 不变。
+kernel void gqa_decode_split_kv_f16_position(
+    device const half *query [[buffer(0)]],
+    device const half *key [[buffer(1)]],
+    device const half *value [[buffer(2)]],
+    device float *statistics [[buffer(3)]],
+    device float *partial_values [[buffer(4)]],
+    constant uint *decode_state [[buffer(5)]],
+    constant uint &head_count [[buffer(6)]],
+    constant uint &kv_head_count [[buffer(7)]],
+    constant uint &head_dim [[buffer(8)]],
+    constant float &score_scale [[buffer(9)]],
+    constant uint &sliding_window [[buffer(10)]],
+    constant uint &kv_capacity [[buffer(11)]],
+    constant uint &block_tokens [[buffer(12)]],
+    constant uint &max_block_count [[buffer(13)]],
+    constant uint &worker_count [[buffer(14)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_groups [[simdgroups_per_threadgroup]])
+{
+    constexpr uint heads_per_group = 4;
+    constexpr uint max_head_dim = 512;
+    constexpr uint max_block_tokens = 256;
+    if (kv_head_count == 0 || head_count % kv_head_count != 0) return;
+    const uint heads_per_kv = head_count / kv_head_count;
+    if (heads_per_kv == 0) return;
+
+    const uint kv_rows = decode_state[1];
+    const uint kv_start = decode_state[2];
+    const uint position = decode_state[0];
+    const uint causal_rows = min(kv_rows, position + 1);
+    const uint window_start = sliding_window == 0 || causal_rows <= sliding_window ? 0 : causal_rows - sliding_window;
+    const uint first_visible = max(kv_start, window_start);
+    const uint source_rows = causal_rows - first_visible;
+    const uint block_count = (source_rows + block_tokens - 1) / block_tokens;
+
+    const uint head_groups_per_kv = (heads_per_kv + heads_per_group - 1) / heads_per_group;
+    const uint kv_head = group.y / head_groups_per_kv;
+    const uint head_group = group.y - kv_head * head_groups_per_kv;
+    const uint first_head_offset = head_group * heads_per_group;
+    const uint active_heads = min(heads_per_group, heads_per_kv - first_head_offset);
+    if (group.x >= min(block_count, worker_count) || kv_head >= kv_head_count
+        || head_dim > max_head_dim || block_tokens == 0 || block_tokens > max_block_tokens) return;
+
+    threadgroup half query_tile[2048];
+    threadgroup float weights[1024];
+    threadgroup float reduction[256];
+
+    const uint query_elements = active_heads * head_dim;
+    const uint first_query_head = kv_head * heads_per_kv + first_head_offset;
+    for (uint index = thread_index; index < query_elements; index += max_block_tokens) {
+        query_tile[index] = query[ulong(first_query_head) * head_dim + index];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // replay 的 grid 固定为少量 worker；上下文增长时每个 worker 依次处理更多
+    // block，避免按 131K 最大容量静态派发数千个立即 return 的 threadgroup。
+    for (uint block = group.x; block < block_count && block < max_block_count; block += worker_count) {
+    const uint row_begin = block * block_tokens;
+    const uint rows = min(block_tokens, source_rows - row_begin);
+
+    // 每个 SIMD group 处理一个 token；K 只读一次，随后对至多 4 个 query 做 dot。
+    for (uint token = simd_group; token < rows; token += simd_groups) {
+        float dot_products[heads_per_group];
+        for (uint query_head = 0; query_head < active_heads; ++query_head) dot_products[query_head] = 0.0f;
+        const uint source = first_visible + row_begin + token;
+        const uint slot = source % kv_capacity;
+        const ulong key_base = (ulong(slot) * kv_head_count + kv_head) * head_dim;
+        for (uint dimension = simd_lane; dimension < head_dim; dimension += 32) {
+            const float key_value = float(key[key_base + dimension]);
+            for (uint query_head = 0; query_head < active_heads; ++query_head) {
+                dot_products[query_head] += float(query_tile[query_head * head_dim + dimension]) * key_value;
+            }
+        }
+        for (uint query_head = 0; query_head < active_heads; ++query_head) {
+            const float score = simd_sum(dot_products[query_head]) * score_scale;
+            if (simd_lane == 0) weights[query_head * max_block_tokens + token] = score;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint query_head = 0; query_head < active_heads; ++query_head) {
+        const uint weight_base = query_head * max_block_tokens;
+        const float local_score = thread_index < rows ? weights[weight_base + thread_index] : -INFINITY;
+        const float simd_maximum = simd_max(local_score);
+        if (simd_lane == 0) reduction[simd_group] = simd_maximum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            const float group_maximum = simd_lane < simd_groups ? reduction[simd_lane] : -INFINITY;
+            const float block_maximum = simd_max(group_maximum);
+            if (simd_lane == 0) reduction[0] = block_maximum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float block_maximum = reduction[0];
+        const float weight = thread_index < rows ? exp(weights[weight_base + thread_index] - block_maximum) : 0.0f;
+        if (thread_index < rows) weights[weight_base + thread_index] = weight;
+        const float simd_denominator = simd_sum(weight);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_lane == 0) reduction[simd_group] = simd_denominator;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (simd_group == 0) {
+            const float group_denominator = simd_lane < simd_groups ? reduction[simd_lane] : 0.0f;
+            const float block_denominator = simd_sum(group_denominator);
+            if (simd_lane == 0) reduction[0] = block_denominator;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_index == 0) {
+            const uint global_head = first_query_head + query_head;
+            const ulong statistic = (ulong(global_head) * max_block_count + block) * 2;
+            statistics[statistic] = block_maximum;
+            statistics[statistic + 1] = reduction[0];
+        }
+    }
+
+    // V 同样只读一次，对组内 query 的 softmax 权重分别累加。
+    for (uint dimension = thread_index; dimension < head_dim; dimension += max_block_tokens) {
+        float accumulated[heads_per_group];
+        for (uint query_head = 0; query_head < active_heads; ++query_head) accumulated[query_head] = 0.0f;
+        for (uint token = 0; token < rows; ++token) {
+            const uint source = first_visible + row_begin + token;
+            const uint slot = source % kv_capacity;
+            const ulong value_index = (ulong(slot) * kv_head_count + kv_head) * head_dim + dimension;
+            const float value_element = float(value[value_index]);
+            for (uint query_head = 0; query_head < active_heads; ++query_head) {
+                accumulated[query_head] += weights[query_head * max_block_tokens + token] * value_element;
+            }
+        }
+        for (uint query_head = 0; query_head < active_heads; ++query_head) {
+            const uint global_head = first_query_head + query_head;
+            const ulong partial = (ulong(global_head) * max_block_count + block) * head_dim + dimension;
+            partial_values[partial] = accumulated[query_head];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void gqa_decode_split_kv_merge_f16_position(
+    device const float *statistics [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant uint *decode_state [[buffer(3)]],
+    constant uint &head_count [[buffer(4)]],
+    constant uint &head_dim [[buffer(5)]],
+    constant uint &sliding_window [[buffer(6)]],
+    constant uint &block_tokens [[buffer(7)]],
+    constant uint &max_block_count [[buffer(8)]],
+    uint query_head [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    if (query_head >= head_count) return;
+    const uint kv_rows = decode_state[1];
+    const uint kv_start = decode_state[2];
+    const uint position = decode_state[0];
+    const uint causal_rows = min(kv_rows, position + 1);
+    const uint window_start = sliding_window == 0 || causal_rows <= sliding_window ? 0 : causal_rows - sliding_window;
+    const uint first_visible = max(kv_start, window_start);
+    const uint source_rows = causal_rows - first_visible;
+    const uint block_count = min(max_block_count, (source_rows + block_tokens - 1) / block_tokens);
+
+    threadgroup float reduction[2];
+    if (thread_index < 32) {
+        float local_maximum = -INFINITY;
+        for (uint block = thread_index; block < block_count; block += 32) {
+            local_maximum = max(local_maximum, statistics[(ulong(query_head) * max_block_count + block) * 2]);
+        }
+        const float maximum = simd_max(local_maximum);
+        if (thread_index == 0) reduction[0] = maximum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float maximum = reduction[0];
+
+    if (thread_index < 32) {
+        float local_denominator = 0.0f;
+        for (uint block = thread_index; block < block_count; block += 32) {
+            const ulong statistic = (ulong(query_head) * max_block_count + block) * 2;
+            local_denominator += statistics[statistic + 1] * exp(statistics[statistic] - maximum);
+        }
+        const float denominator = simd_sum(local_denominator);
+        if (thread_index == 0) reduction[1] = denominator;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float denominator = reduction[1];
+
+    for (uint dimension = thread_index; dimension < head_dim; dimension += 256) {
+        float accumulated = 0.0f;
+        for (uint block = 0; block < block_count; ++block) {
+            const ulong statistic = (ulong(query_head) * max_block_count + block) * 2;
+            const ulong partial = (ulong(query_head) * max_block_count + block) * head_dim + dimension;
+            accumulated += partial_values[partial] * exp(statistics[statistic] - maximum);
+        }
+        output[ulong(query_head) * head_dim + dimension] = finite_f16(accumulated / denominator);
+    }
+}
+
+// Gemma4 global attention 专用 persistent flash 路径：16Q:1KV 在同一组内完成，
+// K/V 每次读取同时服务 16 个 head。每个 worker 负责一个连续 token
+// 分区，并在分区内按 128-token tile 做 online-softmax，故上下文增长只增加
+// worker 内循环，不增加 replay 的静态 dispatch 数和 scratch stride。
+kernel void gqa_decode_flash_f16_position_16h(
+    device const half *query [[buffer(0)]],
+    device const half *key [[buffer(1)]],
+    device const half *value [[buffer(2)]],
+    device float *statistics [[buffer(3)]],
+    device float *partial_values [[buffer(4)]],
+    constant uint *decode_state [[buffer(5)]],
+    constant uint &head_count [[buffer(6)]],
+    constant uint &kv_head_count [[buffer(7)]],
+    constant uint &head_dim [[buffer(8)]],
+    constant float &score_scale [[buffer(9)]],
+    constant uint &sliding_window [[buffer(10)]],
+    constant uint &kv_capacity [[buffer(11)]],
+    constant uint &partition_count [[buffer(12)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_groups [[simdgroups_per_threadgroup]])
+{
+    constexpr uint heads_per_group = 16;
+    constexpr uint tile_tokens = 128;
+    constexpr uint threads = 256;
+    if (kv_head_count == 0 || head_count % kv_head_count != 0 || head_dim != 512 || partition_count == 0) return;
+    const uint heads_per_kv = head_count / kv_head_count;
+    const uint head_groups_per_kv = (heads_per_kv + heads_per_group - 1) / heads_per_group;
+    const uint kv_head = group.y / head_groups_per_kv;
+    const uint head_group = group.y - kv_head * head_groups_per_kv;
+    const uint first_head_offset = head_group * heads_per_group;
+    if (group.x >= partition_count || kv_head >= kv_head_count || first_head_offset >= heads_per_kv) return;
+    const uint active_heads = min(heads_per_group, heads_per_kv - first_head_offset);
+    const uint first_query_head = kv_head * heads_per_kv + first_head_offset;
+
+    const uint kv_rows = decode_state[1];
+    const uint kv_start = decode_state[2];
+    const uint position = decode_state[0];
+    const uint causal_rows = min(kv_rows, position + 1);
+    const uint window_start = sliding_window == 0 || causal_rows <= sliding_window ? 0 : causal_rows - sliding_window;
+    const uint first_visible = max(kv_start, window_start);
+    const uint source_rows = causal_rows - first_visible;
+    const uint partition = group.x;
+    const uint partition_begin = uint((ulong(source_rows) * partition) / partition_count);
+    const uint partition_end = uint((ulong(source_rows) * (partition + 1)) / partition_count);
+
+    threadgroup half query_tile[heads_per_group * 512];
+    threadgroup float weights[heads_per_group * tile_tokens];
+    threadgroup float reduction[threads];
+    threadgroup float state[heads_per_group * 4];
+    const uint query_elements = active_heads * head_dim;
+    for (uint index = thread_index; index < query_elements; index += threads) {
+        query_tile[index] = query[ulong(first_query_head) * head_dim + index];
+    }
+    if (thread_index < active_heads) {
+        state[thread_index * 4] = -INFINITY;
+        state[thread_index * 4 + 1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float2 accumulated[heads_per_group] = {
+        float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f),
+        float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f),
+        float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f),
+        float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f)
+    };
+    for (uint tile_begin = partition_begin; tile_begin < partition_end; tile_begin += tile_tokens) {
+        const uint rows = min(tile_tokens, partition_end - tile_begin);
+        for (uint token = simd_group; token < rows; token += simd_groups) {
+            const uint source = first_visible + tile_begin + token;
+            const uint slot = source % kv_capacity;
+            const ulong key_base = (ulong(slot) * kv_head_count + kv_head) * head_dim;
+            const uint dimension = simd_lane * 16;
+            const half4 k0 = *((device const half4 *)(key + key_base + dimension));
+            const half4 k1 = *((device const half4 *)(key + key_base + dimension + 4));
+            const half4 k2 = *((device const half4 *)(key + key_base + dimension + 8));
+            const half4 k3 = *((device const half4 *)(key + key_base + dimension + 12));
+            float dot_products[heads_per_group] = {
+                0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f
+            };
+            for (uint head = 0; head < active_heads; ++head) {
+                const threadgroup half4 *q = (threadgroup half4 *)(query_tile + head * head_dim + dimension);
+                dot_products[head] = dot(float4(q[0]), float4(k0)) + dot(float4(q[1]), float4(k1))
+                    + dot(float4(q[2]), float4(k2)) + dot(float4(q[3]), float4(k3));
+            }
+            for (uint head = 0; head < active_heads; ++head) {
+                const float score = simd_sum(dot_products[head]) * score_scale;
+                if (simd_lane == 0) weights[head * tile_tokens + token] = score;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint head = 0; head < active_heads; ++head) {
+            const uint weight_base = head * tile_tokens;
+            const float local_score = thread_index < rows ? weights[weight_base + thread_index] : -INFINITY;
+            const float simd_maximum = simd_max(local_score);
+            if (simd_lane == 0) reduction[simd_group] = simd_maximum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                const float group_maximum = simd_lane < simd_groups ? reduction[simd_lane] : -INFINITY;
+                const float tile_maximum = simd_max(group_maximum);
+                if (simd_lane == 0) reduction[0] = tile_maximum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float tile_maximum = reduction[0];
+            float local_denominator = 0.0f;
+            if (thread_index < rows) {
+                const float weight = exp(weights[weight_base + thread_index] - tile_maximum);
+                weights[weight_base + thread_index] = weight;
+                local_denominator = weight;
+            }
+            local_denominator = simd_sum(local_denominator);
+            if (simd_lane == 0) reduction[simd_group] = local_denominator;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                const float group_denominator = simd_lane < simd_groups ? reduction[simd_lane] : 0.0f;
+                const float tile_denominator = simd_sum(group_denominator);
+                if (simd_lane == 0) {
+                    const uint state_base = head * 4;
+                    const float previous_maximum = state[state_base];
+                    const float merged_maximum = max(previous_maximum, tile_maximum);
+                    const float previous_scale = state[state_base + 1] == 0.0f ? 0.0f : exp(previous_maximum - merged_maximum);
+                    const float tile_scale = exp(tile_maximum - merged_maximum);
+                    state[state_base] = merged_maximum;
+                    state[state_base + 1] = state[state_base + 1] * previous_scale + tile_denominator * tile_scale;
+                    state[state_base + 2] = previous_scale;
+                    state[state_base + 3] = tile_scale;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const uint value_dimension = thread_index * 2;
+        const bool value_active = value_dimension < head_dim;
+        float2 tile_accumulated[heads_per_group] = {
+            float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f),
+            float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f),
+            float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f),
+            float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f)
+        };
+        if (value_active) {
+            for (uint token = 0; token < rows; ++token) {
+                const uint source = first_visible + tile_begin + token;
+                const uint slot = source % kv_capacity;
+                const ulong value_base = (ulong(slot) * kv_head_count + kv_head) * head_dim;
+                const float2 value_element = float2(*((device const half2 *)(value + value_base + value_dimension)));
+                for (uint head = 0; head < active_heads; ++head) {
+                    tile_accumulated[head] += weights[head * tile_tokens + token] * value_element;
+                }
+            }
+        }
+        // state 由每 head 的 lane0 写；下一 tile 前所有线程都必须看到缩放系数。
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (value_active) {
+            for (uint head = 0; head < active_heads; ++head) {
+                const uint state_base = head * 4;
+                accumulated[head] = accumulated[head] * state[state_base + 2] + tile_accumulated[head] * state[state_base + 3];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint head = 0; head < active_heads; ++head) {
+        const uint query_head = first_query_head + head;
+        const ulong statistic = (ulong(query_head) * partition_count + partition) * 2;
+        if (thread_index == 0) {
+            statistics[statistic] = state[head * 4];
+            statistics[statistic + 1] = state[head * 4 + 1];
+        }
+        const uint value_dimension = thread_index * 2;
+        if (value_dimension < head_dim) {
+            const ulong partial = (ulong(query_head) * partition_count + partition) * head_dim + value_dimension;
+            *((device float2 *)(partial_values + partial)) = accumulated[head];
+        }
+    }
+}
+
+kernel void gqa_decode_flash_merge_f16_position(
+    device const float *statistics [[buffer(0)]],
+    device const float *partial_values [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant uint &partition_count [[buffer(3)]],
+    constant uint &head_count [[buffer(4)]],
+    constant uint &head_dim [[buffer(5)]],
+    uint query_head [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    if (query_head >= head_count) return;
+    threadgroup float reduction[2];
+    if (thread_index < 32) {
+        float local_maximum = -INFINITY;
+        for (uint partition = thread_index; partition < partition_count; partition += 32) {
+            local_maximum = max(local_maximum, statistics[(ulong(query_head) * partition_count + partition) * 2]);
+        }
+        const float maximum = simd_max(local_maximum);
+        if (thread_index == 0) reduction[0] = maximum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float maximum = reduction[0];
+    if (thread_index < 32) {
+        float local_denominator = 0.0f;
+        for (uint partition = thread_index; partition < partition_count; partition += 32) {
+            const ulong statistic = (ulong(query_head) * partition_count + partition) * 2;
+            local_denominator += statistics[statistic + 1] * exp(statistics[statistic] - maximum);
+        }
+        const float denominator = simd_sum(local_denominator);
+        if (thread_index == 0) reduction[1] = denominator;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float denominator = reduction[1];
+    for (uint dimension = thread_index; dimension < head_dim; dimension += 256) {
+        float accumulated = 0.0f;
+        for (uint partition = 0; partition < partition_count; ++partition) {
+            const ulong statistic = (ulong(query_head) * partition_count + partition) * 2;
+            const ulong partial = (ulong(query_head) * partition_count + partition) * head_dim + dimension;
+            accumulated += partial_values[partial] * exp(statistics[statistic] - maximum);
+        }
+        output[ulong(query_head) * head_dim + dimension] = finite_f16(accumulated / denominator);
+    }
+}
+
+// Gemma4 local attention(2Q:1KV, dim=256)低占用版本。与 global persistent
+// flash 同构，但静态 threadgroup 数组只按 2 heads 分配；40 个 local 层因此
+// 不再为通用 4-head 上限牺牲 occupancy。
+kernel void gqa_decode_flash_f16_position_2h(
+    device const half *query [[buffer(0)]],
+    device const half *key [[buffer(1)]],
+    device const half *value [[buffer(2)]],
+    device float *statistics [[buffer(3)]],
+    device float *partial_values [[buffer(4)]],
+    constant uint *decode_state [[buffer(5)]],
+    constant uint &head_count [[buffer(6)]],
+    constant uint &kv_head_count [[buffer(7)]],
+    constant uint &head_dim [[buffer(8)]],
+    constant float &score_scale [[buffer(9)]],
+    constant uint &sliding_window [[buffer(10)]],
+    constant uint &kv_capacity [[buffer(11)]],
+    constant uint &partition_count [[buffer(12)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_groups [[simdgroups_per_threadgroup]])
+{
+    constexpr uint heads_per_group = 2;
+    constexpr uint tile_tokens = 256;
+    if (kv_head_count == 0 || head_count / kv_head_count != heads_per_group || head_dim != 256 || partition_count == 0) return;
+    const uint kv_head = group.y;
+    if (group.x >= partition_count || kv_head >= kv_head_count) return;
+    const uint first_query_head = kv_head * heads_per_group;
+
+    const uint kv_rows = decode_state[1];
+    const uint kv_start = decode_state[2];
+    const uint position = decode_state[0];
+    const uint causal_rows = min(kv_rows, position + 1);
+    const uint window_start = sliding_window == 0 || causal_rows <= sliding_window ? 0 : causal_rows - sliding_window;
+    const uint first_visible = max(kv_start, window_start);
+    const uint source_rows = causal_rows - first_visible;
+    const uint partition = group.x;
+    const uint partition_begin = uint((ulong(source_rows) * partition) / partition_count);
+    const uint partition_end = uint((ulong(source_rows) * (partition + 1)) / partition_count);
+
+    threadgroup half query_tile[heads_per_group * 256];
+    threadgroup float weights[heads_per_group * tile_tokens];
+    threadgroup float reduction[256];
+    threadgroup float state[heads_per_group * 4];
+    for (uint index = thread_index; index < heads_per_group * head_dim; index += 256) {
+        query_tile[index] = query[ulong(first_query_head) * head_dim + index];
+    }
+    if (thread_index < heads_per_group) {
+        state[thread_index * 4] = -INFINITY;
+        state[thread_index * 4 + 1] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float accumulated[heads_per_group] = {0.0f, 0.0f};
+    for (uint tile_begin = partition_begin; tile_begin < partition_end; tile_begin += tile_tokens) {
+        const uint rows = min(tile_tokens, partition_end - tile_begin);
+        for (uint token = simd_group; token < rows; token += simd_groups) {
+            const uint source = first_visible + tile_begin + token;
+            const uint slot = source % kv_capacity;
+            const ulong key_base = (ulong(slot) * kv_head_count + kv_head) * head_dim;
+            const uint dimension = simd_lane * 8;
+            const half4 k0 = *((device const half4 *)(key + key_base + dimension));
+            const half4 k1 = *((device const half4 *)(key + key_base + dimension + 4));
+            float dot_products[heads_per_group] = {0.0f, 0.0f};
+            for (uint head = 0; head < heads_per_group; ++head) {
+                const threadgroup half4 *q = (threadgroup half4 *)(query_tile + head * head_dim + dimension);
+                dot_products[head] = dot(float4(q[0]), float4(k0)) + dot(float4(q[1]), float4(k1));
+            }
+            for (uint head = 0; head < heads_per_group; ++head) {
+                const float score = simd_sum(dot_products[head]) * score_scale;
+                if (simd_lane == 0) weights[head * tile_tokens + token] = score;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint head = 0; head < heads_per_group; ++head) {
+            const uint weight_base = head * tile_tokens;
+            const float local_score = thread_index < rows ? weights[weight_base + thread_index] : -INFINITY;
+            const float simd_maximum = simd_max(local_score);
+            if (simd_lane == 0) reduction[simd_group] = simd_maximum;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                const float group_maximum = simd_lane < simd_groups ? reduction[simd_lane] : -INFINITY;
+                const float tile_maximum = simd_max(group_maximum);
+                if (simd_lane == 0) reduction[0] = tile_maximum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float tile_maximum = reduction[0];
+            float local_denominator = 0.0f;
+            if (thread_index < rows) {
+                const float weight = exp(weights[weight_base + thread_index] - tile_maximum);
+                weights[weight_base + thread_index] = weight;
+                local_denominator = weight;
+            }
+            local_denominator = simd_sum(local_denominator);
+            if (simd_lane == 0) reduction[simd_group] = local_denominator;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (simd_group == 0) {
+                const float group_denominator = simd_lane < simd_groups ? reduction[simd_lane] : 0.0f;
+                const float tile_denominator = simd_sum(group_denominator);
+                if (simd_lane == 0) {
+                    const uint state_base = head * 4;
+                    const float previous_maximum = state[state_base];
+                    const float merged_maximum = max(previous_maximum, tile_maximum);
+                    const float previous_scale = state[state_base + 1] == 0.0f ? 0.0f : exp(previous_maximum - merged_maximum);
+                    const float tile_scale = exp(tile_maximum - merged_maximum);
+                    state[state_base] = merged_maximum;
+                    state[state_base + 1] = state[state_base + 1] * previous_scale + tile_denominator * tile_scale;
+                    state[state_base + 2] = previous_scale;
+                    state[state_base + 3] = tile_scale;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        float tile_accumulated[heads_per_group] = {0.0f, 0.0f};
+        for (uint token = 0; token < rows; ++token) {
+            const uint source = first_visible + tile_begin + token;
+            const uint slot = source % kv_capacity;
+            const ulong value_index = (ulong(slot) * kv_head_count + kv_head) * head_dim + thread_index;
+            const float value_element = float(value[value_index]);
+            for (uint head = 0; head < heads_per_group; ++head) {
+                tile_accumulated[head] += weights[head * tile_tokens + token] * value_element;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint head = 0; head < heads_per_group; ++head) {
+            const uint state_base = head * 4;
+            accumulated[head] = accumulated[head] * state[state_base + 2] + tile_accumulated[head] * state[state_base + 3];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint head = 0; head < heads_per_group; ++head) {
+        const uint query_head = first_query_head + head;
+        const ulong statistic = (ulong(query_head) * partition_count + partition) * 2;
+        if (thread_index == 0) {
+            statistics[statistic] = state[head * 4];
+            statistics[statistic + 1] = state[head * 4 + 1];
+        }
+        const ulong partial = (ulong(query_head) * partition_count + partition) * head_dim + thread_index;
+        partial_values[partial] = accumulated[head];
+    }
+}
+
 // split-KV decode attention(position 化):每 simdgroup 承担 token 的一个切片
 // (first_visible + sg,步进 sg_count),片内是 nobar 结构(lane 常驻 q/acc 分量,
 // 片内逐 token 零 barrier),片末经 threadgroup 合并各片 online softmax(3 次
@@ -2643,10 +3217,6 @@ pub(crate) fn gqa_decode_attention_position_tensor(ctx: &MetalContext, query: &M
     // 全组同步,短中上下文 decode 实测 0.46ms/层)。要求 threads == head_dim
     // (sg_count == segments),非 2 的幂 head_dim 回落 barrier 版。
     let split_kv = spec.head_dim.is_power_of_two() && spec.head_dim <= 512;
-    let pipeline = ctx.pipeline(if split_kv { "gqa_decode_attention_split_f16_position" } else { "gqa_decode_attention_f16_position" })?;
-    if threads as u64 > pipeline.max_total_threads_per_threadgroup() {
-        return Err(format!("decode attention head_dim={} 需要 {threads} threads，超过 pipeline 上限", spec.head_dim));
-    }
     let heads = validate_u32("decode attention heads", spec.num_heads)?;
     let kv_heads = validate_u32("decode attention kv heads", spec.num_kv_heads)?;
     let dimension = validate_u32("decode attention head_dim", spec.head_dim)?;
@@ -2664,6 +3234,188 @@ pub(crate) fn gqa_decode_attention_position_tensor(ctx: &MetalContext, query: &M
     let score_scale = spec.score_scale;
     if !score_scale.is_finite() || score_scale <= 0.0 {
         return Err(format!("decode attention position score_scale={score_scale} 非法"));
+    }
+    let heads_per_kv = spec.num_heads / spec.num_kv_heads;
+    #[cfg(test)]
+    let grouped_replay_attention = std::env::var_os("ZLLM_GEMMA4_LEGACY_REPLAY_ATTENTION").is_none();
+    #[cfg(not(test))]
+    let grouped_replay_attention = true;
+    if grouped_replay_attention && heads_per_kv >= 8 && spec.head_dim == 512 {
+        const THREADS: u64 = 256;
+        let retained_rows = view.rows.saturating_sub(view.start);
+        let recorded_visible = if sliding_window == 0 { retained_rows } else { retained_rows.min(sliding_window as usize) };
+        // 至少 8 个 persistent partition 保持短 prompt 的 GPU 并行度；长 prompt
+        // 按 256-token tile 增长，封顶 32 后由 worker 内循环继续承接上下文。
+        let default_partitions = recorded_visible.div_ceil(128).clamp(8, 48);
+        #[cfg(test)]
+        let partitions = std::env::var("ZLLM_GEMMA4_GLOBAL_ATTN_PARTITIONS").ok().and_then(|value| value.parse::<usize>().ok()).filter(|value| (1..=64).contains(value)).unwrap_or(default_partitions);
+        #[cfg(not(test))]
+        let partitions = default_partitions;
+        let partition_count = validate_u32("decode flash attention partitions", partitions)?;
+        let statistics_elements = spec.num_heads.checked_mul(partitions).and_then(|value| value.checked_mul(2)).ok_or("decode flash attention statistics 大小溢出")?;
+        let partial_elements = spec.num_heads.checked_mul(partitions).and_then(|value| value.checked_mul(spec.head_dim)).ok_or("decode flash attention partial 大小溢出")?;
+        let statistics = ctx.tensor_pooled_f32("gqa_replay_flash_statistics", 1, statistics_elements);
+        let partial = ctx.tensor_pooled_f32("gqa_replay_flash_partial", 1, partial_elements);
+        let output = ctx.tensor_kernel_output(1, query.cols);
+        let flash_pipeline = ctx.pipeline("gqa_decode_flash_f16_position_16h")?;
+        let merge_pipeline = ctx.pipeline("gqa_decode_flash_merge_f16_position")?;
+        if flash_pipeline.max_total_threads_per_threadgroup() < THREADS || merge_pipeline.max_total_threads_per_threadgroup() < THREADS {
+            return Err("decode flash attention 需要 256 threads/threadgroup".to_owned());
+        }
+        let head_groups = spec.num_kv_heads.checked_mul(heads_per_kv.div_ceil(16)).ok_or("decode flash attention grid 溢出")?;
+        let command = ctx.command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&flash_pipeline);
+        encoder.set_buffer(0, Some(&query.buffer), 0);
+        encoder.set_buffer(1, Some(&view.buffer), view.key_offset);
+        encoder.set_buffer(2, Some(&view.buffer), view.value_offset);
+        encoder.set_buffer(3, Some(&statistics.buffer), 0);
+        encoder.set_buffer(4, Some(&partial.buffer), 0);
+        encoder.set_buffer(5, Some(decode_state), state_offset);
+        set_bytes(&encoder, 6, &heads);
+        set_bytes(&encoder, 7, &kv_heads);
+        set_bytes(&encoder, 8, &dimension);
+        set_bytes(&encoder, 9, &score_scale);
+        set_bytes(&encoder, 10, &sliding_window);
+        set_bytes(&encoder, 11, &capacity);
+        set_bytes(&encoder, 12, &partition_count);
+        encoder.dispatch_thread_groups(MTLSize::new(partitions as u64, head_groups as u64, 1), MTLSize::new(THREADS, 1, 1));
+        encoder.end_encoding();
+
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&merge_pipeline);
+        encoder.set_buffer(0, Some(&statistics.buffer), 0);
+        encoder.set_buffer(1, Some(&partial.buffer), 0);
+        encoder.set_buffer(2, Some(&output.buffer), 0);
+        set_bytes(&encoder, 3, &partition_count);
+        set_bytes(&encoder, 4, &heads);
+        set_bytes(&encoder, 5, &dimension);
+        encoder.dispatch_thread_groups(MTLSize::new(heads as u64, 1, 1), MTLSize::new(THREADS, 1, 1));
+        encoder.end_encoding();
+        let shape = format!("heads={heads},kv_heads={kv_heads},dim={dimension},window={sliding_window},partitions={partition_count}");
+        ctx.commit_and_wait_profiled(&command, "gqa_decode_attention_flash_f16_position", &shape, query.buffer.length() + view.buffer.length(), output.buffer.length() + statistics.buffer.length() + partial.buffer.length());
+        return Ok(output);
+    }
+    if grouped_replay_attention && heads_per_kv == 2 && spec.head_dim == 256 {
+        const THREADS: u64 = 256;
+        let retained_rows = view.rows.saturating_sub(view.start);
+        let recorded_visible = if sliding_window == 0 { retained_rows } else { retained_rows.min(sliding_window as usize) };
+        let default_partitions = recorded_visible.div_ceil(256).clamp(4, 8);
+        #[cfg(test)]
+        let partitions = std::env::var("ZLLM_GEMMA4_LOCAL_ATTN_PARTITIONS").ok().and_then(|value| value.parse::<usize>().ok()).filter(|value| (1..=16).contains(value)).unwrap_or(default_partitions);
+        #[cfg(not(test))]
+        let partitions = default_partitions;
+        let partition_count = validate_u32("decode local flash attention partitions", partitions)?;
+        let statistics_elements = spec.num_heads.checked_mul(partitions).and_then(|value| value.checked_mul(2)).ok_or("decode local flash statistics 大小溢出")?;
+        let partial_elements = spec.num_heads.checked_mul(partitions).and_then(|value| value.checked_mul(spec.head_dim)).ok_or("decode local flash partial 大小溢出")?;
+        let statistics = ctx.tensor_pooled_f32("gqa_replay_local_flash_statistics", 1, statistics_elements);
+        let partial = ctx.tensor_pooled_f32("gqa_replay_local_flash_partial", 1, partial_elements);
+        let output = ctx.tensor_kernel_output(1, query.cols);
+        let flash_pipeline = ctx.pipeline("gqa_decode_flash_f16_position_2h")?;
+        let merge_pipeline = ctx.pipeline("gqa_decode_flash_merge_f16_position")?;
+        if flash_pipeline.max_total_threads_per_threadgroup() < THREADS || merge_pipeline.max_total_threads_per_threadgroup() < THREADS {
+            return Err("decode local flash attention 需要 256 threads/threadgroup".to_owned());
+        }
+        let command = ctx.command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&flash_pipeline);
+        encoder.set_buffer(0, Some(&query.buffer), 0);
+        encoder.set_buffer(1, Some(&view.buffer), view.key_offset);
+        encoder.set_buffer(2, Some(&view.buffer), view.value_offset);
+        encoder.set_buffer(3, Some(&statistics.buffer), 0);
+        encoder.set_buffer(4, Some(&partial.buffer), 0);
+        encoder.set_buffer(5, Some(decode_state), state_offset);
+        set_bytes(&encoder, 6, &heads);
+        set_bytes(&encoder, 7, &kv_heads);
+        set_bytes(&encoder, 8, &dimension);
+        set_bytes(&encoder, 9, &score_scale);
+        set_bytes(&encoder, 10, &sliding_window);
+        set_bytes(&encoder, 11, &capacity);
+        set_bytes(&encoder, 12, &partition_count);
+        encoder.dispatch_thread_groups(MTLSize::new(partitions as u64, spec.num_kv_heads as u64, 1), MTLSize::new(THREADS, 1, 1));
+        encoder.end_encoding();
+
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&merge_pipeline);
+        encoder.set_buffer(0, Some(&statistics.buffer), 0);
+        encoder.set_buffer(1, Some(&partial.buffer), 0);
+        encoder.set_buffer(2, Some(&output.buffer), 0);
+        set_bytes(&encoder, 3, &partition_count);
+        set_bytes(&encoder, 4, &heads);
+        set_bytes(&encoder, 5, &dimension);
+        encoder.dispatch_thread_groups(MTLSize::new(heads as u64, 1, 1), MTLSize::new(THREADS, 1, 1));
+        encoder.end_encoding();
+        let shape = format!("heads={heads},kv_heads={kv_heads},dim={dimension},window={sliding_window},partitions={partition_count}");
+        ctx.commit_and_wait_profiled(&command, "gqa_decode_attention_local_flash_f16_position", &shape, query.buffer.length() + view.buffer.length(), output.buffer.length() + statistics.buffer.length() + partial.buffer.length());
+        return Ok(output);
+    }
+    // GQA replay 的长上下文走 grouped split-KV：每次 K/V 读取服务至多 4 个
+    // query heads。scratch 由 context 池化，48 层串行复用同一组 buffer；stride
+    // 按 ring 最大可见长度固定，position 变化不改变已录制命令的 buffer 布局。
+    if grouped_replay_attention && heads > kv_heads && spec.head_dim <= 512 {
+        const BLOCK_TOKENS: usize = 256;
+        const GROUPED_THREADS: u64 = 256;
+        let max_visible = if sliding_window == 0 { view.capacity } else { view.capacity.min(sliding_window as usize) };
+        let max_block_count = max_visible.div_ceil(BLOCK_TOKENS).max(1);
+        let statistics_elements = spec.num_heads.checked_mul(max_block_count).and_then(|value| value.checked_mul(2)).ok_or("decode grouped attention statistics 大小溢出")?;
+        let partial_elements = spec.num_heads.checked_mul(max_block_count).and_then(|value| value.checked_mul(spec.head_dim)).ok_or("decode grouped attention partial 大小溢出")?;
+        let statistics = ctx.tensor_pooled_f32("gqa_replay_grouped_statistics", 1, statistics_elements);
+        let partial = ctx.tensor_pooled_f32("gqa_replay_grouped_partial", 1, partial_elements);
+        let output = ctx.tensor_kernel_output(1, query.cols);
+        let split_pipeline = ctx.pipeline("gqa_decode_split_kv_f16_position")?;
+        let merge_pipeline = ctx.pipeline("gqa_decode_split_kv_merge_f16_position")?;
+        if split_pipeline.max_total_threads_per_threadgroup() < GROUPED_THREADS || merge_pipeline.max_total_threads_per_threadgroup() < GROUPED_THREADS {
+            return Err("decode grouped attention 需要 256 threads/threadgroup".to_owned());
+        }
+        let block_tokens = BLOCK_TOKENS as u32;
+        let max_blocks = validate_u32("decode grouped attention max blocks", max_block_count)?;
+        let retained_rows = view.rows.saturating_sub(view.start);
+        let recorded_visible = if sliding_window == 0 { retained_rows } else { retained_rows.min(sliding_window as usize) };
+        let recorded_blocks = recorded_visible.div_ceil(BLOCK_TOKENS).max(1);
+        let worker_count = validate_u32("decode grouped attention workers", recorded_blocks.min(max_block_count))?;
+        let head_groups = spec.num_kv_heads.checked_mul(heads_per_kv.div_ceil(4)).ok_or("decode grouped attention grid 溢出")?;
+        let command = ctx.command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&split_pipeline);
+        encoder.set_buffer(0, Some(&query.buffer), 0);
+        encoder.set_buffer(1, Some(&view.buffer), view.key_offset);
+        encoder.set_buffer(2, Some(&view.buffer), view.value_offset);
+        encoder.set_buffer(3, Some(&statistics.buffer), 0);
+        encoder.set_buffer(4, Some(&partial.buffer), 0);
+        encoder.set_buffer(5, Some(decode_state), state_offset);
+        set_bytes(&encoder, 6, &heads);
+        set_bytes(&encoder, 7, &kv_heads);
+        set_bytes(&encoder, 8, &dimension);
+        set_bytes(&encoder, 9, &score_scale);
+        set_bytes(&encoder, 10, &sliding_window);
+        set_bytes(&encoder, 11, &capacity);
+        set_bytes(&encoder, 12, &block_tokens);
+        set_bytes(&encoder, 13, &max_blocks);
+        set_bytes(&encoder, 14, &worker_count);
+        encoder.dispatch_thread_groups(MTLSize::new(worker_count as u64, head_groups as u64, 1), MTLSize::new(GROUPED_THREADS, 1, 1));
+        encoder.end_encoding();
+
+        let encoder = command.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&merge_pipeline);
+        encoder.set_buffer(0, Some(&statistics.buffer), 0);
+        encoder.set_buffer(1, Some(&partial.buffer), 0);
+        encoder.set_buffer(2, Some(&output.buffer), 0);
+        encoder.set_buffer(3, Some(decode_state), state_offset);
+        set_bytes(&encoder, 4, &heads);
+        set_bytes(&encoder, 5, &dimension);
+        set_bytes(&encoder, 6, &sliding_window);
+        set_bytes(&encoder, 7, &block_tokens);
+        set_bytes(&encoder, 8, &max_blocks);
+        encoder.dispatch_thread_groups(MTLSize::new(heads as u64, 1, 1), MTLSize::new(GROUPED_THREADS, 1, 1));
+        encoder.end_encoding();
+        let shape = format!("heads={heads},kv_heads={kv_heads},dim={dimension},window={sliding_window},max_blocks={max_blocks}");
+        ctx.commit_and_wait_profiled(&command, "gqa_decode_attention_grouped_f16_position", &shape, query.buffer.length() + view.buffer.length(), output.buffer.length() + statistics.buffer.length() + partial.buffer.length());
+        return Ok(output);
+    }
+
+    let pipeline = ctx.pipeline(if split_kv { "gqa_decode_attention_split_f16_position" } else { "gqa_decode_attention_f16_position" })?;
+    if threads as u64 > pipeline.max_total_threads_per_threadgroup() {
+        return Err(format!("decode attention head_dim={} 需要 {threads} threads，超过 pipeline 上限", spec.head_dim));
     }
     let output = ctx.tensor_kernel_output(1, query.cols);
     let command = ctx.command_buffer();

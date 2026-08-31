@@ -1,4 +1,5 @@
 use super::*;
+use crate::moe::topk_moe::{RoutedMoeInputs, RoutedMoeWeightsRef, SharedExpertRef};
 
 mod reference;
 use reference::{f32_expert as reference_f32_expert_batch, nvfp4_expert as reference_nvfp4_expert_batch, route_cpu};
@@ -475,6 +476,173 @@ impl RocmContext {
         trace_segment_hashes(if residual.is_some() { "final" } else { "routed" }, &output)?;
         Ok(Some(output))
     }
+
+    fn cooperative_ct_moe_add(
+        &self,
+        spec: &TopkMoeSpec,
+        weights: RoutedMoeWeightsRef<'_, RocmWeight>,
+        shared_experts: &[SharedExpertRef<'_, RocmWeight>],
+        layer: usize,
+        experts: &mut RocmPrefillExperts,
+        inputs: RoutedMoeInputs<'_, RocmTensor>,
+        residual: &RocmTensor,
+    ) -> Result<RocmTensor, BackendError> {
+        experts.cooperative_peer.ok_or_else(|| compute_error("ROCm cooperative expert peer 缺失"))?;
+        if inputs.route.rows == 0 || inputs.route.rows != inputs.expert.rows || residual.rows != inputs.expert.rows {
+            return Err(compute_error(format!("ROCm cooperative experts 行数不一致，L{layer} rows={}/{}/{}", inputs.route.rows, inputs.expert.rows, residual.rows,)));
+        }
+        if !ops::hip::options().decode_moe_fused
+            || !matches!(&experts.archive, RocmExpertArchive::Ct(_))
+            || !matches!(spec.activation, Activation::Silu)
+            || spec.num_shared_experts != 1
+            || shared_experts.len() != 1
+            || spec.shared_intermediate_size != spec.intermediate_size
+            || inputs.route.cols != inputs.expert.cols
+            || residual.cols != inputs.expert.cols
+            || !spec.intermediate_size.is_multiple_of(2)
+            || !inputs.expert.cols.is_multiple_of(2)
+            || !matches!(inputs.expert.dtype, RocmTensorDType::Bf16 | RocmTensorDType::F32)
+        {
+            return Err(compute_error(format!("ROCm cooperative experts L{layer} 不满足 CT W4 fused decode 前提")));
+        }
+        let shared = &shared_experts[0];
+        if shared.output_gate.is_some()
+            || shared.gate.rows != spec.intermediate_size
+            || shared.up.rows != spec.intermediate_size
+            || shared.down.rows != inputs.expert.cols
+            || shared.gate.cols != inputs.expert.cols
+            || shared.up.cols != inputs.expert.cols
+            || shared.down.cols != spec.intermediate_size
+        {
+            return Err(compute_error(format!("ROCm cooperative shared expert L{layer} shape 不兼容")));
+        }
+        let (Some(route_device), Some(_), Some(_)) = (inputs.route.device.as_deref(), inputs.expert.device.as_deref(), residual.device.as_deref()) else {
+            return Err(compute_error("ROCm cooperative experts 缺少 device input"));
+        };
+        // 双卡 consumer 会在同一闭包中切换 current device；单卡 deferred
+        // route workspace 无法在闭包返回后可靠地给 owner stream 记录 event。
+        // owned route buffer 保活到两卡提交完成，析构仍排在 owner join 之后。
+        let route = match weights.selected_experts {
+            Some(selected) => {
+                let weight_device = resident_weight(weights.router, "selected router")?;
+                ops::hip::try_moe_route_selected_resident_device_f32(self.device_id, route_device, weight_device, selected, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, spec.routed_scaling_factor)
+            }
+            None => {
+                let weight_device = weights.router.router_resident(self.device_id, ops::hip::options().precise_router)?;
+                let bias_device = resident_weight(weights.bias, "router bias")?;
+                let scoring = match spec.scoring_func {
+                    crate::moe::topk_moe::ScoringFunc::Softmax => 0,
+                    crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
+                    crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
+                };
+                ops::hip::try_moe_route_resident_device_f32(self.device_id, route_device, weight_device, bias_device, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor)
+            }
+        }
+        .map_err(|error| compute_error(format!("ROCm cooperative device route L{layer}: {error}")))?;
+        let expected_routes = inputs.route.rows.checked_mul(spec.top_k).ok_or_else(|| compute_error("ROCm cooperative route 数溢出"))?;
+        if route.len != expected_routes {
+            return Err(compute_error(format!("ROCm cooperative route 数异常: {}/{}", route.len, expected_routes)));
+        }
+        self.cooperative_ct_moe_device_add(spec, shared, layer, experts, inputs.expert, residual, Arc::new(route.expert_ids), Arc::new(route.weights), route.len)
+            .map_err(|error| compute_error(format!("ROCm cooperative L{layer}: {error:?}")))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn cooperative_ct_moe_device_add(
+        &self,
+        spec: &TopkMoeSpec,
+        shared: &SharedExpertRef<'_, RocmWeight>,
+        layer: usize,
+        experts: &RocmPrefillExperts,
+        input: &RocmTensor,
+        residual: &RocmTensor,
+        route_ids: Arc<ops::hip::DeviceBuffer>,
+        route_weights: Arc<ops::hip::DeviceBuffer>,
+        route_count: usize,
+    ) -> Result<RocmTensor, BackendError> {
+        let peer = experts.cooperative_peer.ok_or_else(|| compute_error("ROCm cooperative expert peer 缺失"))?;
+        let local = experts.cooperative_resident_partition(self, layer, spec.num_experts, peer.local_partition)?;
+        let remote = experts.cooperative_resident_partition(&peer.context, layer, spec.num_experts, 1 - peer.local_partition)?;
+        let local_grouped = grouped_w4_experts(&local)?;
+        let remote_grouped = grouped_w4_experts(&remote)?;
+
+        self.activate().map_err(compute_error)?;
+        // 三个小输入均先稳定再排入 peer stream；源 buffer 统一由 owner stage
+        // completion 保活，整个路由与传输路径不再访问 host。
+        let stable_route_ids = route_ids;
+        let stable_route_weights = route_weights;
+        let stable_input = self.tensor_to_stable_deferred(input.clone())?;
+        let source = stable_input.device.as_ref().ok_or_else(|| compute_error("ROCm cooperative stable input 缺少 device buffer"))?;
+        // 每个双卡组只有 owner 拥有 pipeline stage；peer 的 legacy stream 专供
+        // 本组 MoE。显式 source/destination event 串起跨卡依赖，同时复用 HIP
+        // 默认流成熟的 buffer 生命周期，避免临时 dedicated stream 脱离 stage 回收。
+        peer.context.activate().map_err(compute_error)?;
+        let [peer_route_ids, peer_route_weights, peer_input]: [ops::hip::DeviceBuffer; 3] =
+            ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&[stable_route_ids.clone(), stable_route_weights.clone(), source.clone()], peer.context.device_id, self.device_id)
+                .map_err(|error| compute_error(format!("L{layer} route/input owner->peer: {error}")))?
+                .try_into()
+                .map_err(|_| compute_error(format!("L{layer} cooperative P2P 输入数量异常")))?;
+        let peer_input = device_tensor_with_dtype(peer_input, input.rows, input.cols, input.dtype);
+
+        let peer_input_device = peer_input.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative peer input 缺少 device buffer"))?;
+        let peer_gate =
+            ops::hip::try_ct_cooperative_gate_up_bf16(peer.context.device_id, peer_input_device, input.rows, input.cols, spec.intermediate_size / 2, &peer_route_ids, &peer_route_weights, route_count, spec.top_k, &remote_grouped)
+                .map_err(compute_error)?;
+        let half_intermediate = spec.intermediate_size / 2;
+        // 标准 TP：gate/up 行分片后，down 按 K 列分片，各卡直接把本地
+        // activation 投影为完整 hidden partial。peer 先完整排队，使其 down
+        // 与 owner 的 gate/down/shared 真正并行；不再 all-gather activation。
+        let peer_output = ops::hip::try_ct_cooperative_sharded_down_bf16(
+            peer.context.device_id,
+            &peer_gate,
+            peer_gate.activated(),
+            peer_gate.activated(),
+            &peer_route_ids,
+            &peer_route_weights,
+            input.rows,
+            route_count,
+            spec.top_k,
+            half_intermediate,
+            0,
+            input.cols,
+        )
+        .map_err(compute_error)?;
+        let stable_peer_output = Arc::new(peer_output.copy_to_stable_deferred().map_err(compute_error)?);
+
+        self.activate().map_err(compute_error)?;
+        let shared_grouped = ops::hip::CtGroupedExpertRef {
+            gate: grouped_w4(shared.gate).ok_or_else(|| compute_error("ROCm cooperative shared gate 不是 W4A16"))?,
+            up: grouped_w4(shared.up).ok_or_else(|| compute_error("ROCm cooperative shared up 不是 W4A16"))?,
+            down: grouped_w4(shared.down).ok_or_else(|| compute_error("ROCm cooperative shared down 不是 W4A16"))?,
+        };
+        let input_device = input.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative local input 缺少 device buffer"))?;
+        let local_gate = ops::hip::try_ct_cooperative_gate_up_bf16(self.device_id, input_device, input.rows, input.cols, spec.intermediate_size / 2, &stable_route_ids, &stable_route_weights, route_count, spec.top_k, &local_grouped)
+            .map_err(compute_error)?;
+        let local_output = ops::hip::try_ct_cooperative_sharded_down_bf16(
+            self.device_id,
+            &local_gate,
+            local_gate.activated(),
+            local_gate.activated(),
+            &stable_route_ids,
+            &stable_route_weights,
+            input.rows,
+            route_count,
+            spec.top_k,
+            half_intermediate,
+            0,
+            input.cols,
+        )
+        .map_err(compute_error)?;
+        // shared 完整留在 owner，与 peer partial 并行但不复制 shared 权重。
+        let shared_output = ops::hip::try_ct_cooperative_shared_bf16(self.device_id, input_device, input.rows, input.cols, spec.intermediate_size, &shared_grouped).map_err(compute_error)?;
+        let peer_output = stable_peer_output.copy_stable_to_device_after_event_retained_by(self.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} output peer->owner: {error}")))?;
+
+        self.activate().map_err(compute_error)?;
+        let residual = f32_tensor(self, residual)?;
+        let residual_device = residual.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative residual 缺少 F32 device buffer"))?;
+        let output = ops::hip::try_ct_cooperative_partial_join_f32(self.device_id, &local_output, &peer_output, &shared_output, residual_device, input.rows, input.cols).map_err(compute_error)?;
+        Ok(device_tensor_f32(output, input.rows, input.cols))
+    }
 }
 
 impl ExpertPrefillBackend for RocmContext {
@@ -492,6 +660,9 @@ impl ExpertPrefillBackend for RocmContext {
     ) -> Result<Option<Self::Tensor>, BackendError> {
         let route_input = inputs.route;
         let expert_input = inputs.expert;
+        if experts.cooperative_peer.is_some() {
+            return self.cooperative_ct_moe_add(spec, weights, shared_experts, layer, experts, inputs, residual).map(Some);
+        }
         if !ops::hip::options().decode_moe_fused
             || !matches!(experts.archive, RocmExpertArchive::Ct(_))
             || !matches!(spec.activation, Activation::Silu)
@@ -533,6 +704,64 @@ impl ExpertPrefillBackend for RocmContext {
         let route_count = route_input.rows.checked_mul(spec.top_k).ok_or_else(|| compute_error("ROCm integrated MoE route 数溢出"))?;
         if route_count > grouped.len() {
             return Ok(None);
+        }
+        let graph_eligible = ops::hip::options().decode_graph
+            && route_input.rows == 1
+            && weights.selected_experts.is_none()
+            && !ops::hip::options().kernel_sync
+            && !ops::hip::options().kernel_profile
+            && !ops::hip::options().trace_moe_route
+            && !ops::hip::options().debug_finite
+            && route_device.bytes() == expert_input.cols * RocmTensorDType::F32.element_bytes()
+            && residual_device.bytes() == expert_input.cols * RocmTensorDType::F32.element_bytes();
+        if graph_eligible {
+            let key = (self.device_id, layer);
+            if !experts.ct_moe_graphs.contains_key(&key) {
+                let weight_device = weights.router.router_resident(self.device_id, ops::hip::options().precise_router)?;
+                let bias_device = resident_weight(weights.bias, "router bias")?;
+                let scoring = match spec.scoring_func {
+                    crate::moe::topk_moe::ScoringFunc::Softmax => 0,
+                    crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
+                    crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
+                };
+                let built = RocmCtMoeGraph::build(
+                    self.device_id,
+                    route_device.bytes(),
+                    expert_device.bytes(),
+                    residual_device.bytes(),
+                    expert_input.cols,
+                    spec.intermediate_size,
+                    spec.num_experts,
+                    spec.top_k,
+                    scoring,
+                    spec.routed_scaling_factor,
+                    weight_device,
+                    bias_device,
+                    &grouped,
+                    &shared_grouped,
+                );
+                match built {
+                    Ok(graph) => {
+                        eprintln!("[rocm-decode-graph] device={} layer={layer} nodes={} status=ready", self.device_id, graph.graph.node_count());
+                        experts.ct_moe_graphs.insert(key, RocmCtMoeGraphState::Ready(graph));
+                    }
+                    Err(error) => {
+                        eprintln!("[rocm-decode-graph] device={} layer={layer} status=disabled error={error}", self.device_id);
+                        experts.ct_moe_graphs.insert(key, RocmCtMoeGraphState::Disabled);
+                    }
+                }
+            }
+            if let Some(RocmCtMoeGraphState::Ready(graph)) = experts.ct_moe_graphs.get(&key) {
+                match graph.launch(route_device, expert_device, residual_device) {
+                    Ok(output) => return Ok(Some(device_tensor_with_arc(output, 1, expert_input.cols, RocmTensorDType::F32))),
+                    Err(error) => {
+                        eprintln!("[rocm-decode-graph] device={} layer={layer} status=replay-disabled error={error}", self.device_id);
+                    }
+                }
+            }
+            if matches!(experts.ct_moe_graphs.get(&key), Some(RocmCtMoeGraphState::Ready(_))) {
+                experts.ct_moe_graphs.insert(key, RocmCtMoeGraphState::Disabled);
+            }
         }
         let run = |route_ids: &ops::hip::DeviceBuffer, route_weights: &ops::hip::DeviceBuffer, route_len| {
             if route_len != route_count {
@@ -933,6 +1162,14 @@ fn grouped_w4(weight: &RocmWeight) -> Option<ops::hip::CtGroupedWeightRef<'_>> {
     }
 }
 
+fn grouped_w4_experts(resident: &[Arc<RocmResidentExpert>]) -> Result<Vec<ops::hip::CtGroupedExpertRef<'_>>, BackendError> {
+    resident
+        .iter()
+        .map(|expert| Some(ops::hip::CtGroupedExpertRef { gate: grouped_w4(&expert.gate)?, up: grouped_w4(&expert.up)?, down: grouped_w4(&expert.down)? }))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| compute_error("ROCm cooperative expert 需要 W4A16 grouped 权重"))
+}
+
 fn grouped_w8(weight: &RocmWeight) -> Option<ops::hip::CtGroupedWeightRef<'_>> {
     match weight.quantized() {
         Some(RocmQuantizedWeight::W8A16 { packed, scales, scale_dtype, group_size }) if group_size.is_multiple_of(4) => Some(ops::hip::CtGroupedWeightRef {
@@ -950,6 +1187,81 @@ fn grouped_w8(weight: &RocmWeight) -> Option<ops::hip::CtGroupedWeightRef<'_>> {
     }
 }
 
+/// 一层单行 integrated MoE 的固定地址 graph owner。输入每轮先 D2D 写入固定
+/// buffer；graph 本体只含 router、top-k、gate/up、down 四个 kernel node。
+struct RocmCtMoeGraph {
+    graph: ops::hip::StaticHipGraph,
+    route_input: Arc<ops::hip::DeviceBuffer>,
+    expert_input: Arc<ops::hip::DeviceBuffer>,
+    residual: Arc<ops::hip::DeviceBuffer>,
+    _route: ops::hip::MoeRouteGraphBuffers,
+    decode: ops::hip::CtIntegratedDecodeGraphBuffers,
+    device_id: i32,
+    stream: usize,
+}
+
+impl RocmCtMoeGraph {
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        device_id: i32,
+        route_input_bytes: usize,
+        expert_input_bytes: usize,
+        residual_bytes: usize,
+        hidden: usize,
+        intermediate: usize,
+        expert_count: usize,
+        top_k: usize,
+        scoring: u32,
+        scaling: f32,
+        router_weight: &ops::hip::DeviceBuffer,
+        router_bias: &ops::hip::DeviceBuffer,
+        experts: &[ops::hip::CtGroupedExpertRef<'_>],
+        shared: &ops::hip::CtGroupedExpertRef<'_>,
+    ) -> Result<Self, String> {
+        let route_input = Arc::new(ops::hip::DeviceBuffer::allocate(device_id, route_input_bytes)?);
+        let expert_input = Arc::new(ops::hip::DeviceBuffer::allocate(device_id, expert_input_bytes)?);
+        let residual = Arc::new(ops::hip::DeviceBuffer::allocate(device_id, residual_bytes)?);
+        let route = ops::hip::MoeRouteGraphBuffers::new(device_id, 1, expert_count, top_k)?;
+        let decode = ops::hip::CtIntegratedDecodeGraphBuffers::new(device_id, 1, hidden, intermediate, top_k, experts, shared)?;
+
+        // buffer 分配和 HIPRTC 预热都会触碰 current device；完成全部准备后再绑定
+        // stream，保证模板 owner 与各 kernel 实际提交到同一条 stage stream。
+        let stream = ops::hip::active_compute_stream();
+        let recorder = ops::hip::StaticGraphRecorder::begin(device_id, stream)?;
+        route.launch(device_id, &route_input, router_weight, router_bias, 1, hidden, expert_count, top_k, scoring, scaling)?;
+        decode.launch(device_id, &expert_input, route.expert_ids(), route.weights(), &residual)?;
+        let graph = recorder.finish()?.ok_or("ROCm integrated MoE graph 录制段没有 kernel 节点")?;
+        if graph.node_count() < 4 {
+            return Err(format!("ROCm integrated MoE graph 节点过少: {}", graph.node_count()));
+        }
+        Ok(Self { graph, route_input, expert_input, residual, _route: route, decode, device_id, stream: stream as usize })
+    }
+
+    fn launch(&self, route_input: &ops::hip::DeviceBuffer, expert_input: &ops::hip::DeviceBuffer, residual: &ops::hip::DeviceBuffer) -> Result<Arc<ops::hip::DeviceBuffer>, String> {
+        if route_input.bytes() != self.route_input.bytes() || expert_input.bytes() != self.expert_input.bytes() || residual.bytes() != self.residual.bytes() {
+            return Err(format!(
+                "ROCm integrated MoE graph 输入 shape 变化: route={}/{} expert={}/{} residual={}/{}",
+                route_input.bytes(),
+                self.route_input.bytes(),
+                expert_input.bytes(),
+                self.expert_input.bytes(),
+                residual.bytes(),
+                self.residual.bytes(),
+            ));
+        }
+        self.route_input.copy_from_device(0, route_input, 0, route_input.bytes())?;
+        self.expert_input.copy_from_device(0, expert_input, 0, expert_input.bytes())?;
+        self.residual.copy_from_device(0, residual, 0, residual.bytes())?;
+        self.graph.launch(self.device_id, self.stream as *mut std::ffi::c_void)?;
+        Ok(self.decode.output())
+    }
+}
+
+enum RocmCtMoeGraphState {
+    Ready(RocmCtMoeGraph),
+    Disabled,
+}
+
 fn grouped_fp8(weight: &RocmFp8Weight) -> ops::hip::CtGroupedWeightRef<'_> {
     ops::hip::CtGroupedWeightRef { packed: &weight.codes, scales: &weight.scales, scale_dtype: 2, group_size: 128, format: 1 }
 }
@@ -965,6 +1277,78 @@ fn prepare_ct_matrix(backend: &RocmContext, matrix: crate::weight::format::compr
 
 fn prepare_ct_expert(backend: &RocmContext, weights: crate::weight::expert_source::CtExpertWeights) -> Result<Arc<RocmResidentExpert>, BackendError> {
     Ok(Arc::new(RocmResidentExpert { gate: prepare_ct_matrix(backend, weights.gate)?, up: prepare_ct_matrix(backend, weights.up)?, down: prepare_ct_matrix(backend, weights.down)? }))
+}
+
+fn ct_matrix_row_shard(matrix: &crate::weight::format::compressed_tensors_hybrid::CtMatrix, partition: usize) -> Result<crate::weight::format::compressed_tensors_hybrid::CtMatrix, BackendError> {
+    use crate::weight::format::{compressed_tensors_hybrid::CtMatrix, quantization::W4A16Matrix, quantization::W8A16Matrix};
+
+    if partition >= 2 || !matrix.rows().is_multiple_of(2) {
+        return Err(compute_error(format!("CT expert row shard partition={partition} rows={} 无效", matrix.rows())));
+    }
+    let rows = matrix.rows() / 2;
+    let row_start = partition * rows;
+    let slice_rows = |bytes: &[u8], row_bytes: usize, label: &str| -> Result<Vec<u8>, BackendError> {
+        let start = row_start.checked_mul(row_bytes).ok_or_else(|| compute_error(format!("CT {label} row offset 溢出")))?;
+        let end = start.checked_add(rows.checked_mul(row_bytes).ok_or_else(|| compute_error(format!("CT {label} row bytes 溢出")))?).ok_or_else(|| compute_error(format!("CT {label} row end 溢出")))?;
+        bytes.get(start..end).map(<[u8]>::to_vec).ok_or_else(|| compute_error(format!("CT {label} row shard {start}..{end}/{} 越界", bytes.len())))
+    };
+    match matrix {
+        CtMatrix::W4(matrix) => {
+            let packed = slice_rows(matrix.packed(), matrix.cols.div_ceil(8) * 4, "W4 packed")?;
+            let scales = slice_rows(matrix.scales(), matrix.cols / matrix.group_size() * matrix.scale_dtype().bytes(), "W4 scales")?;
+            W4A16Matrix::new(packed, scales, matrix.scale_dtype(), matrix.group_size(), rows, matrix.cols).map(CtMatrix::W4).map_err(compute_error)
+        }
+        CtMatrix::W8(matrix) => {
+            let packed = slice_rows(matrix.packed(), matrix.cols.div_ceil(4) * 4, "W8 packed")?;
+            let scales = slice_rows(matrix.scales(), matrix.cols / matrix.group_size() * matrix.scale_dtype().bytes(), "W8 scales")?;
+            W8A16Matrix::new(packed, scales, matrix.scale_dtype(), matrix.group_size(), rows, matrix.cols).map(CtMatrix::W8).map_err(compute_error)
+        }
+    }
+}
+
+fn ct_matrix_column_shard(matrix: &crate::weight::format::compressed_tensors_hybrid::CtMatrix, partition: usize) -> Result<crate::weight::format::compressed_tensors_hybrid::CtMatrix, BackendError> {
+    use crate::weight::format::{compressed_tensors_hybrid::CtMatrix, quantization::W4A16Matrix, quantization::W8A16Matrix};
+
+    if partition >= 2 || !matrix.cols().is_multiple_of(2) {
+        return Err(compute_error(format!("CT expert column shard partition={partition} cols={} 无效", matrix.cols())));
+    }
+    let rows = matrix.rows();
+    let cols = matrix.cols() / 2;
+    let slice_columns = |bytes: &[u8], source_row_bytes: usize, shard_row_bytes: usize, label: &str| -> Result<Vec<u8>, BackendError> {
+        let mut shard = Vec::with_capacity(rows.checked_mul(shard_row_bytes).ok_or_else(|| compute_error(format!("CT {label} column shard 容量溢出")))?);
+        let column_offset = partition * shard_row_bytes;
+        for row in 0..rows {
+            let start = row.checked_mul(source_row_bytes).and_then(|offset| offset.checked_add(column_offset)).ok_or_else(|| compute_error(format!("CT {label} column offset 溢出")))?;
+            let end = start.checked_add(shard_row_bytes).ok_or_else(|| compute_error(format!("CT {label} column end 溢出")))?;
+            shard.extend_from_slice(bytes.get(start..end).ok_or_else(|| compute_error(format!("CT {label} column shard {start}..{end}/{} 越界", bytes.len())))?);
+        }
+        Ok(shard)
+    };
+    match matrix {
+        CtMatrix::W4(matrix) => {
+            if !cols.is_multiple_of(matrix.group_size()) {
+                return Err(compute_error(format!("CT expert W4 column shard cols={cols} group={} 无效", matrix.group_size())));
+            }
+            let packed = slice_columns(matrix.packed(), matrix.cols.div_ceil(8) * 4, cols.div_ceil(8) * 4, "W4 packed")?;
+            let scales = slice_columns(matrix.scales(), matrix.cols / matrix.group_size() * matrix.scale_dtype().bytes(), cols / matrix.group_size() * matrix.scale_dtype().bytes(), "W4 scales")?;
+            W4A16Matrix::new(packed, scales, matrix.scale_dtype(), matrix.group_size(), rows, cols).map(CtMatrix::W4).map_err(compute_error)
+        }
+        CtMatrix::W8(matrix) => {
+            if !cols.is_multiple_of(matrix.group_size()) {
+                return Err(compute_error(format!("CT expert W8 column shard cols={cols} group={} 无效", matrix.group_size())));
+            }
+            let packed = slice_columns(matrix.packed(), matrix.cols.div_ceil(4) * 4, cols.div_ceil(4) * 4, "W8 packed")?;
+            let scales = slice_columns(matrix.scales(), matrix.cols / matrix.group_size() * matrix.scale_dtype().bytes(), cols / matrix.group_size() * matrix.scale_dtype().bytes(), "W8 scales")?;
+            W8A16Matrix::new(packed, scales, matrix.scale_dtype(), matrix.group_size(), rows, cols).map(CtMatrix::W8).map_err(compute_error)
+        }
+    }
+}
+
+fn prepare_ct_expert_tp_shard(backend: &RocmContext, weights: &crate::weight::expert_source::CtExpertWeights, partition: usize) -> Result<Arc<RocmResidentExpert>, BackendError> {
+    let gate = prepare_ct_matrix(backend, ct_matrix_row_shard(&weights.gate, partition)?)?;
+    let up = prepare_ct_matrix(backend, ct_matrix_row_shard(&weights.up, partition)?)?;
+    let down = prepare_ct_matrix(backend, ct_matrix_column_shard(&weights.down, partition)?)?;
+    Ok(Arc::new(RocmResidentExpert { gate, up, down }))
 }
 
 fn prepare_fp8_expert(backend: &RocmContext, weights: crate::weight::format::official_fp8::Fp8ExpertWeights) -> Result<Arc<RocmResidentExpert>, BackendError> {
@@ -1001,6 +1385,16 @@ pub struct RocmPrefillExperts {
     fp8_metas: HashMap<(i32, usize), Arc<ops::hip::DeviceBuffer>>,
     /// MXFP4 层级大 buffer(gate/up 拼段 + down),grouped kernel 直接消费。
     mxfp4_grouped: HashMap<(i32, usize), Arc<Mxfp4GroupedLayer>>,
+    /// 与 resident 权重同 generation 的单行固定地址 graph；Disabled 避免失败后逐轮重试。
+    ct_moe_graphs: HashMap<(i32, usize), RocmCtMoeGraphState>,
+    /// 单路实验只在同机相邻卡间拆 routed experts；Attention/KV/DSA 仍由当前卡持有。
+    cooperative_peer: Option<RocmCooperativeExpertPeer>,
+}
+
+#[derive(Clone, Copy)]
+struct RocmCooperativeExpertPeer {
+    context: RocmContext,
+    local_partition: usize,
 }
 
 /// 一层全部专家的 4bit 驻留大 buffer:grouped kernel 的权重布局。
@@ -1013,28 +1407,47 @@ pub struct Mxfp4GroupedLayer {
 
 impl RocmPrefillExperts {
     pub fn fp8(root: &Path, intermediate: usize, hidden: usize, expert_count: usize) -> Result<Self, String> {
-        Ok(Self { archive: RocmExpertArchive::Fp8(OfficialExpertArchive::open(root, intermediate, hidden, expert_count)?), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new() })
+        Ok(Self {
+            archive: RocmExpertArchive::Fp8(OfficialExpertArchive::open(root, intermediate, hidden, expert_count)?),
+            resident: HashMap::new(),
+            fp8_resident: HashMap::new(),
+            fp8_metas: HashMap::new(),
+            mxfp4_grouped: HashMap::new(),
+            ct_moe_graphs: HashMap::new(),
+            cooperative_peer: None,
+        })
     }
 
     /// 任意 Fp8ExpertSource(非 DeepSeek 目录命名,如 GLM-5.3-Flash)的 FP8 专家通道。
     pub fn fp8_source(source: std::sync::Arc<dyn crate::weight::expert_source::Fp8ExpertSource + Send + Sync>) -> Self {
-        Self { archive: RocmExpertArchive::Fp8Source(source), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new() }
+        Self { archive: RocmExpertArchive::Fp8Source(source), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new(), ct_moe_graphs: HashMap::new(), cooperative_peer: None }
     }
 
     pub fn nvfp4(source: NvidiaNvfp4Experts) -> Self {
-        Self { archive: RocmExpertArchive::Nvfp4(source), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new() }
+        Self { archive: RocmExpertArchive::Nvfp4(source), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new(), ct_moe_graphs: HashMap::new(), cooperative_peer: None }
     }
 
     pub fn mxfp4(source: Arc<dyn Mxfp4ExpertSource>) -> Self {
-        Self { archive: RocmExpertArchive::Mxfp4(source), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new() }
+        Self { archive: RocmExpertArchive::Mxfp4(source), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new(), ct_moe_graphs: HashMap::new(), cooperative_peer: None }
     }
 
     pub fn gguf(source: Arc<dyn GgufExpertSource>) -> Self {
-        Self { archive: RocmExpertArchive::Gguf(source), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new() }
+        Self { archive: RocmExpertArchive::Gguf(source), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new(), ct_moe_graphs: HashMap::new(), cooperative_peer: None }
     }
 
     pub fn ct(source: CompressedTensorsSource) -> Self {
-        Self { archive: RocmExpertArchive::Ct(source), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new() }
+        Self { archive: RocmExpertArchive::Ct(source), resident: HashMap::new(), fp8_resident: HashMap::new(), fp8_metas: HashMap::new(), mxfp4_grouped: HashMap::new(), ct_moe_graphs: HashMap::new(), cooperative_peer: None }
+    }
+
+    pub fn enable_cooperative_peer(&mut self, context: RocmContext, local_partition: usize) -> Result<(), BackendError> {
+        if !matches!(&self.archive, RocmExpertArchive::Ct(_)) {
+            return Err(compute_error("ROCm cooperative experts 当前只支持 compressed-tensors"));
+        }
+        if local_partition >= 2 {
+            return Err(compute_error(format!("ROCm cooperative expert partition={local_partition} 非法")));
+        }
+        self.cooperative_peer = Some(RocmCooperativeExpertPeer { context, local_partition });
+        Ok(())
     }
 
     fn load(&mut self, backend: &RocmContext, layer: usize, expert: usize) -> Result<RocmPrefillExpert, BackendError> {
@@ -1144,6 +1557,15 @@ impl RocmPrefillExperts {
         expert_ids.iter().map(|&expert| self.load(backend, layer, expert)).collect()
     }
 
+    fn cooperative_resident_partition(&self, backend: &RocmContext, layer: usize, expert_count: usize, partition: usize) -> Result<Vec<Arc<RocmResidentExpert>>, BackendError> {
+        if partition >= 2 {
+            return Err(compute_error(format!("ROCm cooperative partition={partition} experts={expert_count} 非法")));
+        }
+        (0..expert_count)
+            .map(|expert| self.resident.get(&(backend.device_id, layer, expert)).cloned().ok_or_else(|| compute_error(format!("ROCm cooperative resident device={} L{layer} E{expert} row-partition={partition} 缺失", backend.device_id))))
+            .collect()
+    }
+
     /// MXFP4 层级大 buffer:全部专家 gate/up/down 拼段一次上传,grouped 消费。
     pub fn mxfp4_grouped(&mut self, backend: &RocmContext, layer: usize, spec: &crate::moe::topk_moe::TopkMoeSpec) -> Result<Arc<Mxfp4GroupedLayer>, BackendError> {
         let key = (backend.device_id, layer);
@@ -1191,6 +1613,34 @@ impl RocmPrefillExperts {
     }
 
     pub fn preload_layer(&mut self, backend: &RocmContext, layer: usize, expert_count: usize) -> Result<(), BackendError> {
+        if let Some(peer) = self.cooperative_peer {
+            let remote_partition = 1 - peer.local_partition;
+            let source = match &self.archive {
+                RocmExpertArchive::Ct(source) => source,
+                _ => return Err(compute_error("ROCm cooperative row shard 只支持 compressed-tensors")),
+            };
+            let missing = (0..expert_count).filter(|&expert| !self.resident.contains_key(&(backend.device_id, layer, expert)) || !self.resident.contains_key(&(peer.context.device_id, layer, expert))).collect::<Vec<_>>();
+            let load_width = ops::hip::options().expert_load_width.max(1);
+            for chunk in missing.chunks(load_width) {
+                let prepared = chunk
+                    .par_iter()
+                    .map(|&expert| {
+                        let weights = source.load_expert_ct(layer, expert).map_err(BackendError::ExpertLoad)?;
+                        let (local, remote) = rayon::join(|| prepare_ct_expert_tp_shard(backend, &weights, peer.local_partition), || prepare_ct_expert_tp_shard(&peer.context, &weights, remote_partition));
+                        Ok((expert, local?, remote?))
+                    })
+                    .collect::<Result<Vec<_>, BackendError>>()?;
+                for (expert, local, remote) in prepared {
+                    self.resident.insert((backend.device_id, layer, expert), local);
+                    self.resident.insert((peer.context.device_id, layer, expert), remote);
+                }
+            }
+            let local = self.cooperative_resident_partition(backend, layer, expert_count, peer.local_partition)?;
+            let remote = self.cooperative_resident_partition(&peer.context, layer, expert_count, remote_partition)?;
+            ops::hip::preload_ct_grouped_expert_metas(backend.device_id, &grouped_w4_experts(&local)?).map_err(compute_error)?;
+            ops::hip::preload_ct_grouped_expert_metas(peer.context.device_id, &grouped_w4_experts(&remote)?).map_err(compute_error)?;
+            return Ok(());
+        }
         if matches!(self.archive, RocmExpertArchive::Fp8(_) | RocmExpertArchive::Fp8Source(_)) {
             let missing = (0..expert_count).filter(|&expert| !self.fp8_resident.contains_key(&(backend.device_id, layer, expert))).collect::<Vec<_>>();
             let load_width = ops::hip::options().expert_load_width.max(1);

@@ -43,6 +43,7 @@ impl Gemma4Engine {
         model_path: &Path,
         max_seq_len: usize,
         execution: crate::config::Gemma4ExecutionConfig,
+        replay_enabled: bool,
         lm_head_quantization: crate::weight::LmHeadQuantization,
         cache_directory: PathBuf,
         persist_kv_cache: bool,
@@ -53,7 +54,7 @@ impl Gemma4Engine {
         let cache_identity = crate::runtime::session::model_cache_identity(model_path, &format!("gemma4-terminal-v3|max_seq_len={max_seq_len}|execution={execution:?}|lm_head={lm_head_quantization:?}"))?;
         let mtp_requested = execution.mtp_weights.is_some();
         let mut session =
-            Gemma4MetalSession::load(model_path, max_seq_len, execution.prefill_chunk_size, lm_head_quantization, execution.mtp_weights, execution.mtp_draft_tokens, execution.replay).map_err(|error| -> DynError { error.into() })?;
+            Gemma4MetalSession::load(model_path, max_seq_len, execution.prefill_chunk_size, lm_head_quantization, execution.mtp_weights, execution.mtp_draft_tokens, replay_enabled).map_err(|error| -> DynError { error.into() })?;
         if session.accepts_images() {
             session.prepare_multimodal_resources().map_err(|error| -> DynError { error.into() })?;
         }
@@ -160,6 +161,10 @@ impl Gemma4Engine {
         // resume 命中时只对 suffix 计费
         let batch_tokens = resumed.as_ref().map_or(tokens.len(), |(state, suffix)| state.pending.len().saturating_add(suffix.len()));
         let _batch_guard = BatchTokenGuard::new(&self.runtime, batch_tokens);
+        let profile_prefill = std::env::var_os("ZLLM_GEMMA4_PROFILE_PREFILL").is_some();
+        if profile_prefill {
+            self.session.context_handle().reset_gpu_stats();
+        }
         let prefill_started = std::time::Instant::now();
         let mut sequence = if let Some(input) = multimodal.as_ref() {
             self.session.prefill_multimodal(input)?
@@ -173,6 +178,22 @@ impl Gemma4Engine {
             self.session.prefill(tokens.clone())?
         };
         let prefill_seconds = prefill_started.elapsed().as_secs_f64();
+        if profile_prefill {
+            let gpu = self.session.context_handle().gpu_stats();
+            let operators = self.session.context_handle().gpu_profile();
+            eprintln!(
+                "[gemma4-prefill-gpu] wall={prefill_seconds:.3}s gpu={:.3}s commands={} operators={} submit_wait={:.3}s gaps={:.3}s tail={:.3}s",
+                gpu.seconds,
+                gpu.command_buffers,
+                operators.len(),
+                gpu.submit_wait_seconds,
+                gpu.inter_command_gap_seconds,
+                gpu.completion_tail_seconds
+            );
+            for operator in operators.into_iter().take(20) {
+                eprintln!("  gemma4 prefill gpu {:>9.3} ms x{} | {} {}", operator.gpu_seconds * 1.0e3, operator.calls, operator.operator, operator.shape);
+            }
+        }
         let max_tokens = requested_tokens.min(self.session.max_seq_len() - sequence.token_count());
         if max_tokens == 0 {
             return Err("会话已没有可用的生成位置".to_owned());

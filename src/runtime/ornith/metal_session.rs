@@ -61,14 +61,14 @@ impl OrnithMetalSession {
         ornith::OrnithRuntime::new(&self.context, &self.config, &self.layers, 0, &self.rope, self.options.runtime)
     }
 
-    pub fn load(model_path: &Path, max_seq_len: usize, options: OrnithOptions, lm_head_quantization: crate::weight::LmHeadQuantization) -> Result<Self, String> {
+    pub fn load_with_replay(model_path: &Path, max_seq_len: usize, options: OrnithOptions, replay_enabled: bool, lm_head_quantization: crate::weight::LmHeadQuantization) -> Result<Self, String> {
         let weights = Arc::new(OrnithGguf::open(model_path)?);
         let config = weights.config().clone();
         ornith::ensure_supported(&config).map_err(|error| format!("Ornith runtime 不支持: {error:?}"))?;
         MetalMoeDecodeState::validate_gguf_expert_formats(weights.as_ref(), config.layer_count, config.num_experts).map_err(|error| format!("Ornith Metal expert 格式预检失败: {error:?}"))?;
         let tokenizer = weights.tokenizer()?;
         let detokenizer = weights.detokenizer()?;
-        let context = MetalContext::new_default().map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
+        let context = MetalContext::new_default_with_replay(replay_enabled).map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
         let layers = ornith::prepare_ornith_layers(&context, weights.as_ref()).map_err(|error| format!("准备 Ornith 层失败: {error:?}"))?;
         let output_head = ornith::prepare_ornith_output_head_quantized(&context, weights.as_ref(), lm_head_quantization).map_err(|error| format!("准备 Ornith 输出头失败: {error:?}"))?;
         let cache_spec = KvCacheSpec::from_attention(&AttentionSpec::Gqa(config.full_attention_spec()))?;

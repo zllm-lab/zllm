@@ -33,18 +33,27 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
     // M5 + F16 input + M=4 实测四形态:8 行批 155ms < ext 161ms < ext-half-dot
     // 171ms < per-y 254ms < MMA 538ms,8 行批最优,ext 不启用(保留作研究)。
 
-    // Q3_K / Q6_K prefill 直接走 fused GEMM，避免 dequant + MPS 两遍。
+    // Q3_K / Q6_K / IQ4_NL prefill 直接走 fused GEMM，避免 dequant + MPS 两遍。
     let use_q3k_fused = input.dtype == MetalTensorDType::F16 && input.rows >= 4 && tensor_type == 11;
     let use_q6k_fused = input.dtype == MetalTensorDType::F16 && input.rows >= 4 && tensor_type == 14;
-    if use_q3k_fused || use_q6k_fused {
+    let use_iq4nl_fused = input.dtype == MetalTensorDType::F16 && input.rows >= 4 && tensor_type == 20;
+    if use_q3k_fused || use_q6k_fused || use_iq4nl_fused {
         // fused 路径不依赖 caller 的 dtype guard, 显式用 input dtype (F16)
         let m = validate_u32("GGUF M", input.rows)?;
         let n = validate_u32("GGUF N", weight_rows)?;
         let k = validate_u32("GGUF K", weight_cols)?;
         let row_bytes_u32 = validate_u32("GGUF row bytes", row_bytes)?;
-        let output = ctx.tensor_kernel_output(input.rows, weight_rows);
         let iq2s_grid = ctx.resident_byte_weight_buffer(as_bytes(crate::weight::codec::ggml::iq2s_grid()));
-        let kernel_name = if use_q3k_fused { "gguf_gemm_q3k_fused_f16" } else { "gguf_gemm_q6k_fused_f16" };
+        let kernel_name = if use_q3k_fused {
+            "gguf_gemm_q3k_fused_f16"
+        } else if use_q6k_fused {
+            "gguf_gemm_q6k_fused_f16"
+        } else if ctx.metal4_available() {
+            "gguf_gemm_iq4nl_mpp_f16"
+        } else {
+            "gguf_gemm_iq4nl_fused_f16"
+        };
+        let output = if kernel_name == "gguf_gemm_iq4nl_mpp_f16" { ctx.tensor_pooled_f32("gguf_iq4nl_mpp_f32", input.rows, weight_rows) } else { ctx.tensor_kernel_output(input.rows, weight_rows) };
         let pipeline = ctx.pipeline(kernel_name)?;
         let threads: usize = 128;
         if pipeline.max_total_threads_per_threadgroup() < threads as u64 {
@@ -61,11 +70,25 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
         set_bytes(&encoder, 5, &n);
         set_bytes(&encoder, 6, &k);
         set_bytes(&encoder, 7, &row_bytes_u32);
-        encoder.dispatch_thread_groups(MTLSize::new(weight_rows.div_ceil(4) as u64, input.rows.div_ceil(4) as u64, 1), MTLSize::new(threads as u64, 1, 1));
+        let groups = if kernel_name == "gguf_gemm_iq4nl_mpp_f16" {
+            MTLSize::new(input.rows.div_ceil(128) as u64, weight_rows.div_ceil(64) as u64, 1)
+        } else if use_iq4nl_fused {
+            MTLSize::new(weight_rows.div_ceil(64) as u64, input.rows.div_ceil(64) as u64, 1)
+        } else {
+            MTLSize::new(weight_rows.div_ceil(4) as u64, input.rows.div_ceil(4) as u64, 1)
+        };
+        encoder.dispatch_thread_groups(groups, MTLSize::new(threads as u64, 1, 1));
         encoder.end_encoding();
         let shape = format!("input=[{m},{k}],weight=[{n},{k}],type={tensor_type}");
         ctx.commit_and_wait_profiled(&command, kernel_name, &shape, input.buffer.length() + expected as u64 + iq2s_grid.length(), output.buffer.length());
-        return Ok(output);
+        return if output.dtype == MetalTensorDType::F32 {
+            // pooled MPP scratch 的地址稳定但内容每次重写，不能命中按地址缓存的
+            // immutable cast view（否则 gate/up 会错误共享上一轮 F16 结果）。
+            ctx.invalidate_f16_cast(&output);
+            to_f16_tensor(ctx, &output)
+        } else {
+            Ok(output)
+        };
     }
 
     if input.rows >= gguf_prefill_mps_rows() {
@@ -257,7 +280,7 @@ pub fn gguf_gemv_add_tensor(ctx: &MetalContext, input: &MetalTensor, blob: &meta
     let rows_u32 = validate_u32("GGUF gemv+add rows", rows)?;
     let row_bytes_u32 = validate_u32("GGUF gemv+add row bytes", row_bytes)?;
     let threads: u64 = if tensor_type == 14 { 64 } else { 128 };
-    if pipeline.max_total_threads_per_threadgroup() < threads {
+    if pipeline.max_total_threads_per_threadgroup() < threads as u64 {
         return Err(format!("GGUF gemv+add 需要 {threads} threads/threadgroup"));
     }
     let command = ctx.command_buffer();
@@ -511,6 +534,13 @@ pub fn gguf_gated_matmul_tensor_resident(
     if input.cols != gate_cols || gate_cols != up_cols || gate_rows != up_rows {
         return Err(format!("GGUF gated matmul shape 不兼容: input=[{},{}], gate=[{gate_rows},{gate_cols}], up=[{up_rows},{up_cols}]", input.rows, input.cols,));
     }
+    // IQ4_NL 长 prefill 复用 tiled fused GEMM，避免 gate/up 各自先展开整份
+    // F16 权重。activation 仍走统一 epilogue，保持与分解路径相同的语义。
+    if input.rows >= 4 && gate_type == 20 && up_type == 20 {
+        let gate = gguf_matmul_tensor_resident(ctx, input, gate_blob, gate_type, gate_row_bytes, gate_rows, gate_cols)?;
+        let up = gguf_matmul_tensor_resident(ctx, input, up_blob, up_type, up_row_bytes, up_rows, up_cols)?;
+        return gated_activation_tensor(ctx, &gate, &up, activation);
+    }
     if input.rows < gguf_prefill_mps_rows() {
         let gate = gguf_matmul_tensor_resident(ctx, input, gate_blob, gate_type, gate_row_bytes, gate_rows, gate_cols)?;
         let up = gguf_matmul_tensor_resident(ctx, input, up_blob, up_type, up_row_bytes, up_rows, up_cols)?;
@@ -732,7 +762,7 @@ pub fn gguf_gated_gemv_tensor_resident(
     } else {
         64
     };
-    if pipeline.max_total_threads_per_threadgroup() < threads {
+    if pipeline.max_total_threads_per_threadgroup() < threads as u64 {
         return Err(format!("GGUF gated GEMV 需要至少 {threads} threads/threadgroup"));
     }
     let command = ctx.command_buffer();
@@ -780,7 +810,7 @@ pub fn gguf_gated_gemv_tensor_resident(
             grid_y as u64,
             1,
         ),
-        MTLSize::new(threads, 1, 1),
+        MTLSize::new(threads as u64, 1, 1),
     );
     encoder.end_encoding();
     let shape = format!("input=[{},{}],output={gate_rows},types={gate_type}/{up_type}", input.rows, input.cols);

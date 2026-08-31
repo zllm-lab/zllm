@@ -45,7 +45,7 @@ use crate::runtime::{
     glm52::{Glm52, Glm52Config, Glm52OutputHead, glm52_sampled_token_ids_fenced, prepare_glm52_mtp_ct, prepare_glm52_mtp_gguf, prepare_glm52_output_head_quantized},
     output::{SamplingConfig, SamplingState},
     rocm_chain,
-    speculative::verify_samples,
+    speculative::{verify_samples, verify_samples_prefix},
 };
 use crate::server::iroh::IrohConfig;
 use crate::server::node::{NodeBatchRequest, NodeBatchResult, NodeEngine};
@@ -112,7 +112,10 @@ use batch::*;
 pub struct Glm52Engine {
     cfg: Glm52Config,
     mla: MlaSpec,
+    /// 每个物理双卡组的 owner；完整 layer stage、Attention/KV/DSA 都只放这里。
     contexts: Vec<RocmContext>,
+    /// cooperative MoE 的另一半计算卡，与 `contexts` 一一对应，不拥有独立 stage。
+    cooperative_peer_contexts: Vec<RocmContext>,
     layer_ends: Vec<usize>,
     stage_end: usize,
     weights: Arc<Glm52Weights>,
@@ -241,6 +244,9 @@ impl Glm52Engine {
     fn commit_submitted_work(task: &mut Glm52BatchTask, inputs: &[u32]) {
         if inputs.len() != 1 || task.dspark_cpu_anchor_in_flight {
             task.pending_verify_rows = inputs.len();
+        }
+        if task.dspark_cpu_flight.is_some() {
+            task.dspark_verify_inputs = inputs.to_vec();
         }
         if task.pending_token.is_some_and(|pending| inputs.first() == Some(&pending)) {
             task.pending_token = None;
@@ -517,7 +523,19 @@ impl Glm52Engine {
         if stage_end == 0 || stage_end >= cfg.layer_count {
             return Err(format!("Glm52Engine stage_end 必须在 1..{}，实际 {stage_end}", cfg.layer_count).into());
         }
-        let contexts = crate::runtime::rocm_chain::RocmDeviceChain::new(&devices, layer_ends.clone(), stage_end - 1, false).map_err(|error| -> DynError { format!("GLM-5.2 设备链: {error}").into() })?.contexts;
+        let (contexts, cooperative_peer_contexts) = if options.cooperative_expert_pairs {
+            if devices.len() < 2 || devices.len() % 2 != 0 || layer_ends.len() != devices.len() / 2 {
+                return Err(format!("cooperative_expert_pairs 要求每两张物理卡对应一个 layer_ends：devices={} layer_ends={}", devices.len(), layer_ends.len()).into());
+            }
+            let owner_devices = devices.iter().step_by(2).copied().collect::<Vec<_>>();
+            let peer_devices = devices.iter().skip(1).step_by(2).copied().collect::<Vec<_>>();
+            let contexts = crate::runtime::rocm_chain::RocmDeviceChain::new(&owner_devices, layer_ends.clone(), stage_end - 1, false).map_err(|error| -> DynError { format!("GLM-5.2 双卡组 owner 设备链: {error}").into() })?.contexts;
+            let peers =
+                peer_devices.iter().map(|&device| RocmContext::configured(device, false).map_err(|error| -> DynError { format!("ROCm cooperative peer device {device} 初始化失败: {error}").into() })).collect::<Result<Vec<_>, _>>()?;
+            (contexts, peers)
+        } else {
+            (crate::runtime::rocm_chain::RocmDeviceChain::new(&devices, layer_ends.clone(), stage_end - 1, false).map_err(|error| -> DynError { format!("GLM-5.2 设备链: {error}").into() })?.contexts, Vec::new())
+        };
         let output_context = contexts[0];
         let output_head = if options.tail_sampling {
             None
@@ -615,7 +633,8 @@ impl Glm52Engine {
             message => return Err(format!("下游连接后未报告设备资源: {message:?}").into()),
         };
         let kv_f16 = options.kv_cache_format == KvCacheFormat::F16;
-        let capabilities = crate::runtime::rocm_chain::node_capabilities(&contexts, max_seq_len, if kv_f16 { "f16" } else { "q8g64" }, "glm52-rocm".to_owned(), 0);
+        let capability_contexts = contexts.iter().chain(&cooperative_peer_contexts).copied().collect::<Vec<_>>();
+        let capabilities = crate::runtime::rocm_chain::node_capabilities(&capability_contexts, max_seq_len, if kv_f16 { "f16" } else { "q8g64" }, "glm52-rocm".to_owned(), 0);
         // resident terminal cache 由 KV token budget 淘汰，不再设固定条目上限。
         let terminal_limit = options.terminal_cache_entries;
         let kv_reservation_page_tokens = options.kv_reservation_page_tokens;
@@ -625,6 +644,7 @@ impl Glm52Engine {
             cfg,
             mla,
             contexts,
+            cooperative_peer_contexts,
             layer_ends,
             stage_end,
             weights,
@@ -682,6 +702,35 @@ impl Glm52Engine {
             let layers = prepare_prefill_layers(&self.contexts, &self.layer_ends, 0, self.stage_end, &self.cfg, &self.mla, &self.weights).map_err(|error| format!("准备 prefill layers: {error:?}"))?;
             let mut experts = (0..self.contexts.len()).map(|_| self.new_experts()).collect::<Result<Vec<_>, _>>()?;
             let preload_experts = self.options.preload_experts;
+            if self.options.cooperative_expert_pairs {
+                if !preload_experts || self.options.preload_layers_per_device.is_some() || !self.weights.source_is_ct() || self.contexts.len() != self.cooperative_peer_contexts.len() {
+                    return Err("cooperative_expert_pairs 要求 CT 权重、preload_experts=true、完整预载且每个逻辑 stage 有一张 peer 卡".to_owned());
+                }
+                let mut layer_start = 0usize;
+                let counts = self
+                    .layer_ends
+                    .iter()
+                    .map(|&layer_end| {
+                        let count = layer_end + 1 - layer_start;
+                        layer_start = layer_end + 1;
+                        count
+                    })
+                    .collect::<Vec<_>>();
+                for &count in &counts {
+                    if count > 12 {
+                        return Err(format!("cooperative expert 双卡组层数 {count} 超过 12 层预算"));
+                    }
+                }
+                for (stage, (expert, &peer)) in experts.iter_mut().zip(&self.cooperative_peer_contexts).enumerate() {
+                    expert.enable_cooperative_peer(peer, 0).map_err(|error| format!("配置 ROCm cooperative expert stage={stage}: {error:?}"))?;
+                }
+                eprintln!(
+                    "[glm52-cooperative-experts] physical_devices={} pairs={} logical_stages={} mode=prefill+decode partition=gate-up-row/down-k-half device-route",
+                    self.contexts.len() + self.cooperative_peer_contexts.len(),
+                    self.contexts.len(),
+                    self.contexts.len(),
+                );
+            }
             if preload_experts && (self.weights.source_is_ct() || self.weights.source_is_gguf()) {
                 let started = Instant::now();
                 let layers_per_device = self.options.preload_layers_per_device.unwrap_or(usize::MAX);
@@ -1326,7 +1375,7 @@ impl Glm52Engine {
                             let request_id = task.request_id.clone();
                             let finish_reason = task.finish_reason.clone();
                             let mut result = self.finish_batch_task(task, on_token, on_tool_call_delta);
-                            let devices = self.contexts.iter().map(RocmContext::device_id).collect::<Vec<_>>();
+                            let devices = self.contexts.iter().chain(&self.cooperative_peer_contexts).map(RocmContext::device_id).collect::<Vec<_>>();
                             if let Err(error) = rocm_chain::release_request_workspaces(&devices) {
                                 let release_error = format!("GLM-5.2 terminal workspace 回收失败: {error}");
                                 result = Err(match result {
@@ -1384,13 +1433,16 @@ impl Glm52Engine {
                             )));
                         }
                         let drafts = result.drafts.map_err(backend_error)?;
+                        let flight = Glm52DsparkCpuFlight::new(result.anchor, drafts, task.dspark_cpu_window);
+                        let inputs = flight.inputs();
+                        let suffix = &inputs[1..];
                         let result_us = diagnostics.trace_stage_events.then(crate::runtime::prefill_scheduler::stage_trace_timestamp_us);
-                        task.dspark_verify_inputs = std::iter::once(result.anchor).chain(drafts.iter().copied()).collect();
+                        task.dspark_verify_inputs = inputs.clone();
                         let suffix_started = diagnostics.trace_stage_events.then(Instant::now);
-                        let works = self.prepare_cpu_verify_suffix(result.session, task, &drafts, &weights)?;
+                        let works = self.prepare_cpu_verify_suffix(result.session, task, suffix, &weights)?;
                         let suffix_us = suffix_started.map(|started| started.elapsed().as_micros()).unwrap_or(0);
                         let fence_started = diagnostics.trace_stage_events.then(Instant::now);
-                        self.send_tail_sampling_fences_suffix(task, &drafts).map_err(backend_error)?;
+                        self.send_tail_sampling_fences_suffix(task, suffix).map_err(backend_error)?;
                         let fence_us = fence_started.map(|started| started.elapsed().as_micros()).unwrap_or(0);
                         if profile_boundaries {
                             decode_started[result.session].extend(std::iter::repeat_n(Instant::now(), works.len()));
@@ -1405,16 +1457,17 @@ impl Glm52Engine {
                                     anchor_position,
                                     result.id,
                                     result.anchor,
-                                    drafts.len(),
+                                    suffix.len(),
                                     crate::runtime::prefill_scheduler::stage_trace_timestamp_us(),
                                 ));
                             }
                             pipeline.submit_many(works)?;
                         }
-                        task.pending_verify_rows = 1 + drafts.len();
-                        task.dspark_verify_hidden.reserve(drafts.len());
-                        task.dspark_verify_aux.reserve(drafts.len());
-                        task.cached_tokens.extend_from_slice(&drafts);
+                        task.pending_verify_rows = inputs.len();
+                        task.dspark_verify_hidden.reserve(suffix.len());
+                        task.dspark_verify_aux.reserve(suffix.len());
+                        task.cached_tokens.extend_from_slice(suffix);
+                        task.dspark_cpu_flight = Some(flight);
                     }
                 }
 
@@ -1943,7 +1996,7 @@ impl Glm52Engine {
         let mut cache_hit = false;
         let head_mtp_enabled = self.options.mtp && !self.options.tail_sampling;
         let dspark_enabled = self.dspark_runtime.is_some();
-        let (mut states, last_hidden, cached_tokens, prefill_position, mut mtp, dspark_aux_history, dspark_aux_history_start, dspark_target_cache) = if let Some((matched_id, cached_tokens, state, resume_assistant)) = resident {
+        let (mut states, last_hidden, cached_tokens, prefill_position, mut mtp, mut dspark_aux_history, mut dspark_aux_history_start, mut dspark_target_cache) = if let Some((matched_id, cached_tokens, state, resume_assistant)) = resident {
             if let Some(assistant) = resume_assistant {
                 let mut resumed = cached_tokens.clone();
                 resumed.extend(state.pending_tokens.as_ref().expect("boundary resume 已检查 pending token"));
@@ -2089,6 +2142,13 @@ impl Glm52Engine {
                 }
             }
         };
+        if !dspark_enabled {
+            // DSpark 是 target KV checkpoint 之上的可选加速状态。关闭 drafter
+            // 时仍可复用同一份 target KV，但不应把旧 aux/cache 带入本轮终态。
+            dspark_aux_history = None;
+            dspark_aux_history_start = 0;
+            dspark_target_cache = DsparkTargetCache::new();
+        }
         if tokens.len() >= self.max_seq_len {
             return Err(format!("GLM-5.2 resume 后 prompt {} tokens 超过 max_seq_len {}", tokens.len(), self.max_seq_len));
         }
@@ -2231,6 +2291,8 @@ impl Glm52Engine {
             dspark_cpu_target_cache: DsparkTargetCache::new(),
             dspark_cpu_pending: None,
             dspark_cpu_anchor_in_flight: false,
+            dspark_cpu_window: 1,
+            dspark_cpu_flight: None,
             dspark_verify_inputs: Vec::new(),
             dspark_verify_hidden: Vec::new(),
             dspark_verify_aux: Vec::new(),
@@ -2644,7 +2706,7 @@ impl Glm52Engine {
                     eprintln!("[glm52-loop-guard] request_id={} kind={} action={}", task.stage_id, recovery.kind, if recovery.forced_end { "close_thinking" } else { "stop" });
                 }
                 let hard_loop = loop_recovery.filter(|recovery| !recovery.forced_end).map(|recovery| recovery.kind);
-                outcomes[session] = Some(Glm52TailOutcome { tokens, drafts, eos: forced_budget.is_none() && loop_recovery.is_none() && *frame_eos, hard_loop });
+                outcomes[session] = Some(Glm52TailOutcome { tokens, drafts, eos: forced_budget.is_none() && loop_recovery.is_none() && *frame_eos, hard_loop, continue_dspark: false });
                 continue;
             }
             if let Some((token, sampled_eos)) = item.sampled_token {
@@ -2665,7 +2727,7 @@ impl Glm52Engine {
                     eprintln!("[glm52-loop-guard] request_id={} kind={} action={}", task.stage_id, recovery.kind, if recovery.forced_end { "close_thinking" } else { "stop" });
                 }
                 let hard_loop = loop_recovery.filter(|recovery| !recovery.forced_end).map(|recovery| recovery.kind);
-                outcomes[session] = Some(Glm52TailOutcome { tokens, drafts: Vec::new(), eos: forced_budget.is_none() && loop_recovery.is_none() && sampled_eos, hard_loop });
+                outcomes[session] = Some(Glm52TailOutcome { tokens, drafts: Vec::new(), eos: forced_budget.is_none() && loop_recovery.is_none() && sampled_eos, hard_loop, continue_dspark: false });
                 continue;
             }
             let Some((offset, count)) = head_ranges[session] else { continue };
@@ -2679,7 +2741,21 @@ impl Glm52Engine {
                 if verify_inputs.len() != count {
                     return Err(format!("A0 speculative verify inputs={} rows={count}", verify_inputs.len()));
                 }
-                let mut outcome = verify_samples(&target_tokens[offset..offset + count], &verify_inputs[1..], &cfg.eos_token_ids).map_err(|error| format!("A0 MTP verify: {error:?}"))?;
+                let (mut outcome, verified_depth, verified_drafts, terminal_chunk) = if let Some(flight) = task.dspark_cpu_flight.as_ref() {
+                    let expected_inputs = flight.inputs();
+                    if verify_inputs != expected_inputs {
+                        return Err(format!("CPU DSpark verify window 失配: inputs={verify_inputs:?} expected={expected_inputs:?}"));
+                    }
+                    let expected = flight.expected(count);
+                    let terminal = flight.terminal(count);
+                    let outcome = if terminal { verify_samples(&target_tokens[offset..offset + count], &expected, &cfg.eos_token_ids) } else { verify_samples_prefix(&target_tokens[offset..offset + count], &expected, &cfg.eos_token_ids) }
+                        .map_err(|error| format!("A0 CPU DSpark verify: {error:?}"))?;
+                    (outcome, flight.depth(), expected.len(), terminal)
+                } else {
+                    let outcome = verify_samples(&target_tokens[offset..offset + count], &verify_inputs[1..], &cfg.eos_token_ids).map_err(|error| format!("A0 MTP verify: {error:?}"))?;
+                    (outcome, 0, count - 1, true)
+                };
+                let model_accepted_drafts = outcome.accepted_drafts;
                 let forced_budget = if let (Some(end_token), Some(budget)) = (task.thinking_end_token, task.thinking_token_budget)
                     && let Some(retained_rows) = enforce_thinking_token_budget(&mut outcome.tokens, task.thinking_tokens, budget, end_token)
                 {
@@ -2698,6 +2774,7 @@ impl Glm52Engine {
                     outcome.eos = false;
                     eprintln!("[glm52-loop-guard] request_id={} kind={} action={}", task.stage_id, recovery.kind, if recovery.forced_end { "close_thinking" } else { "stop" });
                 }
+                let continue_dspark = task.dspark_cpu_flight.is_some() && !terminal_chunk && model_accepted_drafts == verified_drafts && outcome.retained_rows == count && !outcome.eos && !forced_budget && loop_recovery.is_none();
                 for _ in 0..outcome.retained_rows {
                     task.sampling.next();
                 }
@@ -2723,27 +2800,38 @@ impl Glm52Engine {
                 }
                 task.cached_tokens.truncate(item.position + outcome.retained_rows);
                 task.pending_verify_rows = 0;
-                task.dspark_cpu_anchor_in_flight = false;
+                if continue_dspark {
+                    task.dspark_cpu_flight.as_mut().expect("CPU DSpark continuation 已检查").advance(count);
+                } else {
+                    task.dspark_cpu_flight = None;
+                    task.dspark_cpu_anchor_in_flight = false;
+                }
                 task.last_hidden = Some(last);
                 if dspark_active {
                     task.dspark_verify_rounds += 1;
-                    task.dspark_verified_drafts += count - 1;
-                    task.dspark_accepted_drafts += outcome.accepted_drafts;
-                    for depth in 0..count - 1 {
-                        task.dspark_verified_by_depth[depth] += 1;
+                    task.dspark_verified_drafts += verified_drafts;
+                    task.dspark_accepted_drafts += model_accepted_drafts;
+                    for depth in verified_depth..verified_depth.saturating_add(verified_drafts) {
+                        if let Some(verified) = task.dspark_verified_by_depth.get_mut(depth) {
+                            *verified += 1;
+                        }
                     }
-                    for depth in 0..outcome.accepted_drafts {
-                        task.dspark_accepted_by_depth[depth] += 1;
+                    for depth in verified_depth..verified_depth.saturating_add(model_accepted_drafts) {
+                        if let Some(accepted) = task.dspark_accepted_by_depth.get_mut(depth) {
+                            *accepted += 1;
+                        }
                     }
                 }
                 if self.options.diagnostics.trace_stage_events || self.options.diagnostics.profile_boundaries {
                     eprintln!(
-                        "[glm52-mtp-verify] request_id={} drafts={} accepted={}/{} head_pass={} retained={}/{} output_tokens={} eos={}",
+                        "[glm52-mtp-verify] request_id={} drafts={} accepted={}/{} depth={} terminal={} continue={} retained={}/{} output_tokens={} eos={}",
                         task.stage_id,
-                        count - 1,
-                        outcome.accepted_drafts,
-                        count - 1,
-                        count,
+                        verified_drafts,
+                        model_accepted_drafts,
+                        verified_drafts,
+                        verified_depth,
+                        terminal_chunk,
+                        continue_dspark,
                         outcome.retained_rows,
                         count,
                         outcome.tokens.len(),
@@ -2751,7 +2839,7 @@ impl Glm52Engine {
                     );
                 }
                 let hard_loop = loop_recovery.filter(|recovery| !recovery.forced_end).map(|recovery| recovery.kind);
-                outcomes[session] = Some(Glm52TailOutcome { tokens: outcome.tokens, drafts: Vec::new(), eos: outcome.eos, hard_loop });
+                outcomes[session] = Some(Glm52TailOutcome { tokens: outcome.tokens, drafts: Vec::new(), eos: outcome.eos, hard_loop, continue_dspark });
             } else {
                 let token = target_tokens[offset];
                 let mut tokens = vec![token];
@@ -2770,7 +2858,7 @@ impl Glm52Engine {
                     eprintln!("[glm52-loop-guard] request_id={} kind={} action={}", task.stage_id, recovery.kind, if recovery.forced_end { "close_thinking" } else { "stop" });
                 }
                 let hard_loop = loop_recovery.filter(|recovery| !recovery.forced_end).map(|recovery| recovery.kind);
-                outcomes[session] = Some(Glm52TailOutcome { tokens, drafts: Vec::new(), eos: forced_budget.is_none() && loop_recovery.is_none() && cfg.eos_token_ids.contains(&token), hard_loop });
+                outcomes[session] = Some(Glm52TailOutcome { tokens, drafts: Vec::new(), eos: forced_budget.is_none() && loop_recovery.is_none() && cfg.eos_token_ids.contains(&token), hard_loop, continue_dspark: false });
             }
         }
         if profile_mtp {
@@ -2842,7 +2930,7 @@ impl Glm52Engine {
             let mut cpu_jobs = Vec::new();
             for (session, slot) in slots.iter_mut().enumerate() {
                 let Some(outcome) = outcomes[session].as_ref() else { continue };
-                if outcome.eos || outcome.hard_loop.is_some() {
+                if outcome.eos || outcome.hard_loop.is_some() || outcome.continue_dspark {
                     continue;
                 }
                 let task = slot.as_mut().expect("CPU DSpark outcome session 已检查");
@@ -2869,6 +2957,7 @@ impl Glm52Engine {
                 cpu_jobs.push(CpuDsparkJob { session, id, anchor, max_drafts: remaining - 1, cache, history, target_position, block_position, minimum_drafts: minimum_dspark_drafts });
                 task.dspark_cpu_pending = Some(id);
                 task.dspark_cpu_anchor_in_flight = true;
+                task.dspark_cpu_window = minimum_dspark_drafts.saturating_add(1);
                 cpu_dispatched[session] = true;
                 self.cpu_dspark_submit_profile[0] += 1;
                 self.cpu_dspark_submit_profile[1] += align_micros;
@@ -2963,6 +3052,9 @@ impl Glm52Engine {
             }
             let next = if matches!(task.finish_reason.as_str(), "cancelled" | "stop" | "repetition") || task.completion_tokens >= task.max_decode {
                 Some(Glm52NextWork::Finish)
+            } else if outcome.continue_dspark {
+                let inputs = task.dspark_cpu_flight.as_ref().ok_or("CPU DSpark continuation 缺少 flight")?.inputs();
+                Some(Glm52NextWork::Verify(inputs))
             } else if cpu_dispatched[session] {
                 let token = *outcome.tokens.last().expect("已检查非空");
                 Some(Glm52NextWork::Verify(vec![token]))

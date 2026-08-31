@@ -275,7 +275,7 @@ impl Gemma4MtpModel {
 /// 参数化是后续工作)。
 #[allow(dead_code)] // 诊断字段用于核对录制层数。
 pub struct Gemma4MtpReplay {
-    commands: crate::backend::metal::api::CommandList,
+    commands: crate::backend::metal::replay::ReplayPlan,
     input: MetalTensor,
     readback: crate::backend::metal::api::Buffer,
     h_next: MetalTensor,
@@ -288,11 +288,7 @@ impl Gemma4MtpModel {
     pub fn record_replay(&self, ctx: &MetalContext, backbone_cache: &MetalKvCache) -> Result<Gemma4MtpReplay, BackendError> {
         let input = ctx.tensor_zeros(1, self.concat_columns());
         let readback = ctx.shared_buffer_zeros(4);
-        crate::backend::metal::api::Transcriber::begin_flat().map_err(compute_error)?;
-        let recorded = self.draft_forward(ctx, backbone_cache, &input, &readback);
-        let transcriber = crate::backend::metal::api::Transcriber::end().ok_or_else(|| compute_error("MTP 重放转录器未在进行"))?;
-        let commands = transcriber.into_command_list().map_err(compute_error)?;
-        let (h_next, layer_count) = recorded?;
+        let (commands, (h_next, layer_count)) = crate::backend::metal::replay::ReplayPlan::record(|| self.draft_forward(ctx, backbone_cache, &input, &readback))?;
         Ok(Gemma4MtpReplay { commands, input, readback, h_next, current_backbone: backbone_cache.buffer().clone(), layer_count })
     }
 
@@ -340,7 +336,7 @@ impl Gemma4MtpModel {
 #[allow(dead_code)] // command_count 仅供 replay 诊断。
 impl Gemma4MtpReplay {
     pub fn command_count(&self) -> usize {
-        self.commands.ops.len()
+        self.commands.command_count()
     }
 
     /// 每请求绑定主干 KV cache(命令表内旧 buffer 指针整体替换)。
@@ -367,15 +363,7 @@ impl Gemma4MtpReplay {
         let packed: Vec<u16> = input.iter().map(|&value| half::f16::from_f32(value).to_bits()).collect();
         let destination = unsafe { std::slice::from_raw_parts_mut(model_input_ptr(&self.input), packed.len() * 2) };
         destination.copy_from_slice(unsafe { std::slice::from_raw_parts(packed.as_ptr().cast::<u8>(), packed.len() * 2) });
-        let command = ctx.command_buffer();
-        {
-            let encoder = command.new_compute_command_encoder();
-            for op in &self.commands.ops {
-                encoder.encode_recorded(op);
-            }
-            encoder.end_encoding();
-        }
-        command.commit();
+        let command = self.commands.submit(ctx);
         command.wait_until_completed();
         if std::env::var_os("ZLLM_GEMMA4_MTP_TRACE").is_some() {
             eprintln!("[mtp-gpu] draft step gpu={:.3}ms", (command.gpu_end_time() - command.gpu_start_time()) * 1.0e3);

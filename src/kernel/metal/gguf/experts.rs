@@ -398,92 +398,120 @@ pub fn gguf_indexed_experts_tensor_resident(
     let down_expert_bytes_u32 = validate_u32("GGUF indexed down expert bytes", down_expert_bytes)?;
     let top_k_u32 = validate_u32("GGUF indexed top_k", top_k)?;
 
-    let command = ctx.command_buffer();
-    let encoder = command.new_compute_command_encoder();
-    encoder.set_compute_pipeline_state(&gate_pipeline);
-    encoder.set_buffer(0, Some(&input.buffer), 0);
-    encoder.set_buffer(1, Some(gate_blob), 0);
-    encoder.set_buffer(2, Some(up_blob), 0);
-    encoder.set_buffer(3, Some(expert_ids), 0);
-    encoder.set_buffer(4, Some(&activated.buffer), 0);
-    encoder.set_buffer(5, Some(&grid), 0);
-    set_bytes(&encoder, 6, &columns);
-    set_bytes(&encoder, 7, &intermediate);
-    set_bytes(&encoder, 8, &gate_row_bytes_u32);
-    set_bytes(&encoder, 9, &up_row_bytes_u32);
-    set_bytes(&encoder, 10, &gate_expert_bytes_u32);
-    set_bytes(&encoder, 11, &up_expert_bytes_u32);
-    set_bytes(&encoder, 12, &params.kind);
-    set_bytes(&encoder, 13, &params.alpha);
-    set_bytes(&encoder, 14, &params.limit);
     let generic_gate = !matches!(*gate_type, 11 | 12 | 22);
-    if generic_gate {
-        set_bytes(&encoder, 15, gate_type);
-        set_bytes(&encoder, 16, up_type);
-    }
     let gate_q3 = *gate_type == 11;
-    encoder.dispatch_thread_groups(
-        MTLSize::new(
-            if generic_gate {
-                *gate_rows
-            } else if gate_q3 {
-                gate_rows.div_ceil(4)
-            } else {
-                gate_rows.div_ceil(8)
-            } as u64,
-            top_k as u64,
-            1,
-        ),
-        MTLSize::new(if generic_gate || gate_q3 { 64 } else { 256 }, 1, 1),
-    );
-    encoder.memory_barrier_with_resources(&[activated.buffer.as_ref()]);
-
-    encoder.set_compute_pipeline_state(&down_pipeline);
-    encoder.set_buffer(0, Some(&activated.buffer), 0);
-    encoder.set_buffer(1, Some(down_blob), 0);
-    encoder.set_buffer(2, Some(expert_ids), 0);
-    encoder.set_buffer(3, Some(&expert_output.buffer), 0);
-    encoder.set_buffer(4, Some(&grid), 0);
-    set_bytes(&encoder, 5, &intermediate);
-    set_bytes(&encoder, 6, &hidden);
-    set_bytes(&encoder, 7, &down_row_bytes_u32);
-    set_bytes(&encoder, 8, &down_expert_bytes_u32);
     let generic_down = !matches!(*down_type, 11 | 12 | 22);
-    if generic_down {
-        set_bytes(&encoder, 9, down_type);
-    }
     let down_q3 = *down_type == 11;
-    encoder.dispatch_thread_groups(
-        MTLSize::new(
-            if generic_down {
-                *down_rows
-            } else if down_q3 {
-                down_rows.div_ceil(4)
-            } else {
-                down_rows.div_ceil(8)
-            } as u64,
-            top_k as u64,
-            1,
-        ),
-        MTLSize::new(if generic_down || down_q3 { 64 } else { 256 }, 1, 1),
-    );
-    encoder.memory_barrier_with_resources(&[expert_output.buffer.as_ref()]);
-
-    encoder.set_compute_pipeline_state(&reduce_pipeline);
-    encoder.set_buffer(0, Some(&expert_output.buffer), 0);
-    encoder.set_buffer(1, Some(route_weights), 0);
-    encoder.set_buffer(2, Some(&output.buffer), 0);
-    set_bytes(&encoder, 3, &top_k_u32);
-    set_bytes(&encoder, 4, &hidden);
-    encoder.dispatch_threads(MTLSize::new(*down_rows as u64, 1, 1), MTLSize::new(128, 1, 1));
-    encoder.end_encoding();
-    ctx.commit_and_wait_profiled(
-        &command,
-        "gguf_indexed_experts_f16",
-        &format!("experts={top_k},hidden={down_rows},intermediate={gate_rows},types={gate_type}/{down_type}"),
-        input.buffer.length() + gate_blob.length() + up_blob.length() + down_blob.length(),
-        activated.buffer.length() + expert_output.buffer.length() + output.buffer.length(),
-    );
+    let encode_gate = |encoder: &metal::ComputeCommandEncoderRef, barrier: bool| {
+        encoder.set_compute_pipeline_state(&gate_pipeline);
+        encoder.set_buffer(0, Some(&input.buffer), 0);
+        encoder.set_buffer(1, Some(gate_blob), 0);
+        encoder.set_buffer(2, Some(up_blob), 0);
+        encoder.set_buffer(3, Some(expert_ids), 0);
+        encoder.set_buffer(4, Some(&activated.buffer), 0);
+        encoder.set_buffer(5, Some(&grid), 0);
+        set_bytes(encoder, 6, &columns);
+        set_bytes(encoder, 7, &intermediate);
+        set_bytes(encoder, 8, &gate_row_bytes_u32);
+        set_bytes(encoder, 9, &up_row_bytes_u32);
+        set_bytes(encoder, 10, &gate_expert_bytes_u32);
+        set_bytes(encoder, 11, &up_expert_bytes_u32);
+        set_bytes(encoder, 12, &params.kind);
+        set_bytes(encoder, 13, &params.alpha);
+        set_bytes(encoder, 14, &params.limit);
+        if generic_gate {
+            set_bytes(encoder, 15, gate_type);
+            set_bytes(encoder, 16, up_type);
+        }
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                if generic_gate {
+                    *gate_rows
+                } else if gate_q3 {
+                    gate_rows.div_ceil(4)
+                } else {
+                    gate_rows.div_ceil(8)
+                } as u64,
+                top_k as u64,
+                1,
+            ),
+            MTLSize::new(if generic_gate || gate_q3 { 64 } else { 256 }, 1, 1),
+        );
+        if barrier {
+            encoder.memory_barrier_with_resources(&[activated.buffer.as_ref()]);
+        }
+    };
+    let encode_down = |encoder: &metal::ComputeCommandEncoderRef, barrier: bool| {
+        encoder.set_compute_pipeline_state(&down_pipeline);
+        encoder.set_buffer(0, Some(&activated.buffer), 0);
+        encoder.set_buffer(1, Some(down_blob), 0);
+        encoder.set_buffer(2, Some(expert_ids), 0);
+        encoder.set_buffer(3, Some(&expert_output.buffer), 0);
+        encoder.set_buffer(4, Some(&grid), 0);
+        set_bytes(encoder, 5, &intermediate);
+        set_bytes(encoder, 6, &hidden);
+        set_bytes(encoder, 7, &down_row_bytes_u32);
+        set_bytes(encoder, 8, &down_expert_bytes_u32);
+        if generic_down {
+            set_bytes(encoder, 9, down_type);
+        }
+        encoder.dispatch_thread_groups(
+            MTLSize::new(
+                if generic_down {
+                    *down_rows
+                } else if down_q3 {
+                    down_rows.div_ceil(4)
+                } else {
+                    down_rows.div_ceil(8)
+                } as u64,
+                top_k as u64,
+                1,
+            ),
+            MTLSize::new(if generic_down || down_q3 { 64 } else { 256 }, 1, 1),
+        );
+        if barrier {
+            encoder.memory_barrier_with_resources(&[expert_output.buffer.as_ref()]);
+        }
+    };
+    let encode_reduce = |encoder: &metal::ComputeCommandEncoderRef| {
+        encoder.set_compute_pipeline_state(&reduce_pipeline);
+        encoder.set_buffer(0, Some(&expert_output.buffer), 0);
+        encoder.set_buffer(1, Some(route_weights), 0);
+        encoder.set_buffer(2, Some(&output.buffer), 0);
+        set_bytes(encoder, 3, &top_k_u32);
+        set_bytes(encoder, 4, &hidden);
+        encoder.dispatch_threads(MTLSize::new(*down_rows as u64, 1, 1), MTLSize::new(128, 1, 1));
+    };
+    let gate_read_bytes = input.buffer.length() + ((gate_expert_bytes + up_expert_bytes) * top_k) as u64 + expert_ids.length();
+    let down_read_bytes = activated.buffer.length() + (down_expert_bytes * top_k) as u64 + expert_ids.length();
+    let reduce_read_bytes = expert_output.buffer.length() + route_weights.length();
+    let shape = format!("experts={top_k},hidden={down_rows},intermediate={gate_rows},types={gate_type}/{down_type}");
+    if ctx.detailed_gpu_profiles_enabled() {
+        for (operator, read_bytes, write_bytes, encode) in [
+            (gate_pipeline_name, gate_read_bytes, activated.buffer.length(), 0_u8),
+            (down_pipeline_name, down_read_bytes, expert_output.buffer.length(), 1_u8),
+            ("gguf_indexed_experts_reduce_f16", reduce_read_bytes, output.buffer.length(), 2_u8),
+        ] {
+            let command = ctx.command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            match encode {
+                0 => encode_gate(&encoder, false),
+                1 => encode_down(&encoder, false),
+                _ => encode_reduce(&encoder),
+            }
+            encoder.end_encoding();
+            ctx.commit_and_wait_profiled(&command, operator, &shape, read_bytes, write_bytes);
+            ctx.submit_batch();
+        }
+    } else {
+        let command = ctx.command_buffer();
+        let encoder = command.new_compute_command_encoder();
+        encode_gate(&encoder, true);
+        encode_down(&encoder, true);
+        encode_reduce(&encoder);
+        encoder.end_encoding();
+        ctx.commit_and_wait_profiled(&command, "gguf_indexed_experts_f16", &shape, gate_read_bytes + down_read_bytes + reduce_read_bytes, activated.buffer.length() + expert_output.buffer.length() + output.buffer.length());
+    }
     Ok(output)
 }
 

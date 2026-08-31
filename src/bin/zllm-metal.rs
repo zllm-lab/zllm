@@ -360,7 +360,7 @@ mod run {
                     weights_directory: plan.weights_directory.clone(),
                     lm_head_quantization: Default::default(),
                     max_sequence_length: plan.max_seq_len,
-                    execution: Gemma4ExecutionConfig { mtp_weights, replay: true, ..Default::default() },
+                    execution: Gemma4ExecutionConfig { mtp_weights, ..Default::default() },
                 })
             }
             DetectedModel::Qwen36 { variant, .. } => NodeModelConfig::Qwen36(Qwen36NodeModelConfig {
@@ -411,7 +411,7 @@ mod run {
     }
 
     fn load_with_retry(plan: &mut Plan) -> Result<Engine, String> {
-        let backend = NodeBackendConfig::Metal(NodeMetalBackendConfig { device: "default".to_owned() });
+        let backend = NodeBackendConfig::Metal(NodeMetalBackendConfig { device: "default".to_owned(), replay: true });
         let cache_directory = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(".cache").join("zllm").join("zllm-metal");
         let session = SessionConfig { cache_directory, persist_kv_cache: false, resident_cache_entries: 1 };
         loop {

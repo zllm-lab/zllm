@@ -8,6 +8,10 @@
 pub const SHADERS: &str = r#"
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
+#if __METAL_VERSION__ >= 400
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#endif
 using namespace metal;
 
 constant uint zllm_fc_u32_0 [[function_constant(0)]];

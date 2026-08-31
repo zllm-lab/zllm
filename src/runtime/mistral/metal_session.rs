@@ -28,11 +28,11 @@ pub struct MistralMetalSession {
 }
 
 impl MistralMetalSession {
-    pub fn load(model_path: &Path, max_seq_len: usize, kv_f16: bool, lm_head_quantization: crate::weight::LmHeadQuantization) -> Result<Self, String> {
+    pub fn load_with_replay(model_path: &Path, max_seq_len: usize, kv_f16: bool, replay_enabled: bool, lm_head_quantization: crate::weight::LmHeadQuantization) -> Result<Self, String> {
         let weights = Arc::new(MistralWeights::open(model_path).map_err(|error| format!("Mistral GGUF 打开失败: {error}"))?);
         let config = *weights.config();
         crate::runtime::validate_max_sequence_length("Mistral", max_seq_len, config.max_position_embeddings)?;
-        let context = MetalContext::new_default().map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
+        let context = MetalContext::new_default_with_replay(replay_enabled).map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
         // 层与 output head 都在加载期 prepare；decode 不得逐 token 重读 GGUF/上传权重。
         let layers = mistral::prepare_mistral_layers(&context, weights.as_ref()).map_err(|error| format!("准备 Mistral layers: {error:?}"))?;
         let output_head = mistral::prepare_mistral_output_head_quantized(&context, &config, weights.as_ref(), lm_head_quantization).map_err(|error| format!("准备 Mistral output head: {error:?}"))?;

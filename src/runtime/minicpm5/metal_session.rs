@@ -61,11 +61,16 @@ pub struct MiniCpm5MetalSession {
 }
 
 impl MiniCpm5MetalSession {
+    #[cfg(test)]
     pub fn load(model_path: &Path, max_seq_len: usize, kv_f16: bool, lm_head_quantization: crate::weight::LmHeadQuantization) -> Result<Self, String> {
+        Self::load_with_replay(model_path, max_seq_len, kv_f16, true, lm_head_quantization)
+    }
+
+    pub fn load_with_replay(model_path: &Path, max_seq_len: usize, kv_f16: bool, replay_enabled: bool, lm_head_quantization: crate::weight::LmHeadQuantization) -> Result<Self, String> {
         let weights = Arc::new(MiniCpm5Weights::open(model_path).map_err(|error| format!("MiniCPM5 GGUF 打开失败: {error}"))?);
         let config = *weights.config();
         crate::runtime::validate_max_sequence_length("MiniCPM5", max_seq_len, config.max_position_embeddings)?;
-        let context = MetalContext::new_default().map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
+        let context = MetalContext::new_default_with_replay(replay_enabled).map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
         let output_head = minicpm5::prepare_minicpm5_output_head_quantized(&context, &config, weights.as_ref(), lm_head_quantization).map_err(|error| format!("准备 MiniCPM5 output head: {error:?}"))?;
         let layers = minicpm5::prepare_minicpm5_layers(&context, weights.as_ref()).map_err(|error| format!("准备 MiniCPM5 层权重: {error:?}"))?;
         let tokenizer = weights.tokenizer().map_err(|error| format!("MiniCPM5 tokenizer: {error}"))?;

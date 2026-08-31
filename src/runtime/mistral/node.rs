@@ -6,15 +6,15 @@
 
 #[cfg(target_os = "macos")]
 use crate::runtime::session::{FixedSessionResidency, GenerationSummary};
+#[cfg(not(target_os = "macos"))]
+use crate::{config::MistralNodeModelConfig, server::node::DynError};
 #[cfg(target_os = "macos")]
 use crate::{
-    config::MistralNodeModelConfig,
+    config::{MistralNodeModelConfig, NodeMetalBackendConfig},
     kv_cache::terminal_cache::TerminalInfo as CacheInfo,
     runtime::session::{AtomicCounterU64, NodeCapabilities, RuntimeStatus as NodeRuntime},
     server::node::{DynError, NodeEngine},
 };
-#[cfg(not(target_os = "macos"))]
-use crate::{config::MistralNodeModelConfig, server::node::DynError};
 #[cfg(target_os = "macos")]
 use serde_json::Value;
 #[cfg(target_os = "macos")]
@@ -38,17 +38,17 @@ use crate::{
 };
 
 #[cfg(target_os = "macos")]
-pub async fn run(model: MistralNodeModelConfig, config: crate::server::node::NodeConfig) -> Result<(), DynError> {
+pub async fn run(model: MistralNodeModelConfig, backend: NodeMetalBackendConfig, config: crate::server::node::NodeConfig) -> Result<(), DynError> {
     let model_path = model.weights_directory;
     let max_seq_len = model.max_sequence_length;
     let kv_f16 = model.execution.kv_cache_format == crate::config::KvCacheFormat::F16;
     let lm_head_quantization = model.lm_head_quantization;
-    let factory = Box::new(move |runtime, compute_steps| MistralEngine::load(&model_path, max_seq_len, kv_f16, lm_head_quantization, runtime, compute_steps).map(|engine| Box::new(engine) as Box<dyn NodeEngine>));
+    let factory = Box::new(move |runtime, compute_steps| MistralEngine::load(&model_path, max_seq_len, kv_f16, backend.replay, lm_head_quantization, runtime, compute_steps).map(|engine| Box::new(engine) as Box<dyn NodeEngine>));
     crate::server::node::run_node(config, factory).await
 }
 
 #[cfg(not(target_os = "macos"))]
-pub async fn run(_model: MistralNodeModelConfig, _config: crate::server::node::NodeConfig) -> Result<(), DynError> {
+pub async fn run(_model: MistralNodeModelConfig, _backend: crate::config::NodeMetalBackendConfig, _config: crate::server::node::NodeConfig) -> Result<(), DynError> {
     Err("Mistral Metal Node 需要 macOS".into())
 }
 
@@ -70,8 +70,16 @@ pub struct MistralEngine {
 
 #[cfg(target_os = "macos")]
 impl MistralEngine {
-    pub fn load(model_path: &Path, max_seq_len: usize, kv_f16: bool, lm_head_quantization: crate::weight::LmHeadQuantization, runtime: Arc<Mutex<NodeRuntime>>, compute_steps: Arc<AtomicCounterU64>) -> Result<Self, DynError> {
-        let session = MistralMetalSession::load(model_path, max_seq_len, kv_f16, lm_head_quantization).map_err(|error| -> DynError { error.into() })?;
+    pub fn load(
+        model_path: &Path,
+        max_seq_len: usize,
+        kv_f16: bool,
+        replay_enabled: bool,
+        lm_head_quantization: crate::weight::LmHeadQuantization,
+        runtime: Arc<Mutex<NodeRuntime>>,
+        compute_steps: Arc<AtomicCounterU64>,
+    ) -> Result<Self, DynError> {
+        let session = MistralMetalSession::load_with_replay(model_path, max_seq_len, kv_f16, replay_enabled, lm_head_quantization).map_err(|error| -> DynError { error.into() })?;
         let session_resident_bytes = session.session_residency_bytes().map_err(|error| -> DynError { error.into() })?;
         let available = crate::backend::metal::available_residency_bytes(session.context()) as usize;
         let engine_resident_bytes = session.context().device.current_allocated_size() as usize;

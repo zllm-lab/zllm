@@ -42,6 +42,8 @@ where
     pub experts: Arc<Mutex<B::PrefillExperts>>,
     pub cache: B::Cache,
     pub dsa: B::DsaState,
+    /// 只描述该 session 在当前物理 stage 是否已经进入 decode；不持久化。
+    pub decode_active: bool,
     pub hidden_projectors: Vec<Arc<dyn Glm52HiddenProjector<B> + Send + Sync>>,
 }
 
@@ -57,6 +59,7 @@ where
             experts: self.experts.clone(),
             cache: self.backend.new_stage_cache(cfg.layer_count, max_seq_len)?,
             dsa: self.backend.new_stage_dsa(cfg.layer_count, max_seq_len, cfg.index_head_dim, cfg.index_top_k)?,
+            decode_active: false,
             hidden_projectors: self.hidden_projectors.clone(),
         })
     }
@@ -64,6 +67,7 @@ where
     pub fn reset_session(&mut self, cfg: &Glm52Config, max_seq_len: usize) -> Result<(), BackendError> {
         self.cache = self.backend.new_stage_cache(cfg.layer_count, max_seq_len)?;
         self.dsa = self.backend.new_stage_dsa(cfg.layer_count, max_seq_len, cfg.index_head_dim, cfg.index_top_k)?;
+        self.decode_active = false;
         Ok(())
     }
 
@@ -104,6 +108,7 @@ where
         states.push(Glm52StageState {
             cache: backend.new_stage_cache(cfg.layer_count, max_seq_len)?,
             dsa: backend.new_stage_dsa(cfg.layer_count, max_seq_len, cfg.index_head_dim, cfg.index_top_k)?,
+            decode_active: false,
             hidden_projectors: Vec::new(),
             backend,
             layer_start: current_start,
@@ -435,6 +440,12 @@ where
     let total_started = diagnose.then(Instant::now);
     let position_min = batch.iter().map(|(_, position, _)| *position).min().unwrap_or(0);
     let position_max = batch.iter().map(|(_, position, _)| *position).max().unwrap_or(0);
+    for (session, _, value) in &batch {
+        if let Some(state) = states.get_mut(*session).and_then(Option::as_mut) {
+            state.decode_active = value.decode || value.verify;
+        }
+    }
+    let decode_parallelism = states.iter().filter(|state| state.as_ref().is_some_and(|state| state.decode_active)).count().max(1);
     let sessions = batch.iter().map(|(session, _, _)| *session).collect::<Vec<_>>();
     let mut compact = Vec::with_capacity(sessions.len());
     for &session in &sessions {
@@ -451,6 +462,9 @@ where
             return Err(BackendError::Compute { msg: format!("GLM dynamic stage session={session} 尚未 Open") });
         };
         compact.push(state);
+    }
+    for state in &mut compact {
+        state.backend.set_stage_decode_parallelism(&mut state.dsa, decode_parallelism);
     }
     let take_micros = total_started.map_or(0, |started| started.elapsed().as_micros());
     let move_started = diagnose.then(Instant::now);

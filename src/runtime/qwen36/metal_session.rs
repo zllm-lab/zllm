@@ -159,6 +159,7 @@ impl Qwen36MetalSession {
         mtp_draft_vocabulary: Option<&Path>,
         dspark_directory: Option<&Path>,
         dspark_draft_tokens: usize,
+        replay_enabled: bool,
         lm_head_quantization: crate::weight::LmHeadQuantization,
     ) -> Result<Self, String> {
         let mut cfg = Qwen36Config::standard_27b();
@@ -204,7 +205,7 @@ impl Qwen36MetalSession {
             Qwen36NodeWeights::Gguf(weights) => (weights.bpe_tokenizer()?, weights.bpe_detokenizer()?),
             Qwen36NodeWeights::Mlx { .. } => crate::tokenizer::load_bpe_directory(model_path).map_err(|error| format!("加载 Qwen3.6 tokenizer: {error}"))?,
         };
-        let context = Arc::new(MetalContext::new_default().map_err(|error| format!("MetalContext 初始化失败: {error}"))?);
+        let context = Arc::new(MetalContext::new_default_with_replay(replay_enabled).map_err(|error| format!("MetalContext 初始化失败: {error}"))?);
         // 诊断模式:批折叠降到 1 op/command,拿 per-kernel 真实耗时(decode 会显著变慢)
         if std::env::var_os("ZLLM_QWEN36_PROFILE").is_some() {
             context.set_decode_batch_max_operations(1);

@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 pub struct RocmOptions {
     pub(crate) kernel_sync: bool,
     pub(crate) kernel_profile: bool,
+    pub(crate) decode_graph: bool,
     pub(crate) generic_full_attention: bool,
     pub(crate) native_full_attention_kv: bool,
     pub(crate) precise_router: bool,
@@ -23,6 +24,9 @@ pub struct RocmOptions {
     pub(crate) native_dsa_wmma: bool,
     pub(crate) dsa_hadamard_i8: bool,
     pub(crate) dsa_hadamard_shadow_samples: usize,
+    pub(crate) dsa_hisa_shadow_samples: usize,
+    pub(crate) dsa_cpu_select: bool,
+    pub(crate) mla_cpu_hot_rows: usize,
     pub(crate) debug_dsa_sync: bool,
     pub(crate) debug_selection: bool,
     pub(crate) debug_finite: bool,
@@ -63,6 +67,7 @@ impl Default for RocmOptions {
         Self {
             kernel_sync: false,
             kernel_profile: false,
+            decode_graph: false,
             generic_full_attention: false,
             native_full_attention_kv: true,
             precise_router: true,
@@ -77,6 +82,9 @@ impl Default for RocmOptions {
             native_dsa_wmma: true,
             dsa_hadamard_i8: false,
             dsa_hadamard_shadow_samples: 0,
+            dsa_hisa_shadow_samples: 0,
+            dsa_cpu_select: false,
+            mla_cpu_hot_rows: 0,
             debug_dsa_sync: false,
             debug_selection: false,
             debug_finite: false,
@@ -118,6 +126,7 @@ impl RocmOptions {
     pub fn configured(
         kernel_sync: bool,
         kernel_profile: bool,
+        decode_graph: bool,
         memory_pool: bool,
         grouped_down_route_buffer: bool,
         rocm_root: String,
@@ -126,11 +135,15 @@ impl RocmOptions {
         mla_decode_split_threshold: usize,
         dsa_hadamard_i8: bool,
         dsa_hadamard_shadow_samples: usize,
+        dsa_hisa_shadow_samples: usize,
+        dsa_cpu_select: bool,
+        mla_cpu_hot_rows: usize,
         precise_router: bool,
     ) -> Self {
         Self {
             kernel_sync,
             kernel_profile,
+            decode_graph,
             memory_pool,
             grouped_down_route_buffer,
             rocm_root,
@@ -141,6 +154,9 @@ impl RocmOptions {
             dsa_hadamard_i8,
             // shadow 会同步下载整行 exact/coarse score，只允许显式 profile 使用。
             dsa_hadamard_shadow_samples: if kernel_profile { dsa_hadamard_shadow_samples } else { 0 },
+            dsa_hisa_shadow_samples: if kernel_profile { dsa_hisa_shadow_samples } else { 0 },
+            dsa_cpu_select,
+            mla_cpu_hot_rows,
             precise_router,
             ..Self::default()
         }

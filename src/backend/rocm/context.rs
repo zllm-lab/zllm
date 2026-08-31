@@ -155,6 +155,10 @@ impl crate::backend::DsaStageBackend for RocmContext {
         RocmDsaState::new(layer_count, max_seq_len, head_dim, top_k).map_err(compute_error)
     }
 
+    fn set_stage_decode_parallelism(&self, dsa: &mut Self::DsaState, sessions: usize) {
+        dsa.decode_parallelism = sessions.max(1);
+    }
+
     fn truncate_stage_state(&self, cache: &mut Self::Cache, dsa: &mut Self::DsaState, rows: usize) -> Result<(), BackendError> {
         cache.truncate_rows(rows)?;
         dsa.truncate_rows(rows)

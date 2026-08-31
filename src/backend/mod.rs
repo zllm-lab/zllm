@@ -190,6 +190,11 @@ pub trait DsaStageBackend: DsaPrefillBackend + StageTensorBackend {
 
     fn new_stage_cache(&self, layer_count: usize, max_seq_len: usize) -> Result<Self::Cache, BackendError>;
     fn new_stage_dsa(&self, layer_count: usize, max_seq_len: usize, head_dim: usize, top_k: usize) -> Result<Self::DsaState, BackendError>;
+    /// 告知当前设备 stage 已进入 decode 的 session 数量。后端只能把它作为
+    /// 不改变数学语义的 dispatch hint；默认实现保持原路径。
+    fn set_stage_decode_parallelism(&self, dsa: &mut Self::DsaState, sessions: usize) {
+        let _ = (dsa, sessions);
+    }
     /// 在下一份工作开始前原地回退 session 的逻辑长度；已分配设备页保持不变。
     fn truncate_stage_state(&self, cache: &mut Self::Cache, dsa: &mut Self::DsaState, rows: usize) -> Result<(), BackendError>;
     fn stage_cache_allocated_bytes(&self, cache: &Self::Cache, dsa: &Self::DsaState) -> u64;
@@ -1006,6 +1011,15 @@ pub trait DecodeBackend: Backend {
         Err(BackendError::Compute { msg: "backend 未实现 kpool 打包追加".to_owned() })
     }
     fn dsa_select_topk(&self, state: &mut Self::DsaState, layer: usize, query: &Self::Tensor, head_weights: &Self::Tensor, spec: &DsaSpec) -> Result<(), BackendError>;
+    /// selection 与后续独立设备工作重叠的入口。默认后端保持同步语义；只有真正
+    /// 拥有异步 CPU/device 实现的 backend 才需要覆盖 begin/finish。
+    fn dsa_select_topk_begin(&self, state: &mut Self::DsaState, layer: usize, query: &Self::Tensor, head_weights: &Self::Tensor, spec: &DsaSpec) -> Result<(), BackendError> {
+        self.dsa_select_topk(state, layer, query, head_weights, spec)
+    }
+    /// 在 selected attention 消费 selection 前退休 begin 提交的工作。
+    fn dsa_select_topk_finish(&self, _state: &mut Self::DsaState) -> Result<(), BackendError> {
+        Ok(())
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn mla_decode_attention_selected(&self, query: &Self::Tensor, cache: &Self::Cache, kv_b: &Self::Weight, layer: usize, position: usize, mla: &MlaSpec, dsa: &DsaSpec, state: &Self::DsaState) -> Result<Self::Tensor, BackendError>;

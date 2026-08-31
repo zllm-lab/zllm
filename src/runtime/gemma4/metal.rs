@@ -60,7 +60,7 @@ pub fn run(
         video_frames.len(),
         audio_samples.len(),
     );
-    let ctx_owner = MetalContext::new_default().map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
+    let ctx_owner = MetalContext::new_default_with_replay(backend.replay).map_err(|error| format!("MetalContext 初始化失败: {error}"))?;
     if let Some(operations) = backend.decode_batch_operations {
         ctx_owner.set_decode_batch_max_operations(operations);
     }
@@ -129,7 +129,7 @@ pub fn run(
     let output_head = prepare_gemma4_metal_output_head(ctx, cfg, &weights, crate::weight::LmHeadQuantization::Native)?;
 
     // 平铺转录重放:整步命令表录制一次,逐 token 重编码执行(诊断/基建路径)
-    if execution.replay {
+    if ctx.replay_enabled() {
         let mut replay = crate::runtime::gemma4::metal_replay::Gemma4DecodeReplay::record(ctx, &mut cache, &model, &layers, &rope, &weights, per_layer_model.as_ref(), &output_head)?;
         eprintln!("[gemma4-replay] commands={}", replay.command_count());
         // 算子消融计时分解:按 (threads, grid) 模式分类,逐级剔除测真实成本。

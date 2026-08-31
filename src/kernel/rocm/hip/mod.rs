@@ -49,6 +49,16 @@ pub(super) fn compute_stream_for(device_id: i32) -> *mut c_void {
     ACTIVE_COMPUTE_STREAMS.with(|streams| streams.borrow().get(&device_id).copied().unwrap_or_default() as *mut c_void)
 }
 
+/// cooperative peer 使用独立队列，避免相邻两个 stage 在同一对物理卡上形成
+/// 双向 stream wait 环，同时允许本卡 stage 与替邻卡执行的 MoE 重叠。
+pub(crate) fn activate_cooperative_peer_stream(owner_device_id: i32, peer_device_id: i32) -> Result<(), String> {
+    let owner_stream = compute_stream_for(owner_device_id) as usize;
+    if owner_stream != 0 && initialized_background_stage_stream(owner_device_id) != Some(owner_stream) {
+        return Err(format!("ROCm cooperative peer 不支持 owner 自定义 stream: device={owner_device_id} stream={owner_stream:#x}"));
+    }
+    activate_compute_stream(peer_device_id, cooperative_peer_stream(peer_device_id)?)
+}
+
 pub(super) fn compute_workspace_key(device_id: i32) -> (i32, usize) {
     let stream = if ACTIVE_DEVICE.get() == device_id { ACTIVE_COMPUTE_STREAM.get() } else { compute_stream_for(device_id) as usize };
     (device_id, stream)
@@ -58,7 +68,6 @@ mod device_buffer;
 mod device_profile;
 #[allow(dead_code)] // 动态 HIP 表覆盖诊断与 graph API，调用点按已启用能力逐步接入。
 mod ffi;
-#[allow(dead_code)] // HIP graph 实验实现尚未接入生产调度，保留作为后续录制路径。
 mod graph;
 mod hiprtc;
 mod options;
@@ -66,7 +75,7 @@ mod roctx;
 
 pub(crate) use peer_copy::try_peer_copy_kernel_ordered;
 
-pub(crate) use graph::kernel_launch_trampoline;
+pub(crate) use graph::{StaticGraphRecorder, StaticHipGraph, kernel_launch_trampoline};
 
 mod attention;
 mod attn_res;

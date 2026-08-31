@@ -80,13 +80,14 @@ pub fn load_direct_engine(
                 Err("Gemma4 CUDA console 需要 --features with-cuda".into())
             }
         }
-        (NodeModelConfig::Gemma4(model), NodeBackendConfig::Metal(_)) => {
+        (NodeModelConfig::Gemma4(model), NodeBackendConfig::Metal(metal)) => {
             #[cfg(target_os = "macos")]
             {
                 crate::runtime::gemma4::engine::Gemma4Engine::load(
                     &model.weights_directory,
                     model.max_sequence_length,
                     model.execution,
+                    metal.replay,
                     model.lm_head_quantization,
                     cache_directory,
                     persist_kv_cache,
@@ -98,11 +99,11 @@ pub fn load_direct_engine(
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (model, cache_directory, persist_kv_cache, resident_cache_entries, runtime, compute_steps);
+                let _ = (model, metal, cache_directory, persist_kv_cache, resident_cache_entries, runtime, compute_steps);
                 Err("Gemma4 Metal console 只支持 macOS".into())
             }
         }
-        (NodeModelConfig::Qwen36(model), NodeBackendConfig::Metal(_)) => {
+        (NodeModelConfig::Qwen36(model), NodeBackendConfig::Metal(metal)) => {
             #[cfg(target_os = "macos")]
             {
                 crate::runtime::qwen36::engine::Qwen36Engine::load(
@@ -110,6 +111,7 @@ pub fn load_direct_engine(
                     model.max_sequence_length,
                     model.variant,
                     model.execution,
+                    metal.replay,
                     model.lm_head_quantization,
                     cache_directory,
                     persist_kv_cache,
@@ -121,29 +123,38 @@ pub fn load_direct_engine(
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (model, cache_directory, persist_kv_cache, resident_cache_entries, runtime, compute_steps);
+                let _ = (model, metal, cache_directory, persist_kv_cache, resident_cache_entries, runtime, compute_steps);
                 Err("Qwen Metal console 只支持 macOS".into())
             }
         }
-        (NodeModelConfig::Ornith(model), NodeBackendConfig::Metal(_)) => {
+        (NodeModelConfig::Ornith(model), NodeBackendConfig::Metal(metal)) => {
             #[cfg(target_os = "macos")]
             {
-                crate::runtime::ornith::node::OrnithEngine::load(&model.weights_directory, model.max_sequence_length, crate::runtime::ornith::options::OrnithOptions::from(model.execution), model.lm_head_quantization, runtime, compute_steps)
-                    .map(|engine| Box::new(engine) as Box<dyn crate::server::node::NodeEngine>)
+                crate::runtime::ornith::node::OrnithEngine::load(
+                    &model.weights_directory,
+                    model.max_sequence_length,
+                    crate::runtime::ornith::options::OrnithOptions::from(model.execution),
+                    metal.replay,
+                    model.lm_head_quantization,
+                    runtime,
+                    compute_steps,
+                )
+                .map(|engine| Box::new(engine) as Box<dyn crate::server::node::NodeEngine>)
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (model, runtime, compute_steps);
+                let _ = (model, metal, runtime, compute_steps);
                 Err("Ornith Metal console 只支持 macOS".into())
             }
         }
-        (NodeModelConfig::Mistral(model), NodeBackendConfig::Metal(_)) => {
+        (NodeModelConfig::Mistral(model), NodeBackendConfig::Metal(metal)) => {
             #[cfg(target_os = "macos")]
             {
                 crate::runtime::mistral::node::MistralEngine::load(
                     &model.weights_directory,
                     model.max_sequence_length,
                     model.execution.kv_cache_format == crate::config::KvCacheFormat::F16,
+                    metal.replay,
                     model.lm_head_quantization,
                     runtime,
                     compute_steps,
@@ -152,17 +163,18 @@ pub fn load_direct_engine(
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (model, runtime, compute_steps);
+                let _ = (model, metal, runtime, compute_steps);
                 Err("Mistral Metal console 只支持 macOS".into())
             }
         }
-        (NodeModelConfig::MiniCpm5(model), NodeBackendConfig::Metal(_)) => {
+        (NodeModelConfig::MiniCpm5(model), NodeBackendConfig::Metal(metal)) => {
             #[cfg(target_os = "macos")]
             {
                 crate::runtime::minicpm5::engine::MiniCpm5Engine::load(
                     &model.weights_directory,
                     model.max_sequence_length,
                     model.execution.kv_cache_format == crate::config::KvCacheFormat::F16,
+                    metal.replay,
                     model.lm_head_quantization,
                     runtime,
                     compute_steps,
@@ -171,7 +183,7 @@ pub fn load_direct_engine(
             }
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (model, runtime, compute_steps);
+                let _ = (model, metal, runtime, compute_steps);
                 Err("MiniCPM5 Metal console 只支持 macOS".into())
             }
         }
@@ -220,7 +232,7 @@ pub async fn run(config: NodeProcessConfig) -> Result<(), Box<dyn std::error::Er
 async fn run_parts(model: NodeModelConfig, backend: NodeBackendConfig, node_config: crate::server::node::NodeConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match model {
         NodeModelConfig::Ornith(model) => match backend {
-            NodeBackendConfig::Metal(_) => crate::runtime::ornith::node::run(model, node_config).await,
+            NodeBackendConfig::Metal(metal) => crate::runtime::ornith::node::run(model, metal, node_config).await,
             NodeBackendConfig::Cpu(_) => unreachable!("配置校验已保证 Ornith 不使用 CPU"),
             NodeBackendConfig::Cuda(cuda) => {
                 #[cfg(feature = "with-cuda")]
@@ -246,14 +258,14 @@ async fn run_parts(model: NodeModelConfig, backend: NodeBackendConfig, node_conf
             }
         },
         NodeModelConfig::Gemma4(model) => match backend {
-            NodeBackendConfig::Metal(_) => {
+            NodeBackendConfig::Metal(metal) => {
                 #[cfg(target_os = "macos")]
                 {
-                    crate::runtime::gemma4::node::run(model, node_config).await
+                    crate::runtime::gemma4::node::run(model, metal, node_config).await
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = (model, node_config);
+                    let _ = (model, metal, node_config);
                     Err("Gemma 4 Metal Node 需要 macOS".into())
                 }
             }
@@ -271,14 +283,14 @@ async fn run_parts(model: NodeModelConfig, backend: NodeBackendConfig, node_conf
             _ => unreachable!("配置校验已保证 Gemma 4 使用 Metal/CUDA"),
         },
         NodeModelConfig::Qwen36(model) => match backend {
-            NodeBackendConfig::Metal(_) => {
+            NodeBackendConfig::Metal(metal) => {
                 #[cfg(target_os = "macos")]
                 {
-                    crate::runtime::qwen36::node::run(model, node_config).await
+                    crate::runtime::qwen36::node::run(model, metal, node_config).await
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
-                    let _ = (model, node_config);
+                    let _ = (model, metal, node_config);
                     Err("Qwen3.6/Qwen3.8 Metal Node 需要 macOS".into())
                 }
             }
@@ -345,7 +357,7 @@ async fn run_parts(model: NodeModelConfig, backend: NodeBackendConfig, node_conf
             }
         }
         NodeModelConfig::Mistral(model) => match backend {
-            NodeBackendConfig::Metal(_) => crate::runtime::mistral::node::run(model, node_config).await,
+            NodeBackendConfig::Metal(metal) => crate::runtime::mistral::node::run(model, metal, node_config).await,
             NodeBackendConfig::Cuda(cuda) => {
                 #[cfg(feature = "with-cuda")]
                 {
@@ -360,7 +372,7 @@ async fn run_parts(model: NodeModelConfig, backend: NodeBackendConfig, node_conf
             _ => unreachable!("配置校验已保证 Mistral 使用 Metal/CUDA"),
         },
         NodeModelConfig::MiniCpm5(model) => match backend {
-            NodeBackendConfig::Metal(_) => crate::runtime::minicpm5::node::run(model, node_config).await,
+            NodeBackendConfig::Metal(metal) => crate::runtime::minicpm5::node::run(model, metal, node_config).await,
             NodeBackendConfig::Cpu(_) => crate::runtime::minicpm5::cpu_node::run(model, node_config).await,
             _ => unreachable!("配置校验已保证 MiniCPM5 使用 Metal/CPU"),
         },

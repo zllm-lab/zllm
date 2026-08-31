@@ -355,6 +355,47 @@ mod gguf_fused_gemm_tests {
             }
         }
     }
+
+    #[test]
+    fn iq4nl_fused_gemm_matches_dequantized_matmul() {
+        let ctx = MetalContext::new_default().unwrap();
+        let m = 8;
+        let columns = 512;
+        let n_rows = 12;
+        let row_bytes = 288; // 512 / 32 * 18
+        let input_values: Vec<f32> = (0..(m * columns)).map(|i| ((i as f32 * 0.0037) + 0.11).sin()).collect();
+        let rounded_input: Vec<f32> = input_values.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+        let input = ctx.tensor_from_f32(&input_values, m, columns).unwrap();
+        let mut weights = vec![0u8; n_rows * row_bytes];
+        for row in 0..n_rows {
+            for block in 0..columns / 32 {
+                let offset = row * row_bytes + block * 18;
+                weights[offset..offset + 2].copy_from_slice(&f16::from_f32(0.015625 + row as f32 * 0.0009765625).to_bits().to_le_bytes());
+                for (index, value) in weights[offset + 2..offset + 18].iter_mut().enumerate() {
+                    *value = index.wrapping_mul(29).wrapping_add(row * 11).wrapping_add(block * 7) as u8;
+                }
+            }
+        }
+        let blob = ctx.resident_byte_weight_buffer(&weights);
+        let actual = gguf_matmul_tensor_resident(&ctx, &input, &blob, 20, row_bytes, n_rows, columns).unwrap();
+        let actual_flat = ctx.tensor_to_f32(&actual);
+        let decoded = crate::weight::codec::ggml::dequantize(20, &weights, n_rows * columns).unwrap();
+        let mut error_squared = 0.0f32;
+        let mut reference_squared = 0.0f32;
+        let mut max_error = 0.0f32;
+        for mi in 0..m {
+            for ni in 0..n_rows {
+                let expected: f32 = (0..columns).map(|k| decoded[ni * columns + k] * rounded_input[mi * columns + k]).sum();
+                let actual_val = actual_flat[mi * n_rows + ni];
+                let err = (actual_val - expected).abs();
+                error_squared += err * err;
+                reference_squared += expected * expected;
+                max_error = max_error.max(err);
+                assert!(err <= 0.05 + expected.abs() * 0.01, "fused iq4nl m={mi} n={ni} actual={actual_val} expected={expected} err={err}");
+            }
+        }
+        println!("[iq4nl-oracle] rel_l2={} max_error={max_error}", (error_squared / reference_squared).sqrt());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -681,13 +722,20 @@ mod gguf_quant_tests {
         let route_buffer = ctx.shared_buffer(as_bytes(&route_weights));
 
         for tensor_type in [8, 11, 12, 13, 14, 17, 18, 21, 22, 23, 30, 39] {
-            let columns = if matches!(tensor_type, 8 | 30 | 39) { 32 } else { 256 };
+            let columns = if matches!(tensor_type, 8 | 30 | 39) {
+                32
+            } else if tensor_type == 11 {
+                512
+            } else {
+                256
+            };
             let rows = columns;
             let input_values = (0..columns).map(|index| (index as f32 * 0.03125).sin()).collect::<Vec<_>>();
             let input = ctx.tensor_from_f32(&input_values, 1, columns).unwrap();
             let first_block = match tensor_type {
                 30 => bf16_row(columns),
                 39 => mxfp4_row(),
+                11 => [block(tensor_type), block(tensor_type)].concat(),
                 _ => block(tensor_type),
             };
             let mut second_block = first_block.clone();

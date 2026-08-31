@@ -58,6 +58,7 @@ impl Qwen36Engine {
         max_seq_len: usize,
         variant: Qwen36Variant,
         execution: crate::config::Qwen36NodeExecutionConfig,
+        replay_enabled: bool,
         lm_head_quantization: crate::weight::LmHeadQuantization,
         cache_directory: PathBuf,
         persist_kv_cache: bool,
@@ -78,6 +79,7 @@ impl Qwen36Engine {
             execution.mtp_draft_vocabulary.as_deref(),
             execution.dspark_directory.as_deref(),
             execution.dspark_draft_tokens,
+            replay_enabled,
             lm_head_quantization,
         )
         .map_err(|error| -> DynError { error.into() })?;

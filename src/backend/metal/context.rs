@@ -15,7 +15,8 @@ use half::{bf16, f16};
 
 /// decode 路径每个 command buffer 的算子上限(经验值,稳态下 GPU 利用率最高)。
 pub(super) const DECODE_BATCH_MAX_OPERATIONS: u64 = 16;
-/// prefill 路径每个 command buffer 的算子上限(经验值)。
+/// prefill 路径每个 command buffer 的算子上限。过大会延长大 activation
+/// 生命周期并导致 UMA 压力；真机完整 Gemma4 prefill 以 8 为当前最优点。
 pub(super) const PREFILL_BATCH_MAX_OPERATIONS: u64 = 8;
 
 #[link(name = "QuartzCore", kind = "framework")]
@@ -105,10 +106,14 @@ pub struct MetalContext {
     submit_wait_nanoseconds: AtomicU64,
     gpu_nanoseconds: AtomicU64,
     inter_command_gap_nanoseconds: AtomicU64,
+    last_profile_gpu_end_bits: AtomicU64,
     completion_tail_nanoseconds: AtomicU64,
     command_buffers: AtomicU64,
     detailed_gpu_profiles: AtomicBool,
     gpu_profiles: Mutex<HashMap<(String, String), MetalGpuProfileCounter>>,
+    metal4: bool,
+    /// backend 级执行策略：Metal 默认开启静态命令重放。
+    replay_enabled: bool,
 }
 
 /// 常驻 GPU 的 decode RoPE 全表 F16(cos/sin 各一份)。按 CPU 源表的
@@ -176,14 +181,34 @@ struct DecodeCommandBatch {
 
 impl MetalContext {
     pub fn new(kernel_source: &str) -> Result<Self, String> {
+        Self::new_with_replay(kernel_source, true)
+    }
+
+    pub fn new_with_replay(kernel_source: &str, replay_enabled: bool) -> Result<Self, String> {
         let device = Device::system_default().ok_or_else(|| "Metal device not found".to_owned())?;
-        let library = device.new_library_with_source(kernel_source, &CompileOptions::new()).map_err(|e| format!("编译 Metal library: {e}"))?;
+        // Metal 4 cooperative tensor 在新设备上显著加速量化 prefill；旧系统或
+        // 旧 GPU 编译失败时仍用同一源码的 MSL 默认版本，保留传统 kernel。
+        let (library, metal4_source) = match device.new_library_with_source(kernel_source, &CompileOptions::metal4()) {
+            Ok(library) => (library, true),
+            Err(_) => (device.new_library_with_source(kernel_source, &CompileOptions::new()).map_err(|e| format!("编译 Metal library: {e}"))?, false),
+        };
+        let mut pipelines = HashMap::new();
+        // MSL 4 能编译不代表当前 GPU 支持 cooperative tensor。预建一次 PSO，
+        // 只有 function 与 pipeline 都成功才开放快路径，否则继续用旧 fused kernel。
+        let metal4 = if metal4_source {
+            library.get_function("gguf_gemm_iq4nl_mpp_f16", None).ok().and_then(|function| device.new_compute_pipeline_state_icb(&function).ok()).is_some_and(|pipeline| {
+                pipelines.insert("gguf_gemm_iq4nl_mpp_f16".to_owned(), pipeline);
+                true
+            })
+        } else {
+            false
+        };
         let queue = device.new_command_queue();
         Ok(Self {
             device,
             queue,
             library,
-            pipelines: Mutex::new(HashMap::new()),
+            pipelines: Mutex::new(pipelines),
             defer_waits: AtomicBool::new(false),
             defer_layer_scope_sync: AtomicBool::new(false),
             decode_batch_max_operations: AtomicU64::new(DECODE_BATCH_MAX_OPERATIONS),
@@ -204,15 +229,30 @@ impl MetalContext {
             submit_wait_nanoseconds: AtomicU64::new(0),
             gpu_nanoseconds: AtomicU64::new(0),
             inter_command_gap_nanoseconds: AtomicU64::new(0),
+            last_profile_gpu_end_bits: AtomicU64::new(0),
             completion_tail_nanoseconds: AtomicU64::new(0),
             command_buffers: AtomicU64::new(0),
             detailed_gpu_profiles: AtomicBool::new(false),
             gpu_profiles: Mutex::new(HashMap::new()),
+            metal4,
+            replay_enabled,
         })
     }
 
     pub fn new_default() -> Result<Self, String> {
-        Self::new(crate::kernel::metal::kernels_source())
+        Self::new_default_with_replay(true)
+    }
+
+    pub fn new_default_with_replay(replay_enabled: bool) -> Result<Self, String> {
+        Self::new_with_replay(crate::kernel::metal::kernels_source(), replay_enabled)
+    }
+
+    pub fn replay_enabled(&self) -> bool {
+        self.replay_enabled
+    }
+
+    pub(crate) fn metal4_available(&self) -> bool {
+        self.metal4
     }
 
     /// 拿(按需缓存)kernel function 的 pipeline state。统一走 descriptor 路径并打开
@@ -506,6 +546,11 @@ impl MetalContext {
         MetalTensor::new_bf16(self.cached_zero_buffer(tag, checked_tensor_bytes(rows, cols, mem::size_of::<bf16>())), rows, cols)
     }
 
+    /// 池化的 F32 workspace；同一 queue 上按“写入→消费→下次写入”顺序复用。
+    pub(crate) fn tensor_pooled_f32(&self, tag: &'static str, rows: usize, cols: usize) -> MetalTensor {
+        MetalTensor::new_f32(self.cached_zero_buffer(tag, checked_tensor_bytes(rows, cols, mem::size_of::<f32>())), rows, cols)
+    }
+
     /// 池化且按槽位区分的 F16 kernel 输出:同尺寸的多个切片需要同时存活时使用。
     pub fn tensor_pooled_slot(&self, tag: &'static str, slot: usize, rows: usize, cols: usize) -> MetalTensor {
         MetalTensor::new(self.cached_zero_buffer_slot(tag, slot, checked_tensor_bytes(rows, cols, mem::size_of::<f16>())), rows, cols)
@@ -564,6 +609,13 @@ impl MetalContext {
             return;
         }
         self.f16_casts.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert((source, input.len()), (input.buffer.clone(), output.clone()));
+    }
+
+    pub(crate) fn invalidate_f16_cast(&self, input: &MetalTensor) {
+        let source = input.buffer.contents() as usize;
+        if source != 0 {
+            self.f16_casts.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).remove(&(source, input.len()));
+        }
     }
 
     /// 权重级 F32->F16 转换：与 activation cast 不同，权重在会话期不变，
@@ -702,6 +754,16 @@ impl MetalContext {
     }
 
     fn submit_profiled(&self, command: &CommandBufferRef, operator: &str, shape: &str, estimated_read_bytes: u64, estimated_write_bytes: u64) {
+        // queue 按 FIFO 完成。提交新工作前无阻塞地回收队首已完成 CB，及时释放其
+        // activation 保活引用；不能把这些 buffer 一直拖到整段 prefill 末尾。
+        let completed = {
+            let mut pending = self.pending_profiles.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let count = pending.iter().take_while(|profile| profile.command.is_completed()).count();
+            pending.drain(..count).collect::<Vec<_>>()
+        };
+        for profile in completed {
+            self.record_completed(profile);
+        }
         let submitted_host_seconds = metal_host_seconds();
         command.commit();
         self.command_buffers.fetch_add(1, Ordering::Relaxed);
@@ -730,6 +792,12 @@ impl MetalContext {
         let end = pending.command.gpu_end_time();
         let gpu_nanoseconds = if start.is_finite() && end.is_finite() && end >= start { ((end - start) * 1.0e9).round() as u64 } else { 0 };
         self.gpu_nanoseconds.fetch_add(gpu_nanoseconds, Ordering::Relaxed);
+        if gpu_nanoseconds != 0 {
+            let previous = f64::from_bits(self.last_profile_gpu_end_bits.swap(end.to_bits(), Ordering::Relaxed));
+            if previous.is_finite() && previous > 0.0 && start >= previous {
+                self.inter_command_gap_nanoseconds.fetch_add(((start - previous) * 1.0e9).round() as u64, Ordering::Relaxed);
+            }
+        }
         if let (Some(operator), Some(shape)) = (pending.operator, pending.shape) {
             let mut profiles = self.gpu_profiles.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             let profile = profiles.entry((operator, shape)).or_default();
@@ -754,20 +822,8 @@ impl MetalContext {
         if let (Some(first), Some(last)) = (pending.first(), pending.last()) {
             let first_gpu_start = first.command.gpu_start_time();
             let last_gpu_end = last.command.gpu_end_time();
-            let gpu_resident_seconds = pending
-                .iter()
-                .map(|profile| {
-                    let start = profile.command.gpu_start_time();
-                    let end = profile.command.gpu_end_time();
-                    if start.is_finite() && end.is_finite() && end >= start { end - start } else { 0.0 }
-                })
-                .sum::<f64>();
             if first_gpu_start.is_finite() && first_gpu_start >= first.submitted_host_seconds {
                 self.submit_wait_nanoseconds.fetch_add(((first_gpu_start - first.submitted_host_seconds) * 1.0e9).round() as u64, Ordering::Relaxed);
-            }
-            if first_gpu_start.is_finite() && last_gpu_end.is_finite() && last_gpu_end >= first_gpu_start {
-                let inter_command_gap_seconds = (last_gpu_end - first_gpu_start - gpu_resident_seconds).max(0.0);
-                self.inter_command_gap_nanoseconds.fetch_add((inter_command_gap_seconds * 1.0e9).round() as u64, Ordering::Relaxed);
             }
             if last_gpu_end.is_finite() && completed_host_seconds >= last_gpu_end {
                 self.completion_tail_nanoseconds.fetch_add(((completed_host_seconds - last_gpu_end) * 1.0e9).round() as u64, Ordering::Relaxed);
@@ -823,6 +879,7 @@ impl MetalContext {
         self.submit_wait_nanoseconds.store(0, Ordering::Relaxed);
         self.gpu_nanoseconds.store(0, Ordering::Relaxed);
         self.inter_command_gap_nanoseconds.store(0, Ordering::Relaxed);
+        self.last_profile_gpu_end_bits.store(0, Ordering::Relaxed);
         self.completion_tail_nanoseconds.store(0, Ordering::Relaxed);
         self.command_buffers.store(0, Ordering::Relaxed);
         self.gpu_profiles.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();

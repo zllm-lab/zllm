@@ -82,7 +82,6 @@ pub struct Gemma4MetalSession {
     /// config.execution.mtp_weights;None 即纯文本部署不受影响。
     mtp_weights: Option<PathBuf>,
     mtp_draft_tokens: usize,
-    replay_decode: bool,
     /// 视觉塔/投影权重,首个图文请求时惰性加载(safetensors checkpoint 可能不含
     /// vision_embedder 张量,启动期加载会让纯文本部署直接失败)。
     multimodal_model: Option<Gemma4MultimodalModel<MetalWeight>>,
@@ -90,7 +89,15 @@ pub struct Gemma4MetalSession {
 }
 
 impl Gemma4MetalSession {
-    pub fn load(model_path: &Path, max_seq_len: usize, prefill_chunk_size: usize, lm_head_quantization: crate::weight::LmHeadQuantization, mtp_weights: Option<PathBuf>, mtp_draft_tokens: usize, replay_decode: bool) -> Result<Self, String> {
+    pub fn load(
+        model_path: &Path,
+        max_seq_len: usize,
+        prefill_chunk_size: usize,
+        lm_head_quantization: crate::weight::LmHeadQuantization,
+        mtp_weights: Option<PathBuf>,
+        mtp_draft_tokens: usize,
+        replay_enabled: bool,
+    ) -> Result<Self, String> {
         let gguf = Gemma4Weights::is_gguf(model_path);
         let mlx_affine = !gguf && Gemma4Weights::is_mlx_affine(model_path)?;
         let model = Gemma4::new(Gemma4Weights::select_config(model_path)?).map_err(|error| format!("Gemma4 规格无效: {error:?}"))?;
@@ -118,7 +125,7 @@ impl Gemma4MetalSession {
             let detokenizer = Detokenizer::load(&tokenizer_path).map_err(|error| format!("Gemma4 detokenizer: {error}"))?;
             (tokenizer, detokenizer, None)
         };
-        let context = std::sync::Arc::new(MetalContext::new_default().map_err(|error| format!("MetalContext 初始化失败: {error}"))?);
+        let context = std::sync::Arc::new(MetalContext::new_default_with_replay(replay_enabled).map_err(|error| format!("MetalContext 初始化失败: {error}"))?);
         let backend = context.as_ref();
         let rope = Gemma4RopeTables::new(cfg, max_seq_len).map_err(|error| format!("Gemma4 RoPE: {error:?}"))?;
         let layers = prepare_gemma4_layers(backend, &model, &weights).map_err(|error| format!("准备 Gemma4 Metal 层: {error:?}"))?;
@@ -182,7 +189,6 @@ impl Gemma4MetalSession {
             verify_replay: None,
             mtp_weights,
             mtp_draft_tokens,
-            replay_decode,
         })
     }
 
@@ -367,10 +373,10 @@ impl Gemma4MetalSession {
         Ok(())
     }
 
-    /// 双缓冲命令重放是否接管 decode，由 execution.replay 明确决定。
+    /// 双缓冲命令重放是否接管 decode，由 Metal backend 策略决定。
     pub fn replay_decode_available(&self) -> bool {
         let per_layer_ready = self.model.config().per_layer_input_size == 0 || self.per_layer_embedding_source.is_some();
-        self.replay_decode && self.embedding_source.is_some() && per_layer_ready
+        self.context.replay_enabled() && self.embedding_source.is_some() && per_layer_ready
     }
 
     pub fn replay_resources_prepared(&self) -> bool {
@@ -785,20 +791,32 @@ mod tests {
     #[test]
     fn replay_step_timing() {
         let Some(root) = std::env::var_os("ZLLM_GEMMA4_GGUF").map(std::path::PathBuf::from) else { return };
-        let session = Gemma4MetalSession::load(&root, 2048, 2048, crate::weight::LmHeadQuantization::Native, None, 3, false).expect("session load");
-        let mut sequence = session.prefill(session.tokenize("Hello, tell me a story.")).expect("prefill");
+        let prompt = std::env::var_os("ZLLM_GEMMA4_REPLAY_PROMPT_FILE").map(std::path::PathBuf::from).map(|path| std::fs::read_to_string(path).expect("读取 replay prompt")).unwrap_or_else(|| "Hello, tell me a story.".to_owned());
+        let default_max_seq_len = if std::env::var_os("ZLLM_GEMMA4_REPLAY_PROMPT_FILE").is_some() { 8192 } else { 2048 };
+        let max_seq_len = std::env::var("ZLLM_GEMMA4_REPLAY_MAX_SEQ_LEN").ok().and_then(|value| value.parse().ok()).unwrap_or(default_max_seq_len);
+        let session = Gemma4MetalSession::load(&root, max_seq_len, 2048, crate::weight::LmHeadQuantization::Native, None, 3, false).expect("session load");
+        let prompt_tokens = session.tokenize(&prompt);
+        println!("[replay-timing] prompt_tokens={}", prompt_tokens.len());
+        let mut sequence = session.prefill(prompt_tokens).expect("prefill");
+        let mut token = session.first_token(&sequence).expect("first token");
         let record_started = std::time::Instant::now();
         let mut replay =
             crate::runtime::gemma4::metal_replay::Gemma4DecodeReplay::record(session.context(), &mut sequence.cache, &session.model, &session.layers, &session.rope, &session.weights, session.per_layer_model.as_ref(), &session.output_head)
                 .expect("record");
         println!("[replay-timing] record wall={:.3}s commands={}", record_started.elapsed().as_secs_f32(), replay.command_count());
-        let mut token = 5u32;
         let mut position = sequence.tokens.len();
+        let mut trace = vec![token];
+        for _ in 0..7 {
+            token = replay.step(token, position).expect("trace step");
+            position += 1;
+            trace.push(token);
+        }
+        println!("[replay-timing] first_tokens={trace:?}");
         for _ in 0..4 {
             token = replay.step(token, position).expect("warmup step");
             position += 1;
         }
-        let steps = 50usize;
+        let steps = std::env::var("ZLLM_GEMMA4_REPLAY_STEPS").ok().and_then(|value| value.parse().ok()).filter(|value| *value > 0).unwrap_or(50usize);
         let started = std::time::Instant::now();
         for _ in 0..steps {
             token = replay.step(token, position).expect("replay step");
@@ -806,6 +824,9 @@ mod tests {
         }
         let wall = started.elapsed().as_secs_f32();
         println!("[replay-timing] step wall={:.1}ms ({:.1} tok/s) token={token}", wall / steps as f32 * 1.0e3, steps as f32 / wall);
+        if std::env::var_os("ZLLM_GEMMA4_REPLAY_SKIP_ABLATION").is_some() {
+            return;
+        }
         // 消融分档:gemv-only / gemv+attn / full,差分出小算子与 attention 的占比
         type Op = crate::backend::metal::api::RecordedComputeOp;
         let tiers: [(&str, fn(&Op) -> bool); 3] = [("gemv-only", |op: &Op| op.threads.width == 64), ("gemv+attn", |op: &Op| op.threads.width == 64 || (op.threads.width == 256 && op.groups.width > 1)), ("full", |_| true)];

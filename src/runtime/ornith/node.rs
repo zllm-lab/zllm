@@ -7,15 +7,15 @@ use super::protocol::{chat_prompt, chat_prompt_suffix};
 use crate::runtime::session::{BatchTokenGuard, FixedSessionResidency, GenerationOutput, GenerationSummary, parse_stops, terminal_cache_id};
 #[cfg(target_os = "macos")]
 use crate::runtime::tool::{RequestToolCallStream, ToolDialect, emit_request_tool_chunk, finish_request_tool_stream};
+#[cfg(not(target_os = "macos"))]
+use crate::{config::OrnithNodeModelConfig, server::node::DynError};
 #[cfg(target_os = "macos")]
 use crate::{
-    config::OrnithNodeModelConfig,
+    config::{NodeMetalBackendConfig, OrnithNodeModelConfig},
     kv_cache::terminal_cache::TerminalInfo as CacheInfo,
     runtime::session::{AtomicCounterU64, NodeCapabilities, RuntimeStatus as NodeRuntime},
     server::node::{DynError, NodeEngine},
 };
-#[cfg(not(target_os = "macos"))]
-use crate::{config::OrnithNodeModelConfig, server::node::DynError};
 #[cfg(target_os = "macos")]
 use serde_json::Value;
 #[cfg(target_os = "macos")]
@@ -30,16 +30,16 @@ use std::{
 };
 
 #[cfg(target_os = "macos")]
-pub async fn run(model: OrnithNodeModelConfig, config: crate::server::node::NodeConfig) -> Result<(), DynError> {
+pub async fn run(model: OrnithNodeModelConfig, backend: NodeMetalBackendConfig, config: crate::server::node::NodeConfig) -> Result<(), DynError> {
     let model_path = model.weights_directory;
     let max_seq_len = model.max_sequence_length;
     let lm_head_quantization = model.lm_head_quantization;
     let options = OrnithOptions::from(model.execution);
-    let factory = Box::new(move |runtime, compute_steps| OrnithEngine::load(&model_path, max_seq_len, options, lm_head_quantization, runtime, compute_steps).map(|engine| Box::new(engine) as Box<dyn NodeEngine>));
+    let factory = Box::new(move |runtime, compute_steps| OrnithEngine::load(&model_path, max_seq_len, options, backend.replay, lm_head_quantization, runtime, compute_steps).map(|engine| Box::new(engine) as Box<dyn NodeEngine>));
     crate::server::node::run_node(config, factory).await
 }
 #[cfg(not(target_os = "macos"))]
-pub async fn run(_model: OrnithNodeModelConfig, _config: crate::server::node::NodeConfig) -> Result<(), DynError> {
+pub async fn run(_model: OrnithNodeModelConfig, _backend: crate::config::NodeMetalBackendConfig, _config: crate::server::node::NodeConfig) -> Result<(), DynError> {
     Err("Ornith Metal Node 需要 macOS".into())
 }
 #[cfg(target_os = "macos")]
@@ -89,8 +89,16 @@ pub struct OrnithEngine {
 }
 #[cfg(target_os = "macos")]
 impl OrnithEngine {
-    pub fn load(model_path: &Path, max_seq_len: usize, options: OrnithOptions, lm_head_quantization: crate::weight::LmHeadQuantization, runtime: Arc<Mutex<NodeRuntime>>, compute_steps: Arc<AtomicCounterU64>) -> Result<Self, DynError> {
-        let mut session = OrnithMetalSession::load(model_path, max_seq_len, options, lm_head_quantization).map_err(|error| -> DynError { error.into() })?;
+    pub fn load(
+        model_path: &Path,
+        max_seq_len: usize,
+        options: OrnithOptions,
+        replay_enabled: bool,
+        lm_head_quantization: crate::weight::LmHeadQuantization,
+        runtime: Arc<Mutex<NodeRuntime>>,
+        compute_steps: Arc<AtomicCounterU64>,
+    ) -> Result<Self, DynError> {
+        let mut session = OrnithMetalSession::load_with_replay(model_path, max_seq_len, options, replay_enabled, lm_head_quantization).map_err(|error| -> DynError { error.into() })?;
         // 非 lazy expert 是引擎常驻资源；必须在建立 session admission 快照前装载。
         if let Some((experts, bytes)) = session.preload_experts().map_err(|error| -> DynError { error.into() })? {
             eprintln!("[ornith] expert 常驻完成 experts={experts} resident_gib={:.2}", bytes as f64 / (1024.0 * 1024.0 * 1024.0));

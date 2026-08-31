@@ -97,6 +97,29 @@ pub fn verify_samples(target_tokens: &[u32], drafts: &[u32], eos_tokens: &[u32])
     Ok(SpeculativeVerification { accepted_drafts, retained_rows: target_tokens.len(), eos: eos_tokens.contains(&bonus), tokens })
 }
 
+/// 验证推测块的非终局前缀。这里每个 target 输出都对应一个尚未执行的 draft，
+/// 全部命中时不追加 bonus，调用方可以继续提交同一推测块的下一段。
+pub fn verify_samples_prefix(target_tokens: &[u32], drafts: &[u32], eos_tokens: &[u32]) -> Result<SpeculativeVerification, BackendError> {
+    if target_tokens.len() != drafts.len() {
+        return Err(BackendError::Compute { msg: format!("推测前缀验证 shape 非法: target={} drafts={}", target_tokens.len(), drafts.len()) });
+    }
+    let mut tokens = Vec::with_capacity(target_tokens.len());
+    let mut accepted_drafts = 0;
+    for (index, (&target, &draft)) in target_tokens.iter().zip(drafts).enumerate() {
+        let accepted = draft == target;
+        accepted_drafts += usize::from(accepted);
+        let token = if accepted { draft } else { target };
+        tokens.push(token);
+        if eos_tokens.contains(&token) {
+            return Ok(SpeculativeVerification { accepted_drafts, retained_rows: index + 1, tokens, eos: true });
+        }
+        if !accepted {
+            return Ok(SpeculativeVerification { accepted_drafts, retained_rows: index + 1, tokens, eos: false });
+        }
+    }
+    Ok(SpeculativeVerification { accepted_drafts, retained_rows: target_tokens.len(), tokens, eos: false })
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SpeculativeStats {
     pub rounds: u64,
@@ -135,6 +158,24 @@ mod tests {
         assert_eq!(result.tokens, [10, 20, 30, 40]);
         assert_eq!(result.accepted_drafts, 3);
         assert_eq!(result.retained_rows, 4);
+    }
+
+    #[test]
+    fn prefix_accepts_all_without_bonus() {
+        let result = verify_samples_prefix(&[10, 20, 30], &[10, 20, 30], &[]).unwrap();
+        assert_eq!(result.tokens, [10, 20, 30]);
+        assert_eq!(result.accepted_drafts, 3);
+        assert_eq!(result.retained_rows, 3);
+        assert!(!result.eos);
+    }
+
+    #[test]
+    fn prefix_stops_at_first_mismatch() {
+        let result = verify_samples_prefix(&[10, 21, 30], &[10, 20, 30], &[]).unwrap();
+        assert_eq!(result.tokens, [10, 21]);
+        assert_eq!(result.accepted_drafts, 1);
+        assert_eq!(result.retained_rows, 2);
+        assert!(!result.eos);
     }
 
     #[test]

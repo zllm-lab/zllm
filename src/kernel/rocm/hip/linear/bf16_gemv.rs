@@ -671,7 +671,7 @@ mod dense_tile_tests {
         assert_eq!(first.download_f32(first_rows).expect("download dual first W4"), first_expected);
         assert_eq!(second.download_f32(second_rows).expect("download dual second W4"), second_expected);
 
-        let input_rows = 3usize;
+        let input_rows = 32usize;
         let input = (0..input_rows * columns).flat_map(|index| bf16((index as f32 * 0.009).cos()).to_ne_bytes()).collect::<Vec<_>>();
         let input = DeviceBuffer::upload(0, &input).expect("upload dual W4 B3 input");
         let first_expected =
@@ -804,6 +804,162 @@ mod dense_tile_tests {
         for (index, ((&integrated, &routed), (&shared, &residual))) in integrated.iter().zip(&plain).zip(shared_plain.iter().zip(&residual)).enumerate() {
             assert_eq!(integrated.to_bits(), (residual + (shared + routed)).to_bits(), "integrated index={index}");
         }
+    }
+
+    #[test]
+    fn rocm_cooperative_decode_matches_single_device_bitwise() {
+        if !super::super::is_hip_available() {
+            eprintln!("[cooperative-decode] 跳过：本机未检测到 ROCm 运行时");
+            return;
+        }
+        struct Weight {
+            packed: DeviceBuffer,
+            scales: DeviceBuffer,
+        }
+        impl Weight {
+            fn new(rows: usize, columns: usize, seed: usize) -> Self {
+                Self::new_rows_on(0, columns, seed, 0, rows)
+            }
+
+            fn new_rows(columns: usize, seed: usize, row_start: usize, rows: usize) -> Self {
+                Self::new_rows_on(0, columns, seed, row_start, rows)
+            }
+
+            fn new_rows_on(device_id: i32, columns: usize, seed: usize, row_start: usize, rows: usize) -> Self {
+                let packed_start = row_start * columns / 2;
+                let packed = (packed_start..packed_start + rows * columns / 2)
+                    .map(|index| {
+                        let low = 6 + ((index + seed) % 5) as u8;
+                        let high = 6 + ((index * 3 + seed + 2) % 5) as u8;
+                        low | (high << 4)
+                    })
+                    .collect::<Vec<_>>();
+                let scale = 0.0078125 + seed as f32 * 0.0009765625;
+                let scales = vec![bf16(scale).to_ne_bytes(); rows * columns.div_ceil(128)].into_iter().flatten().collect::<Vec<_>>();
+                Self { packed: DeviceBuffer::upload(device_id, &packed).expect("upload cooperative W4 packed"), scales: DeviceBuffer::upload(device_id, &scales).expect("upload cooperative W4 scales") }
+            }
+
+            fn new_columns_on(device_id: i32, rows: usize, full_columns: usize, seed: usize, column_start: usize, columns: usize) -> Self {
+                let mut packed = Vec::with_capacity(rows * columns / 2);
+                for row in 0..rows {
+                    let start = row * full_columns / 2 + column_start / 2;
+                    packed.extend((start..start + columns / 2).map(|index| {
+                        let low = 6 + ((index + seed) % 5) as u8;
+                        let high = 6 + ((index * 3 + seed + 2) % 5) as u8;
+                        low | (high << 4)
+                    }));
+                }
+                let scale = 0.0078125 + seed as f32 * 0.0009765625;
+                let scales = vec![bf16(scale).to_ne_bytes(); rows * columns.div_ceil(128)].into_iter().flatten().collect::<Vec<_>>();
+                Self { packed: DeviceBuffer::upload(device_id, &packed).expect("upload cooperative W4 column shard"), scales: DeviceBuffer::upload(device_id, &scales).expect("upload cooperative W4 column scales") }
+            }
+
+            fn grouped(&self, _columns: usize) -> CtGroupedWeightRef<'_> {
+                CtGroupedWeightRef { packed: &self.packed, scales: &self.scales, scale_dtype: 0, group_size: 128, format: 0 }
+            }
+        }
+        struct Expert {
+            gate: Weight,
+            up: Weight,
+            down: Weight,
+        }
+
+        // 直接覆盖 GLM-5.2 的真实 decode 形状；只把 expert 数缩到一次
+        // Top-8 实际会触达的集合，避免 oracle 无意义地占满测试机显存。
+        let hidden = 6_144usize;
+        let intermediate = 2_048usize;
+        let expert_count = 8usize;
+        let experts =
+            (0..=expert_count).map(|expert| Expert { gate: Weight::new(intermediate, hidden, expert * 3), up: Weight::new(intermediate, hidden, expert * 3 + 1), down: Weight::new(hidden, intermediate, expert * 3 + 2) }).collect::<Vec<_>>();
+        let grouped = experts.iter().map(|expert| CtGroupedExpertRef { gate: expert.gate.grouped(hidden), up: expert.up.grouped(hidden), down: expert.down.grouped(intermediate) }).collect::<Vec<_>>();
+        let input_rows = 1_024usize;
+        let top_k = 8usize;
+        let input_values = (0..input_rows * hidden).map(|index| (index as f32 * 0.071).sin() * 0.25).collect::<Vec<_>>();
+        let residual = (0..input_rows * hidden).map(|index| (index as f32 * 0.017).cos() * -0.03125).collect::<Vec<_>>();
+        let routes = (0..input_rows * top_k).map(|route| ((route * 5 + route / top_k * 3) % expert_count) as u32).collect::<Vec<_>>();
+        let route_weights = (0..input_rows * top_k).map(|route| 0.25_f32 / (1 + route % top_k) as f32).collect::<Vec<_>>();
+        let input = DeviceBuffer::upload(0, f32_bytes(&input_values)).expect("upload cooperative input");
+        let residual_device = DeviceBuffer::upload(0, f32_bytes(&residual)).expect("upload cooperative residual");
+        let routes_device = upload_pod(0, &routes).expect("upload cooperative routes");
+        let weights_device = upload_pod(0, &route_weights).expect("upload cooperative route weights");
+
+        let routed_expected = try_ct_grouped_experts_bf16(0, &input, input_rows, hidden, intermediate, &[], &[], &[], &grouped[..expert_count], Some((&routes_device, &weights_device, routes.len())), None, None)
+            .expect("single-device routed MoE batch")
+            .download_f32(input_rows * hidden)
+            .expect("download single-device routed MoE batch");
+        let shared_routes = upload_pod(0, &vec![0_u32; input_rows]).expect("upload cooperative shared routes");
+        let shared_weights = upload_pod(0, &vec![1.0_f32; input_rows]).expect("upload cooperative shared weights");
+        let shared_expected = try_ct_grouped_experts_bf16(0, &input, input_rows, hidden, intermediate, &[], &[], &[], std::slice::from_ref(&grouped[expert_count]), Some((&shared_routes, &shared_weights, input_rows)), None, None)
+            .expect("single-device shared MoE batch")
+            .download_f32(input_rows * hidden)
+            .expect("download single-device shared MoE batch");
+        let expected = residual.iter().zip(&shared_expected).zip(&routed_expected).map(|((&residual, &shared), &routed)| residual + (shared + routed)).collect::<Vec<_>>();
+        let sharded = |device_id: i32, intermediate_start: usize| {
+            (0..expert_count)
+                .map(|expert| Expert {
+                    gate: Weight::new_rows_on(device_id, hidden, expert * 3, intermediate_start, intermediate / 2),
+                    up: Weight::new_rows_on(device_id, hidden, expert * 3 + 1, intermediate_start, intermediate / 2),
+                    down: Weight::new_columns_on(device_id, hidden, intermediate, expert * 3 + 2, intermediate_start, intermediate / 2),
+                })
+                .collect::<Vec<_>>()
+        };
+        let low_experts = sharded(0, 0);
+        let high_experts = sharded(0, intermediate / 2);
+        let low_grouped = low_experts.iter().map(|expert| CtGroupedExpertRef { gate: expert.gate.grouped(hidden), up: expert.up.grouped(hidden), down: expert.down.grouped(intermediate) }).collect::<Vec<_>>();
+        let high_grouped = high_experts.iter().map(|expert| CtGroupedExpertRef { gate: expert.gate.grouped(hidden), up: expert.up.grouped(hidden), down: expert.down.grouped(intermediate) }).collect::<Vec<_>>();
+        let low_gate = try_ct_cooperative_gate_up_bf16(0, &input, input_rows, hidden, intermediate / 2, &routes_device, &weights_device, routes.len(), top_k, &low_grouped).expect("sharded low gate/up");
+        let high_gate = try_ct_cooperative_gate_up_bf16(0, &input, input_rows, hidden, intermediate / 2, &routes_device, &weights_device, routes.len(), top_k, &high_grouped).expect("sharded high gate/up");
+        let low_output_device =
+            try_ct_cooperative_sharded_down_bf16(0, &low_gate, low_gate.activated(), low_gate.activated(), &routes_device, &weights_device, input_rows, routes.len(), top_k, intermediate / 2, 0, hidden).expect("sharded low down");
+        let high_output_device =
+            try_ct_cooperative_sharded_down_bf16(0, &high_gate, high_gate.activated(), high_gate.activated(), &routes_device, &weights_device, input_rows, routes.len(), top_k, intermediate / 2, 0, hidden).expect("sharded high down");
+        let low_output = low_output_device.download_f32(input_rows * hidden).expect("download sharded low down");
+        let high_output = high_output_device.download_f32(input_rows * hidden).expect("download sharded high down");
+        for token in 0..input_rows {
+            for column in 0..hidden {
+                let actual = low_output[token * hidden + column] + high_output[token * hidden + column];
+                let expected = routed_expected[token * hidden + column];
+                assert!(actual.is_finite() && (actual - expected).abs() <= 1.0e-4, "sharded token={token} column={column} actual={actual} expected={expected}");
+            }
+        }
+        let shared_output_device = try_ct_cooperative_shared_bf16(0, &input, input_rows, hidden, intermediate, &grouped[expert_count]).expect("standalone cooperative shared");
+        let joined = try_ct_cooperative_partial_join_f32(0, &low_output_device, &high_output_device, &shared_output_device, &residual_device, input_rows, hidden)
+            .expect("join sharded output")
+            .download_f32(input_rows * hidden)
+            .expect("download joined sharded output");
+        assert!(joined.iter().zip(&expected).all(|(&actual, &expected)| actual.is_finite() && (actual - expected).abs() <= 1.0e-4), "joined sharded output differs from integrated oracle");
+
+        if let Err(error) = set_device(1) {
+            eprintln!("[cooperative-decode] 跳过双卡 oracle：{error}");
+            set_device(0).expect("restore owner device");
+            return;
+        }
+        set_device(0).expect("restore owner device");
+        let owner_stream = super::super::background_stage_stream(0).expect("owner background stream");
+        super::super::order_stream_after(0, 0, owner_stream).expect("order owner background after default");
+        super::super::activate_compute_stream(0, owner_stream).expect("activate owner background stream");
+        let stable_input = std::sync::Arc::new(input.copy_to_stable_deferred().expect("stabilize cooperative input"));
+        let stable_routes = std::sync::Arc::new(routes_device.copy_to_stable_deferred().expect("stabilize cooperative routes"));
+        let stable_weights = std::sync::Arc::new(weights_device.copy_to_stable_deferred().expect("stabilize cooperative route weights"));
+        super::super::activate_cooperative_peer_stream(0, 1).expect("activate matching peer stream");
+        let [peer_input, peer_routes, peer_weights]: [DeviceBuffer; 3] =
+            DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&[stable_input, stable_routes, stable_weights], 1, 0).expect("event-ordered cooperative inputs").try_into().expect("three cooperative inputs");
+        let peer_high_experts = sharded(1, intermediate / 2);
+        let peer_high_grouped = peer_high_experts.iter().map(|expert| CtGroupedExpertRef { gate: expert.gate.grouped(hidden), up: expert.up.grouped(hidden), down: expert.down.grouped(intermediate) }).collect::<Vec<_>>();
+        let peer_high_gate = try_ct_cooperative_gate_up_bf16(1, &peer_input, input_rows, hidden, intermediate / 2, &peer_routes, &peer_weights, routes.len(), top_k, &peer_high_grouped).expect("peer sharded high gate/up");
+        let high_output_device = try_ct_cooperative_sharded_down_bf16(1, &peer_high_gate, peer_high_gate.activated(), peer_high_gate.activated(), &peer_routes, &peer_weights, input_rows, routes.len(), top_k, intermediate / 2, 0, hidden)
+            .expect("two-device sharded high down");
+        let stable_high_output = std::sync::Arc::new(high_output_device.copy_to_stable_deferred().expect("stabilize peer high partial"));
+        super::super::activate_compute_stream(0, owner_stream).expect("restore owner background stream");
+        let high_output_on_owner = stable_high_output.copy_stable_to_device_ordered_async_retained_by(0, 0).expect("event-ordered high partial to owner");
+        let joined = try_ct_cooperative_partial_join_f32(0, &low_output_device, &high_output_on_owner, &shared_output_device, &residual_device, input_rows, hidden)
+            .expect("join two-device sharded output")
+            .download_f32(input_rows * hidden)
+            .expect("download joined two-device sharded output");
+        assert!(joined.iter().zip(&expected).all(|(&actual, &expected)| actual.is_finite() && (actual - expected).abs() <= 1.0e-4), "two-device joined output differs from integrated oracle");
+        super::super::retire_pending_p2p_sources(0);
+        super::super::activate_compute_stream(1, 0).expect("restore peer default stream");
+        super::super::activate_compute_stream(0, 0).expect("restore owner default stream");
     }
 
     #[test]

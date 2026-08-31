@@ -193,6 +193,7 @@ struct RocmEntry {
     stage_transport: Option<StageLink>,
     pipeline_chunk_size: usize,
     preload_experts: bool,
+    cooperative_expert_pairs: bool,
     preload_layers_per_device: Option<usize>,
     max_concurrency: usize,
     diagnostics: Glm52StageDiagnosticsConfig,
@@ -250,6 +251,7 @@ impl RocmEntry {
                         stage_transport: Some(transport),
                         pipeline_chunk_size: execution.prefill_chunk_size,
                         preload_experts: execution.preload_experts,
+                        cooperative_expert_pairs: execution.cooperative_expert_pairs,
                         preload_layers_per_device: execution.preload_layers_per_device,
                         max_concurrency: execution.max_concurrency,
                         diagnostics: execution.diagnostics,
@@ -281,6 +283,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         stage_transport,
         pipeline_chunk_size,
         preload_experts,
+        cooperative_expert_pairs,
         preload_layers_per_device,
         max_concurrency,
         diagnostics,
@@ -366,11 +369,12 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
     if let Some(path) = diagnostics.input_artifact.as_deref() {
         return run_glm52_stage_input(backend, &args, &cfg, &mla, &weights, &tokenizer_path, path);
     }
-    let prefill_contexts = match (&args.prefill_devices, &args.prefill_layer_ends) {
-        (None, None) => vec![*ctx],
+    let (prefill_contexts, cooperative_peer_contexts, prefill_layer_ends) = match (&args.prefill_devices, &args.prefill_layer_ends) {
+        (None, None) if cooperative_expert_pairs => return Err("cooperative_expert_pairs 要求显式配置物理 devices 和每个双卡组的 layer_ends".into()),
+        (None, None) => (vec![*ctx], Vec::new(), vec![stage_end - 1]),
         (Some(devices), Some(ends)) => {
-            if devices.len() != ends.len() || ends.last().copied() != Some(stage_end - 1) {
-                return Err(format!("--prefill-devices 与 --prefill-layer-ends 数量必须相等，当前阶段最后边界必须是 {}", stage_end - 1).into());
+            if ends.last().copied() != Some(stage_end - 1) {
+                return Err(format!("--prefill-layer-ends 的最后边界必须是 {}", stage_end - 1).into());
             }
             if ends.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err("--prefill-layer-ends 必须严格递增".into());
@@ -378,14 +382,26 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
             if ends.first().is_some_and(|end| *end < stage_start) {
                 return Err("--prefill-layer-ends 的首个边界早于当前 stage_start".into());
             }
-            devices.iter().map(|&device| ctx.for_device(device).map_err(|error| format!("ROCm device {device} 初始化失败: {error}"))).collect::<Result<Vec<_>, _>>()?
+            if cooperative_expert_pairs {
+                if devices.len() < 2 || devices.len() % 2 != 0 || ends.len() != devices.len() / 2 {
+                    return Err(format!("cooperative_expert_pairs 要求每两张物理卡对应一个 layer_ends：devices={} layer_ends={}", devices.len(), ends.len()).into());
+                }
+                let owners = devices.iter().step_by(2).map(|&device| ctx.for_device(device).map_err(|error| format!("ROCm owner device {device} 初始化失败: {error}"))).collect::<Result<Vec<_>, _>>()?;
+                let peers = devices.iter().skip(1).step_by(2).map(|&device| ctx.for_device(device).map_err(|error| format!("ROCm cooperative peer device {device} 初始化失败: {error}"))).collect::<Result<Vec<_>, _>>()?;
+                (owners, peers, ends.clone())
+            } else {
+                if devices.len() != ends.len() {
+                    return Err("--prefill-devices 与 --prefill-layer-ends 数量必须相等".into());
+                }
+                let contexts = devices.iter().map(|&device| ctx.for_device(device).map_err(|error| format!("ROCm device {device} 初始化失败: {error}"))).collect::<Result<Vec<_>, _>>()?;
+                (contexts, Vec::new(), ends.clone())
+            }
         }
         _ => return Err("--prefill-devices 与 --prefill-layer-ends 必须同时提供".into()),
     };
     for pair in prefill_contexts.windows(2) {
         pair[1].enable_peer_access_from(pair[0].device_id()).map_err(|error| format!("初始化 ROCm P2P {} -> {} 失败: {error}", pair[0].device_id(), pair[1].device_id()))?;
     }
-    let prefill_layer_ends = args.prefill_layer_ends.clone().unwrap_or_else(|| vec![stage_end - 1]);
     if distributed && pipeline_chunk_size == 0 {
         return Err("distributed stage 的 model.execution.prefill_chunk_size 必须大于 0".into());
     }
@@ -414,6 +430,34 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
     };
     let expert_state_count = if pipeline_enabled || distributed { prefill_contexts.len() } else { 1 };
     let mut prefill_experts = (0..expert_state_count).map(|_| new_prefill_experts()).collect::<Result<Vec<_>, _>>()?;
+    if cooperative_expert_pairs {
+        if !distributed || !preload_experts || preload_layers_per_device.is_some() || !weights.source_is_ct() || prefill_contexts.len() != cooperative_peer_contexts.len() {
+            return Err("cooperative_expert_pairs 要求 distributed CT stage、preload_experts=true、完整预载且每个逻辑 stage 有一张 peer 卡".into());
+        }
+        let mut layer_start = stage_start;
+        let counts = prefill_layer_ends
+            .iter()
+            .map(|&layer_end| {
+                let count = layer_end + 1 - layer_start;
+                layer_start = layer_end + 1;
+                count
+            })
+            .collect::<Vec<_>>();
+        for &count in &counts {
+            if count > 12 {
+                return Err(format!("cooperative expert 双卡组层数 {count} 超过 12 层预算").into());
+            }
+        }
+        for (stage, (experts, &peer)) in prefill_experts.iter_mut().zip(&cooperative_peer_contexts).enumerate() {
+            experts.enable_cooperative_peer(peer, 0).map_err(|error| format!("配置 ROCm cooperative expert stage={stage}: {error:?}"))?;
+        }
+        eprintln!(
+            "[glm52-cooperative-experts] physical_devices={} pairs={} logical_stages={} mode=prefill+decode partition=gate-up-row/down-k-half device-route",
+            prefill_contexts.len() + cooperative_peer_contexts.len(),
+            prefill_contexts.len(),
+            prefill_contexts.len(),
+        );
+    }
     // 分布式 decode 必须直接命中 GPU 常驻专家；否则 prefill 命中集合会让多数层退回 host route。
     if preload_experts && (weights.source_is_ct() || weights.source_is_gguf()) {
         let started = Instant::now();

@@ -130,6 +130,7 @@ fn configure_backend(backend: &zllm::config::RocmBackendConfig, kv_f16: bool) ->
     let options = zllm::kernel::rocm::hip::RocmOptions::configured(
         backend.kernel_sync,
         backend.kernel_profile,
+        backend.decode_graph,
         backend.memory_pool,
         backend.grouped_down_route_buffer,
         backend.root.to_string_lossy().into_owned(),
@@ -138,6 +139,9 @@ fn configure_backend(backend: &zllm::config::RocmBackendConfig, kv_f16: bool) ->
         backend.mla_decode_split_threshold,
         backend.dsa_hadamard_i8,
         backend.dsa_hadamard_shadow_samples,
+        backend.dsa_hisa_shadow_samples,
+        backend.dsa_cpu_select,
+        backend.mla_cpu_hot_rows,
         backend.precise_router,
     );
     zllm::kernel::rocm::hip::configure(options)?;
