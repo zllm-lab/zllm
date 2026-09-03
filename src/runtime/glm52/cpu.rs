@@ -77,7 +77,7 @@ pub fn run(
             let output = match kind {
                 Glm52PrefillLayerKind::Dense => {
                     let resident = crate::runtime::glm52::load_prepare_dense_prefill_layer(&backend, &cfg, &mla, &weights, layer, false)?;
-                    glm52_dense_prefill_layer(&backend, &cfg, &mla, &resident, layer, Some(&mut dsa_state), &hidden, &rope, Some(&mut cache), 0)?
+                    glm52_dense_prefill_layer(&backend, &cfg, &mla, &resident, layer, None, Some(&mut dsa_state), &hidden, &rope, Some(&mut cache), 0)?
                 }
                 Glm52PrefillLayerKind::Moe => {
                     let resident = crate::runtime::glm52::load_prepare_moe_prefill_layer(&backend, &cfg, &mla, &weights, layer, false)?;

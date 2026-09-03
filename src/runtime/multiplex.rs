@@ -46,6 +46,15 @@ impl BatchScheduler {
         self.initial_batch_released = requests == 0;
     }
 
+    /// 初始边界释放前，新进入连续流的相邻 slot 仍属于同一批。长 prefill
+    /// 足以让并发请求在首个 decode 前全部到达；把它们纳入既有边界可避免
+    /// 第一条先解码、其余请求随后被 mixed-prefill 限流。边界一旦释放便不重建。
+    pub fn extend_initial_batch(&mut self, requests: usize) {
+        if !self.initial_batch_released {
+            self.initial_batch = self.initial_batch.max(requests);
+        }
+    }
+
     pub fn initial_batch_released(&self) -> bool {
         self.initial_batch_released
     }
@@ -165,6 +174,21 @@ mod tests {
         let mut scheduler = BatchScheduler::new(4, 8).unwrap();
         scheduler.align_initial_batch(2);
         assert_eq!(scheduler.next(&[RequestPhase::DecodeReady { position: 1 }, RequestPhase::PrefillReady { position: 4, end: 12 }]), Some(BatchPlan { prefill: vec![PrefillSlice { request: 1, position: 4, len: 4 }], decode: vec![] }),);
+    }
+
+    #[test]
+    fn initial_batch_includes_requests_arriving_before_release() {
+        let mut scheduler = BatchScheduler::new(4, 8).unwrap();
+        scheduler.align_initial_batch(1);
+        scheduler.extend_initial_batch(3);
+        assert_eq!(scheduler.next(&[RequestPhase::DecodeReady { position: 1 }, RequestPhase::Pending, RequestPhase::DecodeReady { position: 3 }]), None);
+        assert_eq!(scheduler.next(&[RequestPhase::DecodeReady { position: 1 }, RequestPhase::DecodeReady { position: 2 }, RequestPhase::DecodeReady { position: 3 }]), Some(BatchPlan { prefill: vec![], decode: vec![0, 1, 2] }),);
+        scheduler.extend_initial_batch(4);
+        assert_eq!(
+            scheduler.next(&[RequestPhase::DecodeReady { position: 4 }, RequestPhase::Pending, RequestPhase::Pending, RequestPhase::Pending]),
+            Some(BatchPlan { prefill: vec![], decode: vec![0] }),
+            "已经释放的初始边界不能由后来请求重建",
+        );
     }
 
     #[test]

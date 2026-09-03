@@ -1,4 +1,4 @@
-//! GLM-5.2 ROCm 尾端采样、MTP 与 terminal 驻留生命周期。
+//! GLM-5.2 ROCm head 侧输出运行时、MTP 与 terminal 驻留生命周期。
 
 use super::*;
 
@@ -11,204 +11,14 @@ pub(super) struct TailSession {
     pub(super) position: usize,
     pub(super) resumed: bool,
     pub(super) started: Instant,
-    pub(super) sampling: SamplingState,
-    pub(super) completion_tokens: usize,
-    pub(super) tail_sampling: bool,
-    pub(super) pending_fences: VecDeque<crate::backend::TokenFence>,
-    pub(super) verify_position: Option<usize>,
-    pub(super) verify_hiddens: Vec<RocmTensor>,
-    pub(super) mtp: Option<RocmMtpSession>,
-}
-
-pub(super) struct TailHeadWork {
-    pub(super) request_id: RequestId,
-    pub(super) cohort: u64,
-    pub(super) cohort_size: usize,
-    pub(super) position: usize,
-    pub(super) hidden: RocmTensor,
-}
-
-pub(super) struct TailHeadCohort {
-    pub(super) size: usize,
-    pub(super) missing: usize,
-    pub(super) works: Vec<TailHeadWork>,
-}
-
-pub(super) fn push_tail_head_work(cohorts: &mut HashMap<u64, TailHeadCohort>, requests: &mut HashMap<RequestId, (u64, usize)>, work: TailHeadWork) -> Result<Option<Vec<TailHeadWork>>, String> {
-    if work.cohort == 0 || work.cohort_size == 1 {
-        return Ok(Some(vec![work]));
-    }
-    let cohort = work.cohort;
-    let cohort_size = work.cohort_size;
-    let group = cohorts.entry(cohort).or_insert_with(|| TailHeadCohort { size: cohort_size, missing: 0, works: Vec::with_capacity(cohort_size) });
-    if group.size != cohort_size {
-        return Err(format!("tail output cohort={cohort} size 从 {} 变为 {cohort_size}", group.size));
-    }
-    group.works.push(work);
-    let expected = group.size.checked_sub(group.missing).ok_or_else(|| format!("tail output cohort={cohort} 取消数超过大小"))?;
-    if group.works.len() > expected {
-        return Err(format!("tail output cohort={cohort} 数量={} 超过 expected={expected}", group.works.len()));
-    }
-    if group.works.len() != expected {
-        return Ok(None);
-    }
-    let works = cohorts.remove(&cohort).expect("tail output cohort 刚检查完成").works;
-    for work in &works {
-        requests.remove(&work.request_id);
-    }
-    Ok(Some(works))
-}
-
-pub(super) fn cancel_tail_head_work(cohorts: &mut HashMap<u64, TailHeadCohort>, requests: &mut HashMap<RequestId, (u64, usize)>, request_id: RequestId) -> Result<Option<Vec<TailHeadWork>>, String> {
-    let Some((cohort, size)) = requests.remove(&request_id) else { return Ok(None) };
-    let group = cohorts.entry(cohort).or_insert_with(|| TailHeadCohort { size, missing: 0, works: Vec::with_capacity(size) });
-    if group.size != size || group.missing >= group.size {
-        return Err(format!("tail output cohort={cohort} 取消状态非法: size={}/{} missing={}", group.size, size, group.missing));
-    }
-    group.works.retain(|work| work.request_id != request_id);
-    group.missing += 1;
-    let expected = group.size - group.missing;
-    if group.works.len() != expected {
-        return Ok(None);
-    }
-    let works = cohorts.remove(&cohort).expect("tail output cohort 取消后刚检查完成").works;
-    for work in &works {
-        requests.remove(&work.request_id);
-    }
-    Ok(Some(works))
-}
-
-#[cfg(test)]
-mod tail_head_cohort_tests {
-    use super::*;
-
-    fn work(request_id: RequestId) -> TailHeadWork {
-        TailHeadWork {
-            request_id,
-            cohort: 7,
-            cohort_size: 4,
-            position: 11,
-            hidden: RocmTensor { data: Vec::new(), rows: 1, cols: 1, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: None },
-        }
-    }
-
-    #[test]
-    fn 取消一路后剩余cohort仍能收口() {
-        let ids = (0..4).map(|index| RequestId::from_cache_id(&format!("tail-{index}"))).collect::<Vec<_>>();
-        let mut cohorts = HashMap::new();
-        let mut requests = ids.iter().copied().map(|request| (request, (7, 4))).collect::<HashMap<_, _>>();
-        assert!(push_tail_head_work(&mut cohorts, &mut requests, work(ids[0])).unwrap().is_none());
-        assert!(push_tail_head_work(&mut cohorts, &mut requests, work(ids[1])).unwrap().is_none());
-        assert!(cancel_tail_head_work(&mut cohorts, &mut requests, ids[2]).unwrap().is_none());
-        let ready = push_tail_head_work(&mut cohorts, &mut requests, work(ids[3])).unwrap().unwrap();
-        assert_eq!(ready.iter().map(|work| work.request_id).collect::<Vec<_>>(), [ids[0], ids[1], ids[3]]);
-        assert!(cohorts.is_empty());
-        assert!(requests.is_empty());
-    }
-}
-
-pub(super) fn tail_sample_batch(
-    link: &mut StageTransport,
-    active: &mut HashMap<RequestId, TailSession>,
-    output_context: &RocmContext,
-    mtp_runtime: &mut Option<RocmMtpRuntime>,
-    weights: &Glm52Weights,
-    cfg: &Glm52Config,
-    mla: &MlaSpec,
-    rope: &RopeTable,
-    output_head: &Glm52OutputHead<RocmWeight>,
-    works: Vec<TailHeadWork>,
-) -> Result<(), String> {
-    if works.is_empty() {
-        return Ok(());
-    }
-    let mut sampling = Vec::with_capacity(works.len());
-    let mut fences = Vec::with_capacity(works.len());
-    let mut hiddens = Vec::with_capacity(works.len());
-    for work in &works {
-        let session = active.get_mut(&work.request_id).ok_or_else(|| format!("tail sampling request={} 已消失", work.request_id))?;
-        if !session.tail_sampling {
-            return Err(format!("tail sampling request={} 未启用末段采样", work.request_id));
-        }
-        sampling.push(session.sampling.next());
-        fences.push(session.pending_fences.pop_front().ok_or_else(|| format!("tail sampling request={} position={} 缺少围栏", work.request_id, work.position))?);
-        hiddens.push(work.hidden.clone());
-    }
-    let hidden = if hiddens.len() == 1 { hiddens.pop().unwrap() } else { output_context.concat_token_rows(&hiddens.iter().collect::<Vec<_>>()).map_err(|error| format!("拼接 tail output head cohort: {error:?}"))? };
-    let tokens = glm52_sampled_token_ids_fenced(output_context, cfg, output_head, &hidden, &sampling, &fences).map_err(|error| format!("tail output head cohort: {error:?}"))?;
-    if tokens.len() != works.len() {
-        return Err(format!("tail output head 返回 {} tokens，期望 {}", tokens.len(), works.len()));
-    }
-    let mut taken = Vec::with_capacity(works.len());
-    for (work, token) in works.into_iter().zip(tokens) {
-        let mut session = active.remove(&work.request_id).ok_or_else(|| format!("tail MTP draft request={} 已消失", work.request_id))?;
-        session.completion_tokens += 1;
-        taken.push((work, token, session));
-    }
-    let taken_len = taken.len();
-    let initial_tokens = taken.iter().map(|(_, token, _)| *token).collect::<Vec<_>>();
-    let mut draft_indices = Vec::new();
-    let mut draft_batch = taken
-        .iter_mut()
-        .enumerate()
-        .filter_map(|(index, (_, token, session))| {
-            if cfg.eos_token_ids.contains(token) {
-                return None;
-            }
-            let mtp = session.mtp.as_mut().filter(|mtp| mtp.active)?;
-            let remaining = mtp.max_decode.saturating_sub(session.completion_tokens);
-            let count = mtp.draft_tokens.min(remaining.saturating_sub(1));
-            let hidden = mtp.pending_hidden.clone()?;
-            draft_indices.push(index);
-            Some(RocmMtpDraftBatch {
-                session: mtp,
-                token: *token,
-                hidden,
-                count,
-                drafts: Vec::new(),
-                // draft 只是候选；每个 target verify row 的真实围栏由 A 随 Verify 下发。
-                fence: GenerationGuard::new(Glm52ToolFence::new(false), false, []),
-            })
-        })
-        .collect::<Vec<_>>();
-    let draft_result = if draft_batch.is_empty() {
-        Ok(())
-    } else if let Some(runtime) = mtp_runtime.as_mut() {
-        mtp_draft_batch(runtime, &mut draft_batch, weights, output_head, cfg, mla, rope).map_err(|error| format!("B7 MTP draft cohort: {error:?}"))
-    } else {
-        Err("B7 active MTP session 缺少 runtime".to_owned())
-    };
-    let mut drafts = vec![Vec::new(); taken_len];
-    if draft_result.is_ok() {
-        for (index, item) in draft_indices.into_iter().zip(draft_batch.iter_mut()) {
-            drafts[index] = std::mem::take(&mut item.drafts);
-            item.session.verify_inputs = std::iter::once(initial_tokens[index]).chain(drafts[index].iter().copied()).collect();
-        }
-    }
-    drop(draft_batch);
-    let mut outbound = Vec::with_capacity(taken.len());
-    for ((work, token, session), drafts) in taken.into_iter().zip(drafts) {
-        active.insert(work.request_id, session);
-        outbound.push((work, token, drafts));
-    }
-    draft_result?;
-    for (work, token, drafts) in outbound {
-        let eos = cfg.eos_token_ids.contains(&token);
-        if drafts.is_empty() {
-            link.send_sampled(work.request_id, work.cohort, work.cohort_size, work.position, token, eos)?;
-        } else {
-            link.send_speculative(work.request_id, &[token], 0, &drafts, false)?;
-        }
-    }
-    Ok(())
 }
 
 /// tail stage 的 resident cache:已完成的 session 状态,等待复用或换出。
+/// 输出与 MTP 驻留 head 首卡,tail 的 resident 只含 KV/DSA 与 terminal hidden。
 pub(super) struct TailResident {
     pub(super) states: Vec<Glm52StageState>,
     pub(super) hidden: RocmTensor,
     pub(super) position: usize,
-    pub(super) mtp: Option<RocmMtpSession>,
 }
 
 pub(super) struct TailOpenRequest {
@@ -218,7 +28,6 @@ pub(super) struct TailOpenRequest {
     pub(super) reserved_rows: usize,
     pub(super) cache_hit: bool,
     pub(super) sampling: SamplingConfig,
-    pub(super) tail_sampling: bool,
 }
 
 pub(super) struct TailPendingOpen {
@@ -311,13 +120,12 @@ pub(super) fn tail_stage_open(
     request: TailOpenRequest,
     prefetched: Option<Result<Option<Glm52CacheSnapshot>, String>>,
 ) -> Result<(), String> {
-    let TailOpenRequest { request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, tail_sampling } = request;
+    let TailOpenRequest { request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling: sampling_config } = request;
     if active.contains_key(&request_id) {
         return Err(format!("后继重复 Open active request={request_id}"));
     }
     let mut states = templates.iter().map(|state| state.fresh_session(cfg, max_seq_len)).collect::<Result<Vec<_>, _>>().map_err(|error| format!("创建 tail stage session: {error:?}"))?;
     let mut hidden = None;
-    let mut mtp = None;
     if cache_hit {
         let reserved_rows = if reserved_rows == 0 { cached_tokens } else { reserved_rows };
         if reserved_rows < cached_tokens || reserved_rows > max_seq_len {
@@ -338,10 +146,6 @@ pub(super) fn tail_stage_open(
             }
             states = saved.states;
             hidden = Some(saved.hidden);
-            mtp = saved.mtp;
-            if let Some(mtp) = mtp.as_mut() {
-                mtp.deactivate();
-            }
         } else {
             let cache_id = cache_request_id.to_string();
             let snapshot = match prefetched {
@@ -360,36 +164,14 @@ pub(super) fn tail_stage_open(
             }
             upload_glm52_session(&mut states, &snapshot.stages, cfg, max_seq_len, reserved_rows)?;
             hidden = Some(output_context.tensor_from_bf16_bits(snapshot.last_hidden, 1, cfg.hidden_size).map_err(|error| format!("恢复 tail terminal hidden: {error:?}"))?);
-            mtp = snapshot.mtp.map(|mtp| RocmMtpSession::restore(mtp, output_context, cfg, max_seq_len, reserved_rows)).transpose()?;
-            if let Some(mtp) = &mtp {
-                eprintln!("[glm52-mtp-swap-in] cache_id={request_id} position={}", mtp.position);
-            }
             eprintln!("[stage-swap-in] cache_id={request_id} tokens={cached_tokens}");
         }
     } else {
         swap.delete(&request_id.to_string())?;
     }
-    let sampling = SamplingState::new(sampling)?;
-    active.insert(
-        request_id,
-        TailSession {
-            states,
-            hidden,
-            completed_hidden: None,
-            prompt_hidden: None,
-            prompt_position: None,
-            position: cached_tokens,
-            resumed: cache_hit,
-            started: Instant::now(),
-            sampling,
-            completion_tokens: 0,
-            tail_sampling,
-            pending_fences: VecDeque::new(),
-            verify_position: None,
-            verify_hiddens: Vec::new(),
-            mtp,
-        },
-    );
+    // 采样参数在 head 侧消费;这里只做一次合法性校验,坏参数在 Open 期暴露。
+    SamplingState::new(sampling_config)?;
+    active.insert(request_id, TailSession { states, hidden, completed_hidden: None, prompt_hidden: None, prompt_position: None, position: cached_tokens, resumed: cache_hit, started: Instant::now() });
     link.send_ready(request_id, cached_tokens)
 }
 
@@ -429,16 +211,7 @@ pub(super) fn tail_stage_cache_commit(
         tail.position = tokens;
     }
     let hidden = tail.hidden.ok_or_else(|| "后继 Cache 缺少 terminal hidden".to_owned())?;
-    let mtp = match tail.mtp.take() {
-        Some(mut mtp) if mtp.active => {
-            mtp.truncate_to_target(tokens).map_err(|error| format!("截断 tail MTP 到 {tokens}: {error:?}"))?;
-            mtp.pending_hidden = Some(hidden.clone());
-            mtp.deactivate();
-            Some(mtp)
-        }
-        _ => None,
-    };
-    resident.insert(next_request_id, TailResident { states: tail.states, hidden, position: tokens, mtp });
+    resident.insert(next_request_id, TailResident { states: tail.states, hidden, position: tokens });
     link.send_ready(request_id, tokens)?;
     Ok(())
 }
@@ -454,7 +227,7 @@ pub(super) fn tail_stage_swap_out(link: &mut StageTransport, resident: &mut Hash
         pending_tokens: None,
         last_hidden: output_context.tensor_to_bf16_bits(&saved.hidden).map_err(|error| format!("下载 tail terminal hidden: {error:?}"))?,
         stages: download_glm52_session(&saved.states)?,
-        mtp: saved.mtp.as_ref().map(|mtp| mtp.snapshot(output_context)).transpose()?,
+        mtp: None,
         dspark_aux: None,
         dspark_target: None,
     };
@@ -476,7 +249,7 @@ pub(super) fn tail_stage_persist(resident: &mut HashMap<RequestId, TailResident>
             pending_tokens: None,
             last_hidden: output_context.tensor_to_bf16_bits(&saved.hidden).map_err(|error| format!("下载 tail terminal hidden: {error:?}"))?,
             stages: download_glm52_session(&saved.states)?,
-            mtp: saved.mtp.as_ref().map(|mtp| mtp.snapshot(output_context)).transpose()?,
+            mtp: None,
             dspark_aux: None,
             dspark_target: None,
         };
@@ -509,31 +282,20 @@ pub(super) fn tail_stage_delete(active: &mut HashMap<RequestId, TailSession>, re
     Ok(active_position.or(resident_position).unwrap_or(0))
 }
 
-/// 处理 MtpContext:为 session 建立/复用 MTP resident state。
-/// 仅非 continuous 入口使用;continuous(A0-output)模式在 B 端不跑 MTP,直接拒绝。
-pub(super) fn tail_stage_mtp_context(
-    session: &mut TailSession,
-    mtp_runtime_enabled: bool,
-    mtp_draft_tokens: usize,
-    cfg: &Glm52Config,
-    max_seq_len: usize,
-    request_id: RequestId,
-    prompt_tokens: Vec<u32>,
-    max_decode: usize,
-    draft_tokens: usize,
-) -> Result<(), String> {
-    if !mtp_runtime_enabled {
-        return Err("前机请求 MTP，但 tail 未启用 model.execution.mtp".to_owned());
+/// MtpContext 已随 tail 采样一并移除:MTP resident state 由 head 首卡持有,
+/// tail 引擎层收到该帧直接拒绝,这里不再提供处理路径。
+
+/// 首卡常驻 BF16 embedding 表的设备侧行 gather;ids 上传 + 一次 kernel,
+/// 输出 F32 [rows, hidden],与 CPU `embedding_rows` 路径语义一致。
+pub(in crate::runtime::glm52) fn gather_embedding_rows(context: &RocmContext, table: &std::sync::Arc<ops::hip::DeviceBuffer>, ids: &[u32], hidden: usize) -> Result<RocmTensor, String> {
+    if ids.is_empty() {
+        return Err("embedding gather ids 为空".to_owned());
     }
-    if session.mtp.is_none() && !session.resumed {
-        session.mtp = Some(RocmMtpSession::fresh(cfg, max_seq_len)?);
-    }
-    if let Some(mtp) = session.mtp.as_mut() {
-        mtp.begin_request(session.position, prompt_tokens, max_decode, draft_tokens.min(mtp_draft_tokens))?;
-    } else {
-        eprintln!("[glm52-mtp-fallback] request_id={request_id} SSD cache 没有 MTP resident state，本轮退回普通 decode");
-    }
-    Ok(())
+    let device_id = context.device_id();
+    let ids_bytes = ids.len().checked_mul(std::mem::size_of::<u32>()).ok_or("embedding ids 字节溢出")?;
+    let ids_buffer = ops::hip::DeviceBuffer::upload(device_id, unsafe { std::slice::from_raw_parts(ids.as_ptr().cast(), ids_bytes) }).map_err(|error| format!("上传 embedding ids: {error}"))?;
+    let output = ops::hip::try_gather_bf16_rows_f32(device_id, table, &ids_buffer, ids.len(), hidden).map_err(|error| format!("embedding gather kernel: {error}"))?;
+    Ok(RocmTensor { data: Vec::new(), rows: ids.len(), cols: hidden, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: Some(std::sync::Arc::new(output)) })
 }
 
 pub(crate) struct RocmMtpCatchUp<'a> {
@@ -600,7 +362,10 @@ pub(crate) fn mtp_catch_up_batch(runtime: &mut RocmMtpRuntime, items: &mut [Rocm
             };
             (item.target_inputs.clone(), hidden, expected)
         };
-        let embedding = runtime.backend.tensor_from_f32(model_weights.embedding_rows(&tokens).map_err(crate::backend::compute_error)?, tokens.len(), cfg.hidden_size).map_err(crate::backend::compute_error)?;
+        let embedding = match runtime.embedding.as_ref() {
+            Some(table) => gather_embedding_rows(&runtime.backend, table, &tokens, cfg.hidden_size).map_err(crate::backend::compute_error)?,
+            None => runtime.backend.tensor_from_f32(model_weights.embedding_rows(&tokens).map_err(crate::backend::compute_error)?, tokens.len(), cfg.hidden_size).map_err(crate::backend::compute_error)?,
+        };
         metadata[index] = Some((position, tokens.len()));
         embeddings[index] = Some(embedding);
         shifted[index] = Some(hidden);
@@ -672,7 +437,10 @@ pub(crate) fn mtp_draft_batch(
             if depth >= item.count || item.drafts.last().is_some_and(|token| cfg.eos_token_ids.contains(token)) {
                 continue;
             }
-            embeddings.push(runtime.backend.tensor_from_f32(model_weights.embedding_rows(&[item.token]).map_err(crate::backend::compute_error)?, 1, cfg.hidden_size).map_err(crate::backend::compute_error)?);
+            embeddings.push(match runtime.embedding.as_ref() {
+                Some(table) => gather_embedding_rows(&runtime.backend, table, &[item.token], cfg.hidden_size).map_err(crate::backend::compute_error)?,
+                None => runtime.backend.tensor_from_f32(model_weights.embedding_rows(&[item.token]).map_err(crate::backend::compute_error)?, 1, cfg.hidden_size).map_err(crate::backend::compute_error)?,
+            });
             hiddens.push(item.hidden.clone());
             metadata[index] = true;
         }
@@ -747,7 +515,19 @@ pub(crate) fn mtp_draft_batch(
     Ok(())
 }
 
-pub(super) fn prepare_tail_output_runtime(
+/// GGUF 源装载期把 token_embd 全表解码为 BF16 并常驻指定卡。
+pub(in crate::runtime::glm52) fn load_resident_embedding(context: &RocmContext, weights: &Glm52Weights, cfg: &Glm52Config) -> Result<Option<std::sync::Arc<ops::hip::DeviceBuffer>>, String> {
+    let Some(bytes) = weights.embedding_table_bf16()? else { return Ok(None) };
+    context.activate().map_err(|error| format!("激活 embedding 常驻卡: {error:?}"))?;
+    let started = Instant::now();
+    let table = ops::hip::DeviceBuffer::upload(context.device_id(), &bytes).map_err(|error| format!("上传 embedding 表: {error}"))?;
+    eprintln!("[glm52-embedding-resident] device={} vocab={} hidden={} bytes={} wall={:.3}s", context.device_id(), cfg.vocab_size, cfg.hidden_size, bytes.len(), started.elapsed().as_secs_f64());
+    Ok(Some(std::sync::Arc::new(table)))
+}
+
+/// head 首卡(A0)的输出运行时:LM head + 采样常驻,以及可选的 MTP L78 与
+/// FR-Spec draft head。tail 采样路径移除后,这是唯一的输出侧装配入口。
+pub(in crate::runtime::glm52) fn prepare_head_output_runtime(
     output_context: &RocmContext,
     weights: &Glm52Weights,
     cfg: &Glm52Config,
@@ -756,10 +536,11 @@ pub(super) fn prepare_tail_output_runtime(
     mtp_draft_tokens: usize,
     mtp_draft_vocabulary: Option<&Path>,
     lm_head_quantization: LmHeadQuantization,
+    embedding_table: Option<std::sync::Arc<ops::hip::DeviceBuffer>>,
 ) -> Result<(Glm52OutputHead<RocmWeight>, Option<RocmMtpRuntime>), String> {
-    let final_norm = weights.final_norm().map_err(|error| format!("加载 tail final norm: {error:?}"))?;
-    let lm_head = weights.lm_head_bf16_bytes().map_err(|error| format!("加载 tail LM head: {error:?}"))?;
-    let output_head = prepare_glm52_output_head_quantized(output_context, cfg, &final_norm, LinearWeight::Bf16Bytes(&lm_head), lm_head_quantization).map_err(|error| format!("准备 tail ROCm GLM output head: {error:?}"))?;
+    let final_norm = weights.final_norm().map_err(|error| format!("加载 final norm: {error:?}"))?;
+    let lm_head = weights.lm_head_bf16_bytes().map_err(|error| format!("加载 LM head: {error:?}"))?;
+    let output_head = prepare_glm52_output_head_quantized(output_context, cfg, &final_norm, LinearWeight::Bf16Bytes(&lm_head), lm_head_quantization).map_err(|error| format!("准备 ROCm GLM output head: {error:?}"))?;
     let draft_head = if mtp_enabled {
         mtp_draft_vocabulary
             .map(|path| {
@@ -782,7 +563,7 @@ pub(super) fn prepare_tail_output_runtime(
             let mut experts = RocmPrefillExperts::ct(source);
             experts.preload_layer(output_context, cfg.layer_count, cfg.expert_count).map_err(|error| format!("常驻 ROCm MTP experts: {error:?}"))?;
             eprintln!("[glm52-mtp-resident] device={} layer={} drafts={} wall={:.3}s", output_context.device_id(), cfg.layer_count, mtp_draft_tokens, started.elapsed().as_secs_f64());
-            Some(RocmMtpRuntime { backend: *output_context, weights: mtp_weights, experts, draft_head })
+            Some(RocmMtpRuntime { backend: *output_context, weights: mtp_weights, experts, draft_head, embedding: embedding_table })
         } else if weights.source_is_gguf() {
             let started = Instant::now();
             output_context.activate()?;
@@ -791,7 +572,7 @@ pub(super) fn prepare_tail_output_runtime(
             let mut experts = RocmPrefillExperts::gguf(weights.gguf_source()?);
             experts.preload_layer(output_context, cfg.layer_count, cfg.expert_count).map_err(|error| format!("常驻 ROCm MTP experts: {error:?}"))?;
             eprintln!("[glm52-mtp-resident] device={} layer={} drafts={} wall={:.3}s", output_context.device_id(), cfg.layer_count, mtp_draft_tokens, started.elapsed().as_secs_f64());
-            Some(RocmMtpRuntime { backend: *output_context, weights: mtp_weights, experts, draft_head })
+            Some(RocmMtpRuntime { backend: *output_context, weights: mtp_weights, experts, draft_head, embedding: embedding_table })
         } else {
             return Err("GLM-5.2 distributed MTP 当前只支持 compressed-tensors/GGUF 权重".to_owned());
         }

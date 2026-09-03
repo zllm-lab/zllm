@@ -30,9 +30,16 @@ pub(super) fn upload_pod<T>(device_id: i32, values: &[T]) -> Result<DeviceBuffer
 
 type CtGroupedMetaCache = std::collections::HashMap<(i32, Vec<u64>), std::sync::Arc<DeviceBuffer>>;
 
+#[derive(Clone)]
+pub(crate) struct GgufGroupedMetas {
+    pub(crate) buffer: std::sync::Arc<DeviceBuffer>,
+    pub(crate) uniform_types: Option<[u32; 3]>,
+}
+
 /// GGUF expert metas 的内容寻址设备缓存(对齐 CT resident_grouped_metas)：
 /// 常驻 expert 指针稳定，同一层重复调用零上传。
-pub(crate) fn resident_gguf_grouped_metas(device_id: i32, metas: &[super::GgufGroupedExpertMeta]) -> Result<std::sync::Arc<DeviceBuffer>, String> {
+pub(crate) fn resident_gguf_grouped_metas(device_id: i32, metas: &[super::GgufGroupedExpertMeta]) -> Result<GgufGroupedMetas, String> {
+    let uniform_types = metas.first().map(|first| [first.gate_type, first.up_type, first.down_type]).filter(|types| metas.iter().all(|meta| [meta.gate_type, meta.up_type, meta.down_type] == *types));
     let mut identity = Vec::with_capacity(metas.len() * 4);
     for expert in metas {
         identity.push(expert.gate);
@@ -44,11 +51,11 @@ pub(crate) fn resident_gguf_grouped_metas(device_id: i32, metas: &[super::GgufGr
     let mut cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new())).lock().map_err(|_| "GGUF grouped expert metadata cache 已损坏".to_owned())?;
     let key = (device_id, identity);
     if let Some(buffer) = cache.get(&key) {
-        return Ok(buffer.clone());
+        return Ok(GgufGroupedMetas { buffer: buffer.clone(), uniform_types });
     }
     let buffer = std::sync::Arc::new(upload_pod(device_id, metas)?);
     cache.insert(key, buffer.clone());
-    Ok(buffer)
+    Ok(GgufGroupedMetas { buffer, uniform_types })
 }
 
 fn resident_grouped_metas(device_id: i32, metas: &[CtGroupedExpertMeta]) -> Result<std::sync::Arc<DeviceBuffer>, String> {
@@ -94,19 +101,19 @@ pub(crate) fn preload_ct_grouped_expert_metas(device_id: i32, experts: &[CtGroup
     resident_grouped_metas(device_id, &metas).map(|_| ())
 }
 
-pub(crate) struct CtCooperativeGateUp {
-    activated: DeviceBuffer,
-    route_to_grouped: DeviceBuffer,
-    grouped_tokens: DeviceBuffer,
-    grouped_weights: DeviceBuffer,
-    grouped_offsets: DeviceBuffer,
-    grouped_metas: DeviceBuffer,
+struct CtCooperativeGateUp<'a> {
+    activated: &'a DeviceBuffer,
+    route_to_grouped: &'a DeviceBuffer,
+    grouped_tokens: &'a DeviceBuffer,
+    grouped_weights: &'a DeviceBuffer,
+    grouped_offsets: &'a DeviceBuffer,
+    grouped_metas: &'a DeviceBuffer,
     slot_count: usize,
 }
 
-impl CtCooperativeGateUp {
-    pub(crate) fn activated(&self) -> &DeviceBuffer {
-        &self.activated
+impl CtCooperativeGateUp<'_> {
+    fn activated(&self) -> &DeviceBuffer {
+        self.activated
     }
 }
 
@@ -118,7 +125,7 @@ fn synchronize_cooperative_kernel(device_id: i32, label: &str) -> Result<(), Str
 }
 
 /// 双卡 MoE 按 gate/up 输出行分片；down 的每个输出行仍由单卡完整累计。
-pub(crate) fn try_ct_cooperative_gate_up_bf16(
+fn try_ct_cooperative_gate_up_bf16<'a>(
     device_id: i32,
     input: &DeviceBuffer,
     input_rows: usize,
@@ -129,7 +136,8 @@ pub(crate) fn try_ct_cooperative_gate_up_bf16(
     route_count: usize,
     top_k: usize,
     experts: &[CtGroupedExpertRef<'_>],
-) -> Result<CtCooperativeGateUp, String> {
+    workspace: &'a TensorWorkspace,
+) -> Result<CtCooperativeGateUp<'a>, String> {
     let input_elements = input_rows.checked_mul(hidden_size).ok_or("cooperative gate input elements 溢出")?;
     let input_bf16_bytes = input_elements.checked_mul(2).ok_or("cooperative gate input 溢出")?;
     let input_f32_bytes = input_elements.checked_mul(4).ok_or("cooperative gate input 溢出")?;
@@ -149,6 +157,16 @@ pub(crate) fn try_ct_cooperative_gate_up_bf16(
         return Err("ROCm cooperative gate/up 参数无效".to_owned());
     }
     let metas = ct_grouped_expert_metas(device_id, experts)?;
+    let fused_small_compatible = metas.iter().all(|expert| {
+        expert.gate.format == 0
+            && expert.up.format == 0
+            && expert.gate.scale_dtype == 0
+            && expert.up.scale_dtype == 0
+            && expert.gate.group_size != 0
+            && expert.gate.group_size == expert.up.group_size
+            && expert.gate.group_size.is_multiple_of(8)
+            && hidden_size.is_multiple_of(expert.gate.group_size as usize)
+    });
     let all_metas = resident_grouped_metas(device_id, &metas)?;
     set_device(device_id)?;
     let input_bf16;
@@ -162,13 +180,13 @@ pub(crate) fn try_ct_cooperative_gate_up_bf16(
     // activation 保持 expert-grouped 布局，down 通过 route_to_grouped 恢复
     // token-major 顺序。这样不需要额外搬运整块 activation。
     let slot_count = route_count.min(experts.len());
-    let grouped_tokens = DeviceBuffer::allocate(device_id, route_count.checked_mul(4).ok_or("cooperative grouped tokens 溢出")?)?;
-    let grouped_weights = DeviceBuffer::allocate(device_id, route_count.checked_mul(4).ok_or("cooperative grouped weights 溢出")?)?;
-    let route_to_grouped = DeviceBuffer::allocate_reusable(device_id, route_count.checked_mul(4).ok_or("cooperative route map 溢出")?)?;
-    let grouped_offsets = DeviceBuffer::allocate(device_id, slot_count.checked_add(1).and_then(|n| n.checked_mul(4)).ok_or("cooperative grouped offsets 溢出")?)?;
-    let grouped_metas = DeviceBuffer::allocate(device_id, slot_count.checked_mul(std::mem::size_of::<CtGroupedExpertMeta>()).ok_or("cooperative grouped metas 溢出")?)?;
-    let gate = DeviceBuffer::allocate(device_id, route_count.checked_mul(intermediate_size).and_then(|n| n.checked_mul(4)).ok_or("cooperative gate workspace 溢出")?)?;
-    let activated = DeviceBuffer::allocate_reusable(device_id, route_count.checked_mul(intermediate_size).and_then(|n| n.checked_mul(2)).ok_or("cooperative activated bytes 溢出")?)?;
+    let grouped_tokens = workspace.buffer(0);
+    let grouped_weights = workspace.buffer(1);
+    let route_to_grouped = workspace.buffer(2);
+    let grouped_offsets = workspace.buffer(3);
+    let grouped_metas = workspace.buffer(4);
+    let gate = workspace.buffer(5);
+    let activated = workspace.buffer(6);
     let functions = ct_quantized_functions(device_id)?;
     let runtime = RocmRuntime::open()?;
     let launch = crate::kernel::rocm::hip::kernel_launch_trampoline;
@@ -249,9 +267,10 @@ pub(crate) fn try_ct_cooperative_gate_up_bf16(
     }
     synchronize_cooperative_kernel(device_id, "cooperative grouped WMMA gate/up")?;
 
-    // WMMA 主体跳过不足 4 条 route 的 expert；复用 grouped scalar 的
-    // singleton 与 2..3 行补写逻辑，保证长尾路由完整。
-    let launch_small = |projection: u32| -> Result<(), String> {
+    // WMMA 主体跳过不足 4 条 route 的 expert。标准 W4G128/BF16 在一个
+    // 紧凑 pass 内同时累计 gate/up 并直接写 activation；其他格式保留
+    // 两遍 scalar fallback。
+    let launch_small = |projection: u32, compact_only: bool| -> Result<(), String> {
         let mut linear_input = input.pointer;
         let mut tokens = grouped_tokens.pointer;
         let mut expert_meta = grouped_metas.pointer;
@@ -285,6 +304,9 @@ pub(crate) fn try_ct_cooperative_gate_up_bf16(
             return Err(runtime.hip_error(singleton, "cooperative grouped singleton gate/up"));
         }
         synchronize_cooperative_kernel(device_id, "cooperative grouped singleton gate/up")?;
+        if compact_only {
+            return Ok(());
+        }
         let status = unsafe { launch(functions.grouped_linear as *mut c_void, output_rows, 1, expert_count, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
         if status != HIP_SUCCESS {
             return Err(runtime.hip_error(status, "cooperative grouped scalar gate/up"));
@@ -292,16 +314,20 @@ pub(crate) fn try_ct_cooperative_gate_up_bf16(
         synchronize_cooperative_kernel(device_id, "cooperative grouped scalar gate/up")?;
         Ok(())
     };
-    launch_small(0)?;
-    launch_small(1)?;
+    if fused_small_compatible {
+        launch_small(0, true)?;
+    } else {
+        launch_small(0, false)?;
+        launch_small(1, false)?;
+    }
 
     Ok(CtCooperativeGateUp { activated, route_to_grouped, grouped_tokens, grouped_weights, grouped_offsets, grouped_metas, slot_count })
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn try_ct_cooperative_sharded_down_bf16(
+fn try_ct_cooperative_sharded_down_bf16(
     device_id: i32,
-    local_gate: &CtCooperativeGateUp,
+    local_gate: &CtCooperativeGateUp<'_>,
     low_activated: &DeviceBuffer,
     high_activated: &DeviceBuffer,
     route_ids: &DeviceBuffer,
@@ -510,65 +536,120 @@ pub(crate) fn try_ct_cooperative_sharded_down_bf16(
     Ok(output)
 }
 
-fn cooperative_single_expert_route(device_id: i32, input_rows: usize) -> Result<(std::sync::Arc<DeviceBuffer>, std::sync::Arc<DeviceBuffer>), String> {
-    // 首请求不能在全局 cache mutex 内做 H2D + stream synchronize：相邻 stage
-    // 的 peer event 会与等待同一 mutex 的 host 线程形成锁环。常量 route 直接
-    // 在当前 stream 上生成，生命周期由后续 shared kernels 自然覆盖。
+/// cooperative routed/shared MoE 的大临时量由 event 保护的有限槽位持有。
+/// gate/up 与 down 必须在同一闭包内排队，slot 才能在最后一个消费者完成后复用。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_ct_cooperative_routed_bf16(
+    device_id: i32,
+    input: &DeviceBuffer,
+    input_rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    route_ids: &DeviceBuffer,
+    route_weights: &DeviceBuffer,
+    route_count: usize,
+    top_k: usize,
+    experts: &[CtGroupedExpertRef<'_>],
+    output_rows: usize,
+) -> Result<DeviceBuffer, String> {
+    let slot_count = route_count.min(experts.len());
+    let route_bytes = route_count.checked_mul(4).ok_or("cooperative route workspace 溢出")?;
+    let sizes = [
+        route_bytes,
+        route_bytes,
+        route_bytes,
+        slot_count.checked_add(1).and_then(|n| n.checked_mul(4)).ok_or("cooperative grouped offsets 溢出")?,
+        slot_count.checked_mul(std::mem::size_of::<CtGroupedExpertMeta>()).ok_or("cooperative grouped metas 溢出")?,
+        route_count.checked_mul(intermediate_size).and_then(|n| n.checked_mul(4)).ok_or("cooperative gate workspace 溢出")?,
+        route_count.checked_mul(intermediate_size).and_then(|n| n.checked_mul(2)).ok_or("cooperative activated workspace 溢出")?,
+    ];
+    with_deferred_cooperative_moe_workspace(device_id, &sizes, |workspace| {
+        let gate = try_ct_cooperative_gate_up_bf16(device_id, input, input_rows, hidden_size, intermediate_size, route_ids, route_weights, route_count, top_k, experts, workspace)?;
+        try_ct_cooperative_sharded_down_bf16(device_id, &gate, gate.activated(), gate.activated(), route_ids, route_weights, input_rows, route_count, top_k, intermediate_size, 0, output_rows)
+    })
+}
+
+pub(super) fn cooperative_single_expert_route(device_id: i32, input_rows: usize) -> Result<(std::sync::Arc<DeviceBuffer>, std::sync::Arc<DeviceBuffer>), String> {
+    // 单 token decode 的 shared route 永远是 {expert=0, weight=1}。按线程和
+    // device 常驻，既不引入全局 mutex，也避免每层重复发两个单元素 fill kernel。
+    if input_rows == 1 {
+        thread_local! {
+            static DECODE_ROUTES: std::cell::RefCell<std::collections::HashMap<i32, (std::sync::Arc<DeviceBuffer>, std::sync::Arc<DeviceBuffer>)>> =
+                std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        if let Some(route) = DECODE_ROUTES.with(|routes| routes.borrow().get(&device_id).cloned()) {
+            return Ok(route);
+        }
+        let ids = std::sync::Arc::new(crate::kernel::rocm::hip::try_fill_resident_u32(device_id, 0, 1)?);
+        let weights = std::sync::Arc::new(crate::kernel::rocm::hip::try_fill_resident_u32(device_id, 1.0_f32.to_bits(), 1)?);
+        DECODE_ROUTES.with(|routes| {
+            routes.borrow_mut().insert(device_id, (ids.clone(), weights.clone()));
+        });
+        return Ok((ids, weights));
+    }
+    // prefill 尺寸会变化；继续在当前 stream 生成，避免全局 cache mutex 与
+    // 相邻 stage 的 peer event 形成锁环。
     let ids = crate::kernel::rocm::hip::try_fill_resident_u32(device_id, 0, input_rows)?;
     let weights = crate::kernel::rocm::hip::try_fill_resident_u32(device_id, 1.0_f32.to_bits(), input_rows)?;
     Ok((std::sync::Arc::new(ids), std::sync::Arc::new(weights)))
 }
 
-/// shared expert 留在 owner 上完整计算；单独返回 shared，最终与 routed、residual
-/// 在 join kernel 中按单卡相同的括号顺序融合。
+/// shared expert 与 routed expert 使用同一种 gate/up 行、down K 列分片。
 pub(crate) fn try_ct_cooperative_shared_bf16(device_id: i32, input: &DeviceBuffer, input_rows: usize, hidden_size: usize, intermediate_size: usize, shared: &CtGroupedExpertRef<'_>) -> Result<DeviceBuffer, String> {
     let (route_ids, route_weights) = cooperative_single_expert_route(device_id, input_rows)?;
-    let gate = try_ct_cooperative_gate_up_bf16(device_id, input, input_rows, hidden_size, intermediate_size, &route_ids, &route_weights, input_rows, 1, std::slice::from_ref(shared))?;
-    // high_columns=0 时第二个 activation 指针不会被读取；复用同一 buffer，
-    // 让 shared 走与 routed 完全相同的确定性 down 累加而不引入 workspace。
-    try_ct_cooperative_sharded_down_bf16(device_id, &gate, gate.activated(), gate.activated(), &route_ids, &route_weights, input_rows, input_rows, 1, intermediate_size, 0, hidden_size)
+    try_ct_cooperative_routed_bf16(device_id, input, input_rows, hidden_size, intermediate_size, &route_ids, &route_weights, input_rows, 1, std::slice::from_ref(shared), hidden_size)
 }
 
-pub(crate) fn try_ct_cooperative_partial_join_f32(
-    device_id: i32,
-    local_partial: &DeviceBuffer,
-    peer_partial: &DeviceBuffer,
-    shared: &DeviceBuffer,
-    residual: &DeviceBuffer,
-    input_rows: usize,
-    hidden_size: usize,
-) -> Result<DeviceBuffer, String> {
+pub(crate) fn try_ct_cooperative_combine_partial_bf16(device_id: i32, routed: &DeviceBuffer, shared: &DeviceBuffer, elements: usize) -> Result<DeviceBuffer, String> {
+    let input_bytes = elements.checked_mul(4).ok_or("cooperative partial combine 输入大小溢出")?;
+    let output_bytes = elements.checked_mul(2).ok_or("cooperative partial combine 输出大小溢出")?;
+    if elements == 0 || routed.device_id != device_id || shared.device_id != device_id || routed.bytes < input_bytes || shared.bytes < input_bytes {
+        return Err("ROCm cooperative partial combine 参数无效".to_owned());
+    }
+    set_device(device_id)?;
+    // peer BAR 来源必须跨 stream/device 保活；直接写显式池，省掉普通 cast
+    // 输出到稳定池的第二次 D2D 复制。
+    let output = DeviceBuffer::allocate_peer(device_id, output_bytes)?;
+    let functions = ct_quantized_functions(device_id)?;
+    let runtime = RocmRuntime::open()?;
+    let launch = crate::kernel::rocm::hip::kernel_launch_trampoline;
+    let mut routed_pointer = routed.pointer;
+    let mut shared_pointer = shared.pointer;
+    let mut output_pointer = output.pointer;
+    let mut elements = u32::try_from(elements).map_err(|_| "cooperative partial combine 元素数超过 u32")?;
+    let mut arguments = [(&mut routed_pointer as *mut *mut c_void).cast(), (&mut shared_pointer as *mut *mut c_void).cast(), (&mut output_pointer as *mut *mut c_void).cast(), (&mut elements as *mut u32).cast()];
+    let status = unsafe { launch(functions.cooperative_combine_partial as *mut c_void, elements.div_ceil(256), 1, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
+    if status != HIP_SUCCESS {
+        return Err(runtime.hip_error(status, "cooperative partial combine"));
+    }
+    synchronize_cooperative_kernel(device_id, "cooperative partial combine")?;
+    Ok(output)
+}
+
+pub(crate) fn try_ct_cooperative_partial_join_f32(device_id: i32, local_partial: &DeviceBuffer, peer_partial: &DeviceBuffer, residual: &DeviceBuffer, input_rows: usize, hidden_size: usize) -> Result<DeviceBuffer, String> {
     let hidden_bytes = input_rows.checked_mul(hidden_size).and_then(|n| n.checked_mul(4)).ok_or("cooperative sharded join bytes 溢出")?;
-    if input_rows == 0
-        || hidden_size == 0
-        || local_partial.device_id != device_id
-        || peer_partial.device_id != device_id
-        || shared.device_id != device_id
-        || residual.device_id != device_id
-        || local_partial.bytes < hidden_bytes
-        || peer_partial.bytes < hidden_bytes
-        || shared.bytes < hidden_bytes
-        || residual.bytes < hidden_bytes
-    {
+    let peer_bytes = hidden_bytes / 2;
+    if input_rows == 0 || hidden_size == 0 || local_partial.device_id != device_id || residual.device_id != device_id || local_partial.bytes < hidden_bytes || peer_partial.bytes < peer_bytes || residual.bytes < hidden_bytes {
         return Err("ROCm cooperative partial join 参数无效".to_owned());
+    }
+    if peer_partial.device_id != device_id {
+        enable_peer_access(device_id, peer_partial.device_id)?;
     }
     set_device(device_id)?;
     let output = DeviceBuffer::allocate_reusable(device_id, hidden_bytes)?;
     let functions = ct_quantized_functions(device_id)?;
     let runtime = RocmRuntime::open()?;
     let launch = crate::kernel::rocm::hip::kernel_launch_trampoline;
-    let mut local = local_partial.pointer;
-    let mut peer = peer_partial.pointer;
-    let mut shared = shared.pointer;
+    let mut local_partial = local_partial.pointer;
+    let mut peer_partial = peer_partial.pointer;
     let mut residual = residual.pointer;
     let mut output_pointer = output.pointer;
     let grid_x = u32::try_from(input_rows.checked_mul(hidden_size).ok_or("cooperative sharded join grid elements 溢出")?.div_ceil(256)).map_err(|_| "cooperative sharded join grid 超过 u32")?;
     let mut input_rows = u32::try_from(input_rows).map_err(|_| "cooperative sharded join input rows 超过 u32")?;
     let mut hidden_size = u32::try_from(hidden_size).map_err(|_| "cooperative partial join hidden 超过 u32")?;
     let mut arguments = [
-        (&mut local as *mut *mut c_void).cast(),
-        (&mut peer as *mut *mut c_void).cast(),
-        (&mut shared as *mut *mut c_void).cast(),
+        (&mut local_partial as *mut *mut c_void).cast(),
+        (&mut peer_partial as *mut *mut c_void).cast(),
         (&mut residual as *mut *mut c_void).cast(),
         (&mut output_pointer as *mut *mut c_void).cast(),
         (&mut input_rows as *mut u32).cast(),

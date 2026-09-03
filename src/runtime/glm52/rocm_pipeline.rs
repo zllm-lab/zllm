@@ -134,7 +134,7 @@ impl Glm52PipelineNode {
             let dsa = &mut session.dsa[*placement];
             let cache = &mut session.caches[*placement];
             hidden = match resident {
-                PrefillLayer::Dense(resident) => glm52_dense_prefill_layer(backend, &self.cfg, &self.mla, resident, layer, Some(dsa), &hidden, &self.rope, Some(cache), message.position),
+                PrefillLayer::Dense(resident) => glm52_dense_prefill_layer(backend, &self.cfg, &self.mla, resident, layer, Some(&self.experts[*placement]), Some(dsa), &hidden, &self.rope, Some(cache), message.position),
                 PrefillLayer::Moe(resident) => glm52_moe_prefill_layer(backend, &self.cfg, &self.mla, resident, layer, &mut self.experts[*placement], None, Some(dsa), &hidden, &self.rope, Some(cache), message.position),
             }
             .map_err(|error| format!("ROCm pipeline L{layer}: {error:?}"))?;

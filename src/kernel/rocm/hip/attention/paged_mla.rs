@@ -31,7 +31,10 @@ struct PagedMlaFunctions {
     cache_copy_q8_pair: usize,
     cache_append_mla_q8_bf16: usize,
     mla_hot_scatter_q8: usize,
+    mla_hot_gather_q8: usize,
     dsa_clear: usize,
+    dsa_gather_selection_scores: usize,
+    dsa_merge_sequence_shards: usize,
     dsa_score: usize,
     dsa_quantize_query_i8: usize,
     dsa_score_i8: usize,
@@ -61,6 +64,9 @@ struct PagedMlaFunctions {
     decode_partial: usize,
     decode_partial_wmma_q8: usize,
     split_merge: usize,
+    selection_split: usize,
+    shard_scale: usize,
+    shard_merge_heads: usize,
     project_value: usize,
     project_value_wmma: usize,
     wavefront_size: u32,
@@ -69,6 +75,20 @@ struct PagedMlaFunctions {
 #[cfg(test)]
 static TEST_SPARSE_PREFILL_WMMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+#[cfg(test)]
+static TEST_MLA_DECODE_WMMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+fn mla_decode_wmma_enabled() -> bool {
+    #[cfg(test)]
+    {
+        if !TEST_MLA_DECODE_WMMA.load(std::sync::atomic::Ordering::Relaxed) {
+            return false;
+        }
+        true
+    }
+    #[cfg(not(test))]
+    true
+}
 fn sparse_prefill_wmma_enabled() -> bool {
     #[cfg(test)]
     {
@@ -81,6 +101,49 @@ fn sparse_prefill_wmma_enabled() -> bool {
 /// 在节点注册前完成 paged MLA/DSA HIPRTC 编译，避免首个请求承担一次性开销。
 pub fn warmup_paged_mla(device_id: i32) -> Result<(), String> {
     paged_mla_functions(device_id).map(|_| ())
+}
+
+pub(crate) struct PagedMlaSelectionShards {
+    pub owner: std::sync::Arc<DeviceBuffer>,
+    pub owner_counts: std::sync::Arc<DeviceBuffer>,
+    pub peer: std::sync::Arc<DeviceBuffer>,
+    pub peer_counts: std::sync::Arc<DeviceBuffer>,
+}
+
+/// 全局 top-k 只做一次，然后按固定 KV block parity 拆成两张紧凑候选表。
+/// counts 使 attention 只扫本卡实际候选数，不把另一半填充槽当作计算量。
+pub(crate) fn try_split_paged_mla_selection_parity(device_id: i32, selection: &DeviceBuffer, rows: usize, width: usize, block_size: usize) -> Result<PagedMlaSelectionShards, String> {
+    if rows == 0 || width == 0 || block_size == 0 {
+        return Err(format!("paged MLA selection split shape rows={rows} width={width} block={block_size} 非法"));
+    }
+    let table_bytes = rows.checked_mul(width).and_then(|n| n.checked_mul(std::mem::size_of::<u32>())).ok_or("paged MLA selection split table 大小溢出")?;
+    let count_bytes = rows.checked_mul(std::mem::size_of::<u32>()).ok_or("paged MLA selection split counts 大小溢出")?;
+    validate_resident(selection, device_id, table_bytes, "paged MLA global selection")?;
+    let owner = std::sync::Arc::new(DeviceBuffer::allocate_reusable(device_id, table_bytes)?);
+    let peer = std::sync::Arc::new(DeviceBuffer::allocate_reusable(device_id, table_bytes)?);
+    let owner_counts = std::sync::Arc::new(DeviceBuffer::allocate_reusable(device_id, count_bytes)?);
+    let peer_counts = std::sync::Arc::new(DeviceBuffer::allocate_reusable(device_id, count_bytes)?);
+    let functions = paged_mla_functions(device_id)?;
+    let mut d_selection = selection.pointer;
+    let mut d_owner = owner.pointer;
+    let mut d_peer = peer.pointer;
+    let mut d_owner_counts = owner_counts.pointer;
+    let mut d_peer_counts = peer_counts.pointer;
+    let mut rows = u32::try_from(rows).map_err(|_| "paged MLA selection split rows 超过 u32")?;
+    let mut width = u32::try_from(width).map_err(|_| "paged MLA selection split width 超过 u32")?;
+    let mut block_size = u32::try_from(block_size).map_err(|_| "paged MLA selection split block 超过 u32")?;
+    let mut arguments = [
+        (&mut d_selection as *mut *mut c_void).cast(),
+        (&mut d_owner as *mut *mut c_void).cast(),
+        (&mut d_peer as *mut *mut c_void).cast(),
+        (&mut d_owner_counts as *mut *mut c_void).cast(),
+        (&mut d_peer_counts as *mut *mut c_void).cast(),
+        (&mut rows as *mut u32).cast(),
+        (&mut width as *mut u32).cast(),
+        (&mut block_size as *mut u32).cast(),
+    ];
+    launch_moe_kernel(functions.selection_split, rows, 1, 256, 0, &mut arguments, "HIP MLA split global selection parity")?;
+    Ok(PagedMlaSelectionShards { owner, owner_counts, peer, peer_counts })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -177,19 +240,69 @@ pub fn try_paged_dsa_append_layernorm_rope_q8(
     block_size: usize,
     eps: f32,
 ) -> Result<(), String> {
+    try_paged_dsa_append_layernorm_rope_q8_at(device_id, input, weight, bias, cache, scales, block_table, position, position, rows, columns, rotary_dim, layout, cos, sin, block_size, eps)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_paged_dsa_append_layernorm_rope_q8_at(
+    device_id: i32,
+    input: &DeviceBuffer,
+    weight: &DeviceBuffer,
+    bias: &DeviceBuffer,
+    cache: &DeviceBuffer,
+    scales: &DeviceBuffer,
+    block_table: &DeviceBuffer,
+    cache_position: usize,
+    rope_position: usize,
+    rows: usize,
+    columns: usize,
+    rotary_dim: usize,
+    layout: crate::attention::rope::RotaryLayout,
+    cos: &[f32],
+    sin: &[f32],
+    block_size: usize,
+    eps: f32,
+) -> Result<(), String> {
+    try_paged_dsa_append_layernorm_rope_q8_remote(device_id, device_id, input, weight, bias, cache, scales, block_table, cache_position, rope_position, rows, columns, rotary_dim, layout, cos, sin, block_size, eps)
+}
+
+/// 与 `_at` 相同，但 cache/scales/table 允许驻留在 cache_device_id（cooperative
+/// 单行 append 直写 peer 卡）。kernel 仍在 device_id 的流上提交。
+#[allow(clippy::too_many_arguments)]
+pub fn try_paged_dsa_append_layernorm_rope_q8_remote(
+    device_id: i32,
+    cache_device_id: i32,
+    input: &DeviceBuffer,
+    weight: &DeviceBuffer,
+    bias: &DeviceBuffer,
+    cache: &DeviceBuffer,
+    scales: &DeviceBuffer,
+    block_table: &DeviceBuffer,
+    cache_position: usize,
+    rope_position: usize,
+    rows: usize,
+    columns: usize,
+    rotary_dim: usize,
+    layout: crate::attention::rope::RotaryLayout,
+    cos: &[f32],
+    sin: &[f32],
+    block_size: usize,
+    eps: f32,
+) -> Result<(), String> {
     if rows == 0 || columns == 0 || columns > 256 || !columns.is_power_of_two() || rotary_dim == 0 || rotary_dim > columns || !rotary_dim.is_multiple_of(2) {
         return Err(format!("paged DSA fused prologue rows={rows} columns={columns} rotary_dim={rotary_dim} 非法"));
     }
     let elements = rows.checked_mul(columns).ok_or("paged DSA fused prologue 元素数溢出")?;
-    let end = position.checked_add(rows).ok_or("paged DSA fused prologue position 溢出")?;
+    let end = cache_position.checked_add(rows).ok_or("paged DSA fused prologue cache position 溢出")?;
+    let rope_end = rope_position.checked_add(rows).ok_or("paged DSA fused prologue rope position 溢出")?;
     validate_resident(input, device_id, elements.checked_mul(4).ok_or("paged DSA fused input 大小溢出")?, "paged DSA fused input")?;
     validate_resident(weight, device_id, columns.checked_mul(4).ok_or("paged DSA fused weight 大小溢出")?, "paged DSA fused weight")?;
     validate_resident(bias, device_id, columns.checked_mul(4).ok_or("paged DSA fused bias 大小溢出")?, "paged DSA fused bias")?;
-    validate_resident(cache, device_id, end.checked_mul(columns).ok_or("paged DSA fused cache 大小溢出")?, "paged DSA fused cache")?;
-    validate_resident(scales, device_id, end.checked_mul(2).ok_or("paged DSA fused scale 大小溢出")?, "paged DSA fused scales")?;
-    validate_resident(block_table, device_id, end.div_ceil(block_size).checked_mul(4).ok_or("paged DSA fused block table 大小溢出")?, "paged DSA fused block table")?;
+    validate_resident(cache, cache_device_id, end.checked_mul(columns).ok_or("paged DSA fused cache 大小溢出")?, "paged DSA fused cache")?;
+    validate_resident(scales, cache_device_id, end.checked_mul(2).ok_or("paged DSA fused scale 大小溢出")?, "paged DSA fused scales")?;
+    validate_resident(block_table, cache_device_id, end.div_ceil(block_size).checked_mul(4).ok_or("paged DSA fused block table 大小溢出")?, "paged DSA fused block table")?;
     let half = rotary_dim / 2;
-    let (cosine, sine) = super::super::tensor::resident_rope_tables(device_id, cos, sin, half, position..end)?;
+    let (cosine, sine) = super::super::tensor::resident_rope_tables(device_id, cos, sin, half, rope_position..rope_end)?;
     let functions = paged_mla_functions(device_id)?;
     let mut d_input = input.pointer;
     let mut d_weight = weight.pointer;
@@ -199,7 +312,8 @@ pub fn try_paged_dsa_append_layernorm_rope_q8(
     let mut d_cache = cache.pointer;
     let mut d_scales = scales.pointer;
     let mut d_table = block_table.pointer;
-    let mut position = u32::try_from(position).map_err(|_| "paged DSA fused position 超过 u32")?;
+    let mut cache_position = u32::try_from(cache_position).map_err(|_| "paged DSA fused cache position 超过 u32")?;
+    let mut rope_position = u32::try_from(rope_position).map_err(|_| "paged DSA fused rope position 超过 u32")?;
     let mut rows = u32::try_from(rows).map_err(|_| "paged DSA fused rows 超过 u32")?;
     let mut columns = u32::try_from(columns).map_err(|_| "paged DSA fused columns 超过 u32")?;
     let mut rotary_dim = u32::try_from(rotary_dim).map_err(|_| "paged DSA fused rotary_dim 超过 u32")?;
@@ -215,7 +329,8 @@ pub fn try_paged_dsa_append_layernorm_rope_q8(
         (&mut d_cache as *mut *mut c_void).cast(),
         (&mut d_scales as *mut *mut c_void).cast(),
         (&mut d_table as *mut *mut c_void).cast(),
-        (&mut position as *mut u32).cast(),
+        (&mut cache_position as *mut u32).cast(),
+        (&mut rope_position as *mut u32).cast(),
         (&mut rows as *mut u32).cast(),
         (&mut columns as *mut u32).cast(),
         (&mut rotary_dim as *mut u32).cast(),
@@ -648,6 +763,7 @@ fn try_paged_cache_append_mla_f32_q8_bf16_inner(
     group_size: usize,
     block_size: usize,
     rope_rotation: Option<(usize, usize, RotaryLayout, &[f32], &[f32])>,
+    cache_device: Option<i32>,
 ) -> Result<(), String> {
     if group_size == 0 || group_size > 256 || !group_size.is_power_of_two() || !latent_columns.is_multiple_of(group_size) {
         return Err(format!("paged MLA Q8 cache group_size={group_size} latent_columns={latent_columns} 非法"));
@@ -659,12 +775,15 @@ fn try_paged_cache_append_mla_f32_q8_bf16_inner(
     let rope_blocks = rope_elements.div_ceil(group_size);
     let blocks = latent_groups.checked_add(rope_blocks).ok_or("paged MLA Q8 cache grid 溢出")?;
     let end = position.checked_add(rows).ok_or("paged MLA Q8 cache position 溢出")?;
+    // cooperative 单行 append 直写对端卡时，cache/scales/table 驻留在 peer 卡：
+    // 校验按它们的实际驻留卡做，launch 仍在本卡流上（输入在本卡，写出跨卡）。
+    let cache_device = cache_device.unwrap_or(device_id);
     validate_resident(latent_input, device_id, latent_elements.checked_mul(4).ok_or("paged MLA Q8 latent input 大小溢出")?, "paged MLA Q8 latent input")?;
-    validate_resident(latent_cache, device_id, end.checked_mul(latent_columns).ok_or("paged MLA Q8 latent cache 大小溢出")?, "paged MLA Q8 latent cache")?;
-    validate_resident(latent_scales, device_id, end.checked_mul(groups_per_row).and_then(|n| n.checked_mul(2)).ok_or("paged MLA Q8 latent scale 大小溢出")?, "paged MLA Q8 latent scales")?;
+    validate_resident(latent_cache, cache_device, end.checked_mul(latent_columns).ok_or("paged MLA Q8 latent cache 大小溢出")?, "paged MLA Q8 latent cache")?;
+    validate_resident(latent_scales, cache_device, end.checked_mul(groups_per_row).and_then(|n| n.checked_mul(2)).ok_or("paged MLA Q8 latent scale 大小溢出")?, "paged MLA Q8 latent scales")?;
     validate_resident(rope_input, device_id, rope_elements.checked_mul(4).ok_or("paged MLA rope input 大小溢出")?, "paged MLA rope input")?;
-    validate_resident(rope_cache, device_id, end.checked_mul(rope_columns).and_then(|n| n.checked_mul(2)).ok_or("paged MLA rope cache 大小溢出")?, "paged MLA rope cache")?;
-    validate_resident(block_table, device_id, end.div_ceil(block_size).checked_mul(4).ok_or("paged MLA block table 大小溢出")?, "paged MLA block table")?;
+    validate_resident(rope_cache, cache_device, end.checked_mul(rope_columns).and_then(|n| n.checked_mul(2)).ok_or("paged MLA rope cache 大小溢出")?, "paged MLA rope cache")?;
+    validate_resident(block_table, cache_device, end.div_ceil(block_size).checked_mul(4).ok_or("paged MLA block table 大小溢出")?, "paged MLA block table")?;
     let resident_rotation = match rope_rotation {
         Some((rope_position, rotary_dim, layout, cos, sin)) => {
             if rotary_dim == 0 || !rotary_dim.is_multiple_of(2) || rotary_dim > rope_columns {
@@ -733,7 +852,7 @@ pub fn try_paged_cache_append_mla_f32_q8_bf16(
     group_size: usize,
     block_size: usize,
 ) -> Result<(), String> {
-    try_paged_cache_append_mla_f32_q8_bf16_inner(device_id, latent_input, latent_cache, latent_scales, rope_input, rope_cache, block_table, position, rows, latent_columns, rope_columns, group_size, block_size, None)
+    try_paged_cache_append_mla_f32_q8_bf16_inner(device_id, latent_input, latent_cache, latent_scales, rope_input, rope_cache, block_table, position, rows, latent_columns, rope_columns, group_size, block_size, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -771,6 +890,7 @@ pub fn try_paged_cache_append_mla_rope_f32_q8_bf16(
         group_size,
         block_size,
         Some((position, rotary_dim, layout, cos, sin)),
+        None,
     )
 }
 
@@ -810,6 +930,52 @@ pub fn try_paged_cache_append_mla_rope_at_f32_q8_bf16(
         group_size,
         block_size,
         Some((rope_position, rotary_dim, layout, cos, sin)),
+        None,
+    )
+}
+
+/// cooperative 单行 append 的直写变体：目标 cache/scales/table 允许驻留在 peer 卡
+/// （cache_device_id != device_id）。kernel 仍在 device_id 的流上提交——输入在本卡、
+/// 输出跨卡直写，省掉 staging + parity 拷贝 + P2P 整段。调用方负责把写入完成事件
+/// 经既有 event/P2P 链串到对端消费点。
+#[allow(clippy::too_many_arguments)]
+pub fn try_paged_cache_append_mla_rope_remote_f32_q8_bf16(
+    device_id: i32,
+    cache_device_id: i32,
+    latent_input: &DeviceBuffer,
+    latent_cache: &DeviceBuffer,
+    latent_scales: &DeviceBuffer,
+    rope_input: &DeviceBuffer,
+    rope_cache: &DeviceBuffer,
+    block_table: &DeviceBuffer,
+    cache_position: usize,
+    rope_position: usize,
+    rows: usize,
+    latent_columns: usize,
+    rope_columns: usize,
+    rotary_dim: usize,
+    layout: RotaryLayout,
+    group_size: usize,
+    block_size: usize,
+    cos: &[f32],
+    sin: &[f32],
+) -> Result<(), String> {
+    try_paged_cache_append_mla_f32_q8_bf16_inner(
+        device_id,
+        latent_input,
+        latent_cache,
+        latent_scales,
+        rope_input,
+        rope_cache,
+        block_table,
+        cache_position,
+        rows,
+        latent_columns,
+        rope_columns,
+        group_size,
+        block_size,
+        Some((rope_position, rotary_dim, layout, cos, sin)),
+        Some(cache_device_id),
     )
 }
 
@@ -867,6 +1033,68 @@ pub fn try_mla_hot_scatter_q8(
         (&mut target_rows as *mut u32).cast(),
     ];
     launch_tensor_kernel(functions.mla_hot_scatter_q8, rows, 256, &mut arguments, "HIP MLA hot scatter Q8+BF16")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_mla_hot_gather_q8(
+    device_id: i32,
+    source_latent: &DeviceBuffer,
+    source_scales: Option<&DeviceBuffer>,
+    source_rope: &DeviceBuffer,
+    tokens: &DeviceBuffer,
+    slots: &DeviceBuffer,
+    target_latent: &DeviceBuffer,
+    target_scales: &DeviceBuffer,
+    target_rope: &DeviceBuffer,
+    rows: usize,
+    latent_columns: usize,
+    scale_columns: usize,
+    rope_columns: usize,
+    target_rows: usize,
+) -> Result<(), String> {
+    if rows == 0 || latent_columns == 0 || scale_columns == 0 || rope_columns == 0 || target_rows == 0 {
+        return Err("MLA hot gather shape 非法".to_owned());
+    }
+    let source_scales = source_scales.ok_or("MLA hot gather 需要 Q8 source scales")?;
+    // source 是全量旧 buffer（H2D+扩容 后已远超 rows*cols），按 rows 取下界足以覆盖 kernel 访问范围。
+    validate_resident(source_latent, device_id, rows.checked_mul(latent_columns).ok_or("MLA hot latent 大小溢出")?, "MLA hot source latent")?;
+    validate_resident(source_scales, device_id, rows.checked_mul(scale_columns).and_then(|n| n.checked_mul(2)).ok_or("MLA hot scales 大小溢出")?, "MLA hot source scales")?;
+    validate_resident(source_rope, device_id, rows.checked_mul(rope_columns).and_then(|n| n.checked_mul(2)).ok_or("MLA hot rope 大小溢出")?, "MLA hot source rope")?;
+    validate_resident(tokens, device_id, rows.checked_mul(4).ok_or("MLA hot tokens 大小溢出")?, "MLA hot gather tokens")?;
+    validate_resident(slots, device_id, rows.checked_mul(4).ok_or("MLA hot slots 大小溢出")?, "MLA hot slots")?;
+    validate_resident(target_latent, device_id, target_rows.checked_mul(latent_columns).ok_or("MLA hot target latent 大小溢出")?, "MLA hot target latent")?;
+    validate_resident(target_scales, device_id, target_rows.checked_mul(scale_columns).and_then(|n| n.checked_mul(2)).ok_or("MLA hot target scales 大小溢出")?, "MLA hot target scales")?;
+    validate_resident(target_rope, device_id, target_rows.checked_mul(rope_columns).and_then(|n| n.checked_mul(2)).ok_or("MLA hot target rope 大小溢出")?, "MLA hot target rope")?;
+    let functions = paged_mla_functions(device_id)?;
+    let mut d_source_latent = source_latent.pointer;
+    let mut d_source_scales = source_scales.pointer;
+    let mut d_source_rope = source_rope.pointer;
+    let mut d_tokens = tokens.pointer;
+    let mut d_slots = slots.pointer;
+    let mut d_target_latent = target_latent.pointer;
+    let mut d_target_scales = target_scales.pointer;
+    let mut d_target_rope = target_rope.pointer;
+    let mut rows = u32::try_from(rows).map_err(|_| "MLA hot rows 超过 u32")?;
+    let mut latent_columns = u32::try_from(latent_columns).map_err(|_| "MLA hot latent columns 超过 u32")?;
+    let mut scale_columns = u32::try_from(scale_columns).map_err(|_| "MLA hot scale columns 超过 u32")?;
+    let mut rope_columns = u32::try_from(rope_columns).map_err(|_| "MLA hot rope columns 超过 u32")?;
+    let mut target_rows = u32::try_from(target_rows).map_err(|_| "MLA hot target rows 超过 u32")?;
+    let mut arguments = [
+        (&mut d_source_latent as *mut *mut c_void).cast(),
+        (&mut d_source_scales as *mut *mut c_void).cast(),
+        (&mut d_source_rope as *mut *mut c_void).cast(),
+        (&mut d_tokens as *mut *mut c_void).cast(),
+        (&mut d_slots as *mut *mut c_void).cast(),
+        (&mut d_target_latent as *mut *mut c_void).cast(),
+        (&mut d_target_scales as *mut *mut c_void).cast(),
+        (&mut d_target_rope as *mut *mut c_void).cast(),
+        (&mut rows as *mut u32).cast(),
+        (&mut latent_columns as *mut u32).cast(),
+        (&mut scale_columns as *mut u32).cast(),
+        (&mut rope_columns as *mut u32).cast(),
+        (&mut target_rows as *mut u32).cast(),
+    ];
+    launch_tensor_kernel(functions.mla_hot_gather_q8, rows, 256, &mut arguments, "HIP MLA hot gather Q8+BF16")
 }
 
 #[derive(Default)]
@@ -1131,6 +1359,79 @@ pub fn try_dsa_select_paged_q8(
     prefer_medium_select_tile: bool,
     block_size: usize,
 ) -> Result<DeviceBuffer, String> {
+    try_dsa_select_paged_q8_impl(
+        device_id,
+        keys,
+        key_scales,
+        key_group_size,
+        hadamard_i8,
+        block_table,
+        query,
+        head_weights,
+        query_rows,
+        context_rows,
+        query_start,
+        head_count,
+        head_dim,
+        top_k,
+        prefer_medium_select_tile,
+        block_size,
+        2,
+        false,
+    )
+    .map(|(selection, _)| selection)
+}
+
+pub struct DsaSequenceShardSelection {
+    pub selection: DeviceBuffer,
+    pub scores: DeviceBuffer,
+    pub width: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_dsa_select_paged_q8_sequence_shard(
+    device_id: i32,
+    keys: &DeviceBuffer,
+    key_scales: &DeviceBuffer,
+    key_group_size: usize,
+    block_table: &DeviceBuffer,
+    query: &DeviceBuffer,
+    head_weights: &DeviceBuffer,
+    query_rows: usize,
+    context_rows: usize,
+    query_start: usize,
+    head_count: usize,
+    head_dim: usize,
+    width: usize,
+    block_size: usize,
+    shard_parity: usize,
+) -> Result<DsaSequenceShardSelection, String> {
+    let (selection, scores) =
+        try_dsa_select_paged_q8_impl(device_id, keys, key_scales, key_group_size, false, block_table, query, head_weights, query_rows, context_rows, query_start, head_count, head_dim, width, false, block_size, shard_parity, true)?;
+    Ok(DsaSequenceShardSelection { selection, scores: scores.expect("sequence shard 必须收集 selection score"), width })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_dsa_select_paged_q8_impl(
+    device_id: i32,
+    keys: &DeviceBuffer,
+    key_scales: &DeviceBuffer,
+    key_group_size: usize,
+    hadamard_i8: bool,
+    block_table: &DeviceBuffer,
+    query: &DeviceBuffer,
+    head_weights: &DeviceBuffer,
+    query_rows: usize,
+    context_rows: usize,
+    query_start: usize,
+    head_count: usize,
+    head_dim: usize,
+    top_k: usize,
+    prefer_medium_select_tile: bool,
+    block_size: usize,
+    shard_parity: usize,
+    collect_selection_scores: bool,
+) -> Result<(DeviceBuffer, Option<DeviceBuffer>), String> {
     if query_rows == 0
         || context_rows <= top_k
         || query_start.checked_add(query_rows) != Some(context_rows)
@@ -1143,6 +1444,7 @@ pub fn try_dsa_select_paged_q8(
         || (hadamard_i8 && (head_dim != key_group_size || head_dim > 256 || !head_dim.is_power_of_two()))
         || top_k == 0
         || block_size == 0
+        || shard_parity > 2
     {
         return Err("paged DSA selection shape 非法".to_owned());
     }
@@ -1154,16 +1456,22 @@ pub fn try_dsa_select_paged_q8(
     let single_row_native_wmma = use_native_wmma && query_rows == 1;
     let use_native_i8 = hadamard_i8 && head_count.is_multiple_of(16) && functions.dense_wmma && options().native_dsa_wmma;
     let compact_select = top_k <= 4096;
+    let compact_shard_scores = shard_parity <= 1 && query_rows == 1;
     const PREFIX_CANDIDATE_CAPACITY: usize = 4096;
     // 128K 的 2K-row append 会因 prefix candidate overflow 重算大量 score；
     // 只在更长上下文使用压缩路径，目标档位继续走精确 compact top-k。
     const PREFIX_CONTEXT_THRESHOLD: usize = 256 * 1024;
     let prefix_select = use_native_wmma && compact_select && query_rows >= 8 && context_rows >= PREFIX_CONTEXT_THRESHOLD;
+    if shard_parity <= 1 && (!use_native_wmma || hadamard_i8 || prefix_select || top_k > 2048) {
+        return Err(format!("paged DSA sequence shard 仅支持 raw-Q8 native WMMA、width<=2048，当前 native={use_native_wmma} hadamard={hadamard_i8} prefix={prefix_select} width={top_k}"));
+    }
     const PARALLEL_SELECT_CONTEXT_THRESHOLD: usize = 32 * 1024;
     // 中档只在 stage 已观察到至少三路 decode 时启用；C1/C2 保持 1K tile。
     // 当前 stage 不能跨 verify 行等待形成 DSA-only cohort；长上下文 decode
     // 改为单行内部按 history tile 并行，selection 集合与稳定顺序都不变。
-    let parallel_select = compact_select && !prefix_select && query_rows <= 4 && context_rows >= PARALLEL_SELECT_CONTEXT_THRESHOLD;
+    // sequence-shard decode 的半片只有 1/2 行数，单 block compact select 已够快；
+    // 关掉 4-kernel tile 链后每侧少 3 次 launch 与 3 个流上间隙。
+    let parallel_select = compact_select && !prefix_select && query_rows <= 4 && context_rows >= PARALLEL_SELECT_CONTEXT_THRESHOLD && shard_parity > 1;
     let score_histogram_shared_bytes: u32 = if compact_select {
         if single_row_native_wmma {
             256 * 4
@@ -1182,13 +1490,21 @@ pub fn try_dsa_select_paged_q8(
     } else {
         128
     };
-    let max_tile_count = context_rows.div_ceil(score_tile_rows);
     let key_groups = head_dim / key_group_size;
-    validate_resident(keys, device_id, context_rows.checked_mul(head_dim).ok_or("DSA Q8 keys 大小溢出")?, "DSA Q8 keys")?;
-    validate_resident(key_scales, device_id, context_rows.checked_mul(key_groups).and_then(|n| n.checked_mul(2)).ok_or("DSA Q8 scales 大小溢出")?, "DSA Q8 scales")?;
+    let resident_rows = if shard_parity <= 1 {
+        let blocks = context_rows / block_size;
+        let tail = context_rows % block_size;
+        (blocks / 2) * block_size + usize::from(blocks % 2 > shard_parity) * block_size + usize::from(blocks % 2 == shard_parity) * tail
+    } else {
+        context_rows
+    };
+    let max_score_rows = if compact_shard_scores { resident_rows } else { context_rows };
+    let max_tile_count = max_score_rows.div_ceil(score_tile_rows);
+    validate_resident(keys, device_id, resident_rows.checked_mul(head_dim).ok_or("DSA Q8 keys 大小溢出")?, "DSA Q8 keys")?;
+    validate_resident(key_scales, device_id, resident_rows.checked_mul(key_groups).and_then(|n| n.checked_mul(2)).ok_or("DSA Q8 scales 大小溢出")?, "DSA Q8 scales")?;
     validate_resident(query, device_id, query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(head_dim)).and_then(|n| n.checked_mul(4)).ok_or("DSA query 大小溢出")?, "DSA query")?;
     validate_resident(head_weights, device_id, query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(4)).ok_or("DSA weights 大小溢出")?, "DSA head weights")?;
-    validate_resident(block_table, device_id, context_rows.div_ceil(block_size).checked_mul(4).ok_or("DSA block table 大小溢出")?, "DSA block table")?;
+    validate_resident(block_table, device_id, resident_rows.max(1).div_ceil(block_size).checked_mul(4).ok_or("DSA block table 大小溢出")?, "DSA block table")?;
 
     let selection_elements = query_rows.checked_mul(top_k).ok_or("DSA selection 大小溢出")?;
     let quantized_query_bytes = if hadamard_i8 { query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(head_dim)).ok_or("DSA i8 query 大小溢出")? } else { 1 };
@@ -1237,6 +1553,7 @@ pub fn try_dsa_select_paged_q8(
         Ok((quantized_query, query_scales, scores, score_prefixes, candidates, candidate_metadata, coarse_histograms, select_tiles))
     })?;
     let selection = DeviceBuffer::allocate_reusable(device_id, selection_bytes)?;
+    let selection_scores = collect_selection_scores.then(|| DeviceBuffer::allocate_reusable(device_id, selection_bytes)).transpose()?;
     let mut dim_u32 = u32::try_from(head_dim).map_err(|_| "DSA head_dim 超过 u32")?;
     let mut profile_quant_ms = 0.0f64;
     let mut profile_score_ms = 0.0f64;
@@ -1274,8 +1591,16 @@ pub fn try_dsa_select_paged_q8(
         let batch_start = query_start.checked_add(query_offset).ok_or("DSA batch query_start 溢出")?;
         // Causal prefill 的当前 batch 只看得到自身末尾；不要为未来 K 启动 WMMA 后再丢弃。
         let batch_context_rows = batch_start.checked_add(current_rows).ok_or("DSA batch context 溢出")?;
-        let batch_tile_count = batch_context_rows.div_ceil(score_tile_rows);
-        let batch_score_stride = batch_tile_count.checked_mul(score_tile_rows).ok_or("DSA batch score stride 溢出")?;
+        let score_context_rows = if shard_parity <= 1 {
+            let blocks = batch_context_rows / block_size;
+            let tail = batch_context_rows % block_size;
+            (blocks / 2) * block_size + usize::from(blocks % 2 > shard_parity) * block_size + usize::from(blocks % 2 == shard_parity) * tail
+        } else {
+            batch_context_rows
+        };
+        let score_stride_rows = if compact_shard_scores { score_context_rows } else { batch_context_rows };
+        let batch_score_stride = score_stride_rows.div_ceil(score_tile_rows).checked_mul(score_tile_rows).ok_or("DSA batch score stride 溢出")?;
+        let batch_tile_count = score_context_rows.div_ceil(score_tile_rows);
 
         let mut d_keys = keys.pointer;
         let mut d_key_scales = key_scales.pointer;
@@ -1305,10 +1630,14 @@ pub fn try_dsa_select_paged_q8(
         let mut current_rows_u32 = u32::try_from(current_rows).map_err(|_| "DSA batch rows 超过 u32")?;
         let mut context_u32 = u32::try_from(batch_context_rows).map_err(|_| "DSA context 超过 u32")?;
         let mut start_u32 = u32::try_from(batch_start).map_err(|_| "DSA query_start 超过 u32")?;
+        let mut selection_start_u32 = u32::try_from(if compact_shard_scores { score_context_rows - 1 } else { batch_start }).map_err(|_| "DSA selection start 超过 u32")?;
         let mut heads_u32 = u32::try_from(head_count).map_err(|_| "DSA heads 超过 u32")?;
         let mut key_group_u32 = u32::try_from(key_group_size).map_err(|_| "DSA key_group_size 超过 u32")?;
         let mut block_u32 = u32::try_from(block_size).map_err(|_| "DSA block_size 超过 u32")?;
         let mut score_tile_rows_u32 = u32::try_from(score_tile_rows).map_err(|_| "DSA score tile 超过 u32")?;
+        let mut score_stride_u32 = u32::try_from(batch_score_stride).map_err(|_| "DSA score stride 超过 u32")?;
+        let mut shard_parity_u32 = u32::try_from(shard_parity).map_err(|_| "DSA shard parity 超过 u32")?;
+        let mut compact_shard_scores_u32 = u32::from(compact_shard_scores);
         let mut candidate_capacity_u32 = u32::try_from(PREFIX_CANDIDATE_CAPACITY).map_err(|_| "DSA prefix candidate capacity 超过 u32")?;
         let mut score_args = [
             (&mut d_keys as *mut *mut c_void).cast(),
@@ -1343,6 +1672,8 @@ pub fn try_dsa_select_paged_q8(
             (&mut key_group_u32 as *mut u32).cast(),
             (&mut block_u32 as *mut u32).cast(),
             (&mut score_tile_rows_u32 as *mut u32).cast(),
+            (&mut score_stride_u32 as *mut u32).cast(),
+            (&mut shard_parity_u32 as *mut u32).cast(),
         ];
         let mut i8_score_args = [
             (&mut d_keys as *mut *mut c_void).cast(),
@@ -1377,6 +1708,11 @@ pub fn try_dsa_select_paged_q8(
                 let mut clear_control_args = [(&mut d_overflow_count as *mut *mut c_void).cast(), (&mut control_elements as *mut u32).cast()];
                 launch_tensor_kernel(functions.dsa_clear, 1, 256, &mut clear_control_args, "HIP DSA clear prefix controls")?;
             }
+        }
+        if shard_parity <= 1 {
+            let mut score_elements = current_rows_u32.checked_mul(u32::try_from(batch_score_stride).map_err(|_| "DSA shard score stride 超过 u32")?).ok_or("DSA shard score clear 大小溢出")?;
+            let mut clear_score_args = [(&mut d_scores as *mut *mut c_void).cast(), (&mut score_elements as *mut u32).cast()];
+            launch_tensor_kernel(functions.dsa_clear, score_elements.div_ceil(256), 256, &mut clear_score_args, "HIP DSA clear sequence-shard scores")?;
         }
         launch_moe_kernel(
             if use_native_i8 {
@@ -1439,7 +1775,6 @@ pub fn try_dsa_select_paged_q8(
         }
 
         let mut d_selection = unsafe { selection.pointer.cast::<u8>().add(selection_offset).cast::<c_void>() };
-        let mut score_stride_u32 = u32::try_from(batch_score_stride).map_err(|_| "DSA score stride 超过 u32")?;
         let mut topk_u32 = u32::try_from(top_k).map_err(|_| "DSA top_k 超过 u32")?;
         let mut visibility_divisor_u32 = 1u32;
         let mut compact_args = [
@@ -1448,7 +1783,7 @@ pub fn try_dsa_select_paged_q8(
             (&mut d_selection as *mut *mut c_void).cast(),
             (&mut current_rows_u32 as *mut u32).cast(),
             (&mut score_stride_u32 as *mut u32).cast(),
-            (&mut start_u32 as *mut u32).cast(),
+            (&mut selection_start_u32 as *mut u32).cast(),
             (&mut topk_u32 as *mut u32).cast(),
             (&mut visibility_divisor_u32 as *mut u32).cast(),
         ];
@@ -1538,7 +1873,7 @@ pub fn try_dsa_select_paged_q8(
             launch_tensor_kernel(functions.dsa_select_prefix, current_rows_u32, 256, &mut prefix_select_args, "HIP DSA prefix radix select top-k")?;
         } else if parallel_select {
             // 240K 起 4K tile；128K 只有高并发才用 2K，避免 C1/C2 欠占用。
-            let select_tile_rows = parallel_select_tile_rows(batch_context_rows, prefer_medium_select_tile);
+            let select_tile_rows = parallel_select_tile_rows(score_stride_rows, prefer_medium_select_tile);
             let mut select_tile_count_u32 = u32::try_from(batch_score_stride.div_ceil(select_tile_rows)).map_err(|_| "DSA parallel select tile count 超过 u32")?;
             let mut select_tile_rows_u32 = u32::try_from(select_tile_rows).map_err(|_| "DSA parallel select tile rows 超过 u32")?;
             let mut clear_rows = current_rows_u32;
@@ -1553,7 +1888,7 @@ pub fn try_dsa_select_paged_q8(
                 (&mut d_overflow_rows as *mut *mut c_void).cast(),
                 (&mut current_rows_u32 as *mut u32).cast(),
                 (&mut score_stride_u32 as *mut u32).cast(),
-                (&mut start_u32 as *mut u32).cast(),
+                (&mut selection_start_u32 as *mut u32).cast(),
                 (&mut topk_u32 as *mut u32).cast(),
                 (&mut select_tile_count_u32 as *mut u32).cast(),
                 (&mut select_tile_rows_u32 as *mut u32).cast(),
@@ -1566,7 +1901,7 @@ pub fn try_dsa_select_paged_q8(
                 (&mut d_select_tile_counts as *mut *mut c_void).cast(),
                 (&mut current_rows_u32 as *mut u32).cast(),
                 (&mut score_stride_u32 as *mut u32).cast(),
-                (&mut start_u32 as *mut u32).cast(),
+                (&mut selection_start_u32 as *mut u32).cast(),
                 (&mut select_tile_count_u32 as *mut u32).cast(),
                 (&mut select_tile_rows_u32 as *mut u32).cast(),
             ];
@@ -1583,7 +1918,7 @@ pub fn try_dsa_select_paged_q8(
                 (&mut d_selection as *mut *mut c_void).cast(),
                 (&mut current_rows_u32 as *mut u32).cast(),
                 (&mut score_stride_u32 as *mut u32).cast(),
-                (&mut start_u32 as *mut u32).cast(),
+                (&mut selection_start_u32 as *mut u32).cast(),
                 (&mut topk_u32 as *mut u32).cast(),
                 (&mut select_tile_count_u32 as *mut u32).cast(),
                 (&mut select_tile_rows_u32 as *mut u32).cast(),
@@ -1593,6 +1928,22 @@ pub fn try_dsa_select_paged_q8(
             launch_tensor_kernel(functions.dsa_select_compact, current_rows_u32, 256, &mut compact_args, "HIP DSA compact radix select top-k")?;
         } else {
             super::super::try_stable_radix_topk_u32_into(device_id, &scores, None, &selection, current_rows, batch_score_stride, batch_start, top_k, query_offset)?;
+        }
+        if let Some(selection_scores) = selection_scores.as_ref() {
+            let mut d_selected_scores = unsafe { selection_scores.pointer.cast::<u8>().add(selection_offset).cast::<c_void>() };
+            let gather_elements = current_rows_u32.checked_mul(topk_u32).ok_or("DSA shard gather 元素数溢出")?;
+            let mut gather_args = [
+                (&mut d_scores as *mut *mut c_void).cast(),
+                (&mut d_selection as *mut *mut c_void).cast(),
+                (&mut d_selected_scores as *mut *mut c_void).cast(),
+                (&mut current_rows_u32 as *mut u32).cast(),
+                (&mut score_stride_u32 as *mut u32).cast(),
+                (&mut topk_u32 as *mut u32).cast(),
+                (&mut block_u32 as *mut u32).cast(),
+                (&mut shard_parity_u32 as *mut u32).cast(),
+                (&mut compact_shard_scores_u32 as *mut u32).cast(),
+            ];
+            launch_tensor_kernel(functions.dsa_gather_selection_scores, gather_elements.div_ceil(256), 256, &mut gather_args, "HIP DSA gather sequence-shard scores")?;
         }
         if profile_dsa || options().debug_dsa_sync {
             super::synchronize_device(device_id, "hipDeviceSynchronize DSA radix select top-k")?;
@@ -1637,7 +1988,41 @@ pub fn try_dsa_select_paged_q8(
             }
         }
     }
-    Ok(selection)
+    Ok((selection, selection_scores))
+}
+
+pub fn try_dsa_merge_sequence_shard_topk(device_id: i32, owner: &DsaSequenceShardSelection, peer: &DsaSequenceShardSelection, rows: usize, top_k: usize) -> Result<DeviceBuffer, String> {
+    let candidates = owner.width.checked_add(peer.width).ok_or("DSA shard merge candidate 数溢出")?;
+    if rows == 0 || top_k == 0 || top_k > candidates || candidates > 4096 {
+        return Err(format!("DSA shard merge rows={rows} owner={} peer={} top_k={top_k} 非法", owner.width, peer.width));
+    }
+    for (buffer, width, label) in [(&owner.selection, owner.width, "owner tokens"), (&owner.scores, owner.width, "owner scores"), (&peer.selection, peer.width, "peer tokens"), (&peer.scores, peer.width, "peer scores")] {
+        validate_resident(buffer, device_id, rows.checked_mul(width).and_then(|n| n.checked_mul(4)).ok_or("DSA shard merge 输入大小溢出")?, label)?;
+    }
+    let output = DeviceBuffer::allocate_reusable(device_id, rows.checked_mul(top_k).and_then(|n| n.checked_mul(4)).ok_or("DSA shard merge 输出大小溢出")?)?;
+    let functions = paged_mla_functions(device_id)?;
+    let mut d_owner_tokens = owner.selection.pointer;
+    let mut d_owner_scores = owner.scores.pointer;
+    let mut owner_width_u32 = u32::try_from(owner.width).map_err(|_| "DSA owner width 超过 u32")?;
+    let mut d_peer_tokens = peer.selection.pointer;
+    let mut d_peer_scores = peer.scores.pointer;
+    let mut peer_width_u32 = u32::try_from(peer.width).map_err(|_| "DSA peer width 超过 u32")?;
+    let mut d_output = output.pointer;
+    let mut rows_u32 = u32::try_from(rows).map_err(|_| "DSA shard merge rows 超过 u32")?;
+    let mut top_k_u32 = u32::try_from(top_k).map_err(|_| "DSA shard merge top_k 超过 u32")?;
+    let mut arguments = [
+        (&mut d_owner_tokens as *mut *mut c_void).cast(),
+        (&mut d_owner_scores as *mut *mut c_void).cast(),
+        (&mut owner_width_u32 as *mut u32).cast(),
+        (&mut d_peer_tokens as *mut *mut c_void).cast(),
+        (&mut d_peer_scores as *mut *mut c_void).cast(),
+        (&mut peer_width_u32 as *mut u32).cast(),
+        (&mut d_output as *mut *mut c_void).cast(),
+        (&mut rows_u32 as *mut u32).cast(),
+        (&mut top_k_u32 as *mut u32).cast(),
+    ];
+    launch_tensor_kernel(functions.dsa_merge_sequence_shards, rows_u32, 256, &mut arguments, "HIP DSA merge sequence-shard top-k")?;
+    Ok(output)
 }
 
 /// glm5_next kpool 全 GPU 选择：对已池化 Q8 key 做 WMMA 评分，按原 token
@@ -1936,6 +2321,7 @@ pub(crate) fn try_paged_mla_attention_ct_segmented(
 
     let mut d_weighted = weighted.pointer;
     let mut d_output = output.pointer;
+    let mut weight_head_start_u32 = 0u32;
     let mut project_args = [
         (&mut d_weighted as *mut *mut c_void).cast(),
         (&mut d_packed as *mut *mut c_void).cast(),
@@ -1943,6 +2329,7 @@ pub(crate) fn try_paged_mla_attention_ct_segmented(
         (&mut d_output as *mut *mut c_void).cast(),
         (&mut query_rows_u32 as *mut u32).cast(),
         (&mut heads_u32 as *mut u32).cast(),
+        (&mut weight_head_start_u32 as *mut u32).cast(),
         (&mut q_head_u32 as *mut u32).cast(),
         (&mut kv_head_u32 as *mut u32).cast(),
         (&mut latent_u32 as *mut u32).cast(),
@@ -1987,45 +2374,118 @@ pub(crate) fn try_paged_mla_attention_ct_into(
     output: &DeviceBuffer,
     split_decode_override: Option<bool>,
 ) -> Result<(), String> {
-    if query_rows == 0 || query_start + query_rows != context_rows || !q_projection.is_multiple_of(head_count) || !weight.rows.is_multiple_of(head_count) || weight.cols == 0 || !weight.cols.is_multiple_of(weight.group_size) {
+    try_paged_mla_attention_ct_inner(
+        device_id,
+        query,
+        latent_cache,
+        latent_scales,
+        latent_group_size,
+        rope_cache,
+        block_table,
+        selection,
+        None,
+        weight,
+        query_rows,
+        context_rows,
+        query_start,
+        q_projection,
+        head_count,
+        rope_dim,
+        top_k,
+        block_size,
+        output,
+        split_decode_override,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_paged_mla_attention_ct_inner(
+    device_id: i32,
+    query: &DeviceBuffer,
+    latent_cache: &DeviceBuffer,
+    latent_scales: Option<&DeviceBuffer>,
+    latent_group_size: usize,
+    rope_cache: &DeviceBuffer,
+    block_table: &DeviceBuffer,
+    selection: Option<&DeviceBuffer>,
+    selection_counts: Option<&DeviceBuffer>,
+    weight: CtMlaWeightRef<'_>,
+    query_rows: usize,
+    context_rows: usize,
+    query_start: usize,
+    q_projection: usize,
+    head_count: usize,
+    rope_dim: usize,
+    top_k: usize,
+    block_size: usize,
+    output: &DeviceBuffer,
+    split_decode_override: Option<bool>,
+    shard: Option<(usize, &DeviceBuffer, &DeviceBuffer)>,
+) -> Result<(), String> {
+    if query_rows == 0
+        || query_start.checked_add(query_rows).is_none_or(|end| end > context_rows)
+        || !q_projection.is_multiple_of(head_count)
+        || !weight.rows.is_multiple_of(head_count)
+        || weight.cols == 0
+        || !weight.cols.is_multiple_of(weight.group_size)
+    {
         return Err("paged MLA shape 非法".to_owned());
     }
     let q_head_dim = q_projection / head_count;
     let kv_head_dim = weight.rows / head_count;
     let latent_dim = weight.cols;
+    let shard_rows = |rows: usize, parity: usize| {
+        let blocks = rows / block_size;
+        let tail = rows % block_size;
+        (blocks / 2) * block_size + usize::from(blocks % 2 > parity) * block_size + usize::from(blocks % 2 == parity) * tail
+    };
+    let resident_rows = shard.map_or(context_rows, |(parity, _, _)| shard_rows(context_rows, parity));
     if latent_group_size != 0 && (!latent_dim.is_multiple_of(latent_group_size) || latent_scales.is_none()) {
         return Err(format!("paged MLA latent Q8G{latent_group_size} cache 非法"));
     }
     validate_resident(query, device_id, query_rows.checked_mul(q_projection).and_then(|n| n.checked_mul(4)).ok_or("paged MLA query 大小溢出")?, "paged MLA query")?;
     let latent_element_bytes = if latent_group_size == 0 { 2 } else { 1 };
-    validate_resident(latent_cache, device_id, context_rows.checked_mul(latent_dim).and_then(|n| n.checked_mul(latent_element_bytes)).ok_or("paged MLA latent 大小溢出")?, "paged MLA latent")?;
+    validate_resident(latent_cache, device_id, resident_rows.checked_mul(latent_dim).and_then(|n| n.checked_mul(latent_element_bytes)).ok_or("paged MLA latent 大小溢出")?, "paged MLA latent")?;
     if let Some(scales) = latent_scales {
-        validate_resident(scales, device_id, context_rows.checked_mul(latent_dim / latent_group_size).and_then(|n| n.checked_mul(2)).ok_or("paged MLA latent scale 大小溢出")?, "paged MLA latent scales")?;
+        validate_resident(scales, device_id, resident_rows.checked_mul(latent_dim / latent_group_size).and_then(|n| n.checked_mul(2)).ok_or("paged MLA latent scale 大小溢出")?, "paged MLA latent scales")?;
     }
-    validate_resident(rope_cache, device_id, context_rows.checked_mul(rope_dim).and_then(|n| n.checked_mul(2)).ok_or("paged MLA rope 大小溢出")?, "paged MLA rope")?;
-    validate_resident(block_table, device_id, context_rows.div_ceil(block_size).checked_mul(4).ok_or("paged MLA table 大小溢出")?, "paged MLA table")?;
+    validate_resident(rope_cache, device_id, resident_rows.checked_mul(rope_dim).and_then(|n| n.checked_mul(2)).ok_or("paged MLA rope 大小溢出")?, "paged MLA rope")?;
+    validate_resident(block_table, device_id, resident_rows.max(1).div_ceil(block_size).checked_mul(4).ok_or("paged MLA table 大小溢出")?, "paged MLA table")?;
     if let Some(selection) = selection {
         validate_resident(selection, device_id, query_rows.checked_mul(top_k).and_then(|n| n.checked_mul(4)).ok_or("paged MLA selection 大小溢出")?, "paged MLA selection")?;
+    }
+    if let Some(counts) = selection_counts {
+        if selection.is_none() || shard.is_none() {
+            return Err("paged MLA selection counts 只能用于 pair shard selection".to_owned());
+        }
+        validate_resident(counts, device_id, query_rows.checked_mul(4).ok_or("paged MLA selection counts 大小溢出")?, "paged MLA selection counts")?;
     }
     if options().debug_finite {
         try_validate_finite_resident_range_f32(device_id, query, (query_rows - 1) * q_projection, q_projection).map_err(|error| format!("paged MLA query 包含非有限值或异常幅值: {error}"))?;
         if let Some(scales) = latent_scales {
-            try_validate_finite_resident_range_bf16(device_id, scales, 0, context_rows * (latent_dim / latent_group_size)).map_err(|error| format!("paged MLA latent scale 包含非有限值或异常幅值: {error}"))?;
+            try_validate_finite_resident_range_bf16(device_id, scales, 0, resident_rows * (latent_dim / latent_group_size)).map_err(|error| format!("paged MLA latent scale 包含非有限值或异常幅值: {error}"))?;
         } else {
-            try_validate_finite_resident_range_bf16(device_id, latent_cache, 0, context_rows * latent_dim).map_err(|error| format!("paged MLA latent cache 包含非有限值或异常幅值: {error}"))?;
+            try_validate_finite_resident_range_bf16(device_id, latent_cache, 0, resident_rows * latent_dim).map_err(|error| format!("paged MLA latent cache 包含非有限值或异常幅值: {error}"))?;
         }
-        try_validate_finite_resident_range_bf16(device_id, rope_cache, 0, context_rows * rope_dim).map_err(|error| format!("paged MLA rope cache 包含非有限值或异常幅值: {error}"))?;
+        try_validate_finite_resident_range_bf16(device_id, rope_cache, 0, resident_rows * rope_dim).map_err(|error| format!("paged MLA rope cache 包含非有限值或异常幅值: {error}"))?;
     }
     let absorbed_elements = query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(latent_dim)).ok_or("paged MLA absorbed 大小溢出")?;
     let output_elements = query_rows.checked_mul(q_projection).ok_or("paged MLA output 大小溢出")?;
     let intermediate_bytes = absorbed_elements.checked_mul(2).ok_or("paged MLA intermediate 字节数溢出")?;
-    let (absorbed, weighted) = PAGED_MLA_WORKSPACES.with(|workspaces| -> Result<_, String> {
+    let (absorbed, workspace_weighted) = PAGED_MLA_WORKSPACES.with(|workspaces| -> Result<_, String> {
         let mut workspaces = workspaces.borrow_mut();
         let workspace = workspaces.entry(crate::kernel::rocm::hip::compute_workspace_key(device_id)).or_default();
         Ok((reserve_paged_dsa_buffer(&mut workspace.absorbed, &mut workspace.absorbed_bytes, device_id, intermediate_bytes)?, reserve_paged_dsa_buffer(&mut workspace.weighted, &mut workspace.weighted_bytes, device_id, intermediate_bytes)?))
     })?;
+    let weighted = shard.map_or(workspace_weighted.as_ref(), |(_, weighted, _)| weighted);
     let output_element_bytes = if query_rows > 1 { 2 } else { 4 };
-    validate_resident(output, device_id, output_elements.checked_mul(output_element_bytes).ok_or("paged MLA output 字节数溢出")?, "paged MLA output")?;
+    if let Some((_, shard_weighted, shard_stats)) = shard {
+        validate_resident(shard_weighted, device_id, intermediate_bytes, "paged MLA shard weighted")?;
+        validate_resident(shard_stats, device_id, query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(2 * std::mem::size_of::<f32>())).ok_or("paged MLA shard stats 大小溢出")?, "paged MLA shard stats")?;
+    } else {
+        validate_resident(output, device_id, output_elements.checked_mul(output_element_bytes).ok_or("paged MLA output 字节数溢出")?, "paged MLA output")?;
+    }
     let functions = paged_mla_functions(device_id)?;
     let profile_mla = options().kernel_profile;
     if options().log_mla_pointers {
@@ -2108,6 +2568,7 @@ pub(crate) fn try_paged_mla_attention_ct_into(
     let mut d_rope = rope_cache.pointer;
     let mut d_table = block_table.pointer;
     let mut d_selection = selection.map_or(ptr::null_mut(), |buffer| buffer.pointer);
+    let mut d_selection_counts = selection_counts.map_or(ptr::null_mut(), |buffer| buffer.pointer);
     let mut d_weighted = weighted.pointer;
     let mut d_split_partial = ptr::null_mut();
     let mut d_split_stats = ptr::null_mut();
@@ -2116,6 +2577,8 @@ pub(crate) fn try_paged_mla_attention_ct_into(
     let mut start_u32 = u32::try_from(query_start).map_err(|_| "paged MLA query_start 超过 u32")?;
     let mut topk_u32 = u32::try_from(top_k).map_err(|_| "paged MLA top_k 超过 u32")?;
     let mut block_u32 = u32::try_from(block_size).map_err(|_| "paged MLA block_size 超过 u32")?;
+    let mut shard_u32 = shard.map_or(2, |(parity, _, _)| parity as u32);
+    let mut d_merged_stats = shard.map_or(ptr::null_mut(), |(_, _, stats)| stats.pointer);
     let force_dense_prefill = query_rows > 1 && options().force_dense_prefill;
     let mut selected_u32 = u32::from(selection.is_some() && !force_dense_prefill);
     let mut split_count_u32 = 1u32;
@@ -2128,6 +2591,7 @@ pub(crate) fn try_paged_mla_attention_ct_into(
         (&mut d_rope as *mut *mut c_void).cast(),
         (&mut d_table as *mut *mut c_void).cast(),
         (&mut d_selection as *mut *mut c_void).cast(),
+        (&mut d_selection_counts as *mut *mut c_void).cast(),
         (&mut d_weighted as *mut *mut c_void).cast(),
         (&mut d_split_partial as *mut *mut c_void).cast(),
         (&mut d_split_stats as *mut *mut c_void).cast(),
@@ -2144,6 +2608,7 @@ pub(crate) fn try_paged_mla_attention_ct_into(
         (&mut selected_u32 as *mut u32).cast(),
         (&mut split_count_u32 as *mut u32).cast(),
         (&mut split_size_u32 as *mut u32).cast(),
+        (&mut shard_u32 as *mut u32).cast(),
     ];
     let mut sparse_args = [
         (&mut d_query as *mut *mut c_void).cast(),
@@ -2166,12 +2631,14 @@ pub(crate) fn try_paged_mla_attention_ct_into(
         (&mut block_u32 as *mut u32).cast(),
         (&mut selected_u32 as *mut u32).cast(),
     ];
-    let split_decode = split_decode_override.or(options().mla_decode_split).unwrap_or(context_rows >= options().mla_decode_split_threshold);
+    let split_decode = shard.is_some() || split_decode_override.or(options().mla_decode_split).unwrap_or(context_rows >= options().mla_decode_split_threshold);
     let attention_started = profile_mla.then(std::time::Instant::now);
-    const WMMA_HEADS_PER_BLOCK: usize = 32;
+    const WMMA_HEADS_PER_BLOCK: usize = 16;
+    const WMMA_TOKEN_TILE: usize = 32;
     const WMMA_OUTPUT_STRIDE: usize = 256;
     const WMMA_MAX_SHARED_BYTES: usize = 64 * 1024;
-    let selected_wmma_shape = options().mla_decode_wmma
+    let selected_wmma_shape = mla_decode_wmma_enabled()
+        && options().mla_decode_wmma
         && functions.decode_partial_wmma_q8 != 0
         && latent_group_size != 0
         && latent_group_size.is_multiple_of(16)
@@ -2181,14 +2648,14 @@ pub(crate) fn try_paged_mla_attention_ct_into(
         && latent_dim / WMMA_OUTPUT_STRIDE == 2;
     let selected_wmma_shared = if selected_wmma_shape {
         Some(
-            (64usize * 16)
+            (WMMA_TOKEN_TILE * 16)
                 .checked_add(WMMA_HEADS_PER_BLOCK.checked_mul(16).ok_or("paged MLA WMMA probability tile 溢出")?)
                 .and_then(|elements| elements.checked_add(latent_dim.checked_mul(16)?))
                 .and_then(|elements| elements.checked_mul(std::mem::size_of::<u16>()))
                 .and_then(|bytes| bytes.checked_add(WMMA_HEADS_PER_BLOCK.checked_mul(std::mem::size_of::<f32>())?))
-                .and_then(|bytes| bytes.checked_add(64 * std::mem::size_of::<u32>()))
-                .and_then(|bytes| bytes.checked_add(64usize.checked_mul(latent_dim)?))
-                .and_then(|bytes| bytes.checked_add(64usize.checked_mul(latent_dim.checked_div(latent_group_size)?)?.checked_mul(std::mem::size_of::<u16>())?))
+                .and_then(|bytes| bytes.checked_add(WMMA_TOKEN_TILE * std::mem::size_of::<u32>()))
+                .and_then(|bytes| bytes.checked_add(WMMA_TOKEN_TILE.checked_mul(latent_dim)?))
+                .and_then(|bytes| bytes.checked_add(WMMA_TOKEN_TILE.checked_mul(latent_dim.checked_div(latent_group_size)?)?.checked_mul(std::mem::size_of::<u16>())?))
                 .ok_or("paged MLA WMMA shared memory 字节数溢出")?,
         )
     } else {
@@ -2203,14 +2670,22 @@ pub(crate) fn try_paged_mla_attention_ct_into(
         let visible_rows = query_start.checked_add(1).ok_or("paged MLA decode visible rows 溢出")?.min(context_rows);
         // DSA selection 按逻辑候选区间拆分，tile 内再映射到真实分页位置。
         let decode_rows = if selection.is_some() { visible_rows.min(top_k) } else { visible_rows };
+        // WMMA kernel 已按 shard_parity 把全局 token 映射到本卡紧凑物理行；
+        // sequence shard 必须与未分片 decode 使用同级算子，才能兑现半程扫描收益。
         let decode_wmma_q8 = selected_wmma_q8;
-        let max_decode_tiles = if decode_wmma_q8 { 128 } else { 64 };
-        let tile_alignment = if decode_wmma_q8 { 64 } else { 128 };
+        // merge kernel 的 shared scale 数组容量决定 tile 绝对上限。
+        const DECODE_MAX_TILES: usize = 512;
+        let tile_alignment = if decode_wmma_q8 { WMMA_TOKEN_TILE } else { 128 };
+        // 单个 tile launch 的 grid.x：WMMA 每 block 16 头、fdot2 每 block 4 头。
+        // cooperative 半头拆分下 head_count 已是半值，目标 tile 数自动翻倍，
+        // 保证每卡总 block 数仍接近 mla_decode_target_blocks。
+        let blocks_per_tile = if decode_wmma_q8 { head_count.div_ceil(WMMA_HEADS_PER_BLOCK) } else { head_count.div_ceil(4) }.max(1);
+        let max_decode_tiles = (options().mla_decode_target_blocks / blocks_per_tile).clamp(1, DECODE_MAX_TILES);
         // split 数受 merge kernel 上限约束；长上下文自动放大 tile，避免退化为运行时错误。
         let minimum_tile_size = decode_rows.div_ceil(max_decode_tiles).div_ceil(tile_alignment).checked_mul(tile_alignment).ok_or("paged MLA decode minimum tile size 溢出")?;
         let decode_tile_size = requested_tile_size.max(minimum_tile_size).div_ceil(tile_alignment).checked_mul(tile_alignment).ok_or("paged MLA decode tile size 溢出")?;
         let tile_count = decode_rows.div_ceil(decode_tile_size);
-        if tile_count == 0 || tile_count > max_decode_tiles {
+        if tile_count == 0 || tile_count > DECODE_MAX_TILES {
             return Err(format!("paged MLA decode tile_count={tile_count} 非法"));
         }
         let partial_elements = tile_count.checked_mul(head_count).and_then(|elements| elements.checked_mul(latent_dim)).ok_or("paged MLA decode partial 元素数溢出")?;
@@ -2227,6 +2702,7 @@ pub(crate) fn try_paged_mla_attention_ct_into(
         let mut d_stats = stats.pointer;
         let mut tile_size_u32 = u32::try_from(decode_tile_size).map_err(|_| "paged MLA decode tile_size 超过 u32")?;
         let mut tile_count_u32 = u32::try_from(tile_count).map_err(|_| "paged MLA decode tile_count 超过 u32")?;
+        let mut stage_chunk_u32 = 0_u32;
         let mut partial_args = [
             (&mut d_query as *mut *mut c_void).cast(),
             (&mut d_absorbed as *mut *mut c_void).cast(),
@@ -2235,6 +2711,7 @@ pub(crate) fn try_paged_mla_attention_ct_into(
             (&mut d_rope as *mut *mut c_void).cast(),
             (&mut d_table as *mut *mut c_void).cast(),
             (&mut d_selection as *mut *mut c_void).cast(),
+            (&mut d_selection_counts as *mut *mut c_void).cast(),
             (&mut d_partial as *mut *mut c_void).cast(),
             (&mut d_stats as *mut *mut c_void).cast(),
             (&mut d_direct_weighted as *mut *mut c_void).cast(),
@@ -2249,6 +2726,8 @@ pub(crate) fn try_paged_mla_attention_ct_into(
             (&mut block_u32 as *mut u32).cast(),
             (&mut selected_u32 as *mut u32).cast(),
             (&mut tile_size_u32 as *mut u32).cast(),
+            (&mut stage_chunk_u32 as *mut u32).cast(),
+            (&mut shard_u32 as *mut u32).cast(),
         ];
         let decode_shared = if decode_wmma_q8 {
             selected_wmma_shared.expect("WMMA Q8 路径已经检查 shared memory")
@@ -2257,18 +2736,58 @@ pub(crate) fn try_paged_mla_attention_ct_into(
                 .checked_mul(std::mem::size_of::<u16>())
                 .and_then(|latent_bytes| rope_dim.checked_mul(std::mem::size_of::<f32>()).and_then(|rope_bytes| latent_bytes.checked_add(rope_bytes)))
                 .ok_or("paged MLA decode query cache 字节数溢出")?;
-            4usize.checked_mul(per_head).ok_or("paged MLA decode query cache 字节数溢出")?
+            let query_cache = 4usize.checked_mul(per_head).ok_or("paged MLA decode query cache 字节数溢出")?;
+            // Step2 软件流水：fdot2 路径把 latent tile 装进 LDS，QK/PV 共用一份。
+            // Q8 存 code+scale（chunk 64），f16 存原始 bf16（chunk 32），都加 rope tile。
+            let stage_chunk = if latent_group_size != 0 { 64usize } else { 32 };
+            let stage_bytes = (if latent_group_size != 0 {
+                stage_chunk.checked_mul(latent_dim).and_then(|codes| stage_chunk.checked_mul(latent_dim / latent_group_size).and_then(|groups| groups.checked_mul(2)).and_then(|scales| codes.checked_add(scales)))
+            } else {
+                stage_chunk.checked_mul(latent_dim).and_then(|latent| latent.checked_mul(2))
+            })
+            .and_then(|latent_tile| stage_chunk.checked_mul(rope_dim).and_then(|rope| rope.checked_mul(2)).and_then(|rope_tile| latent_tile.checked_add(rope_tile)))
+            .ok_or("paged MLA decode staging 字节数溢出")?;
+            // gfx11 每 workgroup 最多 64 KiB LDS；放不下时回退 legacy 直读路径。
+            if query_cache.checked_add(stage_bytes).is_some_and(|shared| shared <= 64 * 1024) {
+                stage_chunk_u32 = u32::try_from(stage_chunk).map_err(|_| "paged MLA decode stage chunk 超过 u32")?;
+                query_cache.checked_add(stage_bytes).expect("staging 字节数已检查")
+            } else {
+                query_cache
+            }
         };
         let decode_shared_u32 = u32::try_from(decode_shared).map_err(|_| "paged MLA decode query cache 超过 u32")?;
-        launch_moe_kernel(
-            if decode_wmma_q8 { functions.decode_partial_wmma_q8 } else { functions.decode_partial },
-            if decode_wmma_q8 { heads_u32.div_ceil(WMMA_HEADS_PER_BLOCK as u32) } else { heads_u32.div_ceil(4) },
-            tile_count_u32,
-            if decode_wmma_q8 { 1024 } else { 256 },
-            decode_shared_u32,
-            &mut partial_args,
-            if decode_wmma_q8 { "HIP paged MLA decode partial Q8 WMMA" } else { "HIP paged MLA decode partial" },
-        )?;
+        if decode_wmma_q8 {
+            // WMMA kernel 没有标量软件流水的 stage_chunk 参数；必须单独维护
+            // 参数表，否则 shard_parity 会错读前一项的 0，peer shard 被当成 owner。
+            let mut wmma_args = [
+                (&mut d_query as *mut *mut c_void).cast(),
+                (&mut d_absorbed as *mut *mut c_void).cast(),
+                (&mut d_latent as *mut *mut c_void).cast(),
+                (&mut d_latent_scales as *mut *mut c_void).cast(),
+                (&mut d_rope as *mut *mut c_void).cast(),
+                (&mut d_table as *mut *mut c_void).cast(),
+                (&mut d_selection as *mut *mut c_void).cast(),
+                (&mut d_selection_counts as *mut *mut c_void).cast(),
+                (&mut d_partial as *mut *mut c_void).cast(),
+                (&mut d_stats as *mut *mut c_void).cast(),
+                (&mut d_direct_weighted as *mut *mut c_void).cast(),
+                (&mut context_u32 as *mut u32).cast(),
+                (&mut start_u32 as *mut u32).cast(),
+                (&mut heads_u32 as *mut u32).cast(),
+                (&mut q_head_u32 as *mut u32).cast(),
+                (&mut latent_u32 as *mut u32).cast(),
+                (&mut latent_group_u32 as *mut u32).cast(),
+                (&mut rope_u32 as *mut u32).cast(),
+                (&mut topk_u32 as *mut u32).cast(),
+                (&mut block_u32 as *mut u32).cast(),
+                (&mut selected_u32 as *mut u32).cast(),
+                (&mut tile_size_u32 as *mut u32).cast(),
+                (&mut shard_u32 as *mut u32).cast(),
+            ];
+            launch_moe_kernel(functions.decode_partial_wmma_q8, heads_u32.div_ceil(WMMA_HEADS_PER_BLOCK as u32), tile_count_u32, 256, decode_shared_u32, &mut wmma_args, "HIP paged MLA decode partial Q8 WMMA")?;
+        } else {
+            launch_moe_kernel(functions.decode_partial, heads_u32.div_ceil(4), tile_count_u32, 256, decode_shared_u32, &mut partial_args, "HIP paged MLA decode partial")?;
+        }
         let mut merge_args = [
             (&mut d_partial as *mut *mut c_void).cast(),
             (&mut d_stats as *mut *mut c_void).cast(),
@@ -2276,13 +2795,14 @@ pub(crate) fn try_paged_mla_attention_ct_into(
             (&mut heads_u32 as *mut u32).cast(),
             (&mut latent_u32 as *mut u32).cast(),
             (&mut tile_count_u32 as *mut u32).cast(),
+            (&mut d_merged_stats as *mut *mut c_void).cast(),
         ];
         launch_moe_kernel(functions.split_merge, heads_u32, 1, 256, 0, &mut merge_args, "HIP paged MLA decode merge")?;
     } else {
         let dense_prefill =
             functions.dense_wmma && (selection.is_none() || force_dense_prefill) && query_rows > 1 && latent_dim.is_multiple_of(16) && rope_dim.is_multiple_of(16) && (latent_group_size == 0 || latent_group_size.is_multiple_of(16));
         let sparse_prefill_wmma = query_rows > 1 && !dense_prefill && selection.is_some() && selected_wmma_q8 && sparse_prefill_wmma_enabled();
-        let sparse_prefill_heads4 = query_rows > 1 && !dense_prefill && options().sparse_prefill_heads4;
+        let sparse_prefill_heads4 = shard.is_none() && query_rows > 1 && !dense_prefill && options().sparse_prefill_heads4;
         attention_kind = if query_rows == 1 {
             "decode"
         } else if dense_prefill {
@@ -2311,14 +2831,17 @@ pub(crate) fn try_paged_mla_attention_ct_into(
             (function, heads_per_block as u32, bytes)
         };
         let attention_shared_u32 = u32::try_from(attention_shared).map_err(|_| "paged MLA query cache 超过 u32")?;
-        let attention_rows = if dense_prefill { query_rows.div_ceil(2) } else { query_rows };
+        let attention_rows = if dense_prefill && selection.is_none() { query_rows.div_ceil(2) } else { query_rows };
         let query_blocks = query_rows.div_ceil(2).checked_mul(head_count.div_ceil(8)).ok_or("paged MLA prefill query block 数溢出")?;
         let target_blocks = options().mla_prefill_target_blocks;
         let max_splits = (context_rows / 2048).clamp(1, 64);
-        let requested_splits = if dense_prefill && query_blocks < target_blocks { target_blocks.div_ceil(query_blocks).min(max_splits) } else { 1 };
+        let requested_splits = if dense_prefill && selection.is_none() && query_blocks < target_blocks { target_blocks.div_ceil(query_blocks).min(max_splits) } else { 1 };
         let split_size = context_rows.div_ceil(requested_splits).div_ceil(128).checked_mul(128).ok_or("paged MLA prefill split size 溢出")?;
         let split_count = context_rows.div_ceil(split_size);
-        let split_buffers = if split_count > 1 {
+        // sparse WMMA 直接把每个 query/head 的最终 weighted latent 写到输出，
+        // 不经过 split partial。parity shard 也不能因此白白保留一份约 128 MiB
+        // 的 F32 workspace，否则长上下文的首次 chunk 会在热路径触发 hipMalloc。
+        let split_buffers = if (split_count > 1 || shard.is_some()) && !sparse_prefill_wmma {
             let partial_elements = query_rows.checked_mul(split_count).and_then(|elements| elements.checked_mul(head_count)).and_then(|elements| elements.checked_mul(latent_dim)).ok_or("paged MLA prefill partial 元素数溢出")?;
             let stats_elements = query_rows.checked_mul(split_count).and_then(|elements| elements.checked_mul(head_count)).and_then(|elements| elements.checked_mul(2)).ok_or("paged MLA prefill stats 元素数溢出")?;
             let partial_bytes = partial_elements.checked_mul(std::mem::size_of::<f32>()).ok_or("paged MLA prefill partial 字节数溢出")?;
@@ -2352,8 +2875,9 @@ pub(crate) fn try_paged_mla_attention_ct_into(
                 (&mut d_rope as *mut *mut c_void).cast(),
                 (&mut d_table as *mut *mut c_void).cast(),
                 (&mut d_selection as *mut *mut c_void).cast(),
+                (&mut d_selection_counts as *mut *mut c_void).cast(),
                 (&mut d_split_partial as *mut *mut c_void).cast(),
-                (&mut d_split_stats as *mut *mut c_void).cast(),
+                (&mut d_merged_stats as *mut *mut c_void).cast(),
                 (&mut d_direct_weighted as *mut *mut c_void).cast(),
                 (&mut context_u32 as *mut u32).cast(),
                 (&mut start_u32 as *mut u32).cast(),
@@ -2366,12 +2890,13 @@ pub(crate) fn try_paged_mla_attention_ct_into(
                 (&mut block_u32 as *mut u32).cast(),
                 (&mut selected_u32 as *mut u32).cast(),
                 (&mut direct_tile_size_u32 as *mut u32).cast(),
+                (&mut shard_u32 as *mut u32).cast(),
             ];
             launch_moe_kernel(
                 functions.decode_partial_wmma_q8,
                 heads_u32.div_ceil(WMMA_HEADS_PER_BLOCK as u32),
                 query_rows_u32,
-                1024,
+                256,
                 u32::try_from(selected_wmma_shared.expect("sparse WMMA 已检查 shared memory")).map_err(|_| "paged MLA sparse WMMA shared memory 超过 u32")?,
                 &mut direct_args,
                 "HIP paged MLA sparse prefill Q8 WMMA",
@@ -2421,7 +2946,7 @@ pub(crate) fn try_paged_mla_attention_ct_into(
                 "HIP paged MLA sparse prefill",
             )?;
         }
-        if split_count > 1 {
+        if (split_count > 1 || shard.is_some()) && !sparse_prefill_wmma {
             let mut merge_args = [
                 (&mut d_split_partial as *mut *mut c_void).cast(),
                 (&mut d_split_stats as *mut *mut c_void).cast(),
@@ -2429,6 +2954,7 @@ pub(crate) fn try_paged_mla_attention_ct_into(
                 (&mut heads_u32 as *mut u32).cast(),
                 (&mut latent_u32 as *mut u32).cast(),
                 (&mut split_count_u32 as *mut u32).cast(),
+                (&mut d_merged_stats as *mut *mut c_void).cast(),
             ];
             launch_moe_kernel(functions.split_merge, heads_u32, query_rows_u32, 256, 0, &mut merge_args, "HIP paged MLA prefill split merge")?;
         }
@@ -2439,10 +2965,14 @@ pub(crate) fn try_paged_mla_attention_ct_into(
     }
     if query_rows != 0 && options().debug_finite {
         let row_elements = head_count * latent_dim;
-        try_validate_finite_resident_range_bf16(device_id, &weighted, (query_rows - 1) * row_elements, row_elements).map_err(|error| format!("paged MLA weighted latent 包含非有限值: {error}"))?;
+        try_validate_finite_resident_range_bf16(device_id, weighted, (query_rows - 1) * row_elements, row_elements).map_err(|error| format!("paged MLA weighted latent 包含非有限值: {error}"))?;
+    }
+    if shard.is_some() {
+        return Ok(());
     }
 
     let mut d_output = output.pointer;
+    let mut weight_head_start_u32 = 0u32;
     let mut project_args = [
         (&mut d_weighted as *mut *mut c_void).cast(),
         (&mut d_packed as *mut *mut c_void).cast(),
@@ -2450,6 +2980,7 @@ pub(crate) fn try_paged_mla_attention_ct_into(
         (&mut d_output as *mut *mut c_void).cast(),
         (&mut query_rows_u32 as *mut u32).cast(),
         (&mut heads_u32 as *mut u32).cast(),
+        (&mut weight_head_start_u32 as *mut u32).cast(),
         (&mut q_head_u32 as *mut u32).cast(),
         (&mut kv_head_u32 as *mut u32).cast(),
         (&mut latent_u32 as *mut u32).cast(),
@@ -2484,6 +3015,283 @@ pub(crate) fn try_paged_mla_attention_ct_into(
         }
     }
     Ok(())
+}
+
+pub(crate) struct PagedMlaShardAttention {
+    pub weighted: std::sync::Arc<DeviceBuffer>,
+    pub stats: std::sync::Arc<DeviceBuffer>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_paged_mla_attention_ct_shard(
+    device_id: i32,
+    query: &DeviceBuffer,
+    latent_cache: &DeviceBuffer,
+    latent_scales: Option<&DeviceBuffer>,
+    latent_group_size: usize,
+    rope_cache: &DeviceBuffer,
+    block_table: &DeviceBuffer,
+    selection: Option<&DeviceBuffer>,
+    selection_counts: Option<&DeviceBuffer>,
+    weight: CtMlaWeightRef<'_>,
+    query_rows: usize,
+    context_rows: usize,
+    query_start: usize,
+    q_projection: usize,
+    head_count: usize,
+    rope_dim: usize,
+    top_k: usize,
+    block_size: usize,
+    parity: usize,
+) -> Result<PagedMlaShardAttention, String> {
+    if parity > 1 || block_size == 0 {
+        return Err(format!("paged MLA shard parity={parity} block_size={block_size} 非法"));
+    }
+    let latent_dim = weight.cols;
+    let weighted_bytes = query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(latent_dim)).and_then(|n| n.checked_mul(2)).ok_or("paged MLA shard weighted 大小溢出")?;
+    let stats_bytes = query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(2 * std::mem::size_of::<f32>())).ok_or("paged MLA shard stats 大小溢出")?;
+    let weighted = std::sync::Arc::new(DeviceBuffer::allocate_reusable(device_id, weighted_bytes)?);
+    let stats = std::sync::Arc::new(DeviceBuffer::allocate_reusable(device_id, stats_bytes)?);
+    let full_blocks = context_rows / block_size;
+    let tail = context_rows % block_size;
+    let resident_rows = (full_blocks / 2) * block_size + usize::from(full_blocks % 2 > parity) * block_size + usize::from(full_blocks % 2 == parity) * tail;
+    if resident_rows == 0 {
+        if !weighted_bytes.is_multiple_of(std::mem::size_of::<u32>()) {
+            return Err(format!("paged MLA 空 shard weighted bytes={weighted_bytes} 未按 u32 对齐"));
+        }
+        let functions = paged_mla_functions(device_id)?;
+        let mut d_weighted = weighted.pointer;
+        let mut weighted_words = u32::try_from(weighted_bytes / std::mem::size_of::<u32>()).map_err(|_| "paged MLA 空 shard weighted words 超过 u32")?;
+        let mut clear_weighted_args = [(&mut d_weighted as *mut *mut c_void).cast(), (&mut weighted_words as *mut u32).cast()];
+        launch_tensor_kernel(functions.dsa_clear, weighted_words.div_ceil(256), 256, &mut clear_weighted_args, "HIP paged MLA empty shard weighted clear")?;
+        let mut d_stats = stats.pointer;
+        let mut stats_words = u32::try_from(stats_bytes / std::mem::size_of::<u32>()).map_err(|_| "paged MLA 空 shard stats words 超过 u32")?;
+        let mut clear_stats_args = [(&mut d_stats as *mut *mut c_void).cast(), (&mut stats_words as *mut u32).cast()];
+        launch_tensor_kernel(functions.dsa_clear, stats_words.div_ceil(256), 256, &mut clear_stats_args, "HIP paged MLA empty shard stats clear")?;
+        return Ok(PagedMlaShardAttention { weighted, stats });
+    }
+    try_paged_mla_attention_ct_inner(
+        device_id,
+        query,
+        latent_cache,
+        latent_scales,
+        latent_group_size,
+        rope_cache,
+        block_table,
+        selection,
+        selection_counts,
+        weight,
+        query_rows,
+        context_rows,
+        query_start,
+        q_projection,
+        head_count,
+        rope_dim,
+        top_k,
+        block_size,
+        &weighted,
+        Some(true),
+        Some((parity, &weighted, &stats)),
+    )?;
+    Ok(PagedMlaShardAttention { weighted, stats })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_paged_mla_shard_scale_project_ct(
+    device_id: i32,
+    weighted: &DeviceBuffer,
+    local_stats: &DeviceBuffer,
+    remote_stats: &DeviceBuffer,
+    weight: CtMlaWeightRef<'_>,
+    query_rows: usize,
+    q_projection: usize,
+    head_count: usize,
+    rope_dim: usize,
+    output: &DeviceBuffer,
+) -> Result<(), String> {
+    if query_rows == 0 || !q_projection.is_multiple_of(head_count) || !weight.rows.is_multiple_of(head_count) || weight.cols == 0 || !weight.cols.is_multiple_of(weight.group_size) {
+        return Err("paged MLA shard project shape 非法".to_owned());
+    }
+    let q_head_dim = q_projection / head_count;
+    let kv_head_dim = weight.rows / head_count;
+    let latent_dim = weight.cols;
+    let weighted_elements = query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(latent_dim)).ok_or("paged MLA shard project weighted 大小溢出")?;
+    let stats_bytes = query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(2 * std::mem::size_of::<f32>())).ok_or("paged MLA shard project stats 大小溢出")?;
+    validate_resident(weighted, device_id, weighted_elements.checked_mul(2).ok_or("paged MLA shard project weighted 字节溢出")?, "paged MLA shard weighted")?;
+    validate_resident(local_stats, device_id, stats_bytes, "paged MLA shard local stats")?;
+    validate_resident(remote_stats, device_id, stats_bytes, "paged MLA shard remote stats")?;
+    validate_resident(output, device_id, query_rows.checked_mul(q_projection).and_then(|n| n.checked_mul(if query_rows > 1 { 2 } else { 4 })).ok_or("paged MLA shard output 大小溢出")?, "paged MLA shard output")?;
+    let functions = paged_mla_functions(device_id)?;
+    let mut d_weighted = weighted.pointer;
+    let mut d_local_stats = local_stats.pointer;
+    let mut d_remote_stats = remote_stats.pointer;
+    let mut rows_u32 = u32::try_from(query_rows).map_err(|_| "paged MLA shard rows 超过 u32")?;
+    let mut heads_u32 = u32::try_from(head_count).map_err(|_| "paged MLA shard heads 超过 u32")?;
+    let mut weight_head_start_u32 = 0u32;
+    let mut latent_u32 = u32::try_from(latent_dim).map_err(|_| "paged MLA shard latent 超过 u32")?;
+    let mut scale_args = [
+        (&mut d_weighted as *mut *mut c_void).cast(),
+        (&mut d_local_stats as *mut *mut c_void).cast(),
+        (&mut d_remote_stats as *mut *mut c_void).cast(),
+        (&mut rows_u32 as *mut u32).cast(),
+        (&mut heads_u32 as *mut u32).cast(),
+        (&mut latent_u32 as *mut u32).cast(),
+    ];
+    launch_tensor_kernel(functions.shard_scale, u32::try_from(weighted_elements.div_ceil(256)).map_err(|_| "paged MLA shard scale grid 超过 u32")?, 256, &mut scale_args, "HIP paged MLA shard scale")?;
+
+    let mut d_packed = weight.packed.pointer;
+    let mut d_scales = weight.scales.pointer;
+    let mut d_output = output.pointer;
+    let mut q_head_u32 = u32::try_from(q_head_dim).map_err(|_| "paged MLA shard q head 超过 u32")?;
+    let mut kv_head_u32 = u32::try_from(kv_head_dim).map_err(|_| "paged MLA shard kv head 超过 u32")?;
+    let mut rope_u32 = u32::try_from(rope_dim).map_err(|_| "paged MLA shard rope 超过 u32")?;
+    let mut group_u32 = u32::try_from(weight.group_size).map_err(|_| "paged MLA shard group 超过 u32")?;
+    let mut scale_u32 = weight.scale_dtype;
+    let mut bits_u32 = weight.bits;
+    let mut project_args = [
+        (&mut d_weighted as *mut *mut c_void).cast(),
+        (&mut d_packed as *mut *mut c_void).cast(),
+        (&mut d_scales as *mut *mut c_void).cast(),
+        (&mut d_output as *mut *mut c_void).cast(),
+        (&mut rows_u32 as *mut u32).cast(),
+        (&mut heads_u32 as *mut u32).cast(),
+        (&mut weight_head_start_u32 as *mut u32).cast(),
+        (&mut q_head_u32 as *mut u32).cast(),
+        (&mut kv_head_u32 as *mut u32).cast(),
+        (&mut latent_u32 as *mut u32).cast(),
+        (&mut rope_u32 as *mut u32).cast(),
+        (&mut group_u32 as *mut u32).cast(),
+        (&mut scale_u32 as *mut u32).cast(),
+        (&mut bits_u32 as *mut u32).cast(),
+    ];
+    let value_dim = kv_head_dim.checked_sub(q_head_dim - rope_dim).ok_or("paged MLA shard value_dim 下溢")?;
+    let project_wmma = query_rows > 1;
+    let project_tile = if project_wmma { 128 } else { 16 };
+    let project_tiles = head_count.checked_mul(value_dim.div_ceil(project_tile)).ok_or("paged MLA shard project grid 溢出")?;
+    launch_moe_kernel(
+        if project_wmma { functions.project_value_wmma } else { functions.project_value },
+        u32::try_from(project_tiles).map_err(|_| "paged MLA shard project grid 超过 u32")?,
+        u32::try_from(query_rows.div_ceil(project_tile)).map_err(|_| "paged MLA shard project rows 超过 u32")?,
+        if project_wmma { functions.wavefront_size * 8 } else { 256 },
+        0,
+        &mut project_args,
+        "HIP MLA shard project value",
+    )
+}
+
+/// 精确合并两个 sequence shard，但只物化本卡负责的 query heads。随后 value
+/// projection 也只计算这些 heads，形成 attention 的 head reduce-scatter。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_paged_mla_shard_merge_project_heads_ct(
+    device_id: i32,
+    local_weighted: &DeviceBuffer,
+    remote_weighted: &DeviceBuffer,
+    local_stats: &DeviceBuffer,
+    remote_stats: &DeviceBuffer,
+    weight: CtMlaWeightRef<'_>,
+    query_rows: usize,
+    q_projection: usize,
+    total_heads: usize,
+    head_start: usize,
+    head_count: usize,
+    rope_dim: usize,
+    output: &DeviceBuffer,
+) -> Result<(), String> {
+    if query_rows == 0
+        || head_count == 0
+        || head_start.checked_add(head_count).map_or(true, |end| end > total_heads)
+        || !q_projection.is_multiple_of(total_heads)
+        || !weight.rows.is_multiple_of(total_heads)
+        || weight.cols == 0
+        || weight.group_size == 0
+        || !weight.cols.is_multiple_of(weight.group_size)
+    {
+        return Err("paged MLA shard head merge shape 非法".to_owned());
+    }
+    let q_head_dim = q_projection / total_heads;
+    let latent_dim = weight.cols;
+    let full_weighted_elements = query_rows.checked_mul(total_heads).and_then(|n| n.checked_mul(latent_dim)).ok_or("paged MLA shard head merge weighted 大小溢出")?;
+    let stats_bytes = query_rows.checked_mul(total_heads).and_then(|n| n.checked_mul(2 * std::mem::size_of::<f32>())).ok_or("paged MLA shard head merge stats 大小溢出")?;
+    let compact_elements = query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(latent_dim)).ok_or("paged MLA shard head merge compact 大小溢出")?;
+    validate_resident(local_weighted, device_id, full_weighted_elements.checked_mul(2).ok_or("paged MLA shard head merge weighted 字节溢出")?, "paged MLA shard local weighted")?;
+    validate_resident(local_stats, device_id, stats_bytes, "paged MLA shard local stats")?;
+    if remote_weighted.bytes < full_weighted_elements.checked_mul(2).ok_or("paged MLA remote weighted 字节溢出")? || remote_stats.bytes < stats_bytes {
+        return Err("paged MLA shard remote weighted/stats 大小不足".to_owned());
+    }
+    if remote_weighted.device_id != device_id {
+        enable_peer_access(device_id, remote_weighted.device_id)?;
+    }
+    if remote_stats.device_id != device_id {
+        enable_peer_access(device_id, remote_stats.device_id)?;
+    }
+    let compact = DeviceBuffer::allocate_reusable(device_id, compact_elements.checked_mul(2).ok_or("paged MLA shard compact 字节溢出")?)?;
+    let functions = paged_mla_functions(device_id)?;
+    let mut d_local_weighted = local_weighted.pointer;
+    let mut d_remote_weighted = remote_weighted.pointer;
+    let mut d_local_stats = local_stats.pointer;
+    let mut d_remote_stats = remote_stats.pointer;
+    let mut d_compact = compact.pointer;
+    let mut rows_u32 = u32::try_from(query_rows).map_err(|_| "paged MLA shard head merge rows 超过 u32")?;
+    let mut total_heads_u32 = u32::try_from(total_heads).map_err(|_| "paged MLA shard total heads 超过 u32")?;
+    let mut head_start_u32 = u32::try_from(head_start).map_err(|_| "paged MLA shard head start 超过 u32")?;
+    let mut head_count_u32 = u32::try_from(head_count).map_err(|_| "paged MLA shard head count 超过 u32")?;
+    let mut latent_u32 = u32::try_from(latent_dim).map_err(|_| "paged MLA shard latent 超过 u32")?;
+    let mut merge_args = [
+        (&mut d_local_weighted as *mut *mut c_void).cast(),
+        (&mut d_remote_weighted as *mut *mut c_void).cast(),
+        (&mut d_local_stats as *mut *mut c_void).cast(),
+        (&mut d_remote_stats as *mut *mut c_void).cast(),
+        (&mut d_compact as *mut *mut c_void).cast(),
+        (&mut rows_u32 as *mut u32).cast(),
+        (&mut total_heads_u32 as *mut u32).cast(),
+        (&mut head_start_u32 as *mut u32).cast(),
+        (&mut head_count_u32 as *mut u32).cast(),
+        (&mut latent_u32 as *mut u32).cast(),
+    ];
+    let merge_heads = query_rows.checked_mul(head_count).ok_or("paged MLA shard head merge grid 溢出")?;
+    launch_tensor_kernel(functions.shard_merge_heads, u32::try_from(merge_heads).map_err(|_| "paged MLA shard head merge grid 超过 u32")?, 256, &mut merge_args, "HIP paged MLA shard merge heads")?;
+
+    let kv_head_dim = weight.rows / total_heads;
+    let output_elements = query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(q_head_dim)).ok_or("paged MLA shard head project output 大小溢出")?;
+    validate_resident(output, device_id, output_elements.checked_mul(if query_rows > 1 { 2 } else { 4 }).ok_or("paged MLA shard head project output 字节溢出")?, "paged MLA shard head project output")?;
+    let mut d_packed = weight.packed.pointer;
+    let mut d_scales = weight.scales.pointer;
+    let mut d_output = output.pointer;
+    let mut q_head_u32 = u32::try_from(q_head_dim).map_err(|_| "paged MLA shard q head 超过 u32")?;
+    let mut kv_head_u32 = u32::try_from(kv_head_dim).map_err(|_| "paged MLA shard kv head 超过 u32")?;
+    let mut rope_u32 = u32::try_from(rope_dim).map_err(|_| "paged MLA shard rope 超过 u32")?;
+    let mut group_u32 = u32::try_from(weight.group_size).map_err(|_| "paged MLA shard group 超过 u32")?;
+    let mut scale_u32 = weight.scale_dtype;
+    let mut bits_u32 = weight.bits;
+    let mut project_args = [
+        (&mut d_compact as *mut *mut c_void).cast(),
+        (&mut d_packed as *mut *mut c_void).cast(),
+        (&mut d_scales as *mut *mut c_void).cast(),
+        (&mut d_output as *mut *mut c_void).cast(),
+        (&mut rows_u32 as *mut u32).cast(),
+        (&mut head_count_u32 as *mut u32).cast(),
+        (&mut head_start_u32 as *mut u32).cast(),
+        (&mut q_head_u32 as *mut u32).cast(),
+        (&mut kv_head_u32 as *mut u32).cast(),
+        (&mut latent_u32 as *mut u32).cast(),
+        (&mut rope_u32 as *mut u32).cast(),
+        (&mut group_u32 as *mut u32).cast(),
+        (&mut scale_u32 as *mut u32).cast(),
+        (&mut bits_u32 as *mut u32).cast(),
+    ];
+    let value_dim = kv_head_dim.checked_sub(q_head_dim - rope_dim).ok_or("paged MLA shard head value_dim 下溢")?;
+    let project_wmma = query_rows > 1;
+    let project_tile = if project_wmma { 128 } else { 16 };
+    let project_tiles = head_count.checked_mul(value_dim.div_ceil(project_tile)).ok_or("paged MLA shard head project grid 溢出")?;
+    launch_moe_kernel(
+        if project_wmma { functions.project_value_wmma } else { functions.project_value },
+        u32::try_from(project_tiles).map_err(|_| "paged MLA shard head project grid 超过 u32")?,
+        u32::try_from(query_rows.div_ceil(project_tile)).map_err(|_| "paged MLA shard head project rows 超过 u32")?,
+        if project_wmma { functions.wavefront_size * 8 } else { 256 },
+        0,
+        &mut project_args,
+        "HIP MLA shard merge/project heads",
+    )
 }
 
 #[cfg(test)]
@@ -2547,6 +3355,50 @@ mod tests {
             assert_eq!(&actual_latent[slot * LATENT_COLUMNS..(slot + 1) * LATENT_COLUMNS], &latent[source * LATENT_COLUMNS..(source + 1) * LATENT_COLUMNS]);
             assert_eq!(&actual_scales[slot * SCALE_COLUMNS..(slot + 1) * SCALE_COLUMNS], &scales[source * SCALE_COLUMNS..(source + 1) * SCALE_COLUMNS]);
             assert_eq!(&actual_rope[slot * ROPE_COLUMNS..(slot + 1) * ROPE_COLUMNS], &rope[source * ROPE_COLUMNS..(source + 1) * ROPE_COLUMNS]);
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn mla_hot_gather_preserves_token_to_slot_routing() {
+        const DEVICE_ID: i32 = 0;
+        const ROWS: usize = 3;
+        const TARGET_ROWS: usize = 6;
+        const LATENT_COLUMNS: usize = 7;
+        const SCALE_COLUMNS: usize = 2;
+        const ROPE_COLUMNS: usize = 3;
+
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        let source_rows = 8;
+        let latent = (0..source_rows * LATENT_COLUMNS).map(|value| value as u8 + 11).collect::<Vec<_>>();
+        let scales = (0..source_rows * SCALE_COLUMNS).map(|value| value as u16 + 51).collect::<Vec<_>>();
+        let rope = (0..source_rows * ROPE_COLUMNS).map(|value| value as u16 + 71).collect::<Vec<_>>();
+        let tokens = [2_u32, 5, 0];
+        let slots = [4_u32, 1, 5];
+        let source_latent = DeviceBuffer::upload(DEVICE_ID, &latent).unwrap();
+        let source_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&scales)).unwrap();
+        let source_rope = DeviceBuffer::upload(DEVICE_ID, as_bytes(&rope)).unwrap();
+        let tokens_device = DeviceBuffer::upload(DEVICE_ID, as_bytes(&tokens)).unwrap();
+        let slots_device = DeviceBuffer::upload(DEVICE_ID, as_bytes(&slots)).unwrap();
+        let target_latent = DeviceBuffer::upload(DEVICE_ID, &vec![0_u8; TARGET_ROWS * LATENT_COLUMNS]).unwrap();
+        let target_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&vec![0_u16; TARGET_ROWS * SCALE_COLUMNS])).unwrap();
+        let target_rope = DeviceBuffer::upload(DEVICE_ID, as_bytes(&vec![0_u16; TARGET_ROWS * ROPE_COLUMNS])).unwrap();
+        try_mla_hot_gather_q8(DEVICE_ID, &source_latent, Some(&source_scales), &source_rope, &tokens_device, &slots_device, &target_latent, &target_scales, &target_rope, ROWS, LATENT_COLUMNS, SCALE_COLUMNS, ROPE_COLUMNS, TARGET_ROWS)
+            .unwrap();
+        super::super::synchronize_device(DEVICE_ID, "HIP MLA hot gather oracle").unwrap();
+
+        let mut actual_latent = vec![0_u8; TARGET_ROWS * LATENT_COLUMNS];
+        let mut actual_scales = vec![0_u16; TARGET_ROWS * SCALE_COLUMNS];
+        let mut actual_rope = vec![0_u16; TARGET_ROWS * ROPE_COLUMNS];
+        target_latent.copy_to_host(&mut actual_latent).unwrap();
+        target_scales.copy_to_host(as_bytes_mut(&mut actual_scales)).unwrap();
+        target_rope.copy_to_host(as_bytes_mut(&mut actual_rope)).unwrap();
+        for (index, (&token, &slot)) in tokens.iter().zip(slots.iter()).enumerate() {
+            let token = token as usize;
+            let slot = slot as usize;
+            assert_eq!(&actual_latent[slot * LATENT_COLUMNS..(slot + 1) * LATENT_COLUMNS], &latent[token * LATENT_COLUMNS..(token + 1) * LATENT_COLUMNS], "latent row {index}");
+            assert_eq!(&actual_scales[slot * SCALE_COLUMNS..(slot + 1) * SCALE_COLUMNS], &scales[token * SCALE_COLUMNS..(token + 1) * SCALE_COLUMNS], "scales row {index}");
+            assert_eq!(&actual_rope[slot * ROPE_COLUMNS..(slot + 1) * ROPE_COLUMNS], &rope[token * ROPE_COLUMNS..(token + 1) * ROPE_COLUMNS], "rope row {index}");
         }
     }
 
@@ -2888,6 +3740,69 @@ mod tests {
 
     #[test]
     #[ignore = "需要 ROCm gfx11+ GPU"]
+    fn dsa_compact_sequence_shards_match_full_topk_bits() {
+        const DEVICE_ID: i32 = 0;
+        const CONTEXT_ROWS: usize = 50_013;
+        const HEAD_COUNT: usize = 64;
+        const HEAD_DIM: usize = 128;
+        const KEY_GROUP_SIZE: usize = 128;
+        const TOP_K: usize = 2048;
+        const BLOCK_SIZE: usize = 64;
+
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        let keys = (0..CONTEXT_ROWS * HEAD_DIM).map(|index| ((index.wrapping_mul(17).wrapping_add(index / HEAD_DIM * 13)) % 255) as u8).collect::<Vec<_>>();
+        let scales = vec![0x3f80_u16; CONTEXT_ROWS];
+        let query = (0..HEAD_COUNT * HEAD_DIM).map(|index| ((index.wrapping_mul(29) % 257) as f32 - 128.0) * (1.0 / 127.0)).collect::<Vec<_>>();
+        let weights = (0..HEAD_COUNT).map(|head| (head + 1) as f32 / HEAD_COUNT as f32).collect::<Vec<_>>();
+        let full_table = (0..CONTEXT_ROWS.div_ceil(BLOCK_SIZE) as u32).collect::<Vec<_>>();
+        let full_keys = DeviceBuffer::upload(DEVICE_ID, &keys).unwrap();
+        let full_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&scales)).unwrap();
+        let full_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&full_table)).unwrap();
+        let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query)).unwrap();
+        let weights = DeviceBuffer::upload(DEVICE_ID, as_bytes(&weights)).unwrap();
+        let full = try_dsa_select_paged_q8(DEVICE_ID, &full_keys, &full_scales, KEY_GROUP_SIZE, false, &full_table, &query, &weights, 1, CONTEXT_ROWS, CONTEXT_ROWS - 1, HEAD_COUNT, HEAD_DIM, TOP_K, false, BLOCK_SIZE).unwrap();
+        let score_stride = CONTEXT_ROWS.div_ceil(128) * 128;
+        let workspace_key = crate::kernel::rocm::hip::compute_workspace_key(DEVICE_ID);
+        let full_scores = PAGED_DSA_WORKSPACES.with(|workspaces| workspaces.borrow().get(&workspace_key).unwrap().scores.as_ref().unwrap().clone());
+        let mut full_score_host = vec![0_u32; score_stride];
+        full_scores.copy_to_host(as_bytes_mut(&mut full_score_host)).unwrap();
+
+        let mut shards = Vec::with_capacity(2);
+        for parity in 0..2 {
+            let tokens = (0..CONTEXT_ROWS).filter(|token| (token / BLOCK_SIZE) % 2 == parity).collect::<Vec<_>>();
+            let shard_keys = tokens.iter().flat_map(|&token| keys[token * HEAD_DIM..(token + 1) * HEAD_DIM].iter().copied()).collect::<Vec<_>>();
+            let shard_scales = tokens.iter().map(|&token| scales[token]).collect::<Vec<_>>();
+            let shard_table = (0..tokens.len().div_ceil(BLOCK_SIZE) as u32).collect::<Vec<_>>();
+            let shard_keys = DeviceBuffer::upload(DEVICE_ID, &shard_keys).unwrap();
+            let shard_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&shard_scales)).unwrap();
+            let shard_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&shard_table)).unwrap();
+            let shard =
+                try_dsa_select_paged_q8_sequence_shard(DEVICE_ID, &shard_keys, &shard_scales, KEY_GROUP_SIZE, &shard_table, &query, &weights, 1, CONTEXT_ROWS, CONTEXT_ROWS - 1, HEAD_COUNT, HEAD_DIM, TOP_K, BLOCK_SIZE, parity).unwrap();
+            let mut shard_tokens = vec![0_u32; TOP_K];
+            let mut shard_scores = vec![0_u32; TOP_K];
+            shard.selection.copy_to_host(as_bytes_mut(&mut shard_tokens)).unwrap();
+            shard.scores.copy_to_host(as_bytes_mut(&mut shard_scores)).unwrap();
+            for rank in 0..TOP_K {
+                let token = shard_tokens[rank] as usize;
+                assert_eq!((token / BLOCK_SIZE) % 2, parity, "parity={parity} rank={rank} token={token}");
+                assert_eq!(shard_scores[rank], full_score_host[token], "parity={parity} rank={rank} token={token}");
+            }
+            shards.push(shard);
+        }
+        let merged = try_dsa_merge_sequence_shard_topk(DEVICE_ID, &shards[0], &shards[1], 1, TOP_K).unwrap();
+        super::super::synchronize_device(DEVICE_ID, "HIP DSA compact sequence shard oracle").unwrap();
+        let mut full_host = vec![0_u32; TOP_K];
+        let mut merged_host = vec![0_u32; TOP_K];
+        full.copy_to_host(as_bytes_mut(&mut full_host)).unwrap();
+        merged.copy_to_host(as_bytes_mut(&mut merged_host)).unwrap();
+        if merged_host != full_host {
+            let rank = merged_host.iter().zip(&full_host).position(|(merged, full)| merged != full).unwrap();
+            panic!("DSA sequence shard merge 不一致: rank={rank} merged={} full={}", merged_host[rank], full_host[rank]);
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm gfx11+ GPU"]
     fn dsa_hadamard_shadow_i8_gpu_matches_integer_oracle() {
         const DEVICE_ID: i32 = 0;
         const CONTEXT_ROWS: usize = 2305;
@@ -3203,6 +4118,359 @@ mod tests {
 
     #[test]
     #[ignore = "需要 ROCm GPU"]
+    fn mla_selection_split_keeps_global_topk_exactly_once() {
+        const DEVICE_ID: i32 = 0;
+        const ROWS: usize = 3;
+        const WIDTH: usize = 12;
+        const BLOCK: usize = 4;
+        set_device(DEVICE_ID).unwrap();
+        let selection = [
+            0_u32, 7, 8, 15, 16, 23, 24, 31, 32, 39, 40, 47, // parity 交替
+            63, 62, 61, 60, 59, 58, 57, 56, 55, 54, 53, 52, // 逆序
+            3, 4, 11, 12, 19, 20, 27, 28, 35, 36, 43, 44,
+        ];
+        let source = DeviceBuffer::upload(DEVICE_ID, as_bytes(&selection)).unwrap();
+        let shards = try_split_paged_mla_selection_parity(DEVICE_ID, &source, ROWS, WIDTH, BLOCK).unwrap();
+        let mut owner = vec![0_u32; ROWS * WIDTH];
+        let mut peer = vec![0_u32; ROWS * WIDTH];
+        let mut owner_counts = vec![0_u32; ROWS];
+        let mut peer_counts = vec![0_u32; ROWS];
+        shards.owner.copy_to_host(as_bytes_mut(&mut owner)).unwrap();
+        shards.peer.copy_to_host(as_bytes_mut(&mut peer)).unwrap();
+        shards.owner_counts.copy_to_host(as_bytes_mut(&mut owner_counts)).unwrap();
+        shards.peer_counts.copy_to_host(as_bytes_mut(&mut peer_counts)).unwrap();
+        for row in 0..ROWS {
+            let input = &selection[row * WIDTH..(row + 1) * WIDTH];
+            let expected_owner = input.iter().copied().filter(|token| ((*token as usize / BLOCK) & 1) == 0).collect::<Vec<_>>();
+            let expected_peer = input.iter().copied().filter(|token| ((*token as usize / BLOCK) & 1) == 1).collect::<Vec<_>>();
+            let actual_owner = owner[row * WIDTH..row * WIDTH + owner_counts[row] as usize].to_vec();
+            let actual_peer = peer[row * WIDTH..row * WIDTH + peer_counts[row] as usize].to_vec();
+            assert_eq!(actual_owner, expected_owner);
+            assert_eq!(actual_peer, expected_peer);
+            assert_eq!(actual_owner.len() + actual_peer.len(), WIDTH);
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn mla_empty_block_parity_shard_is_zero_contribution() {
+        const DEVICE_ID: i32 = 0;
+        set_device(DEVICE_ID).unwrap();
+        let query = DeviceBuffer::upload_f32(DEVICE_ID, &[1.0, -1.0]).unwrap();
+        let latent = DeviceBuffer::upload(DEVICE_ID, &[0_u8; 2]).unwrap();
+        let scales = DeviceBuffer::upload(DEVICE_ID, &[0_u8; 2]).unwrap();
+        let rope = DeviceBuffer::upload(DEVICE_ID, &[0_u8; 4]).unwrap();
+        let table = DeviceBuffer::upload(DEVICE_ID, &[0_u8; 4]).unwrap();
+        let packed = DeviceBuffer::upload(DEVICE_ID, &[0_u8; 4]).unwrap();
+        let weight_scales = DeviceBuffer::upload(DEVICE_ID, &[0_u8; 2]).unwrap();
+        let shard = try_paged_mla_attention_ct_shard(
+            DEVICE_ID,
+            &query,
+            &latent,
+            Some(&scales),
+            2,
+            &rope,
+            &table,
+            None,
+            None,
+            CtMlaWeightRef { packed: &packed, scales: &weight_scales, rows: 2, cols: 2, group_size: 2, scale_dtype: 0, bits: 16 },
+            1,
+            33,
+            32,
+            2,
+            1,
+            2,
+            0,
+            64,
+            1,
+        )
+        .unwrap();
+        super::super::synchronize_device(DEVICE_ID, "HIP MLA empty parity shard oracle").unwrap();
+        let mut weighted = [u32::MAX];
+        shard.weighted.copy_to_host(as_bytes_mut(&mut weighted)).unwrap();
+        assert_eq!(weighted, [0]);
+        assert_eq!(shard.stats.download_f32(2).unwrap(), vec![0.0, 0.0]);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn mla_block_parity_shards_match_full_attention() {
+        const DEVICE_ID: i32 = 0;
+        const CONTEXT_ROWS: usize = 257;
+        const HEADS: usize = 32;
+        const Q_HEAD: usize = 256;
+        const KV_HEAD: usize = 448;
+        const LATENT: usize = 512;
+        const ROPE: usize = 64;
+        const GROUP: usize = 64;
+        const BLOCK: usize = 64;
+        let q_projection = HEADS * Q_HEAD;
+        let kv_projection = HEADS * KV_HEAD;
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        set_device(DEVICE_ID).unwrap();
+
+        let weight_bits = (0..kv_projection * LATENT)
+            .map(|index| {
+                let value = (((index * 17) % 127) as f32 - 63.0) * (1.0 / 4096.0);
+                (value.to_bits() >> 16) as u16
+            })
+            .collect::<Vec<_>>();
+        let weight = DeviceBuffer::upload(DEVICE_ID, as_bytes(&weight_bits)).unwrap();
+        let weight_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&[0x3f80_u16])).unwrap();
+        let latent = (0..CONTEXT_ROWS * LATENT).map(|index| ((index * 29 + index / LATENT * 7) % 63 + 1) as u8).collect::<Vec<_>>();
+        let latent_scales = vec![0x3b80_u16; CONTEXT_ROWS * (LATENT / GROUP)];
+        let rope = (0..CONTEXT_ROWS * ROPE)
+            .map(|index| {
+                let value = (((index * 13) % 127) as f32 - 63.0) * (1.0 / 128.0);
+                (value.to_bits() >> 16) as u16
+            })
+            .collect::<Vec<_>>();
+        let compact = |bytes: &[u8], row_bytes: usize, parity: usize| {
+            let mut output = Vec::new();
+            for row in 0..CONTEXT_ROWS {
+                if ((row / BLOCK) & 1) == parity {
+                    output.extend_from_slice(&bytes[row * row_bytes..(row + 1) * row_bytes]);
+                }
+            }
+            output
+        };
+        let latent_device = DeviceBuffer::upload(DEVICE_ID, &latent).unwrap();
+        let scales_device = DeviceBuffer::upload(DEVICE_ID, as_bytes(&latent_scales)).unwrap();
+        let rope_device = DeviceBuffer::upload(DEVICE_ID, as_bytes(&rope)).unwrap();
+        let full_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&(0..CONTEXT_ROWS.div_ceil(BLOCK) as u32).collect::<Vec<_>>())).unwrap();
+        let owner_latent = DeviceBuffer::upload(DEVICE_ID, &compact(&latent, LATENT, 0)).unwrap();
+        let peer_latent = DeviceBuffer::upload(DEVICE_ID, &compact(&latent, LATENT, 1)).unwrap();
+        let owner_scales = DeviceBuffer::upload(DEVICE_ID, &compact(as_bytes(&latent_scales), LATENT / GROUP * 2, 0)).unwrap();
+        let peer_scales = DeviceBuffer::upload(DEVICE_ID, &compact(as_bytes(&latent_scales), LATENT / GROUP * 2, 1)).unwrap();
+        let owner_rope = DeviceBuffer::upload(DEVICE_ID, &compact(as_bytes(&rope), ROPE * 2, 0)).unwrap();
+        let peer_rope = DeviceBuffer::upload(DEVICE_ID, &compact(as_bytes(&rope), ROPE * 2, 1)).unwrap();
+        let owner_rows = (0..CONTEXT_ROWS).filter(|row| ((row / BLOCK) & 1) == 0).count();
+        let peer_rows = CONTEXT_ROWS - owner_rows;
+        let owner_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&(0..owner_rows.div_ceil(BLOCK) as u32).collect::<Vec<_>>())).unwrap();
+        let peer_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&(0..peer_rows.div_ceil(BLOCK) as u32).collect::<Vec<_>>())).unwrap();
+
+        for query_rows in [1_usize, 8] {
+            let query_host = (0..query_rows * q_projection).map(|index| ((index % 257) as f32 - 128.0) * (1.0 / 256.0)).collect::<Vec<_>>();
+            let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query_host)).unwrap();
+            let output_bytes = query_rows * q_projection * if query_rows == 1 { 4 } else { 2 };
+            let full = DeviceBuffer::allocate(DEVICE_ID, output_bytes).unwrap();
+            let weight_ref = || CtMlaWeightRef { packed: &weight, scales: &weight_scales, rows: kv_projection, cols: LATENT, group_size: LATENT, scale_dtype: 0, bits: 16 };
+            try_paged_mla_attention_ct_into(
+                DEVICE_ID,
+                &query,
+                &latent_device,
+                Some(&scales_device),
+                GROUP,
+                &rope_device,
+                &full_table,
+                None,
+                weight_ref(),
+                query_rows,
+                CONTEXT_ROWS,
+                CONTEXT_ROWS - query_rows,
+                q_projection,
+                HEADS,
+                ROPE,
+                0,
+                BLOCK,
+                &full,
+                Some(true),
+            )
+            .unwrap();
+            let owner = try_paged_mla_attention_ct_shard(
+                DEVICE_ID,
+                &query,
+                &owner_latent,
+                Some(&owner_scales),
+                GROUP,
+                &owner_rope,
+                &owner_table,
+                None,
+                None,
+                weight_ref(),
+                query_rows,
+                CONTEXT_ROWS,
+                CONTEXT_ROWS - query_rows,
+                q_projection,
+                HEADS,
+                ROPE,
+                0,
+                BLOCK,
+                0,
+            )
+            .unwrap();
+            let peer = try_paged_mla_attention_ct_shard(
+                DEVICE_ID,
+                &query,
+                &peer_latent,
+                Some(&peer_scales),
+                GROUP,
+                &peer_rope,
+                &peer_table,
+                None,
+                None,
+                weight_ref(),
+                query_rows,
+                CONTEXT_ROWS,
+                CONTEXT_ROWS - query_rows,
+                q_projection,
+                HEADS,
+                ROPE,
+                0,
+                BLOCK,
+                1,
+            )
+            .unwrap();
+            let owner_output = DeviceBuffer::allocate(DEVICE_ID, output_bytes).unwrap();
+            let peer_output = DeviceBuffer::allocate(DEVICE_ID, output_bytes).unwrap();
+            try_paged_mla_shard_scale_project_ct(DEVICE_ID, &owner.weighted, &owner.stats, &peer.stats, weight_ref(), query_rows, q_projection, HEADS, ROPE, &owner_output).unwrap();
+            try_paged_mla_shard_scale_project_ct(DEVICE_ID, &peer.weighted, &peer.stats, &owner.stats, weight_ref(), query_rows, q_projection, HEADS, ROPE, &peer_output).unwrap();
+            let half_output_bytes = output_bytes / 2;
+            let owner_half = DeviceBuffer::allocate(DEVICE_ID, half_output_bytes).unwrap();
+            let peer_half = DeviceBuffer::allocate(DEVICE_ID, half_output_bytes).unwrap();
+            try_paged_mla_shard_merge_project_heads_ct(DEVICE_ID, &owner.weighted, &peer.weighted, &owner.stats, &peer.stats, weight_ref(), query_rows, q_projection, HEADS, 0, HEADS / 2, ROPE, &owner_half).unwrap();
+            try_paged_mla_shard_merge_project_heads_ct(DEVICE_ID, &peer.weighted, &owner.weighted, &peer.stats, &owner.stats, weight_ref(), query_rows, q_projection, HEADS, HEADS / 2, HEADS / 2, ROPE, &peer_half).unwrap();
+            super::super::synchronize_device(DEVICE_ID, "HIP MLA parity shard oracle").unwrap();
+            let decode = |buffer: &DeviceBuffer| {
+                if query_rows == 1 {
+                    let mut values = vec![0.0_f32; buffer.bytes / std::mem::size_of::<f32>()];
+                    buffer.copy_to_host(as_bytes_mut(&mut values)).unwrap();
+                    values
+                } else {
+                    let mut values = vec![0_u16; buffer.bytes / std::mem::size_of::<u16>()];
+                    buffer.copy_to_host(as_bytes_mut(&mut values)).unwrap();
+                    values.into_iter().map(|bits| f32::from_bits(u32::from(bits) << 16)).collect()
+                }
+            };
+            let full = decode(&full);
+            let owner_output = decode(&owner_output);
+            let peer_output = decode(&peer_output);
+            let max_abs = full.iter().zip(owner_output.iter().zip(&peer_output)).map(|(full, (owner, peer))| (full - (owner + peer)).abs()).fold(0.0_f32, f32::max);
+            println!("[mla-parity-shard-oracle] rows={query_rows} context={CONTEXT_ROWS} max_abs={max_abs:.6e}");
+            assert!(max_abs <= if query_rows == 1 { 2.0e-2 } else { 5.0e-2 }, "rows={query_rows} max_abs={max_abs}");
+            let owner_half = decode(&owner_half);
+            let peer_half = decode(&peer_half);
+            let half_columns = q_projection / 2;
+            let head_reduce_scatter_max_abs = (0..query_rows)
+                .flat_map(|row| {
+                    let owner = &owner_half[row * half_columns..(row + 1) * half_columns];
+                    let peer = &peer_half[row * half_columns..(row + 1) * half_columns];
+                    owner.iter().chain(peer).zip(&full[row * q_projection..(row + 1) * q_projection]).map(|(actual, expected)| (actual - expected).abs())
+                })
+                .fold(0.0_f32, f32::max);
+            println!("[mla-head-reduce-scatter-oracle] rows={query_rows} context={CONTEXT_ROWS} max_abs={head_reduce_scatter_max_abs:.6e}");
+            assert!(head_reduce_scatter_max_abs <= if query_rows == 1 { 2.0e-2 } else { 5.0e-2 }, "rows={query_rows} head reduce-scatter max_abs={head_reduce_scatter_max_abs}");
+        }
+
+        // prefill 的全局候选表先按 parity 紧凑拆分；pair 两半的 WMMA
+        // 结果相加必须与未分片标量 attention 一致。候选刻意跨越两个
+        // 相邻 block，并保留每行独立 counts，覆盖真实 DSA 数据流。
+        const TOP_K: usize = 64;
+        for query_rows in [1_usize, 8] {
+            let query_start = CONTEXT_ROWS - query_rows;
+            let query_host = (0..query_rows * q_projection).map(|index| ((index % 257) as f32 - 128.0) * (1.0 / 256.0)).collect::<Vec<_>>();
+            let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query_host)).unwrap();
+            let selection = (0..query_rows).flat_map(|row| (0..TOP_K).map(move |index| if index < TOP_K / 2 { index as u32 } else { (BLOCK + index - TOP_K / 2 + row % 3) as u32 })).collect::<Vec<_>>();
+            let selection = DeviceBuffer::upload(DEVICE_ID, as_bytes(&selection)).unwrap();
+            let shards = try_split_paged_mla_selection_parity(DEVICE_ID, &selection, query_rows, TOP_K, BLOCK).unwrap();
+            let output_bytes = query_rows * q_projection * if query_rows == 1 { 4 } else { 2 };
+            let full = DeviceBuffer::allocate(DEVICE_ID, output_bytes).unwrap();
+            let weight_ref = || CtMlaWeightRef { packed: &weight, scales: &weight_scales, rows: kv_projection, cols: LATENT, group_size: LATENT, scale_dtype: 0, bits: 16 };
+            TEST_SPARSE_PREFILL_WMMA.store(false, std::sync::atomic::Ordering::Relaxed);
+            try_paged_mla_attention_ct_into(
+                DEVICE_ID,
+                &query,
+                &latent_device,
+                Some(&scales_device),
+                GROUP,
+                &rope_device,
+                &full_table,
+                Some(&selection),
+                weight_ref(),
+                query_rows,
+                CONTEXT_ROWS,
+                query_start,
+                q_projection,
+                HEADS,
+                ROPE,
+                TOP_K,
+                BLOCK,
+                &full,
+                Some(false),
+            )
+            .unwrap();
+            TEST_SPARSE_PREFILL_WMMA.store(true, std::sync::atomic::Ordering::Relaxed);
+            let owner = try_paged_mla_attention_ct_shard(
+                DEVICE_ID,
+                &query,
+                &owner_latent,
+                Some(&owner_scales),
+                GROUP,
+                &owner_rope,
+                &owner_table,
+                Some(&shards.owner),
+                Some(&shards.owner_counts),
+                weight_ref(),
+                query_rows,
+                CONTEXT_ROWS,
+                query_start,
+                q_projection,
+                HEADS,
+                ROPE,
+                TOP_K,
+                BLOCK,
+                0,
+            )
+            .unwrap();
+            let peer = try_paged_mla_attention_ct_shard(
+                DEVICE_ID,
+                &query,
+                &peer_latent,
+                Some(&peer_scales),
+                GROUP,
+                &peer_rope,
+                &peer_table,
+                Some(&shards.peer),
+                Some(&shards.peer_counts),
+                weight_ref(),
+                query_rows,
+                CONTEXT_ROWS,
+                query_start,
+                q_projection,
+                HEADS,
+                ROPE,
+                TOP_K,
+                BLOCK,
+                1,
+            )
+            .unwrap();
+            let owner_output = DeviceBuffer::allocate(DEVICE_ID, output_bytes).unwrap();
+            let peer_output = DeviceBuffer::allocate(DEVICE_ID, output_bytes).unwrap();
+            try_paged_mla_shard_scale_project_ct(DEVICE_ID, &owner.weighted, &owner.stats, &peer.stats, weight_ref(), query_rows, q_projection, HEADS, ROPE, &owner_output).unwrap();
+            try_paged_mla_shard_scale_project_ct(DEVICE_ID, &peer.weighted, &peer.stats, &owner.stats, weight_ref(), query_rows, q_projection, HEADS, ROPE, &peer_output).unwrap();
+            super::super::synchronize_device(DEVICE_ID, "HIP MLA selected parity shard oracle").unwrap();
+            let decode = |buffer: &DeviceBuffer| {
+                if query_rows == 1 {
+                    let mut values = vec![0.0_f32; query_rows * q_projection];
+                    buffer.copy_to_host(as_bytes_mut(&mut values)).unwrap();
+                    values
+                } else {
+                    let mut values = vec![0_u16; query_rows * q_projection];
+                    buffer.copy_to_host(as_bytes_mut(&mut values)).unwrap();
+                    values.into_iter().map(|bits| f32::from_bits(u32::from(bits) << 16)).collect::<Vec<_>>()
+                }
+            };
+            let full = decode(&full);
+            let owner_output = decode(&owner_output);
+            let peer_output = decode(&peer_output);
+            let max_abs = full.iter().zip(owner_output.iter().zip(&peer_output)).map(|(full, (owner, peer))| (full - (owner + peer)).abs()).fold(0.0_f32, f32::max);
+            println!("[mla-selected-parity-shard-oracle] rows={query_rows} context={CONTEXT_ROWS} topk={TOP_K} max_abs={max_abs:.6e}");
+            assert!(max_abs <= if query_rows == 1 { 2.0e-2 } else { 5.0e-2 }, "selected parity rows={query_rows} max_abs={max_abs}");
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
     fn mla_rope_q8_bf16_append_matches_separate_kernels_bits() {
         const DEVICE_ID: i32 = 0;
         const ROWS: usize = 5;
@@ -3353,6 +4621,7 @@ mod tests {
         let mut max_index = 0;
         let mut squared = 0.0_f64;
         for (index, (reference, actual)) in baseline_host.iter().zip(&candidate_host).enumerate() {
+            assert!(reference.is_finite() && actual.is_finite(), "index={index} scalar={reference} wmma={actual}");
             let error = (reference - actual).abs();
             if error > max_abs {
                 max_abs = error;
@@ -3486,26 +4755,30 @@ mod tests {
     #[ignore = "需要 ROCm GPU"]
     fn mla_decode_split_matches_serial_and_reports_latency() {
         const DEVICE_ID: i32 = 0;
-        const HEAD_COUNT: usize = 64;
         const Q_HEAD_DIM: usize = 256;
-        const Q_PROJECTION: usize = HEAD_COUNT * Q_HEAD_DIM;
         const LATENT_DIM: usize = 512;
         const KV_HEAD_DIM: usize = 448;
-        const KV_PROJECTION: usize = HEAD_COUNT * KV_HEAD_DIM;
         const ROPE_DIM: usize = 64;
         const LATENT_GROUP: usize = 64;
         const BLOCK_SIZE: usize = 128;
 
         super::super::configure(super::super::RocmOptions::default()).unwrap();
 
-        let query = (0..Q_PROJECTION).map(|index| ((index % 257) as f32 - 128.0) * (1.0 / 256.0)).collect::<Vec<_>>();
-        let weight = (0..KV_PROJECTION * LATENT_DIM).map(|index| (((index * 17) % 127) as f32 - 63.0) * (1.0 / 4096.0)).map(|value| (value.to_bits() >> 16) as u16).collect::<Vec<_>>();
-        let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query)).unwrap();
-        let weight = DeviceBuffer::upload(DEVICE_ID, as_bytes(&weight)).unwrap();
-        let scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&[0x3f80_u16])).unwrap();
-
-        for (mode, latent_group) in [("q8g64", LATENT_GROUP), ("f16", 0)] {
-            for context_rows in [64_usize, 128, 256, 512, 768, 1357, 2048] {
+        // head_count=32 复现 cooperative 半头拆分下每卡的 grid.x=1 形态；
+        // 131072 上下文让 WMMA split 超过旧 merge 上限 128，验证扩容后的正确性。
+        // wmma=off 强制走 fdot2 标量路径，覆盖 Step2 的 staged LDS 流水。
+        for (mode, latent_group, head_count, wmma) in
+            [("q8g64", LATENT_GROUP, 64_usize, true), ("q8g64", LATENT_GROUP, 32, true), ("f16", 0, 64, true), ("q8g64", LATENT_GROUP, 64, false), ("q8g64", LATENT_GROUP, 32, false), ("f16", 0, 64, false)]
+        {
+            TEST_MLA_DECODE_WMMA.store(wmma, std::sync::atomic::Ordering::Relaxed);
+            for context_rows in [64_usize, 128, 256, 512, 768, 1357, 2048, 16384, 131072] {
+                let q_projection = head_count * Q_HEAD_DIM;
+                let kv_projection = head_count * KV_HEAD_DIM;
+                let query = (0..q_projection).map(|index| ((index % 257) as f32 - 128.0) * (1.0 / 256.0)).collect::<Vec<_>>();
+                let weight = (0..kv_projection * LATENT_DIM).map(|index| (((index * 17) % 127) as f32 - 63.0) * (1.0 / 4096.0)).map(|value| (value.to_bits() >> 16) as u16).collect::<Vec<_>>();
+                let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query)).unwrap();
+                let weight = DeviceBuffer::upload(DEVICE_ID, as_bytes(&weight)).unwrap();
+                let scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&[0x3f80_u16])).unwrap();
                 let latent_bytes = if latent_group == 0 {
                     let values = (0..context_rows * LATENT_DIM).map(|index| (((index * 29 + index / LATENT_DIM * 7) % 127) as f32 - 63.0) * (1.0 / 64.0)).map(|value| (value.to_bits() >> 16) as u16).collect::<Vec<_>>();
                     as_bytes(&values).to_vec()
@@ -3515,12 +4788,15 @@ mod tests {
                 let latent_scales = (latent_group != 0).then(|| vec![0x3b80_u16; context_rows * (LATENT_DIM / LATENT_GROUP)]);
                 let rope = (0..context_rows * ROPE_DIM).map(|index| (((index * 13) % 127) as f32 - 63.0) * (1.0 / 128.0)).map(|value| (value.to_bits() >> 16) as u16).collect::<Vec<_>>();
                 let table = (0..context_rows.div_ceil(BLOCK_SIZE) as u32).collect::<Vec<_>>();
+                let top_k = context_rows.min(2048);
+                let selection = (0..top_k).map(|index| ((index * 251 + 17) % context_rows) as u32).collect::<Vec<_>>();
                 let latent = DeviceBuffer::upload(DEVICE_ID, &latent_bytes).unwrap();
                 let latent_scales = latent_scales.as_ref().map(|scales| DeviceBuffer::upload(DEVICE_ID, as_bytes(scales)).unwrap());
                 let rope = DeviceBuffer::upload(DEVICE_ID, as_bytes(&rope)).unwrap();
                 let table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&table)).unwrap();
-                let serial = DeviceBuffer::allocate(DEVICE_ID, Q_PROJECTION * 4).unwrap();
-                let split = DeviceBuffer::allocate(DEVICE_ID, Q_PROJECTION * 4).unwrap();
+                let selection = DeviceBuffer::upload(DEVICE_ID, as_bytes(&selection)).unwrap();
+                let serial = DeviceBuffer::allocate(DEVICE_ID, q_projection * 4).unwrap();
+                let split = DeviceBuffer::allocate(DEVICE_ID, q_projection * 4).unwrap();
 
                 let run = |output: &DeviceBuffer, split_decode| {
                     let started = std::time::Instant::now();
@@ -3532,15 +4808,15 @@ mod tests {
                         latent_group,
                         &rope,
                         &table,
-                        None,
-                        CtMlaWeightRef { packed: &weight, scales: &scales, rows: KV_PROJECTION, cols: LATENT_DIM, group_size: LATENT_DIM, scale_dtype: 0, bits: 16 },
+                        Some(&selection),
+                        CtMlaWeightRef { packed: &weight, scales: &scales, rows: kv_projection, cols: LATENT_DIM, group_size: LATENT_DIM, scale_dtype: 0, bits: 16 },
                         1,
                         context_rows,
                         context_rows - 1,
-                        Q_PROJECTION,
-                        HEAD_COUNT,
+                        q_projection,
+                        head_count,
                         ROPE_DIM,
-                        0,
+                        top_k,
                         BLOCK_SIZE,
                         output,
                         Some(split_decode),
@@ -3554,8 +4830,8 @@ mod tests {
                 let serial_ms = (0..3).map(|_| run(&serial, false)).sum::<f64>() / 3.0;
                 let split_ms = (0..3).map(|_| run(&split, true)).sum::<f64>() / 3.0;
 
-                let mut serial_host = vec![0_f32; Q_PROJECTION];
-                let mut split_host = vec![0_f32; Q_PROJECTION];
+                let mut serial_host = vec![0_f32; q_projection];
+                let mut split_host = vec![0_f32; q_projection];
                 serial.copy_to_host(as_bytes_mut(&mut serial_host)).unwrap();
                 split.copy_to_host(as_bytes_mut(&mut split_host)).unwrap();
                 let mut max_abs = 0.0_f32;
@@ -3566,11 +4842,12 @@ mod tests {
                     max_abs = max_abs.max(error);
                     squared += f64::from(error) * f64::from(error);
                 }
-                let rmse = (squared / Q_PROJECTION as f64).sqrt();
-                println!("[mla-split-oracle] mode={mode} context={context_rows} serial_ms={serial_ms:.3} split_ms={split_ms:.3} speedup={:.3} max_abs={max_abs:.6e} rmse={rmse:.6e}", serial_ms / split_ms);
+                let rmse = (squared / q_projection as f64).sqrt();
+                println!("[mla-split-oracle] mode={mode} heads={head_count} wmma={wmma} context={context_rows} serial_ms={serial_ms:.3} split_ms={split_ms:.3} speedup={:.3} max_abs={max_abs:.6e} rmse={rmse:.6e}", serial_ms / split_ms);
                 let tolerance = if latent_group == 0 { 1.0e-2 } else { 5.0e-3 };
                 assert!(max_abs <= tolerance, "mode={mode} context={context_rows} max_abs={max_abs}");
             }
         }
+        TEST_MLA_DECODE_WMMA.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }

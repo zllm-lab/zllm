@@ -1,6 +1,6 @@
 [package]
 name = "zllm"
-version = "0.8.4"
+version = "0.8.5"
 edition = "2024"
 description = "跨平台跨模型的高性能 LLM 推理引擎"
 license = "Apache-2.0"

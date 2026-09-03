@@ -95,7 +95,37 @@ pub struct RuntimeStatus {
     pub kv_cache_used_bytes: u64,
     pub kv_bytes_per_token: u64,
     pub current_batch_tokens: usize,
+    /// 正在执行完整新会话 prefill 的 session 数。
+    #[serde(default)]
+    pub new_prefill: usize,
+    /// 命中已有 cache 后正在追加 prefill 的 session 数。
+    #[serde(default)]
+    pub append_prefill: usize,
+    /// 已进入生成阶段的 session 数（普通 decode 与 DSpark verify 都计一条）。
+    #[serde(default)]
+    pub decode: usize,
+    /// 当前实际采用的 DSpark draft token 数；0 表示本轮未启用 DSpark。
+    #[serde(default)]
+    pub dspark_draft_tokens: usize,
+    /// 当前可直接恢复的内存终点 cache。
+    #[serde(default)]
+    pub memory_cache_ids: Vec<String>,
+    /// 当前可从本机 SSD 恢复的终点 cache。
+    #[serde(default)]
+    pub ssd_cache_ids: Vec<String>,
     pub compute_steps_total: u64,
+}
+
+impl RuntimeStatus {
+    pub const MAX_SCHEDULING_PRESSURE: usize = 22;
+
+    pub fn scheduling_pressure(&self) -> usize {
+        self.new_prefill.saturating_mul(4).saturating_add(self.append_prefill).saturating_add(self.decode)
+    }
+}
+
+pub fn effective_dspark_draft_tokens(configured: usize, decode: usize) -> usize {
+    if decode == 0 { 0 } else { configured.min(32 / decode) }
 }
 
 #[derive(Debug, Default)]
@@ -172,7 +202,12 @@ impl FixedSessionResidency {
         if session_resident_bytes == 0 {
             return Err("固定 session resident footprint 不能为 0".to_owned());
         }
-        Ok(Self { budget: ResidencyBudget::new(capacity_bytes), engine_resident_bytes, session_resident_bytes })
+        // 权重等引擎常驻必须从 session 预算中扣除：只进报表会放行超卖配置，
+        // 统一内存超卖下 GPU 命令缓冲区等页不返回，decode 表现为永久挂死
+        // 而不是可恢复的分配错误。与首请求惰性增长的 consume_engine_growth
+        // 同一口径（基线常驻在构造期一次性扣减）。
+        let budget = ResidencyBudget::new(capacity_bytes.saturating_sub(engine_resident_bytes));
+        Ok(Self { budget, engine_resident_bytes, session_resident_bytes })
     }
 
     pub fn configure(&self, capabilities: &mut NodeCapabilities, runtime: &Arc<Mutex<RuntimeStatus>>) {
@@ -789,6 +824,19 @@ mod tests {
     }
 
     #[test]
+    fn 引擎常驻从session预算扣除() {
+        let runtime = Arc::new(Mutex::new(RuntimeStatus::default()));
+        let mut capabilities = NodeCapabilities { accelerator: "device".to_owned(), max_seq_len: 10, ..NodeCapabilities::default() };
+        // 容量 1000、引擎常驻 950：剩余 50 放不下一块 101 的 session，
+        // 超卖配置必须在准入期拒绝而不是装载后 decode 挂死
+        let residency = FixedSessionResidency::new(1000, 950, 101).unwrap();
+        residency.configure(&mut capabilities, &runtime);
+        assert_eq!(capabilities.kv_cache_devices[0].token_capacity, 0);
+        assert!(residency.reserve().is_err());
+        assert_eq!(runtime.lock().unwrap().engine_resident_bytes, 950);
+    }
+
+    #[test]
     fn completion预算遵循新字段优先级与默认值() {
         assert_eq!(requested_completion_tokens(&serde_json::json!({})), 256);
         assert_eq!(requested_completion_tokens(&serde_json::json!({ "max_tokens": 17 })), 17);
@@ -813,6 +861,15 @@ mod tests {
         assert_eq!(runtime.kv_cache_allocated_bytes, 3000);
         assert_eq!(runtime.kv_cache_used_bytes, 3000);
         assert_eq!(runtime.kv_bytes_per_token, 40);
+    }
+
+    #[test]
+    fn dspark深度随decode并发收缩到总量三十二() {
+        assert_eq!(effective_dspark_draft_tokens(8, 0), 0);
+        assert_eq!(effective_dspark_draft_tokens(8, 4), 8);
+        assert_eq!(effective_dspark_draft_tokens(8, 5), 6);
+        assert_eq!(effective_dspark_draft_tokens(8, 16), 2);
+        assert_eq!(effective_dspark_draft_tokens(8, 22), 1);
     }
 
     #[test]

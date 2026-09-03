@@ -522,7 +522,7 @@ impl Gemma4MetalSession {
             };
             let weights = crate::weight::model::gemma4::Gemma4MtpWeights::open(&path)?;
             let backbone_types: Vec<bool> = (0..self.model.layer_count()).map(|layer| self.model.layer_spec(layer).expect("层规格").attention.hybrid.window == crate::attention::gqa::CausalWindow::Full).collect();
-            let model = crate::runtime::gemma4::metal_mtp::Gemma4MtpModel::prepare(self.context(), &weights, &backbone_types, self.model.config().num_kv_shared_layers, self.max_seq_len.min(8192))
+            let model = crate::runtime::gemma4::metal_mtp::Gemma4MtpModel::prepare(self.context(), &weights, &backbone_types, self.model.config().num_kv_shared_layers, self.max_seq_len.min(crate::runtime::gemma4::MTP_MAX_POSITIONS))
                 .map_err(|error| format!("准备 Gemma4 MTP: {error:?}"))?;
             eprintln!("[gemma4] MTP 投机解码已启用(4 层 draft 头)");
             self.mtp = Some(model);

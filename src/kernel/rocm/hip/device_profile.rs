@@ -1,7 +1,7 @@
 use super::*;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 const DETAIL_SAMPLE_STRIDE: u64 = 16;
 
@@ -46,6 +46,10 @@ struct DeviceTimeline {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+// 诊断 profile 需要把长 prefill 与 decode 的累计 event 分开。第一个
+// latency submission 负责 flush，其他 stage 等它完成后再提交 decode，
+// 避免边界两侧的 scope event 交叉计入。
+static DECODE_BOUNDARY: AtomicU8 = AtomicU8::new(0);
 static TIMELINES: OnceLock<Mutex<HashMap<i32, DeviceTimeline>>> = OnceLock::new();
 static SCOPE_TIMELINES: OnceLock<Mutex<HashMap<i32, DeviceTimeline>>> = OnceLock::new();
 
@@ -58,11 +62,31 @@ fn scope_timelines() -> &'static Mutex<HashMap<i32, DeviceTimeline>> {
 }
 
 pub(crate) fn enable_device_profile() {
+    DECODE_BOUNDARY.store(0, Ordering::Release);
     ENABLED.store(true, Ordering::Release);
 }
 
 pub(crate) fn device_profile_enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
+}
+
+pub(crate) fn device_profile_decode_boundary() {
+    if !ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    match DECODE_BOUNDARY.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => {
+            report_device_profiles(0, 0);
+            eprintln!("[device-profile-boundary] phase=decode");
+            DECODE_BOUNDARY.store(2, Ordering::Release);
+        }
+        Err(1) => {
+            while DECODE_BOUNDARY.load(Ordering::Acquire) == 1 {
+                std::hint::spin_loop();
+            }
+        }
+        Err(_) => {}
+    }
 }
 
 fn drain_completed(device_id: i32, timeline: &mut DeviceTimeline, runtime: &RocmRuntime) -> Result<(), String> {

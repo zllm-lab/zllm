@@ -23,7 +23,7 @@ use tokio::{
 };
 
 pub const SCHEDULER_ALPN: &[u8] = b"zllm/scheduler/1";
-pub const SCHEDULER_PROTOCOL_VERSION: u32 = 7;
+pub const SCHEDULER_PROTOCOL_VERSION: u32 = 8;
 const MAX_MESSAGE_BYTES: usize = 80 * 1024 * 1024;
 pub(super) const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 static ARTIFACT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -41,6 +41,7 @@ pub use crate::runtime::session::{
 pub enum NodeMessage {
     Register { protocol_version: u32, api_key: Option<String>, model: String, max_concurrency: usize, caches: Vec<CacheInfo>, capabilities: NodeCapabilities, runtime: NodeRuntime },
     Heartbeat { caches: Vec<CacheInfo>, runtime: NodeRuntime },
+    RuntimeChanged { runtime: NodeRuntime },
     Event { request_id: String, event: InferenceEvent },
     TaskStatus { task_id: String, status: String, error: Option<String>, outputs: Vec<ArtifactDescriptor> },
     TaskProgress { task_id: String, progress: TaskProgress },
@@ -150,6 +151,8 @@ struct RegisteredNode {
     view: AvailableNode,
     connection: u64,
     last_dispatched: u64,
+    /// 已下发、尚未被 node 最新负载快照覆盖的准入压力。
+    pending_pressure: usize,
     commands: NodeCommands,
     /// 持有 iroh 连接防 drop 关闭；standalone 同进程节点没有 transport。
     _transport: Option<iroh::endpoint::Connection>,
@@ -327,6 +330,7 @@ impl Scheduler {
                     },
                     connection,
                     last_dispatched: 0,
+                    pending_pressure: 0,
                     commands,
                     _transport: transport,
                 },
@@ -341,6 +345,16 @@ impl Scheduler {
         if let Some(node) = state.nodes.get_mut(node_id).filter(|node| node.connection == connection) {
             node.view.caches = caches;
             node.view.runtime = runtime;
+            node.pending_pressure = 0;
+            node.view.last_seen = unix_seconds();
+        }
+    }
+
+    async fn update_runtime(&self, node_id: &str, connection: u64, runtime: NodeRuntime) {
+        let mut state = self.state.lock().await;
+        if let Some(node) = state.nodes.get_mut(node_id).filter(|node| node.connection == connection) {
+            node.view.runtime = runtime;
+            node.pending_pressure = 0;
             node.view.last_seen = unix_seconds();
         }
     }
@@ -400,24 +414,23 @@ impl Scheduler {
             if cache_id.is_some_and(|cache_id| state.requests.values().any(|request| request.cache_id.as_deref() == Some(cache_id))) {
                 return Err(DispatchError::CacheWriterBusy(model));
             }
-            // 已知 cache owner 是线性 session 的唯一写入位置；owner 满载时等待，不能
-            // fallback 到其他节点重算并制造同 cache_id 的第二个 owner。
-            let owner = cache_id.and_then(|cache_id| {
+            let cached_nodes = cache_id
+                .map_or_else(Vec::new, |cache_id| state.nodes.iter().filter(|(_, node)| node.view.model == model && node.view.caches.iter().any(|cache| cache.cache_id == cache_id)).map(|(node_id, _)| node_id.clone()).collect::<Vec<_>>());
+            let admission_pressure = if cached_nodes.is_empty() { 4 } else { 1 };
+            // cache 已存在时只在持有者中选择：内存优先于本机 SSD；全部满载则排队，
+            // 不 fallback 到无 cache 节点重算并制造第二个 writer。
+            let selected = if let Some(cache_id) = cache_id.filter(|_| !cached_nodes.is_empty()) {
+                cached_nodes.into_iter().filter(|node_id| state.nodes.get(node_id).is_some_and(|node| node_has_capacity(node, admission_pressure))).min_by_key(|node_id| {
+                    let node = &state.nodes[node_id];
+                    (cache_location_rank(&node.view.runtime, cache_id), node.view.runtime.scheduling_pressure(), node.last_dispatched, node.view.registration_seq)
+                })
+            } else {
                 state
                     .nodes
                     .iter()
-                    .filter(|(_, node)| node.view.model == model && node.view.caches.iter().any(|cache| cache.cache_id == cache_id))
-                    .min_by_key(|(_, node)| (node.view.registered_at, node.view.registration_seq))
-                    .map(|(node_id, _)| node_id.clone())
-            });
-            let selected = match owner {
-                Some(node_id) => state.nodes.get(&node_id).filter(|node| node.view.active_requests < node.view.max_concurrency).map(|_| node_id),
-                None => state
-                    .nodes
-                    .iter()
-                    .filter(|(_, node)| node.view.model == model && node.view.active_requests < node.view.max_concurrency)
+                    .filter(|(_, node)| node.view.model == model && node_has_capacity(node, admission_pressure))
                     .min_by_key(|(_, node)| dispatch_order(&node.view, node.last_dispatched, None))
-                    .map(|(node_id, _)| node_id.clone()),
+                    .map(|(node_id, _)| node_id.clone())
             };
             let Some(node_id) = selected else {
                 return Err(DispatchError::NoAvailableNode(model));
@@ -426,6 +439,7 @@ impl Scheduler {
             let dispatch = state.next_dispatch;
             let node = state.nodes.get_mut(&node_id).expect("刚选择的节点必须存在");
             node.last_dispatched = dispatch;
+            node.pending_pressure = node.pending_pressure.saturating_add(admission_pressure);
             let commands = node.commands.clone();
             let (event_tx, event_rx) = mpsc::channel(64);
             state.requests.insert(request_id.clone(), InflightRequest { node_id: node_id.clone(), events: event_tx.clone(), cache_id: cache_id.map(str::to_owned), cancelled: false });
@@ -450,6 +464,7 @@ impl Scheduler {
                 state.requests.remove(&request_id);
                 if let Some(node) = state.nodes.get_mut(&node_id) {
                     node.view.active_requests = node.view.active_requests.saturating_sub(1);
+                    node.pending_pressure = node.pending_pressure.saturating_sub(admission_pressure);
                 }
                 return Err(error);
             }
@@ -567,6 +582,11 @@ impl Scheduler {
                     NodeMessage::Heartbeat { caches, runtime } => {
                         if let Some(connection_id) = connection {
                             scheduler.update_heartbeat(&node_id, connection_id, caches, runtime).await;
+                        }
+                    }
+                    NodeMessage::RuntimeChanged { runtime } => {
+                        if let Some(connection_id) = connection {
+                            scheduler.update_runtime(&node_id, connection_id, runtime).await;
                         }
                     }
                     NodeMessage::Event { request_id, event } => {
@@ -838,13 +858,17 @@ impl Scheduler {
 }
 
 fn registered_max_concurrency(requested: usize, capabilities: &NodeCapabilities) -> usize {
-    let requested = requested.max(1);
+    let requested = requested.clamp(1, NodeRuntime::MAX_SCHEDULING_PRESSURE);
     if capabilities.kv_cache_devices.is_empty() {
         return requested;
     }
     let page_tokens = capabilities.kv_reservation_page_tokens.max(1);
     let min_tokens = capabilities.kv_cache_devices.iter().map(|device| device.token_capacity).min().unwrap_or(0);
     requested.min(min_tokens / page_tokens)
+}
+
+fn node_has_capacity(node: &RegisteredNode, additional: usize) -> bool {
+    node.view.active_requests < node.view.max_concurrency && node.view.runtime.scheduling_pressure().saturating_add(node.pending_pressure).saturating_add(additional) <= NodeRuntime::MAX_SCHEDULING_PRESSURE
 }
 
 /// 节点断连时 video_generation 等持久化任务会置回 queued 等待原节点恢复；若原
@@ -883,6 +907,16 @@ fn adopt_orphaned_tasks(state: &mut RegistryState, node_id: &str) -> Vec<Adopted
 fn dispatch_order(node: &AvailableNode, last_dispatched: u64, cache_id: Option<&str>) -> (bool, usize, usize, u64) {
     let cache_miss = cache_id.is_some_and(|cache_id| !node.caches.iter().any(|cache| cache.cache_id == cache_id));
     (cache_miss, node.runtime.current_batch_tokens, node.active_requests, last_dispatched)
+}
+
+fn cache_location_rank(runtime: &NodeRuntime, cache_id: &str) -> u8 {
+    if runtime.memory_cache_ids.iter().any(|id| id == cache_id) {
+        0
+    } else if runtime.ssd_cache_ids.iter().any(|id| id == cache_id) {
+        1
+    } else {
+        2
+    }
 }
 
 pub struct SchedulerService {
@@ -1001,6 +1035,7 @@ async fn handle_connection(connection: iroh::endpoint::Connection, scheduler: Sc
                 NodeMessage::Heartbeat { caches, runtime } => {
                     scheduler.update_heartbeat(&peer_id, connection_id, caches, runtime).await;
                 }
+                NodeMessage::RuntimeChanged { runtime } => scheduler.update_runtime(&peer_id, connection_id, runtime).await,
                 NodeMessage::Event { request_id, event } => {
                     scheduler.publish(&peer_id, &request_id, event).await;
                 }
@@ -1419,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_uses_minimum_device_kv_capacity() {
+    fn registration_uses_kv_capacity_but_caps_node_at_twenty_two_sessions() {
         let capabilities = NodeCapabilities {
             kv_cache_devices: vec![
                 KvCacheDeviceCapacity { device: "gpu0".to_owned(), available_bytes: 8 << 30, bytes_per_token: 4096, token_capacity: 2_097_152 },
@@ -1428,9 +1463,23 @@ mod tests {
             kv_reservation_page_tokens: 1024,
             ..NodeCapabilities::default()
         };
-        assert_eq!(registered_max_concurrency(1024, &capabilities), 512);
-        assert_eq!(registered_max_concurrency(128, &capabilities), 128);
-        assert_eq!(registered_max_concurrency(128, &NodeCapabilities::default()), 128);
+        assert_eq!(registered_max_concurrency(1024, &capabilities), 22);
+        assert_eq!(registered_max_concurrency(128, &capabilities), 22);
+        assert_eq!(registered_max_concurrency(128, &NodeCapabilities::default()), 22);
+    }
+
+    #[test]
+    fn runtime_pressure_uses_prefill_four_to_one_ratio() {
+        let runtime = NodeRuntime { new_prefill: 2, append_prefill: 3, decode: 5, ..NodeRuntime::default() };
+        assert_eq!(runtime.scheduling_pressure(), 16);
+    }
+
+    #[test]
+    fn cache_location_prefers_memory_then_ssd() {
+        let runtime = NodeRuntime { memory_cache_ids: vec!["memory".to_owned()], ssd_cache_ids: vec!["ssd".to_owned()], ..NodeRuntime::default() };
+        assert_eq!(cache_location_rank(&runtime, "memory"), 0);
+        assert_eq!(cache_location_rank(&runtime, "ssd"), 1);
+        assert_eq!(cache_location_rank(&runtime, "missing"), 2);
     }
 
     #[test]
@@ -1477,6 +1526,19 @@ mod tests {
         let total_current_load: usize = nodes.iter().map(|n| n.current_load).sum();
         assert_eq!(total_max_load, 12);
         assert_eq!(total_current_load, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_prefill按四点压力在二十二上限排队() {
+        let scheduler = Scheduler::default();
+        let _node = register_local_node(&scheduler, "node", "glm-5.2", 22, Vec::new()).await;
+        let mut receivers = Vec::new();
+        for index in 0..5 {
+            receivers.push(scheduler.dispatch(format!("req-{index}"), "glm-5.2".to_owned(), None, json!({"model":"glm-5.2"})).await.unwrap());
+        }
+        assert!(matches!(scheduler.dispatch("req-5".to_owned(), "glm-5.2".to_owned(), None, json!({"model":"glm-5.2"})).await, Err(DispatchError::NoAvailableNode(_))));
+        assert_eq!(scheduler.nodes().await[0].active_requests, 5);
+        drop(receivers);
     }
 
     #[tokio::test(flavor = "multi_thread")]

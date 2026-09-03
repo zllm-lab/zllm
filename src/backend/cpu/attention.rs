@@ -52,7 +52,7 @@ impl BlockAttentionBackend for CpuContext {
     }
 }
 
-fn block_attention_cpu(query: &CpuTensor, segments: &[(&CpuTensor, &CpuTensor)], spec: &crate::attention::block::BlockAttentionSpec) -> Result<Vec<f32>, BackendError> {
+pub(crate) fn block_attention_cpu(query: &CpuTensor, segments: &[(&CpuTensor, &CpuTensor)], spec: &crate::attention::block::BlockAttentionSpec) -> Result<Vec<f32>, BackendError> {
     let query_cols = spec.geometry.query_columns().map_err(compute)?;
     let kv_cols = spec.geometry.kv_columns().map_err(compute)?;
     let kv_rows = segments.iter().try_fold(0usize, |rows, (key, value)| {

@@ -153,6 +153,10 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
     let multirow_rows = input.rows < gguf_prefill_mps_rows();
     let pipeline_name = if multirow_rows && tensor_type == 8 {
         "gguf_gemv_q8_0_f16"
+    } else if multirow_rows && tensor_type == 2 {
+        // q4_0 与 q8_0 同 kernel 结构(8 行 × 8 输入行);此前落通用 gguf_gemv_f16
+        // 标量解码,decode 实测 ~1.5-4 tok/s,QAT GGUF 主力格式必须走专用路径
+        "gguf_gemv_q4_0_f16"
     } else if input.rows == 1 && tensor_type == 11 {
         "gguf_gemv_q3k_f16"
     } else if input.rows < 4 && tensor_type == 14 {
@@ -202,6 +206,10 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
     let pipeline = ctx.pipeline(pipeline_name)?;
     let iq_packed_rows =
         matches!(pipeline_name, "gguf_gemv_iq4xs_f16" | "gguf_gemv_iq4xs_1r_f16" | "gguf_gemv_iq4nl_f16" | "gguf_gemv_iq4nl_1r_f16" | "gguf_gemv_iq4nl_4r_f16" | "gguf_gemv_iq3s_f16" | "gguf_gemv_q5k_f16" | "gguf_gemv_q5k_1r_f16");
+    let iq_packed_rows = matches!(
+        pipeline_name,
+        "gguf_gemv_iq4xs_f16" | "gguf_gemv_iq4xs_1r_f16" | "gguf_gemv_iq4nl_f16" | "gguf_gemv_iq4nl_1r_f16" | "gguf_gemv_iq4nl_4r_f16" | "gguf_gemv_iq3s_f16" | "gguf_gemv_q4_0_f16" | "gguf_gemv_q5k_f16" | "gguf_gemv_q5k_1r_f16"
+    );
     let packed_simd_rows = matches!(pipeline_name, "gguf_gemv_q8_0_f16" | "gguf_gemv_q3k_f16" | "gguf_gemv_q4k_f16" | "gguf_gemv_q4k_3m_f16" | "gguf_gemv_q6k_f16" | "gguf_gemv_qk_f16" | "gguf_gemv_iq2s_f16" | "gguf_gemv_iq3xxs_f16");
     let threads = if matches!(pipeline_name, "gguf_gemv_q6k_f16" | "gguf_gemv_q3k_f16") {
         64
@@ -239,8 +247,8 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
             } else if pipeline_name == "gguf_gemv_iq4nl_1r_f16" || pipeline_name == "gguf_gemv_iq4nl_4r_f16" {
                 // iq4nl 单行/4 行版:每 simdgroup 一行权重,128 threads = 4 行/threadgroup
                 weight_rows.div_ceil(4)
-            } else if pipeline_name == "gguf_gemv_iq4xs_f16" || pipeline_name == "gguf_gemv_iq4xs_1r_f16" || pipeline_name == "gguf_gemv_iq4nl_f16" {
-                // iq4xs/iq4nl 是 16 K-lane x 2 行/simdgroup,128 threads = 8 行/threadgroup
+            } else if pipeline_name == "gguf_gemv_iq4xs_f16" || pipeline_name == "gguf_gemv_iq4xs_1r_f16" || pipeline_name == "gguf_gemv_iq4nl_f16" || pipeline_name == "gguf_gemv_q4_0_f16" {
+                // iq4xs/iq4nl/q4_0 是 16 K-lane x 2 行/simdgroup,128 threads = 8 行/threadgroup
                 weight_rows.div_ceil(8)
             } else if pipeline_name == "gguf_gemv_q3k_f16" || iq_packed_rows {
                 weight_rows.div_ceil(4)
@@ -730,6 +738,10 @@ pub fn gguf_gated_gemv_tensor_resident(
     let iq2s_grid = ctx.resident_byte_weight_buffer(as_bytes(crate::weight::codec::ggml::iq2s_grid()));
     let pipeline_name = if gate_type == 11 && up_type == 11 {
         "gguf_gated_gemv_q3k_f16"
+    } else if gate_type == 2 && up_type == 2 {
+        // q4_0 gated:8 行/threadgroup,gate/up 同读一次输入;此前落通用
+        // gguf_gated_gemv_f16 标量解码,decode 实测仅 ~2 tok/s
+        "gguf_gated_gemv_q4_0_f16"
     } else if gate_type == 12 && up_type == 12 {
         // decode 单行用双行变体:96 个 work item 恰好摊满 32 lane(见 kernel 注释)
         if input.rows == 1 { "gguf_gated_gemv_q4k_2r_f16" } else { "gguf_gated_gemv_q4k_f16" }
@@ -748,10 +760,13 @@ pub fn gguf_gated_gemv_tensor_resident(
         "gguf_gated_gemv_f16"
     };
     let pipeline = ctx.pipeline(pipeline_name)?;
-    let packed_rows = matches!(gate_type, 11 | 12 | 18 | 22) && gate_type == up_type;
+    let packed_rows = matches!(gate_type, 2 | 11 | 12 | 18 | 22) && gate_type == up_type;
     let iq_packed_rows = matches!(gate_type, 20 | 21 | 23) && gate_type == up_type;
     let threads = if gate_type == 11 && up_type == 11 {
         64
+    } else if gate_type == 2 && up_type == 2 {
+        // q4_0 gated:16 K-lane x 2 行/simdgroup,4 simdgroups = 8 行/threadgroup
+        128
     } else if iq_packed_rows {
         128
     } else if gate_type == 12 && up_type == 12 && input.rows == 1 {

@@ -608,6 +608,9 @@ pub struct Glm52NodeExecutionConfig {
     pub kv_reservation_page_tokens: usize,
     #[serde(default = "default_true")]
     pub preload_experts: bool,
+    /// 完整单进程链路的输出层执行位置。
+    #[serde(default)]
+    pub output_backend: Glm52OutputBackend,
     /// 同机相邻卡共享 routed expert 计算；当前只用于单行 decode 实验。
     #[serde(default)]
     pub cooperative_expert_pairs: bool,
@@ -641,9 +644,6 @@ pub struct Glm52NodeExecutionConfig {
     /// 1 为逐行流水(旧行为),与行数相等则整批。
     #[serde(default = "default_dspark_verify_group_rows")]
     pub dspark_verify_group_rows: usize,
-    /// 把 final norm、LM head 与采样放到末段最后一张卡，decode 只回传 token。
-    #[serde(default)]
-    pub tail_sampling: bool,
     #[serde(default = "default_mtp_draft_tokens")]
     pub mtp_draft_tokens: usize,
     #[serde(default)]
@@ -664,6 +664,7 @@ impl Default for Glm52NodeExecutionConfig {
             terminal_cache_entries: default_unlimited_entries(),
             kv_reservation_page_tokens: default_kv_reservation_page_tokens(),
             preload_experts: true,
+            output_backend: Glm52OutputBackend::default(),
             cooperative_expert_pairs: false,
             preload_layers_per_device: None,
             memory_reserve_bytes: default_memory_reserve_bytes(),
@@ -676,7 +677,6 @@ impl Default for Glm52NodeExecutionConfig {
             dspark_confidence_threshold: None,
             dspark_weight_quantization: ResidentWeightQuantization::Native,
             dspark_verify_group_rows: default_dspark_verify_group_rows(),
-            tail_sampling: false,
             mtp_draft_tokens: default_mtp_draft_tokens(),
             reasoning_effort: Glm52ReasoningEffort::default(),
             thinking_token_budget: None,
@@ -684,6 +684,14 @@ impl Default for Glm52NodeExecutionConfig {
             diagnostics: Glm52DiagnosticsConfig::default(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Glm52OutputBackend {
+    #[default]
+    Rocm,
+    Cpu,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1305,6 +1313,12 @@ pub struct RocmBackendConfig {
     /// 单 token MLA decode 从串行 kernel 切到 split/WMMA kernel 的上下文阈值。
     #[serde(default = "default_rocm_mla_decode_split_threshold")]
     pub mla_decode_split_threshold: usize,
+    /// MLA decode split 走 Q8 WMMA kernel；false 走 fdot2 标量 staged 路径。
+    #[serde(default = "default_true")]
+    pub mla_decode_wmma: bool,
+    /// cooperative decode 用序列拆分（两卡全头各扫半段 + LSE 合并）替代半头拆分。
+    #[serde(default)]
+    pub cooperative_mla_sequence_split: bool,
     /// DSA Q/K 同时做 Hadamard+Q8，并以 i8 WMMA 评分；真机 oracle 前默认关闭。
     #[serde(default)]
     pub dsa_hadamard_i8: bool,
@@ -1320,6 +1334,12 @@ pub struct RocmBackendConfig {
     /// CPU 保存全量 MLA，GPU 每层只保留固定行数的精确 hot cache；0 表示关闭。
     #[serde(default)]
     pub mla_cpu_hot_rows: usize,
+    /// Prefill 的 DSA selection 与 MLA attention 由 CPU 执行；GPU 只生成当前 chunk 投影并接回 attention 输出。
+    #[serde(default)]
+    pub prefill_attention_cpu: bool,
+    /// 仅记录 MLA hot 路径分段耗时与命中统计（每 128 token 聚合打印），不引入 kernel_profile 的全局同步。
+    #[serde(default)]
+    pub mla_hot_trace: bool,
     /// prefill grouped-down 先写 route-major F32，再按固定路由顺序归约。
     #[serde(default)]
     pub grouped_down_route_buffer: bool,
@@ -1885,20 +1905,21 @@ fn validate_glm52(model: &Glm52NodeModelConfig, backend: &RocmBackendConfig) -> 
     if weight_overrides > 1 {
         return Err(ConfigError::Invalid("GLM-5.2 compressed_tensors_directory、nvfp4_directory 与 gguf_directory 最多配置一个".to_owned()));
     }
-    if model.execution.mtp && !model.execution.tail_sampling {
-        return Err(ConfigError::Invalid("GLM-5.2 MTP 必须与 tail_sampling 一起启用，LM head 与 L78 固定驻留尾卡".to_owned()));
-    }
     if model.execution.mtp && model.execution.dspark_directory.is_some() {
         return Err(ConfigError::Invalid("GLM-5.2 MTP 与 DSpark 不能同时启用".to_owned()));
     }
     if backend.mla_decode_split_threshold == 0 {
         return Err(ConfigError::Invalid("ROCm MLA decode split 阈值必须大于 0".to_owned()));
     }
-    if model.head.stage_end == 0 || model.head.stage_end >= GLM52_LAYER_COUNT {
-        return Err(ConfigError::Invalid(format!("GLM-5.2 Node head.stage_end 必须在 1..{GLM52_LAYER_COUNT}")));
+    if model.head.stage_end == 0 || model.head.stage_end > GLM52_LAYER_COUNT {
+        return Err(ConfigError::Invalid(format!("GLM-5.2 Node head.stage_end 必须在 1..={GLM52_LAYER_COUNT}")));
     }
-    if model.head.downstream.ticket.trim().is_empty() {
+    let single_process = model.head.stage_end == GLM52_LAYER_COUNT;
+    if !single_process && model.head.downstream.ticket.trim().is_empty() {
         return Err(ConfigError::Invalid("model.head.downstream.ticket 不能为空".to_owned()));
+    }
+    if single_process && (model.execution.mtp || model.execution.dspark_directory.is_some() || model.execution.cooperative_expert_pairs) {
+        return Err(ConfigError::Invalid("GLM-5.2 单进程完整层链当前要求关闭 MTP、DSpark 与 cooperative experts".to_owned()));
     }
     let logical_stage_count = if model.execution.cooperative_expert_pairs {
         if backend.devices.len() % 2 != 0 {
@@ -2278,12 +2299,11 @@ mod tests {
         let RuntimeProcessConfig::Node(head) = RuntimeProcessConfig::load(Path::new("config/node-glm52.yaml")).unwrap() else { unreachable!() };
         let NodeModelConfig::Glm52(head_model) = head.model else { unreachable!() };
         let NodeBackendConfig::Rocm(head_backend) = head.backend else { unreachable!() };
-        assert_eq!(head.node.max_concurrency, Some(8));
+        assert_eq!(head.node.max_concurrency, Some(22));
         assert_eq!(head_model.head.stage_end, 38);
         assert_eq!(head_model.head.layer_ends, [2, 7, 12, 17, 22, 27, 32, 37]);
         assert_eq!(head_backend.devices, [0, 1, 2, 3, 4, 5, 6, 7]);
         assert!(head_model.execution.mtp);
-        assert!(head_model.execution.tail_sampling);
         assert_eq!(head_model.execution.mtp_draft_tokens, 3);
         assert_eq!(head_model.execution.reasoning_effort, Glm52ReasoningEffort::Max);
         assert_eq!(head_model.execution.thinking_token_budget, Some(16_384));
@@ -2294,8 +2314,9 @@ mod tests {
         assert_eq!((tail_model.layers.start, tail_model.layers.end), (38, 78));
         assert_eq!(tail_model.layers.device_layer_ends, [42, 47, 52, 57, 62, 67, 73, 77]);
         assert_eq!(tail_backend.devices, [0, 1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(tail_model.execution.max_concurrency, 8);
-        assert!(tail_model.execution.mtp);
+        assert_eq!(tail_model.execution.max_concurrency, 22);
+        // MTP 驻留 head 首卡,tail 不再装载 MTP。
+        assert!(!tail_model.execution.mtp);
     }
 
     #[test]
@@ -2343,7 +2364,6 @@ mod tests {
         assert_eq!(execution.scheduling.append_prefill_chunk_size, 2048);
         assert_eq!(execution.reasoning_effort, Glm52ReasoningEffort::Max);
         assert_eq!(execution.thinking_token_budget, None);
-        assert!(!execution.tail_sampling);
         assert_eq!(execution.dspark_backend, Glm52DsparkExecutionBackend::Rocm);
         assert_eq!(execution.dspark_cpu_affinity, None);
         assert_eq!(execution.dspark_weight_quantization, ResidentWeightQuantization::Native);
@@ -2446,25 +2466,31 @@ mod tests {
             accelerator_memory_bytes: None,
             recommended_working_set_bytes: None,
             mla_decode_split_threshold: 1,
+            mla_decode_wmma: true,
+            cooperative_mla_sequence_split: false,
             dsa_hadamard_i8: false,
             dsa_hadamard_shadow_samples: 0,
             dsa_hisa_shadow_samples: 0,
             dsa_cpu_select: false,
             mla_cpu_hot_rows: 0,
+            prefill_attention_cpu: false,
+            mla_hot_trace: false,
             grouped_down_route_buffer: false,
         }
     }
 
     #[test]
     fn glm52_node_head_stage_end_must_be_in_range() {
-        // stage_end == 0 或 >= GLM52_LAYER_COUNT 都要拒。校验是分布式 head NodeEngine 拓扑守门,
-        // 否则 rocm_node.rs 会按 head 跑 0..stage_end 触发空层 / 越界 panic。
-        for invalid in [0usize, GLM52_LAYER_COUNT, GLM52_LAYER_COUNT + 1] {
+        // 完整 78 层由单进程链合法承载；只有空范围与真实越界必须拒绝。
+        for invalid in [0usize, GLM52_LAYER_COUNT + 1] {
             let head = Glm52HeadConfig { stage_end: invalid, layer_ends: vec![invalid.saturating_sub(1).clamp(1, GLM52_LAYER_COUNT - 1)], downstream: StagePeerConfig { ticket: "ticket".into(), iroh: IrohPeerConfig::default() } };
             let (model, backend) = glm52_node_fixture(head, vec![0]);
             let error = validate_glm52(&model, &backend).unwrap_err();
             assert!(error.to_string().contains("stage_end"), "stage_end={invalid} 应拒: {error}");
         }
+        let head = Glm52HeadConfig { stage_end: GLM52_LAYER_COUNT, layer_ends: vec![GLM52_LAYER_COUNT - 1], downstream: StagePeerConfig { ticket: String::new(), iroh: IrohPeerConfig::default() } };
+        let (model, backend) = glm52_node_fixture(head, vec![0]);
+        validate_glm52(&model, &backend).expect("完整 78 层单进程链应合法");
     }
 
     #[test]
@@ -2500,16 +2526,12 @@ mod tests {
     }
 
     #[test]
-    fn glm52_node_head_mtp_requires_tail_sampling() {
-        // mtp=true 必须 tail_sampling=true,反之不行(已存在的校验)。本测试固化该约束,
-        // 避免有人把 GLM-5.2 head 部署成"MTP 但 LM head 留在 head"的非法拓扑。
+    fn glm52_node_head_mtp_without_tail_sampling() {
+        // tail 采样路径已移除:LM head 与 L78 固定驻留 head 首卡 A0,
+        // mtp=true 不再需要任何配套开关,单独配置即合法。
         let head = Glm52HeadConfig { stage_end: 38, layer_ends: vec![37], downstream: StagePeerConfig { ticket: "t".into(), iroh: IrohPeerConfig::default() } };
         let (mut model, backend) = glm52_node_fixture(head, vec![0]);
         model.execution.mtp = true;
-        model.execution.tail_sampling = false;
-        let error = validate_glm52(&model, &backend).unwrap_err();
-        assert!(error.to_string().contains("tail_sampling"), "MTP 必带 tail_sampling: {error}");
-        model.execution.tail_sampling = true;
-        validate_glm52(&model, &backend).expect("MTP + tail_sampling 合法");
+        validate_glm52(&model, &backend).expect("MTP 单独配置应合法");
     }
 }

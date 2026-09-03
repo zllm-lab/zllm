@@ -118,6 +118,15 @@ impl W4A16Matrix {
         decode_w4a16_matrix(&self.packed, &self.scales, self.scale_dtype, self.group_size, self.rows, self.cols, &mut out)?;
         Ok(out)
     }
+
+    pub(crate) fn slice_rows(&self, range: std::ops::Range<usize>) -> Result<Self, String> {
+        slice_groupwise_rows(self.packed(), self.scales(), self.scale_dtype, self.group_size, self.rows, self.cols, 4, range).and_then(|(packed, scales, rows)| Self::new(packed, scales, self.scale_dtype, self.group_size, rows, self.cols))
+    }
+
+    pub(crate) fn slice_columns(&self, range: std::ops::Range<usize>) -> Result<Self, String> {
+        slice_groupwise_columns(self.packed(), self.scales(), self.scale_dtype, self.group_size, self.rows, self.cols, 4, range)
+            .and_then(|(packed, scales, cols)| Self::new(packed, scales, self.scale_dtype, self.group_size, self.rows, cols))
+    }
 }
 
 /// compressed-tensors `pack-quantized` W8A16 矩阵。
@@ -300,6 +309,51 @@ impl W8A16Matrix {
         }
         Ok(out)
     }
+
+    pub(crate) fn slice_rows(&self, range: std::ops::Range<usize>) -> Result<Self, String> {
+        if self.convrot_group_size.is_some() {
+            return Err("ConvRot W8 不支持张量并行切片".to_owned());
+        }
+        slice_groupwise_rows(self.packed(), self.scales(), self.scale_dtype, self.group_size, self.rows, self.cols, 8, range).and_then(|(packed, scales, rows)| Self::new(packed, scales, self.scale_dtype, self.group_size, rows, self.cols))
+    }
+
+    pub(crate) fn slice_columns(&self, range: std::ops::Range<usize>) -> Result<Self, String> {
+        if self.convrot_group_size.is_some() {
+            return Err("ConvRot W8 不支持张量并行切片".to_owned());
+        }
+        slice_groupwise_columns(self.packed(), self.scales(), self.scale_dtype, self.group_size, self.rows, self.cols, 8, range)
+            .and_then(|(packed, scales, cols)| Self::new(packed, scales, self.scale_dtype, self.group_size, self.rows, cols))
+    }
+}
+
+fn slice_groupwise_rows(packed: &[u8], scales: &[u8], scale_dtype: ScaleDType, group_size: usize, rows: usize, cols: usize, bits: usize, range: std::ops::Range<usize>) -> Result<(Vec<u8>, Vec<u8>, usize), String> {
+    if range.start >= range.end || range.end > rows {
+        return Err(format!("W{bits} row slice={range:?}/{rows} 非法"));
+    }
+    let values_per_word = 32 / bits;
+    let packed_row_bytes = cols.div_ceil(values_per_word) * 4;
+    let scale_row_bytes = cols / group_size * scale_dtype.bytes();
+    Ok((packed[range.start * packed_row_bytes..range.end * packed_row_bytes].to_vec(), scales[range.start * scale_row_bytes..range.end * scale_row_bytes].to_vec(), range.len()))
+}
+
+fn slice_groupwise_columns(packed: &[u8], scales: &[u8], scale_dtype: ScaleDType, group_size: usize, rows: usize, cols: usize, bits: usize, range: std::ops::Range<usize>) -> Result<(Vec<u8>, Vec<u8>, usize), String> {
+    let values_per_word = 32 / bits;
+    if range.start >= range.end || range.end > cols || !range.start.is_multiple_of(group_size) || !range.end.is_multiple_of(group_size) || !range.start.is_multiple_of(values_per_word) || !range.end.is_multiple_of(values_per_word) {
+        return Err(format!("W{bits} column slice={range:?}/{cols} group={group_size} 非法"));
+    }
+    let source_packed_row_bytes = cols.div_ceil(values_per_word) * 4;
+    let source_scale_row_bytes = cols / group_size * scale_dtype.bytes();
+    let packed_start = range.start / values_per_word * 4;
+    let packed_bytes = range.len() / values_per_word * 4;
+    let scale_start = range.start / group_size * scale_dtype.bytes();
+    let scale_bytes = range.len() / group_size * scale_dtype.bytes();
+    let mut sliced_packed = Vec::with_capacity(rows * packed_bytes);
+    let mut sliced_scales = Vec::with_capacity(rows * scale_bytes);
+    for row in 0..rows {
+        sliced_packed.extend_from_slice(&packed[row * source_packed_row_bytes + packed_start..row * source_packed_row_bytes + packed_start + packed_bytes]);
+        sliced_scales.extend_from_slice(&scales[row * source_scale_row_bytes + scale_start..row * source_scale_row_bytes + scale_start + scale_bytes]);
+    }
+    Ok((sliced_packed, sliced_scales, range.len()))
 }
 
 /// Backend 准备 resident 权重时消费的统一量化视图。

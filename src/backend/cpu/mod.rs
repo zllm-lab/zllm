@@ -12,6 +12,8 @@ mod moe;
 mod vae;
 mod vision;
 
+#[cfg(feature = "with-rocm")]
+pub(crate) use attention::block_attention_cpu;
 pub use attention::{CpuDsaState, CpuKvCache};
 pub use compressed_sparse::CpuCompressedKvStorage;
 pub use context::{CpuContext, CpuWeight};

@@ -681,6 +681,184 @@ kernel void gguf_gemv_q8_0_f16(
         }
     }
 }
+// Q4_0 decode GEMV:沿用 iq4nl 的 16 K-lane x 2 权重行/simdgroup 分割(移植
+// llama.cpp mul_mv_ext 的二维切法):每 lane 每轮负责一个 18B block 的 16 值
+// (偶 tx 低 nibble = 元素 0-15,奇 tx 高 nibble = 元素 16-31),反量化驻寄存器、
+// 对批内 8 个 input 行复用。Q4_0 值 = (nibble - 8) * d,无 LUT。
+kernel void gguf_gemv_q4_0_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *weight [[buffer(1)]],
+    device half *output [[buffer(3)]],
+    constant uint &columns [[buffer(4)]],
+    constant uint &output_rows [[buffer(5)]],
+    constant uint &row_bytes [[buffer(7)]],
+    constant uint &input_rows [[buffer(8)]],
+    uint2 group_position [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    const uint tx = simd_lane & 15;
+    const uint ty = simd_lane >> 4;
+    const uint row = group_position.x * 8 + simd_group * 2 + ty;
+    if (row >= output_rows) return;
+    device const uchar *weight_row = weight + ulong(row) * row_bytes;
+    const bool high = (tx & 1) != 0;
+    const uint ir_base = group_position.y * 8;
+    const uint ir_count = min(8u, input_rows - ir_base);
+    float sums[8];
+    #pragma unroll
+    for (uint ir = 0; ir < 8; ++ir) {
+        sums[ir] = 0.0f;
+    }
+    const uint block_count = columns >> 5;
+    for (uint block_index = tx >> 1; block_index < block_count; block_index += 8) {
+        device const uchar *block = weight_row + ulong(block_index) * 18;
+        const float d = float(load_f16(block));
+        // qs 2B 对齐:uint16 成对读进寄存器、shift 解 nibble(同 iq4nl 手法)
+        device const ushort *qs16 = (device const ushort *)(block + 2);
+        uint nib[16];
+        #pragma unroll
+        for (uint j = 0; j < 8; ++j) {
+            const uint pair = qs16[j];
+            if (high) {
+                nib[2 * j] = (pair >> 4) & 15;
+                nib[2 * j + 1] = (pair >> 12) & 15;
+            } else {
+                nib[2 * j] = pair & 15;
+                nib[2 * j + 1] = (pair >> 8) & 15;
+            }
+        }
+        const float4 v0 = d * float4(float(nib[0]) - 8.0f, float(nib[1]) - 8.0f, float(nib[2]) - 8.0f, float(nib[3]) - 8.0f);
+        const float4 v1 = d * float4(float(nib[4]) - 8.0f, float(nib[5]) - 8.0f, float(nib[6]) - 8.0f, float(nib[7]) - 8.0f);
+        const float4 v2 = d * float4(float(nib[8]) - 8.0f, float(nib[9]) - 8.0f, float(nib[10]) - 8.0f, float(nib[11]) - 8.0f);
+        const float4 v3 = d * float4(float(nib[12]) - 8.0f, float(nib[13]) - 8.0f, float(nib[14]) - 8.0f, float(nib[15]) - 8.0f);
+        #pragma unroll
+        for (uint ir = 0; ir < 8; ++ir) {
+            if (ir < ir_count) {
+                device const half *source = input + ulong(ir_base + ir) * columns + ulong(block_index) * 32 + (tx & 1) * 16;
+                sums[ir] += dot(v0, float4(*(device const half4 *)(source)));
+                sums[ir] += dot(v1, float4(*(device const half4 *)(source + 4)));
+                sums[ir] += dot(v2, float4(*(device const half4 *)(source + 8)));
+                sums[ir] += dot(v3, float4(*(device const half4 *)(source + 12)));
+            }
+        }
+    }
+    // 16-lane 组内树归约:offset 都小于 16,lane0 的累加树只覆盖本行的 16 个 lane
+    // (ty=1 组的中间值不进入 lane0 链)。守卫条件全 lane 一致(ir_count 为
+    // dispatch 常量),simd 集体操作语义安全。
+    #pragma unroll
+    for (uint ir = 0; ir < 8; ++ir) {
+        if (ir < ir_count) {
+            float sum = sums[ir];
+            sum += simd_shuffle_down(sum, 8);
+            sum += simd_shuffle_down(sum, 4);
+            sum += simd_shuffle_down(sum, 2);
+            sum += simd_shuffle_down(sum, 1);
+            if (tx == 0) {
+                output[ulong(ir_base + ir) * output_rows + row] = finite_f16(sum);
+            }
+        }
+    }
+}
+kernel void gguf_gated_gemv_q4_0_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *gate_weight [[buffer(1)]],
+    device const uchar *up_weight [[buffer(2)]],
+    device const ulong *iq2s_grid [[buffer(3)]],
+    device half *output [[buffer(4)]],
+    constant uint &columns [[buffer(5)]],
+    constant uint &output_rows [[buffer(6)]],
+    constant uint &gate_type [[buffer(7)]],
+    constant uint &up_type [[buffer(8)]],
+    constant uint &gate_row_bytes [[buffer(9)]],
+    constant uint &up_row_bytes [[buffer(10)]],
+    constant uint &activation_kind [[buffer(11)]],
+    constant float &alpha [[buffer(12)]],
+    constant float &limit [[buffer(13)]],
+    uint2 group_position [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    (void)iq2s_grid;
+    (void)gate_type;
+    (void)up_type;
+    // 与 gguf_gemv_q4_0_f16 相同的 16 K-lane x 2 行/simdgroup 分割;每 lane
+    // 每轮同时反量化 gate 与 up 两个 block,gate/up 权重与输入各读一次
+    const uint tx = simd_lane & 15;
+    const uint ty = simd_lane >> 4;
+    const uint row = group_position.x * 8 + simd_group * 2 + ty;
+    if (row >= output_rows) return;
+    device const uchar *gate_row = gate_weight + ulong(row) * gate_row_bytes;
+    device const uchar *up_row = up_weight + ulong(row) * up_row_bytes;
+    const bool high = (tx & 1) != 0;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    const uint block_count = columns >> 5;
+    for (uint block_index = tx >> 1; block_index < block_count; block_index += 8) {
+        device const uchar *gate_block = gate_row + ulong(block_index) * 18;
+        device const uchar *up_block = up_row + ulong(block_index) * 18;
+        device const half *source = input + ulong(block_index) * 32 + (tx & 1) * 16;
+        const float4 in0 = float4(*(device const half4 *)(source));
+        const float4 in1 = float4(*(device const half4 *)(source + 4));
+        const float4 in2 = float4(*(device const half4 *)(source + 8));
+        const float4 in3 = float4(*(device const half4 *)(source + 12));
+        {
+            const float d = float(load_f16(gate_block));
+            device const ushort *qs16 = (device const ushort *)(gate_block + 2);
+            uint nib[16];
+            #pragma unroll
+            for (uint j = 0; j < 8; ++j) {
+                const uint pair = qs16[j];
+                if (high) {
+                    nib[2 * j] = (pair >> 4) & 15;
+                    nib[2 * j + 1] = (pair >> 12) & 15;
+                } else {
+                    nib[2 * j] = pair & 15;
+                    nib[2 * j + 1] = (pair >> 8) & 15;
+                }
+            }
+            gate_sum += dot(d * float4(float(nib[0]) - 8.0f, float(nib[1]) - 8.0f, float(nib[2]) - 8.0f, float(nib[3]) - 8.0f), in0);
+            gate_sum += dot(d * float4(float(nib[4]) - 8.0f, float(nib[5]) - 8.0f, float(nib[6]) - 8.0f, float(nib[7]) - 8.0f), in1);
+            gate_sum += dot(d * float4(float(nib[8]) - 8.0f, float(nib[9]) - 8.0f, float(nib[10]) - 8.0f, float(nib[11]) - 8.0f), in2);
+            gate_sum += dot(d * float4(float(nib[12]) - 8.0f, float(nib[13]) - 8.0f, float(nib[14]) - 8.0f, float(nib[15]) - 8.0f), in3);
+        }
+        {
+            const float d = float(load_f16(up_block));
+            device const ushort *qs16 = (device const ushort *)(up_block + 2);
+            uint nib[16];
+            #pragma unroll
+            for (uint j = 0; j < 8; ++j) {
+                const uint pair = qs16[j];
+                if (high) {
+                    nib[2 * j] = (pair >> 4) & 15;
+                    nib[2 * j + 1] = (pair >> 12) & 15;
+                } else {
+                    nib[2 * j] = pair & 15;
+                    nib[2 * j + 1] = (pair >> 8) & 15;
+                }
+            }
+            up_sum += dot(d * float4(float(nib[0]) - 8.0f, float(nib[1]) - 8.0f, float(nib[2]) - 8.0f, float(nib[3]) - 8.0f), in0);
+            up_sum += dot(d * float4(float(nib[4]) - 8.0f, float(nib[5]) - 8.0f, float(nib[6]) - 8.0f, float(nib[7]) - 8.0f), in1);
+            up_sum += dot(d * float4(float(nib[8]) - 8.0f, float(nib[9]) - 8.0f, float(nib[10]) - 8.0f, float(nib[11]) - 8.0f), in2);
+            up_sum += dot(d * float4(float(nib[12]) - 8.0f, float(nib[13]) - 8.0f, float(nib[14]) - 8.0f, float(nib[15]) - 8.0f), in3);
+        }
+    }
+    // 16-lane 组内树归约(offset < 16,lane0 的累加树只覆盖本行的 16 个 lane)
+    gate_sum += simd_shuffle_down(gate_sum, 8);
+    gate_sum += simd_shuffle_down(gate_sum, 4);
+    gate_sum += simd_shuffle_down(gate_sum, 2);
+    gate_sum += simd_shuffle_down(gate_sum, 1);
+    up_sum += simd_shuffle_down(up_sum, 8);
+    up_sum += simd_shuffle_down(up_sum, 4);
+    up_sum += simd_shuffle_down(up_sum, 2);
+    up_sum += simd_shuffle_down(up_sum, 1);
+    if (tx == 0) {
+        const half gate_f16 = finite_f16(gate_sum);
+        const half up_f16 = finite_f16(up_sum);
+        output[row] = finite_f16(gated_activation_value(
+            float(gate_f16), float(up_f16), activation_kind, alpha, limit));
+    }
+}
 kernel void gguf_gemv_q3k_f16(
     device const half *input [[buffer(0)]],
     device const uchar *weight [[buffer(1)]],

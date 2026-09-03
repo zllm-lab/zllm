@@ -167,7 +167,7 @@ pub fn run(model: Glm52StandaloneModelConfig, backend: MetalBackendConfig) -> Re
                                 let w = weights.load_dense_layer(layer).map_err(|msg| crate::backend::BackendError::Compute { msg: format!("L{layer} dense 权重: {msg}") })?;
                                 prepare_dense_prefill_layer(ctx, &cfg, &mla, &w)?
                             };
-                            glm52_dense_prefill_layer(ctx, &cfg, &mla, &resident, layer, Some(&mut dsa_state), &device_hidden, &rope_table, Some(&mut kv_cache), 0)?
+                            glm52_dense_prefill_layer(ctx, &cfg, &mla, &resident, layer, None, Some(&mut dsa_state), &device_hidden, &rope_table, Some(&mut kv_cache), 0)?
                         }
                         Glm52PrefillLayerKind::Moe => {
                             let resident = if weights.source_is_nvfp4() {

@@ -257,8 +257,22 @@ impl Engine {
 
     /// 生成并流式返回 token。`request` 与 `/v1/chat/completions` 请求体保持同一
     /// 结构语义；回调返回 false 会以 cancelled 结束。
+    ///
+    /// 请求级循环围栏在这里统一接线（glm52/deepseek rocm node 各自接线的
+    /// GenerationGuard 同一实现）：所有 embedded 模型共用——逐 token 推进检测，
+    /// 失控复读/循环立即停止并以 repetition 收口，替代磨满 max_tokens 的
+    /// 失控长生成。
     pub fn generate(&mut self, request: &Value, cancellation: &Cancellation, mut on_token: impl FnMut(u32, &str) -> bool) -> Result<GenerationResult, String> {
-        let summary = match &mut self.inner {
+        let mut guard = crate::runtime::generation_guard::GenerationGuard::new((), true, []);
+        let mut repetition = false;
+        let mut on_token = |token: u32, text: &str| -> bool {
+            if !repetition && guard.advance_and_check(token).is_some() {
+                repetition = true;
+                return false;
+            }
+            on_token(token, text)
+        };
+        let mut summary = match &mut self.inner {
             #[cfg(target_os = "macos")]
             EngineInner::Gemma4(engine) => engine.generate(request, &cancellation.cancelled, &mut |token, text| on_token(token.unwrap_or(0), &text))?,
             #[cfg(target_os = "macos")]
@@ -273,6 +287,9 @@ impl Engine {
             #[cfg(target_os = "macos")]
             EngineInner::Mistral(engine) => engine.generate("embedded", request, &cancellation.cancelled, &mut |token, text| on_token(token.unwrap_or(0), &text))?,
         };
+        if repetition {
+            summary.finish_reason = "repetition".to_owned();
+        }
         Ok(GenerationResult { finish_reason: summary.finish_reason, prompt_tokens: summary.prompt_tokens, completion_tokens: summary.completion_tokens, cache_id: summary.cache.map(|cache| cache.cache_id), tool_calls: summary.tool_calls })
     }
 

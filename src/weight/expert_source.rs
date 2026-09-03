@@ -74,6 +74,12 @@ pub trait GgufExpertSource: Sync + Send {
     fn intermediate(&self) -> usize;
     fn hidden(&self) -> usize;
     fn load_expert_gguf(&self, layer: usize, expert: usize) -> Result<GgufExpertWeights, String>;
+
+    /// 双卡 TP 需要把 shared expert 与 routed expert 做同构分片；没有 shared
+    /// expert 的模型保持默认拒绝，避免 backend 猜测模型专属张量名。
+    fn load_shared_expert_gguf(&self, layer: usize) -> Result<GgufExpertWeights, String> {
+        Err(format!("GGUF L{layer} source 不提供 shared expert"))
+    }
 }
 
 pub trait Fp8ExpertSource {

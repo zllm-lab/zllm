@@ -51,6 +51,96 @@ __device__ __forceinline__ unsigned long long paged_row(
     return (unsigned long long)block_table[token / block_size] * block_size + token % block_size;
 }
 
+__device__ __forceinline__ bool paged_shard_owns(
+    unsigned int token,
+    unsigned int block_size,
+    unsigned int shard_parity)
+{
+    return shard_parity > 1u || ((token / block_size) & 1u) == shard_parity;
+}
+
+__device__ __forceinline__ unsigned long long paged_shard_row(
+    const unsigned int* block_table,
+    unsigned int token,
+    unsigned int block_size,
+    unsigned int shard_parity)
+{
+    if (shard_parity > 1u) return paged_row(block_table, token, block_size);
+    const unsigned int block = token / block_size;
+    // dense shard 路径会在 score mask 前预取 physical row；非本卡 block
+    // 必须先定向安全行 0，否则尾部 block 会越过 compact buffer。
+    if ((block & 1u) != shard_parity) return 0;
+    const unsigned int local = (block >> 1u) * block_size + token % block_size;
+    return paged_row(block_table, local, block_size);
+}
+
+__device__ __forceinline__ unsigned int paged_shard_global_token(
+    unsigned int local,
+    unsigned int block_size,
+    unsigned int shard_parity)
+{
+    if (shard_parity > 1u) return local;
+    const unsigned int block = local / block_size;
+    return (block * 2u + shard_parity) * block_size + local % block_size;
+}
+
+// DSA 先产生一张全局 top-k；这里只按固定 block parity 拆表，
+// 不在两卡分别做 top-k，因此候选精度与单卡路径一致。
+extern "C" __global__ void mla_split_selection_parity(
+    const unsigned int* selection,
+    unsigned int* owner,
+    unsigned int* peer,
+    unsigned int* owner_counts,
+    unsigned int* peer_counts,
+    unsigned int rows,
+    unsigned int width,
+    unsigned int block_size)
+{
+    const unsigned int row = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    if (row >= rows || block_size == 0) return;
+    // 每个线程负责连续列区间，lane 0 对各区间做独占前缀和；这样输出
+    // 严格保持 global selection 的 token 顺序，不让跨 wave atomic 顺序
+    // 改变 softmax 归约次序。width=2048 时每线程只顺序处理 8 项。
+    __shared__ unsigned int owner_offsets[256];
+    __shared__ unsigned int peer_offsets[256];
+    const unsigned int begin = (unsigned int)(((unsigned long long)width * lane) / blockDim.x);
+    const unsigned int end = (unsigned int)(((unsigned long long)width * (lane + 1u)) / blockDim.x);
+    unsigned int owner_count = 0u;
+    unsigned int peer_count = 0u;
+    for (unsigned int column = begin; column < end; ++column) {
+        const unsigned int token = selection[(unsigned long long)row * width + column];
+        if (((token / block_size) & 1u) == 0u) ++owner_count;
+        else ++peer_count;
+    }
+    owner_offsets[lane] = owner_count;
+    peer_offsets[lane] = peer_count;
+    __syncthreads();
+    if (lane == 0) {
+        unsigned int owner_total = 0u;
+        unsigned int peer_total = 0u;
+        for (unsigned int thread = 0; thread < blockDim.x; ++thread) {
+            const unsigned int thread_owner = owner_offsets[thread];
+            const unsigned int thread_peer = peer_offsets[thread];
+            owner_offsets[thread] = owner_total;
+            peer_offsets[thread] = peer_total;
+            owner_total += thread_owner;
+            peer_total += thread_peer;
+        }
+        owner_counts[row] = owner_total;
+        peer_counts[row] = peer_total;
+    }
+    __syncthreads();
+    unsigned int owner_target = owner_offsets[lane];
+    unsigned int peer_target = peer_offsets[lane];
+    for (unsigned int column = begin; column < end; ++column) {
+        const unsigned int token = selection[(unsigned long long)row * width + column];
+        const unsigned int parity = (token / block_size) & 1u;
+        if (parity == 0) owner[(unsigned long long)row * width + owner_target++] = token;
+        else peer[(unsigned long long)row * width + peer_target++] = token;
+    }
+}
+
 extern "C" __global__ void paged_cache_append_f32_bf16(
     const float* input,
     unsigned short* cache,
@@ -120,7 +210,8 @@ extern "C" __global__ void paged_dsa_append_layernorm_rope_q8(
     signed char* cache,
     unsigned short* scales,
     const unsigned int* block_table,
-    unsigned int position,
+    unsigned int cache_position,
+    unsigned int rope_position,
     unsigned int rows,
     unsigned int columns,
     unsigned int rotary_dim,
@@ -172,8 +263,8 @@ extern "C" __global__ void paged_dsa_append_layernorm_rope_q8(
             const unsigned int imaginary = split_half ? half + pair : real + 1u;
             const float real_value = normalized[real];
             const float imaginary_value = normalized[imaginary];
-            const float c = cosine[(unsigned long long)(position + row) * half + pair];
-            const float s = sine[(unsigned long long)(position + row) * half + pair];
+            const float c = cosine[(unsigned long long)(rope_position + row) * half + pair];
+            const float s = sine[(unsigned long long)(rope_position + row) * half + pair];
             value = lane == real ? real_value * c - imaginary_value * s
                                  : imaginary_value * c + real_value * s;
         }
@@ -187,7 +278,7 @@ extern "C" __global__ void paged_dsa_append_layernorm_rope_q8(
         if (lane < offset) maxima[lane] = fmaxf(maxima[lane], maxima[lane + offset]);
         __syncthreads();
     }
-    const unsigned long long physical = paged_row(block_table, position + row, block_size);
+    const unsigned long long physical = paged_row(block_table, cache_position + row, block_size);
     if (lane == 0) {
         const float scale = maxima[0] == 0.0f ? 1.0f : maxima[0] * (1.0f / 127.0f);
         const unsigned short encoded = zllm_f32_to_bf16(scale);
@@ -685,6 +776,41 @@ extern "C" __global__ void mla_hot_scatter_q8(
     }
 }
 
+extern "C" __global__ void mla_hot_gather_q8(
+    const signed char* source_latent,
+    const unsigned short* source_scales,
+    const unsigned short* source_rope,
+    const unsigned int* tokens,
+    const unsigned int* slots,
+    signed char* target_latent,
+    unsigned short* target_scales,
+    unsigned short* target_rope,
+    unsigned int rows,
+    unsigned int latent_columns,
+    unsigned int scale_columns,
+    unsigned int rope_columns,
+    unsigned int target_rows)
+{
+    const unsigned int row = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    if (row >= rows) return;
+    const unsigned int token = tokens[row];
+    const unsigned int slot = slots[row];
+    if (slot >= target_rows) return;
+    for (unsigned int column = lane; column < latent_columns; column += blockDim.x) {
+        target_latent[(unsigned long long)slot * latent_columns + column]
+            = source_latent[(unsigned long long)token * latent_columns + column];
+    }
+    for (unsigned int column = lane; column < scale_columns; column += blockDim.x) {
+        target_scales[(unsigned long long)slot * scale_columns + column]
+            = source_scales[(unsigned long long)token * scale_columns + column];
+    }
+    for (unsigned int column = lane; column < rope_columns; column += blockDim.x) {
+        target_rope[(unsigned long long)slot * rope_columns + column]
+            = source_rope[(unsigned long long)token * rope_columns + column];
+    }
+}
+
 __device__ __forceinline__ unsigned int dsa_ordered_score(float score)
 {
     const unsigned int bits = __float_as_uint(score);
@@ -891,7 +1017,9 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
     unsigned int head_dim,
     unsigned int key_group_size,
     unsigned int block_size,
-    unsigned int tile_rows)
+    unsigned int tile_rows,
+    unsigned int score_stride,
+    unsigned int shard_parity)
 {
 #if defined(__gfx950__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
     using DsaWmmaShort16 = short __attribute__((ext_vector_type(16)));
@@ -920,9 +1048,10 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
     }
 
     for (unsigned int local = threadIdx.x; local < tile_rows; local += blockDim.x) {
-        const unsigned int token = tile * tile_rows + local;
+        const unsigned int compact_token = tile * tile_rows + local;
+        const unsigned int token = paged_shard_global_token(compact_token, block_size, shard_parity);
         physicals[local] = token < context_rows
-            ? (unsigned int)paged_row(block_table, token, block_size)
+            ? (unsigned int)paged_row(block_table, compact_token, block_size)
             : 0u;
     }
     __syncthreads();
@@ -930,7 +1059,8 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
     // 每个 column、head batch 都重复读取同一 BF16 scale并做类型转换。
     if (key_group_size == head_dim) {
         for (unsigned int local = threadIdx.x; local < tile_rows; local += blockDim.x) {
-            const unsigned int token = tile * tile_rows + local;
+            const unsigned int compact_token = tile * tile_rows + local;
+            const unsigned int token = paged_shard_global_token(compact_token, block_size, shard_parity);
             key_row_scales[local] = token < context_rows
                 ? zllm_bf16_to_f32(key_scales[physicals[local]])
                 : 1.0f;
@@ -953,7 +1083,8 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
                     const unsigned int row = element / 16u;
                     const unsigned int column = column_base + element % 16u;
                     const unsigned int local = candidate_base + target_wave * 16u + row;
-                    const unsigned int token = tile * tile_rows + local;
+                    const unsigned int compact_token = tile * tile_rows + local;
+                    const unsigned int token = paged_shard_global_token(compact_token, block_size, shard_parity);
                     float value = 0.0f;
                     if (local < tile_rows && token < context_rows) {
                         const unsigned long long physical = physicals[local];
@@ -1029,10 +1160,10 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
         if (lane < 16u) {
             const unsigned int candidate_slot
                 = candidate_base + key_wave * 16u + (lane & 15u);
-            const unsigned int token = tile * tile_rows + candidate_slot;
+            const unsigned int compact_token = tile * tile_rows + candidate_slot;
+            const unsigned int token = paged_shard_global_token(compact_token, block_size, shard_parity);
             if (candidate_slot < tile_rows && token < context_rows) {
-                const unsigned long long stride
-                    = (unsigned long long)gridDim.x * tile_rows;
+                const unsigned long long stride = score_stride;
                 if (query_row < query_rows && token < (query_start + query_row + 1u) / visibility_divisor) {
                     const unsigned int key = dsa_ordered_score(score0);
                     if constexpr (PrefixOnly) {
@@ -1092,6 +1223,8 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
     (void)key_group_size;
     (void)block_size;
     (void)tile_rows;
+    (void)score_stride;
+    (void)shard_parity;
 #endif
 }
 
@@ -1110,12 +1243,15 @@ extern "C" __global__ void dsa_score_tiles_native_wmma_q8(
     unsigned int head_dim,
     unsigned int key_group_size,
     unsigned int block_size,
-    unsigned int tile_rows)
+    unsigned int tile_rows,
+    unsigned int score_stride,
+    unsigned int shard_parity)
 {
     dsa_score_tiles_native_wmma_q8_impl<false>(
         keys, key_scales, block_table, query, head_weights, score_keys,
         coarse_histograms, query_rows, context_rows, query_start, 1u,
-        head_count, head_dim, key_group_size, block_size, tile_rows);
+        head_count, head_dim, key_group_size, block_size, tile_rows,
+        score_stride, shard_parity);
 }
 
 // Decode 单行不走四行通用映射：8 个 wave 各负责 16 个 token，既保持
@@ -1136,7 +1272,9 @@ extern "C" __global__ void dsa_score_tiles_native_wmma_q8_decode(
     unsigned int head_dim,
     unsigned int key_group_size,
     unsigned int block_size,
-    unsigned int tile_rows)
+    unsigned int tile_rows,
+    unsigned int score_stride,
+    unsigned int shard_parity)
 {
 #if defined(__gfx950__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
     using DsaWmmaShort16 = short __attribute__((ext_vector_type(16)));
@@ -1162,16 +1300,18 @@ extern "C" __global__ void dsa_score_tiles_native_wmma_q8_decode(
 
     for (unsigned int local = threadIdx.x; local < tile_rows;
          local += blockDim.x) {
-        const unsigned int token = tile * tile_rows + local;
+        const unsigned int compact_token = tile * tile_rows + local;
+        const unsigned int token = paged_shard_global_token(compact_token, block_size, shard_parity);
         physicals[local] = token < context_rows
-            ? (unsigned int)paged_row(block_table, token, block_size)
+            ? (unsigned int)paged_row(block_table, compact_token, block_size)
             : 0u;
     }
     __syncthreads();
     if (key_group_size == head_dim) {
         for (unsigned int local = threadIdx.x; local < tile_rows;
              local += blockDim.x) {
-            const unsigned int token = tile * tile_rows + local;
+            const unsigned int compact_token = tile * tile_rows + local;
+            const unsigned int token = paged_shard_global_token(compact_token, block_size, shard_parity);
             key_row_scales[local] = token < context_rows
                 ? zllm_bf16_to_f32(key_scales[physicals[local]])
                 : 1.0f;
@@ -1193,7 +1333,8 @@ extern "C" __global__ void dsa_score_tiles_native_wmma_q8_decode(
                 const unsigned int row = element / 16u;
                 const unsigned int column = column_base + element % 16u;
                 const unsigned int local = target_wave * 16u + row;
-                const unsigned int token = tile * tile_rows + local;
+                const unsigned int compact_token = tile * tile_rows + local;
+                const unsigned int token = paged_shard_global_token(compact_token, block_size, shard_parity);
                 float value = 0.0f;
                 if (local < tile_rows && token < context_rows) {
                     const unsigned long long physical = physicals[local];
@@ -1254,13 +1395,15 @@ extern "C" __global__ void dsa_score_tiles_native_wmma_q8_decode(
 
     if (lane < 16u) {
         const unsigned int local = wave * 16u + lane;
-        const unsigned int token = tile * tile_rows + local;
+        const unsigned int compact_token = tile * tile_rows + local;
+        const unsigned int token = paged_shard_global_token(compact_token, block_size, shard_parity);
         if (local < tile_rows && token < context_rows
             && token <= query_start + query_row) {
-            const unsigned long long stride
-                = (unsigned long long)gridDim.x * tile_rows;
+            const unsigned long long stride = score_stride;
             const unsigned int key = dsa_ordered_score(score);
-            score_keys[(unsigned long long)query_row * stride + token] = key;
+            const unsigned int score_token
+                = shard_parity < 2u ? compact_token : token;
+            score_keys[(unsigned long long)query_row * stride + score_token] = key;
             if (collect_histogram) {
                 atomicAdd(&coarse_histogram[key >> 24], 1u);
             }
@@ -1290,6 +1433,8 @@ extern "C" __global__ void dsa_score_tiles_native_wmma_q8_decode(
     (void)key_group_size;
     (void)block_size;
     (void)tile_rows;
+    (void)score_stride;
+    (void)shard_parity;
 #endif
 }
 
@@ -1491,7 +1636,8 @@ extern "C" __global__ void dsa_score_tiles_native_wmma_q8_kpool(
     dsa_score_tiles_native_wmma_q8_impl<false>(
         keys, key_scales, block_table, query, head_weights, score_keys,
         coarse_histograms, query_rows, context_rows, query_start, kpool,
-        head_count, head_dim, key_group_size, block_size, tile_rows);
+        head_count, head_dim, key_group_size, block_size, tile_rows,
+        gridDim.x * tile_rows, 2u);
 }
 
 extern "C" __global__ void dsa_score_prefix_tiles_native_wmma_q8(
@@ -1509,13 +1655,15 @@ extern "C" __global__ void dsa_score_prefix_tiles_native_wmma_q8(
     unsigned int head_dim,
     unsigned int key_group_size,
     unsigned int block_size,
-    unsigned int tile_rows)
+    unsigned int tile_rows,
+    unsigned int score_stride,
+    unsigned int shard_parity)
 {
     dsa_score_tiles_native_wmma_q8_impl<true>(
         keys, key_scales, block_table, query, head_weights, score_prefixes,
         coarse_histograms, query_rows, context_rows,
         query_start, 1u, head_count, head_dim, key_group_size, block_size,
-        tile_rows);
+        tile_rows, score_stride, shard_parity);
 }
 
 // 正常路径只对最高字节阈值桶重算完整 score；极端聚集分布由固定数量
@@ -1865,6 +2013,122 @@ extern "C" __global__ void dsa_clear_u32(unsigned int* values, unsigned int elem
 {
     const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < elements) values[index] = 0u;
+}
+
+extern "C" __global__ void dsa_gather_selection_scores(
+    const unsigned int* scores,
+    unsigned int* selection,
+    unsigned int* selected_scores,
+    unsigned int rows,
+    unsigned int score_stride,
+    unsigned int width,
+    unsigned int block_size,
+    unsigned int shard_parity,
+    unsigned int compact_tokens)
+{
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int elements = rows * width;
+    if (index >= elements) return;
+    const unsigned int row = index / width;
+    const unsigned int token = selection[index];
+    selected_scores[index] = scores[(unsigned long long)row * score_stride + token];
+    if (compact_tokens != 0u) {
+        selection[index] = paged_shard_global_token(token, block_size, shard_parity);
+    }
+}
+
+// 每个 sequence shard 的局部 Top-K 已足以覆盖全局 Top-K。先按
+// (score desc, token asc) 精确选出成员，再按 token 升序恢复原 compact
+// selection 的稳定消费顺序，避免改变后续 attention 的归约次序。
+extern "C" __global__ void dsa_merge_sequence_shard_topk(
+    const unsigned int* owner_tokens,
+    const unsigned int* owner_scores,
+    unsigned int owner_width,
+    const unsigned int* peer_tokens,
+    const unsigned int* peer_scores,
+    unsigned int peer_width,
+    unsigned int* output,
+    unsigned int rows,
+    unsigned int output_width)
+{
+    constexpr unsigned int capacity = 4096u;
+    const unsigned int row = blockIdx.x;
+    const unsigned int candidates = owner_width + peer_width;
+    if (row >= rows || candidates == 0u || candidates > capacity
+        || output_width == 0u || output_width > candidates) return;
+    unsigned int padded = 1u;
+    while (padded < candidates) padded <<= 1u;
+    __shared__ unsigned long long ranks[capacity];
+    for (unsigned int index = threadIdx.x; index < padded; index += blockDim.x) {
+        unsigned int token = 0xffffffffu;
+        unsigned int score = 0u;
+        if (index < owner_width) {
+            token = owner_tokens[(unsigned long long)row * owner_width + index];
+            score = owner_scores[(unsigned long long)row * owner_width + index];
+        } else if (index < candidates) {
+            const unsigned int peer = index - owner_width;
+            token = peer_tokens[(unsigned long long)row * peer_width + peer];
+            score = peer_scores[(unsigned long long)row * peer_width + peer];
+        }
+        ranks[index] = ((unsigned long long)score << 32u)
+            | (unsigned long long)(0xffffffffu - token);
+    }
+    __syncthreads();
+    for (unsigned int size = 2u; size <= padded; size <<= 1u) {
+        for (unsigned int stride = size >> 1u; stride > 0u; stride >>= 1u) {
+            for (unsigned int left = threadIdx.x; left < padded; left += blockDim.x) {
+                const unsigned int right = left ^ stride;
+                if (right > left) {
+                    const bool ascending = (left & size) == 0u;
+                    const unsigned long long a = ranks[left];
+                    const unsigned long long b = ranks[right];
+                    if ((a > b) == ascending) {
+                        ranks[left] = b;
+                        ranks[right] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    // ranks 目前升序；尾部是全局 Top-K。完整 radix 的稳定输出约定是：
+    // 先按 token 顺序写 score 高于阈值的成员，再写阈值同分成员。这里保持
+    // 同一顺序，避免 sequence shard 改变后续 attention 的归约次序。
+    const unsigned int threshold_score
+        = (unsigned int)(ranks[padded - output_width] >> 32u);
+    for (unsigned int index = threadIdx.x; index < padded; index += blockDim.x) {
+        if (index < output_width) {
+            const unsigned long long selected = ranks[padded - 1u - index];
+            const unsigned int score = (unsigned int)(selected >> 32u);
+            const unsigned int token = 0xffffffffu - (unsigned int)selected;
+            ranks[index] = ((unsigned long long)(score == threshold_score) << 32u)
+                | token;
+        } else {
+            ranks[index] = 0xffffffffffffffffull;
+        }
+    }
+    __syncthreads();
+    for (unsigned int size = 2u; size <= padded; size <<= 1u) {
+        for (unsigned int stride = size >> 1u; stride > 0u; stride >>= 1u) {
+            for (unsigned int left = threadIdx.x; left < padded; left += blockDim.x) {
+                const unsigned int right = left ^ stride;
+                if (right > left) {
+                    const bool ascending = (left & size) == 0u;
+                    const unsigned long long a = ranks[left];
+                    const unsigned long long b = ranks[right];
+                    if ((a > b) == ascending) {
+                        ranks[left] = b;
+                        ranks[right] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (unsigned int index = threadIdx.x; index < output_width; index += blockDim.x) {
+        output[(unsigned long long)row * output_width + index]
+            = (unsigned int)ranks[index];
+    }
 }
 
 // coarse histogram 给出最高字节阈值；这里只写阈值桶 token。正常分布的
@@ -2977,6 +3241,7 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
     const unsigned short* rope_cache,
     const unsigned int* block_table,
     const unsigned int* selection,
+    const unsigned int* selection_counts,
     unsigned short* weighted_latent,
     float* split_partial,
     float* split_stats,
@@ -2992,7 +3257,8 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
     unsigned int block_size,
     unsigned int selected,
     unsigned int split_count,
-    unsigned int split_size)
+    unsigned int split_size,
+    unsigned int shard_parity)
 {
     const unsigned int head_base = blockIdx.x * 8;
 #ifdef ZLLM_PAGED_WMMA_BF16
@@ -3013,7 +3279,9 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
     // selection 只在候选数超过 top-k 时有定义；同一 prefill batch 的前缀行
     // 仍需直接遍历完整 causal 范围，不能读取尚未填满的 selection 槽。
     const bool use_selection = selected && top_k < visible;
-    const unsigned int count = use_selection ? top_k : visible;
+    const unsigned int count = use_selection
+        ? (selection_counts == nullptr ? top_k : selection_counts[row])
+        : visible;
     __shared__ float scores[16 * 128];
     float* weights = scores;
     __shared__ unsigned int physicals[128];
@@ -3082,8 +3350,8 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
             const unsigned int tile_count = dense_count - candidate_base < 128
                 ? dense_count - candidate_base : 128;
             if (lane < tile_count) {
-                physicals[lane] = (unsigned int)paged_row(
-                    block_table, split_start + candidate_base + lane, block_size);
+                physicals[lane] = (unsigned int)paged_shard_row(
+                    block_table, split_start + candidate_base + lane, block_size, shard_parity);
             }
             __syncthreads();
 
@@ -3152,6 +3420,7 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
                     const unsigned int head = combo & 7;
                     scores[combo * 128 + candidate_slot]
                         = combo_row < pair_rows && token < visible_count[combo_row]
+                            && paged_shard_owns(token, block_size, shard_parity)
                             && head_base + head < head_count
                         ? score_fragment[index] * dense_scale
                         : -3.402823466e+38F;
@@ -3187,8 +3456,10 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
                 for (unsigned int part = 0; part < 4; ++part) {
                     const unsigned int slot = dense_wave_lane + part * 32;
                     if (slot < tile_count) {
-                        const float weight
-                            = expf(scores[combo * 128 + slot] - maximum[combo]);
+                        const float score = scores[combo * 128 + slot];
+                        const float weight = score > -3.0e+38F
+                            ? expf(score - maximum[combo])
+                            : 0.0f;
                         local_weights[part] = weight;
                         weight_sum += weight;
                     }
@@ -3275,7 +3546,7 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
             __syncthreads();
         }
 
-        if (split_count > 1) {
+        if (split_partial != nullptr) {
             if (lane < 16) {
                 const unsigned int query_offset = lane >> 3;
                 const unsigned int head = lane & 7;
@@ -3371,7 +3642,7 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
             const unsigned int token = use_selection
                 ? selection[(unsigned long long)row * top_k + candidate]
                 : candidate;
-            physicals[lane] = (unsigned int)paged_row(block_table, token, block_size);
+            physicals[lane] = (unsigned int)paged_shard_row(block_table, token, block_size, shard_parity);
         }
         __syncthreads();
         #pragma unroll
@@ -3500,9 +3771,13 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
                 for (unsigned int head = 0; head < 8; ++head) score[head] += __shfl_down(score[head], offset, 8);
             }
             if (sublane == 0) {
+                const unsigned int token = candidate < count
+                    ? (use_selection ? selection[(unsigned long long)row * top_k + candidate] : candidate)
+                    : 0u;
+                const bool owned = candidate < count && paged_shard_owns(token, block_size, shard_parity);
                 #pragma unroll
                 for (unsigned int head = 0; head < 8; ++head) {
-                    scores[head * 128 + slot] = candidate < count && head_base + head < head_count
+                    scores[head * 128 + slot] = owned && head_base + head < head_count
                         ? score[head] * rsqrtf((float)q_head_dim) : -3.402823466e+38F;
                 }
             }
@@ -3525,7 +3800,10 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
         }
         __syncthreads();
         for (unsigned int candidate = wave_lane; candidate < tile_count; candidate += 32) {
-            weights[wave * 128 + candidate] = expf(scores[wave * 128 + candidate] - maximum[wave]);
+            const float score = scores[wave * 128 + candidate];
+            weights[wave * 128 + candidate] = score > -3.0e+38F
+                ? expf(score - maximum[wave])
+                : 0.0f;
         }
         __syncthreads();
         float reduced0 = wave_lane < tile_count ? weights[wave * 128 + wave_lane] : 0.0f;
@@ -3563,16 +3841,23 @@ extern "C" __global__ void mla_paged_dense_latent_f32(
         }
         __syncthreads();
     }
+    if (split_partial != nullptr && lane < 8 && head_base + lane < head_count) {
+        const unsigned long long split_head = ((unsigned long long)row * head_count + head_base + lane);
+        split_stats[split_head * 2] = maximum[lane];
+        split_stats[split_head * 2 + 1] = denominator[lane];
+    }
     #pragma unroll
     for (unsigned int head = 0; head < 8; ++head) {
         if (head_base + head < head_count) {
             if (dimension0 < latent_dim) {
-                weighted_latent[((unsigned long long)row * head_count + head_base + head) * latent_dim + dimension0]
-                    = zllm_f32_to_bf16(acc0[head] / denominator[head]);
+                const unsigned long long output = ((unsigned long long)row * head_count + head_base + head) * latent_dim + dimension0;
+                if (split_partial != nullptr) split_partial[output] = acc0[head];
+                else weighted_latent[output] = zllm_f32_to_bf16(acc0[head] / denominator[head]);
             }
             if (dimension1 < latent_dim) {
-                weighted_latent[((unsigned long long)row * head_count + head_base + head) * latent_dim + dimension1]
-                    = zllm_f32_to_bf16(acc1[head] / denominator[head]);
+                const unsigned long long output = ((unsigned long long)row * head_count + head_base + head) * latent_dim + dimension1;
+                if (split_partial != nullptr) split_partial[output] = acc1[head];
+                else weighted_latent[output] = zllm_f32_to_bf16(acc1[head] / denominator[head]);
             }
         }
     }
@@ -3818,12 +4103,14 @@ extern "C" __global__ void mla_paged_sparse_latent_f32(
         }
         __syncthreads();
         for (unsigned int candidate = wave_lane; candidate < tile_count; candidate += 32) {
+            const float score = scores[wave * 128 + candidate];
 #ifdef ZLLM_PAGED_BF16_DOT2
             weights[wave * 128 + candidate] = zllm_f32_to_bf16(
-                expf(scores[wave * 128 + candidate] - maximum[wave]));
+                score > -3.0e+38F ? expf(score - maximum[wave]) : 0.0f);
 #else
-            weights[wave * 128 + candidate] = expf(
-                scores[wave * 128 + candidate] - maximum[wave]);
+            weights[wave * 128 + candidate] = score > -3.0e+38F
+                ? expf(score - maximum[wave])
+                : 0.0f;
 #endif
         }
         __syncthreads();
@@ -3945,8 +4232,10 @@ extern "C" __global__ void mla_paged_decode_partial_f32(
     const unsigned short* rope_cache,
     const unsigned int* block_table,
     const unsigned int* selection,
+    const unsigned int* selection_counts,
     float* partial,
     float* stats,
+    unsigned short* weighted_latent,
     unsigned int context_rows,
     unsigned int query_start,
     unsigned int head_count,
@@ -3957,15 +4246,37 @@ extern "C" __global__ void mla_paged_decode_partial_f32(
     unsigned int top_k,
     unsigned int block_size,
     unsigned int selected,
-    unsigned int tile_size)
+    unsigned int tile_size,
+    unsigned int stage_chunk,
+    unsigned int shard_parity)
 {
     const unsigned int head_base = blockIdx.x * 4;
     const unsigned int tile = blockIdx.y;
     const unsigned int lane = threadIdx.x;
     const unsigned int dense_visible = query_start + 1 < context_rows ? query_start + 1 : context_rows;
-    const unsigned int visible = selected && top_k < dense_visible ? top_k : dense_visible;
+    const bool use_selection = selected && top_k < dense_visible;
+    const unsigned int visible = use_selection
+        ? (selection_counts == nullptr ? top_k : selection_counts[0])
+        : dense_visible;
     const unsigned int tile_start = tile * tile_size;
-    if (head_base >= head_count || tile_start >= visible) return;
+    if (head_base >= head_count) return;
+    if (tile_start >= visible) {
+        const unsigned long long tile_head_base
+            = (unsigned long long)tile * head_count + head_base;
+        #pragma unroll
+        for (unsigned int head = 0; head < 4; ++head) {
+            if (head_base + head < head_count) {
+                if (lane == head) {
+                    stats[(tile_head_base + head) * 2] = -3.402823466e+38F;
+                    stats[(tile_head_base + head) * 2 + 1] = 0.0f;
+                }
+                for (unsigned int column = lane; column < latent_dim; column += blockDim.x) {
+                    partial[(tile_head_base + head) * latent_dim + column] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
     const unsigned int count = visible - tile_start < tile_size ? visible - tile_start : tile_size;
     __shared__ float scores[4 * 128];
     __shared__ float weights[4 * 128];
@@ -4019,12 +4330,245 @@ extern "C" __global__ void mla_paged_decode_partial_f32(
     const unsigned int sublane = lane & 7;
     const unsigned int dimension0 = lane * 2;
     const unsigned int dimension1 = dimension0 + 1;
+    if (stage_chunk != 0) {
+        // Step2 软件流水：把 WMMA 路径已有的 eager tile materialization 补给 fdot2
+        // 标量路径。latent 以 Q8 code+scale（group==0 时为原始 bf16）tile 进 LDS，
+        // QK 与 PV 共用同一份 tile，全局 cache 每 token 只读一次；下一个 chunk 的
+        // physicals 在当前 chunk 装载阶段提前 gather，页表/selection 延迟与计算重叠。
+        const unsigned int chunk = stage_chunk;
+        const unsigned int groups = latent_group_size != 0 ? latent_dim / latent_group_size : 0;
+#ifdef ZLLM_PAGED_BF16_DOT2
+        const unsigned int query_cache_bytes = 4 * latent_dim * 2 + 4 * rope_dim * 4;
+#else
+        const unsigned int query_cache_bytes = 4 * latent_dim * 4 + 4 * rope_dim * 4;
+#endif
+        unsigned char* code_tile = decode_partial_query_cache + query_cache_bytes;
+        unsigned short* scale_tile = reinterpret_cast<unsigned short*>(code_tile + chunk * latent_dim);
+        unsigned short* rope_tile = latent_group_size != 0
+            ? scale_tile + chunk * groups
+            : reinterpret_cast<unsigned short*>(code_tile) + chunk * latent_dim;
+        if (lane < chunk) {
+            const unsigned int candidate = tile_start + lane;
+            const unsigned int token = selected ? selection[candidate] : candidate;
+            physicals[lane] = candidate < visible
+                ? (unsigned int)paged_shard_row(block_table, token, block_size, shard_parity)
+                : 0;
+        }
+        __syncthreads();
+        for (unsigned int base = 0; base < count; base += chunk) {
+            const unsigned int sub = count - base < chunk ? count - base : chunk;
+            for (unsigned int index = lane; index < sub * latent_dim; index += blockDim.x) {
+                const unsigned long long physical = physicals[index / latent_dim];
+                const unsigned int column = index % latent_dim;
+                if (latent_group_size != 0) {
+                    code_tile[index] = reinterpret_cast<const unsigned char*>(
+                        latent_cache)[physical * latent_dim + column];
+                } else {
+                    reinterpret_cast<unsigned short*>(code_tile)[index]
+                        = latent_cache[physical * latent_dim + column];
+                }
+            }
+            for (unsigned int index = lane; index < sub * groups; index += blockDim.x) {
+                scale_tile[index]
+                    = latent_scales[physicals[index / groups] * groups + index % groups];
+            }
+            for (unsigned int index = lane; index < sub * rope_dim; index += blockDim.x) {
+                rope_tile[index]
+                    = rope_cache[physicals[index / rope_dim] * rope_dim + index % rope_dim];
+            }
+            // 预取下一个 chunk 的 physicals；gather 延迟与当前 chunk 的计算重叠。
+            if (lane < chunk) {
+                const unsigned int next = base + chunk + lane;
+                const unsigned int candidate = tile_start + next;
+                const unsigned int token = selected ? selection[candidate] : candidate;
+                physicals[chunk + lane] = next < count
+                    ? (unsigned int)paged_shard_row(block_table, token, block_size, shard_parity)
+                    : 0;
+            }
+            __syncthreads();
+            // 每个 32-slot 组由 8 线程组覆盖；chunk=64 走两组，chunk=32 只走一组。
+            for (unsigned int candidate_half = 0; candidate_half * 32 < chunk; ++candidate_half) {
+                const unsigned int slot = group + candidate_half * 32;
+                const unsigned int candidate = base + slot;
+                float score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (unsigned int column = sublane * 2; candidate < count && column < latent_dim; column += 16) {
+                    unsigned int packed;
+                    if (latent_group_size != 0) {
+                        const unsigned int local = slot * latent_dim + column;
+                        const float scale = zllm_bf16_to_f32(
+                            scale_tile[slot * groups + column / latent_group_size]);
+                        const float value0 = (float)(signed char)code_tile[local] * scale;
+                        const float value1 = column + 1 < latent_dim
+                            ? (float)(signed char)code_tile[local + 1] * scale
+                            : 0.0f;
+                        packed = (unsigned int)zllm_f32_to_bf16(value0)
+                            | ((unsigned int)zllm_f32_to_bf16(value1) << 16);
+                    } else {
+                        const unsigned short* value
+                            = reinterpret_cast<unsigned short*>(code_tile) + slot * latent_dim + column;
+                        packed = column + 1 < latent_dim
+                            ? *reinterpret_cast<const unsigned int*>(value)
+                            : value[0];
+                    }
+#ifdef ZLLM_PAGED_BF16_DOT2
+                    const zllm_paged_bf16x2 cached_pair
+                        = *reinterpret_cast<const zllm_paged_bf16x2*>(&packed);
+#else
+                    const float cached0 = zllm_bf16_to_f32((unsigned short)packed);
+                    const float cached1 = zllm_bf16_to_f32((unsigned short)(packed >> 16));
+#endif
+                    #pragma unroll
+                    for (unsigned int head = 0; head < 4; ++head) {
+                        if (head_base + head < head_count) {
+#ifdef ZLLM_PAGED_BF16_DOT2
+                            const unsigned short* query_ptr
+                                = absorbed_query + head * latent_dim + column;
+                            const unsigned int query_packed = column + 1 < latent_dim
+                                ? *reinterpret_cast<const unsigned int*>(query_ptr)
+                                : query_ptr[0];
+                            const zllm_paged_bf16x2 query_pair
+                                = *reinterpret_cast<const zllm_paged_bf16x2*>(&query_packed);
+                            score[head] = __builtin_amdgcn_fdot2_f32_bf16(
+                                query_pair, cached_pair, score[head], false);
+#else
+                            const float* query_ptr = absorbed_query + head * latent_dim + column;
+                            const float2 query_pair = column + 1 < latent_dim
+                                ? *reinterpret_cast<const float2*>(query_ptr)
+                                : make_float2(query_ptr[0], 0.0f);
+                            score[head] += query_pair.x * cached0 + query_pair.y * cached1;
+#endif
+                        }
+                    }
+                }
+                for (unsigned int column = sublane * 2; candidate < count && column < rope_dim; column += 16) {
+                    const unsigned short* cached_ptr = rope_tile + slot * rope_dim + column;
+                    const unsigned int packed = column + 1 < rope_dim
+                        ? *reinterpret_cast<const unsigned int*>(cached_ptr)
+                        : cached_ptr[0];
+                    const float cached0
+                        = zllm_bf16_to_f32((unsigned short)packed);
+                    const float cached1
+                        = zllm_bf16_to_f32((unsigned short)(packed >> 16));
+                    #pragma unroll
+                    for (unsigned int head = 0; head < 4; ++head) {
+                        if (head_base + head < head_count) {
+                            const float* query_ptr = rope_query + head * rope_dim + column;
+                            const float2 query_pair = column + 1 < rope_dim
+                                ? *reinterpret_cast<const float2*>(query_ptr)
+                                : make_float2(query_ptr[0], 0.0f);
+                            score[head] += query_pair.x * cached0 + query_pair.y * cached1;
+                        }
+                    }
+                }
+                for (unsigned int offset = 4; offset > 0; offset >>= 1) {
+                    #pragma unroll
+                    for (unsigned int head = 0; head < 4; ++head) {
+                        score[head] += __shfl_down(score[head], offset, 8);
+                    }
+                }
+                if (sublane == 0) {
+                    const unsigned int logical = tile_start + candidate;
+                    const unsigned int token = candidate < count ? (selected ? selection[logical] : logical) : 0u;
+                    const bool owned = candidate < count && paged_shard_owns(token, block_size, shard_parity);
+                    #pragma unroll
+                    for (unsigned int head = 0; head < 4; ++head) {
+                        scores[head * chunk + slot] = owned && head_base + head < head_count
+                            ? score[head] * rsqrtf((float)q_head_dim)
+                            : -3.402823466e+38F;
+                    }
+                }
+            }
+            __syncthreads();
+
+            const unsigned int wave = lane >> 6;
+            const unsigned int wave_lane = lane & 63;
+            const unsigned int half = wave_lane >> 5;
+            const unsigned int half_lane = wave_lane & 31;
+            float reduced = wave_lane < sub
+                ? scores[wave * chunk + wave_lane]
+                : -3.402823466e+38F;
+            for (unsigned int offset = 16; offset > 0; offset >>= 1) {
+                reduced = fmaxf(reduced, __shfl_down(reduced, offset));
+            }
+            if (half_lane == 0) reduction[wave * 2 + half] = reduced;
+            __syncthreads();
+            if (wave_lane == 0) {
+                const float tile_max = fmaxf(reduction[wave * 2], reduction[wave * 2 + 1]);
+                const float next_max = fmaxf(maximum[wave], tile_max);
+                alpha[wave] = expf(maximum[wave] - next_max);
+                maximum[wave] = next_max;
+            }
+            __syncthreads();
+
+            if (wave_lane < sub) {
+                const float score = scores[wave * chunk + wave_lane];
+                weights[wave * chunk + wave_lane] = score > -3.0e+38F
+                    ? expf(score - maximum[wave])
+                    : 0.0f;
+            }
+            __syncwarp();
+            reduced = wave_lane < sub ? weights[wave * chunk + wave_lane] : 0.0f;
+            for (unsigned int offset = 16; offset > 0; offset >>= 1) {
+                reduced += __shfl_down(reduced, offset);
+            }
+            if (half_lane == 0) reduction[wave * 2 + half] = reduced;
+            __syncthreads();
+            if (wave_lane == 0) {
+                denominator[wave] = denominator[wave] * alpha[wave]
+                    + reduction[wave * 2] + reduction[wave * 2 + 1];
+            }
+            __syncthreads();
+
+            if (dimension0 < latent_dim) {
+                float sum0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                float sum1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                for (unsigned int candidate = 0; candidate < sub; ++candidate) {
+                    unsigned int packed;
+                    if (latent_group_size != 0) {
+                        const unsigned int local = candidate * latent_dim + dimension0;
+                        const float scale = zllm_bf16_to_f32(
+                            scale_tile[candidate * groups + dimension0 / latent_group_size]);
+                        const float value0 = (float)(signed char)code_tile[local] * scale;
+                        const float value1 = dimension0 + 1 < latent_dim
+                            ? (float)(signed char)code_tile[local + 1] * scale
+                            : 0.0f;
+                        packed = (unsigned int)zllm_f32_to_bf16(value0)
+                            | ((unsigned int)zllm_f32_to_bf16(value1) << 16);
+                    } else {
+                        const unsigned short* value
+                            = reinterpret_cast<unsigned short*>(code_tile) + candidate * latent_dim + dimension0;
+                        packed = dimension0 + 1 < latent_dim
+                            ? *reinterpret_cast<const unsigned int*>(value)
+                            : value[0];
+                    }
+                    const float cached0 = zllm_bf16_to_f32((unsigned short)packed);
+                    const float cached1 = zllm_bf16_to_f32((unsigned short)(packed >> 16));
+                    #pragma unroll
+                    for (unsigned int head = 0; head < 4; ++head) {
+                        const float weight = weights[head * chunk + candidate];
+                        sum0[head] += weight * cached0;
+                        sum1[head] += weight * cached1;
+                    }
+                }
+                #pragma unroll
+                for (unsigned int head = 0; head < 4; ++head) {
+                    acc0[head] = acc0[head] * alpha[head] + sum0[head];
+                    acc1[head] = acc1[head] * alpha[head] + sum1[head];
+                }
+            }
+            __syncthreads();
+            if (lane < chunk) {
+                physicals[lane] = physicals[chunk + lane];
+            }
+            __syncthreads();
+        }
+    } else
     for (unsigned int candidate_base = 0; candidate_base < count; candidate_base += 128) {
         const unsigned int tile_count = count - candidate_base < 128 ? count - candidate_base : 128;
         if (lane < tile_count) {
             const unsigned int candidate = tile_start + candidate_base + lane;
             const unsigned int token = selected ? selection[candidate] : candidate;
-            physicals[lane] = (unsigned int)paged_row(block_table, token, block_size);
+            physicals[lane] = (unsigned int)paged_shard_row(block_table, token, block_size, shard_parity);
         }
         __syncthreads();
         #pragma unroll
@@ -4093,9 +4637,12 @@ extern "C" __global__ void mla_paged_decode_partial_f32(
                 }
             }
             if (sublane == 0) {
+                const unsigned int logical = tile_start + candidate_base + slot;
+                const unsigned int token = candidate < count ? (selected ? selection[logical] : logical) : 0u;
+                const bool owned = candidate < count && paged_shard_owns(token, block_size, shard_parity);
                 #pragma unroll
                 for (unsigned int head = 0; head < 4; ++head) {
-                    scores[head * 128 + slot] = candidate < count && head_base + head < head_count
+                    scores[head * 128 + slot] = owned && head_base + head < head_count
                         ? score[head] * rsqrtf((float)q_head_dim)
                         : -3.402823466e+38F;
                 }
@@ -4127,11 +4674,16 @@ extern "C" __global__ void mla_paged_decode_partial_f32(
         __syncthreads();
 
         if (wave_lane < tile_count) {
-            weights[wave * 128 + wave_lane] = expf(scores[wave * 128 + wave_lane] - maximum[wave]);
+            const float score = scores[wave * 128 + wave_lane];
+            weights[wave * 128 + wave_lane] = score > -3.0e+38F
+                ? expf(score - maximum[wave])
+                : 0.0f;
         }
         if (wave_lane + 64 < tile_count) {
-            weights[wave * 128 + wave_lane + 64] = expf(
-                scores[wave * 128 + wave_lane + 64] - maximum[wave]);
+            const float score = scores[wave * 128 + wave_lane + 64];
+            weights[wave * 128 + wave_lane + 64] = score > -3.0e+38F
+                ? expf(score - maximum[wave])
+                : 0.0f;
         }
         __syncwarp();
         reduced = wave_lane < tile_count ? weights[wave * 128 + wave_lane] : 0.0f;
@@ -4193,11 +4745,11 @@ extern "C" __global__ void mla_paged_decode_partial_f32(
 }
 
 #ifdef ZLLM_PAGED_WMMA_BF16
-// Q8 selected attention: 每个 64-token tile 的 Q8 codes/scales 只读取一次全局 cache，
+// Q8 selected attention: 每个 32-token tile 的 Q8 codes/scales 只读取一次全局 cache，
 // score 留在寄存器中，随后从 LDS 复用同一份原始 latent 完成 P×V。
 // decode 通过 partial/stats 输出 split；prefill 每个 query 只发一个 block，直接归一化输出，
 // 避免 query×split×head×latent 的大 scratch。
-extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q8_wmma_f32(
+extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8_wmma_f32(
     const float* query,
     const unsigned short* absorbed,
     const unsigned short* latent_cache,
@@ -4205,6 +4757,7 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
     const unsigned short* rope_cache,
     const unsigned int* block_table,
     const unsigned int* selection,
+    const unsigned int* selection_counts,
     float* partial,
     float* stats,
     unsigned short* weighted_latent,
@@ -4218,25 +4771,27 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
     unsigned int top_k,
     unsigned int block_size,
     unsigned int selected,
-    unsigned int tile_size)
+    unsigned int tile_size,
+    unsigned int shard_parity)
 {
     const unsigned int lane = threadIdx.x;
     const unsigned int wave = lane >> 5;
     const unsigned int wave_lane = lane & 31;
     const unsigned int row_column = wave_lane & 15;
     const unsigned int half = wave_lane >> 4;
-    // 一个 workgroup 固定处理两个 16-head WMMA tile；这样其余 30 个 wave
-    // 可以覆盖 16 组 value dimension，每个 wave 只保留两个输出 accumulator。
-    const unsigned int heads_per_block = 32;
+    // 一个 workgroup 固定处理一个 16-head WMMA tile；8 个 wave
+    // 覆盖 8 组 value dimension，每个 wave 保留四个输出 accumulator。
+    const unsigned int heads_per_block = 16;
     const unsigned int head_start = blockIdx.x * heads_per_block;
-    if (blockDim.x != 1024 || head_start >= head_count || latent_group_size == 0) return;
+    if (blockDim.x != 256 || head_start >= head_count || latent_group_size == 0) return;
     const unsigned int block_head_count = head_count - head_start < heads_per_block
         ? head_count - head_start : heads_per_block;
-    const unsigned int query_waves = 2;
-    const unsigned int dimension_groups = 16;
-    const unsigned int output_stride = 256;
+    const unsigned int query_waves = 1;
+    const unsigned int dimension_groups = 8;
+    const unsigned int token_tile = 32;
+    const unsigned int output_stride = 128;
     const unsigned int output_passes = latent_dim / output_stride;
-    if (block_head_count != heads_per_block || output_passes == 0 || output_passes > 2
+    if (block_head_count != heads_per_block || output_passes != 4
         || latent_dim % output_stride != 0 || latent_dim % 16 != 0
         || rope_dim % 16 != 0) return;
 
@@ -4245,10 +4800,32 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
     const unsigned int dense_visible = query_start + query_row + 1 < context_rows
         ? query_start + query_row + 1 : context_rows;
     const bool use_selection = selected && top_k < dense_visible;
-    const unsigned int visible = use_selection ? top_k : dense_visible;
+    const unsigned int visible = use_selection
+        ? (selection_counts == nullptr ? top_k : selection_counts[query_row])
+        : dense_visible;
     const unsigned int tile = direct_output ? 0u : blockIdx.y;
     const unsigned int tile_start = tile * tile_size;
-    if (tile_start >= visible) return;
+    if (tile_start >= visible) {
+        const unsigned long long output_head_base
+            = (unsigned long long)(direct_output ? query_row : tile) * head_count
+                + head_start;
+        if (stats != nullptr) {
+            for (unsigned int head = lane; head < block_head_count; head += blockDim.x) {
+                stats[(output_head_base + head) * 2] = -3.402823466e+38F;
+                stats[(output_head_base + head) * 2 + 1] = 0.0f;
+            }
+        }
+        for (unsigned int index = lane;
+             index < block_head_count * latent_dim;
+             index += blockDim.x) {
+            if (direct_output) {
+                weighted_latent[output_head_base * latent_dim + index] = 0u;
+            } else {
+                partial[output_head_base * latent_dim + index] = 0.0f;
+            }
+        }
+        return;
+    }
     const unsigned int count = visible - tile_start < tile_size
         ? visible - tile_start : tile_size;
     const unsigned int groups = latent_dim / latent_group_size;
@@ -4260,15 +4837,15 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
 
     extern __shared__ unsigned char decode_wmma_cache[];
     unsigned short* key_tile = reinterpret_cast<unsigned short*>(decode_wmma_cache);
-    unsigned short* probability_tile = key_tile + 64 * 16;
+    unsigned short* probability_tile = key_tile + token_tile * 16;
     unsigned short* value_tile = probability_tile + heads_per_block * 16;
     float* alpha = reinterpret_cast<float*>(value_tile + 16 * latent_dim);
     unsigned int* physicals = reinterpret_cast<unsigned int*>(alpha + heads_per_block);
-    unsigned int* latent_code_tile = reinterpret_cast<unsigned int*>(physicals + 64);
+    unsigned int* latent_code_tile = reinterpret_cast<unsigned int*>(physicals + token_tile);
     unsigned short* latent_scale_tile = reinterpret_cast<unsigned short*>(
-        latent_code_tile + 64 * latent_dim / 4);
+        latent_code_tile + token_tile * latent_dim / 4);
 
-    zllm_wmma_float8 output_accumulator[2] = {};
+    zllm_wmma_float8 output_accumulator[4] = {};
     float running_max[8];
     float running_denominator[8];
     #pragma unroll
@@ -4277,27 +4854,29 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
         running_denominator[index] = 0.0f;
     }
 
-    for (unsigned int tile_base = 0; tile_base < count; tile_base += 64) {
-        if (lane < 64) {
+    for (unsigned int tile_base = 0; tile_base < count; tile_base += token_tile) {
+        if (lane < token_tile) {
             const unsigned int candidate = tile_base + lane;
             if (candidate < count) {
                 const unsigned int logical = tile_start + candidate;
                 const unsigned int token = use_selection
                     ? selection[(unsigned long long)query_row * top_k + logical]
                     : logical;
-                physicals[lane] = (unsigned int)paged_row(block_table, token, block_size);
+                physicals[lane] = (unsigned int)(shard_parity < 2
+                    ? paged_shard_row(block_table, token, block_size, shard_parity)
+                    : paged_row(block_table, token, block_size));
             } else {
                 physicals[lane] = 0;
             }
         }
         __syncthreads();
 
-        // Eager tile materialization：一次并行装载整个 64-token tile 的 code/scale 进
+        // Eager tile materialization：一次并行装载整个 32-token tile 的 code/scale 进
         // LDS（QK/PV 共用的 tile），QK 内循环不再触碰全局散读，每 tile 的 DRAM 延迟
         // 只暴露一次，替代原先 32 个 16 列块逐块串行暴露。
         {
             const unsigned int words_per_token = latent_dim / 4;
-            for (unsigned int word = lane; word < 64 * words_per_token; word += blockDim.x) {
+            for (unsigned int word = lane; word < token_tile * words_per_token; word += blockDim.x) {
                 const unsigned int token_column = word / words_per_token;
                 const unsigned int candidate = tile_base + token_column;
                 latent_code_tile[word] = candidate < count
@@ -4306,7 +4885,7 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
                           + (word - token_column * words_per_token)]
                     : 0u;
             }
-            for (unsigned int index = lane; index < 64 * groups; index += blockDim.x) {
+            for (unsigned int index = lane; index < token_tile * groups; index += blockDim.x) {
                 const unsigned int token_column = index / groups;
                 const unsigned int group = index - token_column * groups;
                 const unsigned int candidate = tile_base + token_column;
@@ -4317,23 +4896,32 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
             __syncthreads();
         }
 
-        zllm_wmma_float8 score_accumulator[4] = {};
+        zllm_wmma_float8 score_accumulator[2] = {};
         for (unsigned int column_base = 0; column_base < latent_dim; column_base += 16) {
-            const unsigned int token_column = lane >> 4;
-            const unsigned int column = lane & 15;
-            const unsigned int candidate = tile_base + token_column;
-            if (candidate < count) {
-                const unsigned int group = column_base / latent_group_size;
-                const unsigned short encoded_scale =
-                    latent_scale_tile[token_column * groups + group];
-                const float scale = zllm_bf16_to_f32(encoded_scale);
-                const unsigned int code_word = latent_code_tile[
-                    (token_column * latent_dim + column_base + column) / 4];
-                const signed char code = (signed char)(
-                    (code_word >> ((column & 3) * 8)) & 0xffu);
-                key_tile[lane] = zllm_f32_to_bf16((float)code * scale);
-            } else {
-                key_tile[lane] = 0;
+            // 一次读取一个 Q8 word，打包写回四个 BF16；避免四个线程
+            // 重复读取同一份 code/scale，也减少 LDS store 指令。
+            const unsigned int key_words = token_tile * 16 / 4;
+            for (unsigned int word = lane; word < key_words; word += blockDim.x) {
+                const unsigned int token_column = word / 4;
+                const unsigned int column = (word & 3) * 4;
+                const unsigned int candidate = tile_base + token_column;
+                unsigned long long packed_bf16 = 0;
+                if (candidate < count) {
+                    const unsigned int group = column_base / latent_group_size;
+                    const unsigned short encoded_scale =
+                        latent_scale_tile[token_column * groups + group];
+                    const float scale = zllm_bf16_to_f32(encoded_scale);
+                    const unsigned int code_word = latent_code_tile[
+                        (token_column * latent_dim + column_base + column) / 4];
+                    #pragma unroll
+                    for (unsigned int element = 0; element < 4; ++element) {
+                        const signed char code = (signed char)(
+                            (code_word >> (element * 8)) & 0xffu);
+                        packed_bf16 |= (unsigned long long)zllm_f32_to_bf16(
+                            (float)code * scale) << (element * 16);
+                    }
+                }
+                reinterpret_cast<unsigned long long*>(key_tile)[word] = packed_bf16;
             }
             __syncthreads();
             if (wave < query_waves) {
@@ -4349,7 +4937,7 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
                 }
                 query_fragment = paged_wmma_expand_bf16(query_fragment);
                 #pragma unroll
-                for (unsigned int token_block = 0; token_block < 4; ++token_block) {
+                for (unsigned int token_block = 0; token_block < token_tile / 16; ++token_block) {
                     zllm_wmma_short16 key_fragment;
                     #pragma unroll
                     for (unsigned int index = 0; index < 8; ++index) {
@@ -4366,13 +4954,17 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
         }
 
         for (unsigned int column_base = 0; column_base < rope_dim; column_base += 16) {
-            const unsigned int token_column = lane >> 4;
-            const unsigned int column = lane & 15;
-            const unsigned int candidate = tile_base + token_column;
-            key_tile[lane] = candidate < count
-                ? rope_cache[(unsigned long long)physicals[token_column] * rope_dim
-                    + column_base + column]
-                : 0;
+            const unsigned int key_words = token_tile * 16 / 4;
+            for (unsigned int word = lane; word < key_words; word += blockDim.x) {
+                const unsigned int token_column = word / 4;
+                const unsigned int column = (word & 3) * 4;
+                const unsigned int candidate = tile_base + token_column;
+                reinterpret_cast<unsigned long long*>(key_tile)[word] = candidate < count
+                    ? *reinterpret_cast<const unsigned long long*>(
+                        rope_cache + (unsigned long long)physicals[token_column] * rope_dim
+                        + column_base + column)
+                    : 0ull;
+            }
             __syncthreads();
             if (wave < query_waves) {
                 zllm_wmma_short16 query_fragment;
@@ -4387,7 +4979,7 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
                 }
                 query_fragment = paged_wmma_expand_bf16(query_fragment);
                 #pragma unroll
-                for (unsigned int token_block = 0; token_block < 4; ++token_block) {
+                for (unsigned int token_block = 0; token_block < token_tile / 16; ++token_block) {
                     zllm_wmma_short16 key_fragment;
                     #pragma unroll
                     for (unsigned int index = 0; index < 8; ++index) {
@@ -4404,7 +4996,7 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
         }
 
         #pragma unroll
-        for (unsigned int token_block = 0; token_block < 4; ++token_block) {
+        for (unsigned int token_block = 0; token_block < token_tile / 16; ++token_block) {
             const unsigned int token_base = tile_base + token_block * 16;
             if (token_base >= count) break;
             if (wave < query_waves) {
@@ -4412,7 +5004,16 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
                 for (unsigned int index = 0; index < 8; ++index) {
                     const unsigned int head = wave * 16 + half + 2 * index;
                     const unsigned int candidate = token_base + row_column;
-                    const float score = candidate < count
+                    const unsigned int logical = tile_start + candidate;
+                    const unsigned int token = candidate < count
+                        ? (use_selection
+                            ? selection[(unsigned long long)query_row * top_k + logical]
+                            : logical)
+                        : 0u;
+                    const bool owned = candidate < count
+                        && (shard_parity >= 2
+                            || paged_shard_owns(token, block_size, shard_parity));
+                    const float score = owned
                         ? score_accumulator[token_block][index] * attention_scale
                         : -3.402823466e+38F;
                     float tile_max = score;
@@ -4423,7 +5024,7 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
                     const float next_max = fmaxf(running_max[index], tile_max);
                     const float old_scale = running_max[index] == -3.402823466e+38F
                         ? 0.0f : __builtin_amdgcn_exp2f((running_max[index] - next_max) * 1.4426950408889634f);
-                    const float probability = candidate < count
+                    const float probability = owned
                         ? __builtin_amdgcn_exp2f((score - next_max) * 1.4426950408889634f) : 0.0f;
                     float tile_sum = probability;
                     #pragma unroll
@@ -4452,17 +5053,17 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
                             + dimension / latent_group_size]);
                     const unsigned int code_word = latent_code_tile[
                         ((token_block * 16 + token_column) * latent_dim + dimension) / 4];
+                    unsigned long long packed_bf16 = 0;
                     #pragma unroll
                     for (unsigned int element = 0; element < 4; ++element) {
                         const signed char code = (signed char)(
                             (code_word >> (element * 8)) & 0xffu);
-                        value_tile[index + element] = zllm_f32_to_bf16((float)code * scale);
+                        packed_bf16 |= (unsigned long long)zllm_f32_to_bf16(
+                            (float)code * scale) << (element * 16);
                     }
+                    reinterpret_cast<unsigned long long*>(value_tile)[word] = packed_bf16;
                 } else {
-                    #pragma unroll
-                    for (unsigned int element = 0; element < 4; ++element) {
-                        value_tile[index + element] = 0;
-                    }
+                    reinterpret_cast<unsigned long long*>(value_tile)[word] = 0ull;
                 }
             }
             __syncthreads();
@@ -4473,7 +5074,7 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
                 const unsigned int head = head_base + half + 2 * index;
                 const float old_scale = head < block_head_count ? alpha[head] : 0.0f;
                 #pragma unroll
-                for (unsigned int pass = 0; pass < 2; ++pass) {
+                for (unsigned int pass = 0; pass < 4; ++pass) {
                     output_accumulator[pass][index] *= old_scale;
                 }
                 probability_fragment[index] = head_base + row_column < block_head_count
@@ -4482,7 +5083,7 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
             }
             probability_fragment = paged_wmma_expand_bf16(probability_fragment);
             #pragma unroll
-            for (unsigned int pass = 0; pass < 2; ++pass) {
+            for (unsigned int pass = 0; pass < 4; ++pass) {
                 const unsigned int dimension_base = pass * output_stride + dimension_group * 16;
                 zllm_wmma_short16 value_fragment;
                 #pragma unroll
@@ -4509,8 +5110,9 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
         }
         __syncthreads();
     }
-    const unsigned long long tile_head_base = (unsigned long long)tile * head_count;
-    if (!direct_output && wave < query_waves && row_column == 0) {
+    const unsigned long long tile_head_base
+        = (unsigned long long)(direct_output ? query_row : tile) * head_count;
+    if (stats != nullptr && wave < query_waves && row_column == 0) {
         #pragma unroll
         for (unsigned int index = 0; index < 8; ++index) {
             const unsigned int local_head = wave * 16 + half + 2 * index;
@@ -4522,7 +5124,7 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
         }
     }
     #pragma unroll
-    for (unsigned int pass = 0; pass < 2; ++pass) {
+    for (unsigned int pass = 0; pass < 4; ++pass) {
         const unsigned int dimension_base = pass * output_stride + dimension_group * 16;
         #pragma unroll
         for (unsigned int index = 0; index < 8; ++index) {
@@ -4530,10 +5132,12 @@ extern "C" __global__ __launch_bounds__(1024, 1) void mla_paged_decode_partial_q
             const unsigned int head = head_start + local_head;
             if (local_head < block_head_count) {
                 if (direct_output) {
+                    const float denominator = alpha[local_head];
                     weighted_latent[((unsigned long long)query_row * head_count + head)
                             * latent_dim + dimension_base + row_column]
-                        = zllm_f32_to_bf16(
-                            output_accumulator[pass][index] / alpha[local_head]);
+                        = zllm_f32_to_bf16(denominator == 0.0f
+                            ? 0.0f
+                            : output_accumulator[pass][index] / denominator);
                 } else {
                     partial[(tile_head_base + head) * latent_dim
                             + dimension_base + row_column] = output_accumulator[pass][index];
@@ -4551,14 +5155,17 @@ extern "C" __global__ void mla_paged_split_merge_f32(
     unsigned short* weighted_latent,
     unsigned int head_count,
     unsigned int latent_dim,
-    unsigned int tile_count)
+    unsigned int tile_count,
+    float* merged_stats)
 {
     const unsigned int head = blockIdx.x;
     const unsigned int row = blockIdx.y;
     const unsigned int lane = threadIdx.x;
-    if (head >= head_count || tile_count == 0 || tile_count > 128) return;
-    __shared__ float old_scales[128];
-    __shared__ float tile_scales[128];
+    // tile 上限由 shared scale 数组容量决定；decode split-k 在 cooperative 半头
+    // 拆分下每卡 grid.x=1，需要 ~target_blocks 个 tile 才能打满 CU。
+    if (head >= head_count || tile_count == 0 || tile_count > 512) return;
+    __shared__ float old_scales[512];
+    __shared__ float tile_scales[512];
     __shared__ float denominator;
     if (lane == 0) {
         float running_max = -3.402823466e+38F;
@@ -4567,16 +5174,22 @@ extern "C" __global__ void mla_paged_split_merge_f32(
             const unsigned long long stat
                 = (((unsigned long long)row * tile_count + tile) * head_count + head) * 2;
             const float tile_max = stats[stat];
-            const float next_max = fmaxf(running_max, tile_max);
-            const float old_scale = expf(running_max - next_max);
-            const float tile_scale = expf(tile_max - next_max);
+            const float tile_denominator = stats[stat + 1];
+            const float next_max = running_denominator == 0.0f ? tile_max : fmaxf(running_max, tile_max);
+            const float old_scale = running_denominator == 0.0f ? 0.0f : expf(running_max - next_max);
+            const float tile_scale = tile_denominator == 0.0f ? 0.0f : expf(tile_max - next_max);
             old_scales[tile] = old_scale;
             tile_scales[tile] = tile_scale;
             running_denominator = running_denominator * old_scale
-                + stats[stat + 1] * tile_scale;
-            running_max = next_max;
+                + tile_denominator * tile_scale;
+            if (tile_denominator != 0.0f) running_max = next_max;
         }
         denominator = running_denominator;
+        if (merged_stats != nullptr) {
+            const unsigned long long merged = ((unsigned long long)row * head_count + head) * 2;
+            merged_stats[merged] = running_max;
+            merged_stats[merged + 1] = running_denominator;
+        }
     }
     __syncthreads();
     for (unsigned int dimension = lane; dimension < latent_dim; dimension += blockDim.x) {
@@ -4588,7 +5201,83 @@ extern "C" __global__ void mla_paged_split_merge_f32(
                     * tile_scales[tile];
         }
         weighted_latent[((unsigned long long)row * head_count + head) * latent_dim + dimension]
-            = zllm_f32_to_bf16(value / denominator);
+            = zllm_f32_to_bf16(denominator == 0.0f ? 0.0f : value / denominator);
+    }
+}
+
+extern "C" __global__ void mla_paged_shard_scale_bf16(
+    unsigned short* weighted_latent,
+    const float* local_stats,
+    const float* remote_stats,
+    unsigned int rows,
+    unsigned int head_count,
+    unsigned int latent_dim)
+{
+    const unsigned long long index
+        = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned long long elements
+        = (unsigned long long)rows * head_count * latent_dim;
+    if (index >= elements) return;
+    const unsigned long long head = index / latent_dim;
+    const float local_denominator = local_stats[head * 2 + 1];
+    const float remote_denominator = remote_stats[head * 2 + 1];
+    const float maximum = fmaxf(local_stats[head * 2], remote_stats[head * 2]);
+    const float local_mass = local_denominator == 0.0f
+        ? 0.0f : local_denominator * expf(local_stats[head * 2] - maximum);
+    const float remote_mass = remote_denominator == 0.0f
+        ? 0.0f : remote_denominator * expf(remote_stats[head * 2] - maximum);
+    const float total = local_mass + remote_mass;
+    const float scale = total == 0.0f ? 0.0f : local_mass / total;
+    weighted_latent[index] = zllm_f32_to_bf16(
+        zllm_bf16_to_f32(weighted_latent[index]) * scale);
+}
+
+// sequence-parallel 的两边各自产生“本地归一化”的 weighted latent。
+// 在 head 维做 reduce-scatter：只合并本卡负责的连续 head，避免两卡随后
+// 重复执行完整 value/o projection。remote 可以是 peer BAR 地址。
+extern "C" __global__ void mla_paged_shard_merge_heads_bf16(
+    const unsigned short* local_weighted,
+    const unsigned short* remote_weighted,
+    const float* local_stats,
+    const float* remote_stats,
+    unsigned short* output,
+    unsigned int rows,
+    unsigned int total_heads,
+    unsigned int head_start,
+    unsigned int head_count,
+    unsigned int latent_dim)
+{
+    const unsigned long long local_head_index = blockIdx.x;
+    const unsigned long long heads = (unsigned long long)rows * head_count;
+    if (local_head_index >= heads) return;
+    const unsigned int local_head = local_head_index % head_count;
+    const unsigned int row = local_head_index / head_count;
+    const unsigned int head = head_start + local_head;
+    const unsigned long long global_head
+        = (unsigned long long)row * total_heads + head;
+    __shared__ float masses[3];
+    if (threadIdx.x == 0) {
+        const float local_denominator = local_stats[global_head * 2 + 1];
+        const float remote_denominator = remote_stats[global_head * 2 + 1];
+        const float maximum = fmaxf(
+            local_stats[global_head * 2], remote_stats[global_head * 2]);
+        masses[0] = local_denominator == 0.0f
+            ? 0.0f : local_denominator * expf(local_stats[global_head * 2] - maximum);
+        masses[1] = remote_denominator == 0.0f
+            ? 0.0f : remote_denominator * expf(remote_stats[global_head * 2] - maximum);
+        masses[2] = masses[0] + masses[1];
+    }
+    __syncthreads();
+    for (unsigned int dimension = threadIdx.x;
+         dimension < latent_dim;
+         dimension += blockDim.x) {
+        const unsigned long long source
+            = global_head * latent_dim + dimension;
+        const float value = masses[2] == 0.0f ? 0.0f : (
+            zllm_bf16_to_f32(local_weighted[source]) * masses[0]
+            + zllm_bf16_to_f32(remote_weighted[source]) * masses[1]) / masses[2];
+        output[local_head_index * latent_dim + dimension]
+            = zllm_f32_to_bf16(value);
     }
 }
 
@@ -4764,9 +5453,17 @@ extern "C" __global__ void mla_paged_decode_latent_f32(
         }
         __syncthreads();
 
-        if (wave_lane < tile_count) weights[wave * 128 + wave_lane] = expf(scores[wave * 128 + wave_lane] - maximum[wave]);
+        if (wave_lane < tile_count) {
+            const float score = scores[wave * 128 + wave_lane];
+            weights[wave * 128 + wave_lane] = score > -3.0e+38F
+                ? expf(score - maximum[wave])
+                : 0.0f;
+        }
         if (wave_lane + 64 < tile_count) {
-            weights[wave * 128 + wave_lane + 64] = expf(scores[wave * 128 + wave_lane + 64] - maximum[wave]);
+            const float score = scores[wave * 128 + wave_lane + 64];
+            weights[wave * 128 + wave_lane + 64] = score > -3.0e+38F
+                ? expf(score - maximum[wave])
+                : 0.0f;
         }
         __syncwarp();
         reduced = wave_lane < tile_count ? weights[wave * 128 + wave_lane] : 0.0f;
@@ -4946,6 +5643,7 @@ extern "C" __global__ void mla_project_value_ct_wmma(
     unsigned short* output,
     unsigned int query_rows,
     unsigned int head_count,
+    unsigned int weight_head_start,
     unsigned int q_head_dim,
     unsigned int kv_head_dim,
     unsigned int latent_dim,
@@ -4995,7 +5693,7 @@ extern "C" __global__ void mla_project_value_ct_wmma(
         }
         if (lane < 16u) {
             const unsigned int value = value_base + lane;
-            const unsigned int row = head * kv_head_dim + nope_dim + value;
+            const unsigned int row = (weight_head_start + head) * kv_head_dim + nope_dim + value;
             const unsigned long long groups = latent_dim / group_size;
             const bool one_group = column_base / group_size
                 == (column_base + 15u) / group_size;
@@ -5136,6 +5834,7 @@ extern "C" __global__ void mla_project_value_ct(
     float* output,
     unsigned int query_rows,
     unsigned int head_count,
+    unsigned int weight_head_start,
     unsigned int q_head_dim,
     unsigned int kv_head_dim,
     unsigned int latent_dim,
@@ -5154,7 +5853,7 @@ extern "C" __global__ void mla_project_value_ct(
         const unsigned int lane = threadIdx.x & 15u;
         if (value < value_dim) {
             float sum = 0.0f;
-            const unsigned int weight_row = head * kv_head_dim + nope_dim + value;
+            const unsigned int weight_row = (weight_head_start + head) * kv_head_dim + nope_dim + value;
             if (bits == 4u && group_size == 128u && (latent_dim & 127u) == 0u) {
                 const unsigned int packed_columns = latent_dim >> 3u;
                 const unsigned int groups = latent_dim >> 7u;
@@ -5216,7 +5915,7 @@ extern "C" __global__ void mla_project_value_ct(
         const unsigned int weight_column = column_base + query_local;
         weight_tile[threadIdx.x] = value < value_dim && weight_column < latent_dim
             ? paged_weight(
-                packed, scales, head * kv_head_dim + nope_dim + value,
+                packed, scales, (weight_head_start + head) * kv_head_dim + nope_dim + value,
                 weight_column, latent_dim, group_size, scale_dtype, bits)
             : 0.0f;
         __syncthreads();

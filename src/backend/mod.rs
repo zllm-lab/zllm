@@ -42,6 +42,78 @@ pub enum BackendError {
     Compute { msg: String },
 }
 
+/// backend 内存池的逻辑用途。用途决定资源能否与另一类 allocation 复用，
+/// 但不暴露 HIP、Metal、CUDA 等平台句柄。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryKind {
+    Scratch,
+    Activation,
+    Cache,
+    Weight,
+    Transfer,
+}
+
+/// allocation 的最长逻辑生命周期。物理内存可以在逻辑 owner 退出后留在
+/// backend pool 中，但必须等待对应设备 completion 后才能再次借出。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MemoryLifetime {
+    Operation,
+    Stage,
+    Session,
+    Model,
+}
+
+/// backend 无关的内存申请。`tag`/`slot` 区分同尺寸但可能同时存活的 workspace；
+/// backend 可以选择 best-fit、精确尺寸或用途槽位复用，不要求平台采用同一种池。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MemoryRequest {
+    pub bytes: usize,
+    pub alignment: usize,
+    pub kind: MemoryKind,
+    pub lifetime: MemoryLifetime,
+    pub tag: Option<&'static str>,
+    pub slot: usize,
+}
+
+impl MemoryRequest {
+    pub const fn new(bytes: usize, kind: MemoryKind, lifetime: MemoryLifetime) -> Self {
+        Self { bytes, alignment: 1, kind, lifetime, tag: None, slot: 0 }
+    }
+
+    pub const fn scratch(tag: &'static str, bytes: usize) -> Self {
+        Self { bytes, alignment: 1, kind: MemoryKind::Scratch, lifetime: MemoryLifetime::Operation, tag: Some(tag), slot: 0 }
+    }
+
+    pub const fn with_alignment(mut self, alignment: usize) -> Self {
+        self.alignment = alignment;
+        self
+    }
+
+    pub const fn with_slot(mut self, slot: usize) -> Self {
+        self.slot = slot;
+        self
+    }
+
+    pub fn validate(self) -> Result<Self, BackendError> {
+        if !self.alignment.is_power_of_two() {
+            return Err(BackendError::Compute { msg: format!("memory pool alignment={} 不是 2 的幂", self.alignment) });
+        }
+        Ok(self)
+    }
+}
+
+/// backend 无关的内存池能力。公共层统一描述用途和生命周期；具体 storage、
+/// completion、pending→available 推进与物理释放仍由 backend 实现。
+///
+/// 返回的 `Memory` 必须是 RAII handle：clone 延长 allocation 生命周期，最后一个
+/// handle 退出后由 backend 决定进入 pending、available 或直接释放。
+pub trait MemoryPool {
+    type Memory: Clone + Send + Sync + 'static;
+
+    fn allocate_memory(&self, request: MemoryRequest) -> Result<Self::Memory, BackendError>;
+    fn memory_bytes(&self, memory: &Self::Memory) -> u64;
+}
+
 /// 单个 token 行的采样参数。temperature=0 表示确定性 argmax。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -249,6 +321,11 @@ pub trait BackendResources {
         Ok(())
     }
     fn prepare_weight(&self, weight: LinearWeight<'_>, rows: usize, cols: usize) -> Result<Self::Weight, BackendError>;
+    /// 专家权重可由 backend 保留适合 grouped/fused kernel 的原始布局；默认与
+    /// 普通线性层相同，避免模型层感知设备侧编码。
+    fn prepare_expert_weight(&self, weight: LinearWeight<'_>, rows: usize, cols: usize) -> Result<Self::Weight, BackendError> {
+        self.prepare_weight(weight, rows, cols)
+    }
     /// 从输出矩阵抽取任意行并保持原顺序。draft vocabulary 只缩小 greedy
     /// LM head；backend 应尽量保留原量化布局，默认实现提供正确性回退。
     fn prepare_weight_rows(&self, weight: LinearWeight<'_>, source_rows: usize, cols: usize, selected_rows: &[u32]) -> Result<Self::Weight, BackendError> {
@@ -1424,6 +1501,93 @@ pub trait MoePrefillBackend: Backend {
 pub trait ExpertPrefillBackend: MoePrefillBackend {
     type PrefillExperts;
 
+    /// 同一 MLA 层已经为两张卡准备 query-head / KV-B / O-proj 分片时返回 true。
+    fn supports_cooperative_mla_prefill(&self, _layer: usize, _experts: &Self::PrefillExperts) -> bool {
+        false
+    }
+
+    /// cooperative attention 已绑定 peer 时，从首次写入起把 DSA key history
+    /// 按固定 block parity 落到唯一物理 owner。返回 true 表示 append 已完成。
+    #[allow(clippy::too_many_arguments)]
+    fn cooperative_dsa_append_keys_layernorm_rope(
+        &self,
+        _layer: usize,
+        _experts: &Self::PrefillExperts,
+        _state: &mut <Self as DecodeBackend>::DsaState,
+        _position: usize,
+        _keys: &Self::Tensor,
+        _norm_weight: &Self::Weight,
+        _norm_bias: &Self::Weight,
+        _eps: f32,
+        _cosine: &[f32],
+        _sine: &[f32],
+        _spec: &DsaSpec,
+    ) -> Result<bool, BackendError>
+    where
+        Self: DsaPrefillBackend,
+    {
+        Ok(false)
+    }
+
+    /// DSA prefill 的 query 行彼此独立时，允许 cooperative peer 分担一部分
+    /// query，并把完整 selection 按原行序归并回 owner。返回 true 表示 selection
+    /// 已写入 state；默认后端保持单卡路径。
+    fn cooperative_dsa_select_prefill(&self, _layer: usize, _experts: &Self::PrefillExperts, _state: &mut <Self as DecodeBackend>::DsaState, _query: &Self::Tensor, _head_weights: &Self::Tensor, _spec: &DsaSpec) -> Result<bool, BackendError>
+    where
+        Self: DsaPrefillBackend,
+    {
+        Ok(false)
+    }
+
+    /// cooperative peer 已常驻 Indexer query 投影权重时，直接按 token 行拆分
+    /// q_lora，在两卡分别完成 wq_b、RoPE 与完整历史扫描。返回 true 表示
+    /// selection 已写入 state；默认后端保持单卡投影与 selection。
+    #[allow(clippy::too_many_arguments)]
+    fn cooperative_dsa_project_select_prefill(
+        &self,
+        _layer: usize,
+        _experts: &Self::PrefillExperts,
+        _state: &mut <Self as DecodeBackend>::DsaState,
+        _q_lora: &Self::Tensor,
+        _owner_wq_b: &Self::Weight,
+        _head_weights: &Self::Tensor,
+        _position: usize,
+        _cosine: &[f32],
+        _sine: &[f32],
+        _spec: &DsaSpec,
+    ) -> Result<bool, BackendError>
+    where
+        Self: DsaPrefillBackend,
+    {
+        Ok(false)
+    }
+
+    /// 两卡共同完成 q_b → MLA → o_proj，并把两份 full-hidden partial 与 residual
+    /// 在 owner 上融合。KV/DSA 的物理 ownership 与同步由 backend 负责。
+    #[allow(clippy::too_many_arguments)]
+    fn cooperative_mla_prefill_add(
+        &self,
+        layer: usize,
+        experts: &Self::PrefillExperts,
+        normalized_q_lora: &Self::Tensor,
+        latent: &Self::Tensor,
+        k_rope: &Self::Tensor,
+        residual: &Self::Tensor,
+        cache: Option<&mut Self::Cache>,
+        dsa_state: Option<&<Self as DecodeBackend>::DsaState>,
+        position: usize,
+        cosine: &[f32],
+        sine: &[f32],
+        mla: &MlaSpec,
+        dsa: &DsaSpec,
+    ) -> Result<Self::Tensor, BackendError>
+    where
+        Self: DsaPrefillBackend,
+    {
+        let _ = (layer, experts, normalized_q_lora, latent, k_rope, residual, cache, dsa_state, position, cosine, sine, mla, dsa);
+        Err(BackendError::Compute { msg: "backend 未实现 cooperative MLA prefill".to_owned() })
+    }
+
     /// resident routed 与 shared expert 可以共享同一份输入和显式工作区时，
     /// 直接完成整层 MoE 与 residual 合并；不支持时返回 `None`。
     fn prefill_resident_moe_add(
@@ -1553,6 +1717,27 @@ pub(crate) fn compute_error(msg: impl Into<String>) -> BackendError {
 
 pub(crate) fn checked_elements(rows: usize, cols: usize, what: &str) -> Result<usize, BackendError> {
     rows.checked_mul(cols).ok_or_else(|| compute_error(format!("{what} shape [{rows},{cols}] 大小溢出")))
+}
+
+#[cfg(test)]
+mod memory_pool_tests {
+    use super::*;
+
+    #[test]
+    fn scratch_request_keeps_backend_independent_lifetime() {
+        let request = MemoryRequest::scratch("attention", 4096).with_slot(2).with_alignment(256).validate().unwrap();
+        assert_eq!(request.kind, MemoryKind::Scratch);
+        assert_eq!(request.lifetime, MemoryLifetime::Operation);
+        assert_eq!(request.tag, Some("attention"));
+        assert_eq!(request.slot, 2);
+        assert_eq!(request.alignment, 256);
+    }
+
+    #[test]
+    fn request_rejects_non_power_of_two_alignment() {
+        let error = MemoryRequest::new(1024, MemoryKind::Activation, MemoryLifetime::Stage).with_alignment(3).validate().unwrap_err();
+        assert!(error.to_string().contains("不是 2 的幂"));
+    }
 }
 /// 推测解码对 KV cache 的最小事务能力。
 ///

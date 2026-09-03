@@ -1,5 +1,29 @@
 use super::*;
 
+impl crate::backend::MemoryPool for RocmContext {
+    type Memory = Arc<ops::hip::DeviceBuffer>;
+
+    fn allocate_memory(&self, request: crate::backend::MemoryRequest) -> Result<Self::Memory, BackendError> {
+        let request = request.validate()?;
+        if request.bytes == 0 {
+            return Err(compute_error("ROCm memory pool 申请字节数不能为 0"));
+        }
+        if request.alignment != 1 {
+            return Err(compute_error(format!("ROCm memory pool 尚不支持 alignment={}", request.alignment)));
+        }
+        let buffer = match request.lifetime {
+            crate::backend::MemoryLifetime::Operation | crate::backend::MemoryLifetime::Stage => ops::hip::DeviceBuffer::allocate_reusable(self.device_id, request.bytes),
+            crate::backend::MemoryLifetime::Session | crate::backend::MemoryLifetime::Model => ops::hip::DeviceBuffer::allocate_cache(self.device_id, request.bytes),
+        }
+        .map_err(compute_error)?;
+        Ok(Arc::new(buffer))
+    }
+
+    fn memory_bytes(&self, memory: &Self::Memory) -> u64 {
+        memory.allocation_bytes() as u64
+    }
+}
+
 impl RocmContext {
     pub(crate) fn profile_stage_begin(&self, detailed_eligible: bool) -> Result<(), BackendError> {
         ops::hip::device_profile_stage_begin(self.device_id, detailed_eligible).map_err(compute_error)
@@ -52,6 +76,9 @@ impl crate::backend::StageExecutionBackend for RocmContext {
     }
 
     fn activate_stage_submission(&self, kind: crate::backend::StageSubmissionKind) -> Result<(), BackendError> {
+        if kind == crate::backend::StageSubmissionKind::Latency {
+            ops::hip::device_profile_decode_boundary();
+        }
         let stream = match kind {
             crate::backend::StageSubmissionKind::Latency => self.compute_stream,
             crate::backend::StageSubmissionKind::Background if self.compute_stream == 0 => {
@@ -222,7 +249,7 @@ impl crate::backend::SegmentedTensorBackend for RocmContext {
             total_rows = total_rows.checked_add(tensor.rows).ok_or_else(|| compute_error("ROCm token concat rows 溢出"))?;
             total_bytes = total_bytes.checked_add(device.bytes()).ok_or_else(|| compute_error("ROCm token concat bytes 溢出"))?;
         }
-        let output = ops::hip::DeviceBuffer::allocate_reusable(self.device_id, total_bytes).map_err(compute_error)?;
+        let output = <Self as crate::backend::MemoryPool>::allocate_memory(self, crate::backend::MemoryRequest::new(total_bytes, crate::backend::MemoryKind::Activation, crate::backend::MemoryLifetime::Operation))?;
         let mut offset = 0usize;
         for tensor in tensors {
             let device = tensor.device.as_deref().expect("上方已检查 device");
@@ -233,7 +260,7 @@ impl crate::backend::SegmentedTensorBackend for RocmContext {
             ops::hip::synchronize_device(self.device_id, "token row concat profile").map_err(compute_error)?;
             eprintln!("[rocm-kernel] concat-token-rows device={} tensors={} rows={} cols={} bytes={} wall={:.6}s", self.device_id, tensors.len(), total_rows, first.cols, total_bytes, started.elapsed().as_secs_f64());
         }
-        Ok(device_tensor_with_dtype(output, total_rows, first.cols, first.dtype))
+        Ok(device_tensor_with_arc(output, total_rows, first.cols, first.dtype))
     }
 
     fn concat_token_rows_reserved(&self, tensors: &[&Self::Tensor], capacity_rows: usize) -> Result<Self::Tensor, BackendError> {
@@ -275,7 +302,7 @@ impl crate::backend::SegmentedTensorBackend for RocmContext {
                 owner
             }
             None => {
-                let owner = std::sync::Arc::new(ops::hip::DeviceBuffer::allocate_reusable(self.device_id, capacity_bytes).map_err(compute_error)?);
+                let owner = <Self as crate::backend::MemoryPool>::allocate_memory(self, crate::backend::MemoryRequest::new(capacity_bytes, crate::backend::MemoryKind::Activation, crate::backend::MemoryLifetime::Stage))?;
                 let mut offset = 0usize;
                 for tensor in tensors {
                     let device = tensor.device.as_deref().expect("上方已检查 device");
@@ -370,7 +397,13 @@ impl BackendResources for RocmContext {
             .map(|group| {
                 let codes = Arc::new(ops::hip::DeviceBuffer::view(code_owner.clone(), group * code_bytes, code_bytes).map_err(compute_error)?);
                 let scales = Arc::new(ops::hip::DeviceBuffer::view(scale_owner.clone(), group * scale_bytes, scale_bytes).map_err(compute_error)?);
-                Ok(RocmWeight { rows: rows_per_group, cols: matrix.cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::BlockFp8 { codes, scales, block_rows, block_cols, bf16_cache: Arc::default() }) })
+                Ok(RocmWeight {
+                    rows: rows_per_group,
+                    cols: matrix.cols,
+                    inner: RocmWeightInner::Quantized(RocmQuantizedWeight::BlockFp8 { codes, scales, block_rows, block_cols, bf16_cache: Arc::default() }),
+                    expert_gguf: None,
+                    cpu_mla_data: None,
+                })
             })
             .collect()
     }
@@ -385,7 +418,7 @@ impl BackendResources for RocmContext {
             }
             let packed = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, matrix.packed()).map_err(compute_error)?);
             let scales = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, matrix.scales()).map_err(compute_error)?);
-            return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::ConvRotInt8 { packed, scales, group_size }) });
+            return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::ConvRotInt8 { packed, scales, group_size }), expert_gguf: None, cpu_mla_data: None });
         }
         let quantized = match weight {
             LinearWeight::Quantized(QuantizedMatrixRef::W4A16(matrix)) => Some((4, matrix.packed(), matrix.scales(), matrix.scale_dtype(), matrix.group_size(), matrix.rows, matrix.cols)),
@@ -399,7 +432,7 @@ impl BackendResources for RocmContext {
             let packed = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, packed).map_err(compute_error)?);
             let scales = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, scales).map_err(compute_error)?);
             let quantized = if bits == 4 { RocmQuantizedWeight::W4A16 { packed, scales, scale_dtype, group_size } } else { RocmQuantizedWeight::W8A16 { packed, scales, scale_dtype, group_size } };
-            return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(quantized) });
+            return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(quantized), expert_gguf: None, cpu_mla_data: None });
         }
         if let LinearWeight::Quantized(QuantizedMatrixRef::Fp8(matrix)) = weight {
             if matrix.rows != rows || matrix.cols != cols {
@@ -410,7 +443,7 @@ impl BackendResources for RocmContext {
             let values = matrix.decode_bf16();
             let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values.as_slice())) };
             let resident = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, bytes).map_err(compute_error)?);
-            return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Dense { data: Vec::new(), resident: Some(resident), resident_bf16: true, router_bf16: Arc::default() } });
+            return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Dense { data: Vec::new(), resident: Some(resident), resident_bf16: true, router_bf16: Arc::default() }, expert_gguf: None, cpu_mla_data: None });
         }
         if let LinearWeight::Quantized(QuantizedMatrixRef::BlockFp8(matrix)) = weight {
             if matrix.rows != rows || matrix.cols != cols {
@@ -419,7 +452,7 @@ impl BackendResources for RocmContext {
             let (block_rows, block_cols) = matrix.block_shape();
             let codes = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, matrix.codes()).map_err(compute_error)?);
             let scales = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, matrix.scales()).map_err(compute_error)?);
-            return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::BlockFp8 { codes, scales, block_rows, block_cols, bf16_cache: Arc::default() }) });
+            return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::BlockFp8 { codes, scales, block_rows, block_cols, bf16_cache: Arc::default() }), expert_gguf: None, cpu_mla_data: None });
         }
         if let LinearWeight::Quantized(QuantizedMatrixRef::Mxfp4(matrix)) = weight {
             if matrix.rows() != rows || matrix.cols() != cols {
@@ -427,7 +460,7 @@ impl BackendResources for RocmContext {
             }
             let packed = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, matrix.packed()).map_err(compute_error)?);
             let scales = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, matrix.scales()).map_err(compute_error)?);
-            return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::Mxfp4 { packed, scales }) });
+            return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::Mxfp4 { packed, scales }), expert_gguf: None, cpu_mla_data: None });
         }
         if let LinearWeight::Quantized(crate::weight::format::quantization::QuantizedMatrixRef::Gguf(matrix)) = weight {
             if matrix.rows != rows || matrix.columns != cols {
@@ -438,35 +471,13 @@ impl BackendResources for RocmContext {
                 // Q8_0(32 元素块 = f16 scale + int8)重排为 CT W8A16 布局(group 32, F16 scale)：
                 // 仅做字节拆分与 +128 偏移包装，不做数值反量化；执行侧复用 WMMA 快路径。
                 8 => {
-                    if cols % 32 != 0 || cols % 4 != 0 {
-                        return Err(compute_error(format!("ROCm GGUF Q8_0 columns={cols} 不是 32 的倍数")));
-                    }
-                    let blocks = cols / 32;
-                    if bytes.len() != rows * blocks * 34 {
-                        return Err(compute_error(format!("ROCm GGUF Q8_0 字节数 {}，期望 {}", bytes.len(), rows * blocks * 34)));
-                    }
-                    let mut packed = vec![0_u8; rows * cols];
-                    let mut scales = Vec::with_capacity(rows * blocks * 2);
-                    for row in 0..rows {
-                        let source = &bytes[row * blocks * 34..][..blocks * 34];
-                        for block in 0..blocks {
-                            let source = &source[block * 34..][..34];
-                            scales.extend_from_slice(&source[..2]);
-                            let destination = &mut packed[row * cols + block * 32..][..32];
-                            for (destination, quant) in destination.iter_mut().zip(&source[2..]) {
-                                *destination = quant.wrapping_add(128);
-                            }
-                        }
-                    }
-                    let packed = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, &packed).map_err(compute_error)?);
-                    let scales = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, &scales).map_err(compute_error)?);
-                    return Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::W8A16 { packed, scales, scale_dtype: ScaleDType::F16, group_size: 32 }) });
+                    return self.prepare_gguf_q8_bytes(&bytes, rows, cols);
                 }
                 // K-quant 保持 GGUF 打包形态常驻。Qwen3.8 的 CPU/ROCm 分层路径
                 // 依赖这里避免把 4/5/6 bit 权重展开为 F32（显存会膨胀约 5-8 倍）。
                 // linear 与 expert kernel 都直接消费原始 block，不创建 host/device F32 shadow。
-                12 | 13 | 14 => return self.prepare_gguf_packed(matrix),
-                other => return Err(compute_error(format!("ROCm GGUF type {other} 无设备路径(仅支持 Q8_0/Q4_K/Q5_K/Q6_K)"))),
+                11 | 12 | 13 | 14 | 21 | 23 => return self.prepare_gguf_packed(matrix),
+                other => return Err(compute_error(format!("ROCm GGUF type {other} 无设备路径(支持 Q8_0/Q3_K/Q4_K/Q5_K/Q6_K/IQ3_S/IQ4_XS)"))),
             }
         }
         let bf16_bytes = match &weight {
@@ -500,7 +511,23 @@ impl BackendResources for RocmContext {
             let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * std::mem::size_of::<f32>()) };
             Some(Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, bytes).map_err(compute_error)?))
         };
-        Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Dense { data, resident, resident_bf16: bf16_bytes.is_some(), router_bf16: Arc::default() } })
+        Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Dense { data, resident, resident_bf16: bf16_bytes.is_some(), router_bf16: Arc::default() }, expert_gguf: None, cpu_mla_data: None })
+    }
+
+    fn prepare_expert_weight(&self, weight: LinearWeight<'_>, rows: usize, cols: usize) -> Result<Self::Weight, BackendError> {
+        if let LinearWeight::Quantized(QuantizedMatrixRef::Gguf(matrix)) = weight
+            && matrix.tensor_type.0 == 8
+        {
+            if matrix.rows != rows || matrix.columns != cols {
+                return Err(compute_error(format!("ROCm GGUF expert weight shape [{},{}]，期望 [{rows},{cols}]", matrix.rows, matrix.columns)));
+            }
+            let packed = self.prepare_gguf_packed(matrix)?;
+            let (codes, tensor_type) = packed.expert_gguf().expect("GGUF packed expert sidecar 已准备");
+            let mut weight = self.prepare_weight(weight, rows, cols)?;
+            weight.expert_gguf = Some((codes.clone(), tensor_type));
+            return Ok(weight);
+        }
+        self.prepare_weight(weight, rows, cols)
     }
 
     fn prepare_f32(&self, values: &[f32], rows: usize, cols: usize) -> Result<Self::Weight, BackendError> {
@@ -510,26 +537,77 @@ impl BackendResources for RocmContext {
         }
         let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * std::mem::size_of::<f32>()) };
         let resident = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, bytes).map_err(compute_error)?);
-        Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Dense { data: values.to_vec(), resident: Some(resident), resident_bf16: false, router_bf16: Arc::default() } })
+        Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Dense { data: values.to_vec(), resident: Some(resident), resident_bf16: false, router_bf16: Arc::default() }, expert_gguf: None, cpu_mla_data: None })
     }
 }
 
 impl RocmContext {
-    pub(crate) fn prepare_gguf_packed(&self, matrix: &crate::weight::container::gguf::GgufMatrix) -> Result<RocmWeight, BackendError> {
-        let rows = matrix.rows;
-        let cols = matrix.columns;
-        let tensor_type = matrix.tensor_type.0;
-        let bytes = matrix.read_bytes().map_err(compute_error)?;
+    fn prepare_gguf_q8_bytes(&self, bytes: &[u8], rows: usize, cols: usize) -> Result<RocmWeight, BackendError> {
+        if cols % 32 != 0 || cols % 4 != 0 {
+            return Err(compute_error(format!("ROCm GGUF Q8_0 columns={cols} 不是 32 的倍数")));
+        }
+        let blocks = cols / 32;
+        if bytes.len() != rows * blocks * 34 {
+            return Err(compute_error(format!("ROCm GGUF Q8_0 字节数 {}，期望 {}", bytes.len(), rows * blocks * 34)));
+        }
+        let mut packed = vec![0_u8; rows * cols];
+        let mut scales = Vec::with_capacity(rows * blocks * 2);
+        for row in 0..rows {
+            let source = &bytes[row * blocks * 34..][..blocks * 34];
+            for block in 0..blocks {
+                let source = &source[block * 34..][..34];
+                scales.extend_from_slice(&source[..2]);
+                let destination = &mut packed[row * cols + block * 32..][..32];
+                for (destination, quant) in destination.iter_mut().zip(&source[2..]) {
+                    *destination = quant.wrapping_add(128);
+                }
+            }
+        }
+        let packed = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, &packed).map_err(compute_error)?);
+        let scales = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, &scales).map_err(compute_error)?);
+        Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::W8A16 { packed, scales, scale_dtype: ScaleDType::F16, group_size: 32 }), expert_gguf: None, cpu_mla_data: None })
+    }
+
+    /// Q8_0 的 32 列 block 与 MLA head 分界对齐；逐行抽取目标 block 后直接
+    /// 转成 W8A16 resident，避免为 o_proj 在两卡各保留一份完整权重。
+    pub(crate) fn prepare_gguf_q8_column_shard(&self, matrix: &crate::weight::container::gguf::GgufMatrix, range: std::ops::Range<usize>) -> Result<RocmWeight, BackendError> {
+        if matrix.tensor_type.0 != 8 || range.start >= range.end || range.end > matrix.columns || !range.start.is_multiple_of(32) || !range.end.is_multiple_of(32) {
+            return Err(compute_error(format!("ROCm GGUF Q8_0 column shard={range:?}/{} 非法", matrix.columns)));
+        }
+        let source = matrix.read_bytes().map_err(compute_error)?;
+        let source_row_bytes = matrix.columns / 32 * 34;
+        let start = range.start / 32 * 34;
+        let row_bytes = range.len() / 32 * 34;
+        let mut shard = Vec::with_capacity(matrix.rows * row_bytes);
+        for row in 0..matrix.rows {
+            let offset = row * source_row_bytes + start;
+            shard.extend_from_slice(&source[offset..offset + row_bytes]);
+        }
+        self.prepare_gguf_q8_bytes(&shard, matrix.rows, range.len())
+    }
+
+    pub(crate) fn prepare_gguf_packed_bytes(&self, bytes: &[u8], tensor_type: u32, rows: usize, cols: usize) -> Result<RocmWeight, BackendError> {
         let block_bytes = match tensor_type {
+            8 => 272,
+            11 | 21 => 110,
             12 => 144,
             13 => 176,
             14 => 210,
+            23 => 136,
             other => return Err(compute_error(format!("ROCm GGUF packed type {other} 不支持"))),
         };
         if cols % 256 != 0 || bytes.len() != rows * (cols / 256) * block_bytes {
             return Err(compute_error(format!("ROCm GGUF packed shape/type 不匹配: rows={rows}, cols={cols}, bytes={}", bytes.len())));
         }
-        let codes = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, &bytes).map_err(compute_error)?);
-        Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::GgufPacked { codes, tensor_type }) })
+        let codes = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, bytes).map_err(compute_error)?);
+        Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::GgufPacked { codes, tensor_type }), expert_gguf: None, cpu_mla_data: None })
+    }
+
+    pub(crate) fn prepare_gguf_packed(&self, matrix: &crate::weight::container::gguf::GgufMatrix) -> Result<RocmWeight, BackendError> {
+        let rows = matrix.rows;
+        let cols = matrix.columns;
+        let tensor_type = matrix.tensor_type.0;
+        let bytes = matrix.read_bytes().map_err(compute_error)?;
+        self.prepare_gguf_packed_bytes(&bytes, tensor_type, rows, cols)
     }
 }

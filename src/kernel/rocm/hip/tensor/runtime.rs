@@ -284,6 +284,9 @@ pub(crate) fn current_device() -> Result<i32, String> {
 }
 
 const DEFERRED_WORKSPACE_SLOTS: usize = 8;
+// 少量 in-flight 槽位足以覆盖 owner/peer；过深排队会让同一 NUMA 内两卡的
+// allocator 与 P2P 提交集中成簇，反而拉长 stage completion。
+const DEFERRED_COOPERATIVE_MOE_WORKSPACE_SLOTS: usize = 4;
 
 struct DeferredTensorWorkspaceSlot {
     workspace: TensorWorkspace,
@@ -301,10 +304,18 @@ thread_local! {
         RefCell::new(HashMap::new());
     static DEFERRED_MOE_ROUTE_WORKSPACES: RefCell<HashMap<i32, DeferredTensorWorkspaces>> =
         RefCell::new(HashMap::new());
+    static DEFERRED_COOPERATIVE_MOE_WORKSPACES: RefCell<HashMap<i32, DeferredTensorWorkspaces>> =
+        RefCell::new(HashMap::new());
 }
 
 /// producer 提交后记录 event；未完成的 slot 留在 pending，不阻塞 CPU，也不允许后续 kernel 覆盖。
-fn with_deferred_workspace<R>(pool: &'static std::thread::LocalKey<RefCell<HashMap<i32, DeferredTensorWorkspaces>>>, device_id: i32, sizes: &[usize], run: impl FnOnce(&TensorWorkspace) -> Result<R, String>) -> Result<R, String> {
+fn with_deferred_workspace<R>(
+    pool: &'static std::thread::LocalKey<RefCell<HashMap<i32, DeferredTensorWorkspaces>>>,
+    slot_limit: usize,
+    device_id: i32,
+    sizes: &[usize],
+    run: impl FnOnce(&TensorWorkspace) -> Result<R, String>,
+) -> Result<R, String> {
     set_device(device_id)?;
     let runtime = RocmRuntime::open()?;
     let create: Symbol<HipEventCreateWithFlags> = runtime.symbol(&runtime.hip, b"hipEventCreateWithFlags\0")?;
@@ -330,9 +341,10 @@ fn with_deferred_workspace<R>(pool: &'static std::thread::LocalKey<RefCell<HashM
 
         let mut slot = if let Some(slot) = workspaces.available.pop() {
             slot
-        } else if workspaces.pending.len() >= DEFERRED_WORKSPACE_SLOTS {
-            // 双缓冲已满时只等待最早 producer；event 完成即复用其 workspace。
-            // 这既保留 kernel/拷贝重叠，也阻止长 prefill 按 kernel 数量无限 hipMalloc。
+        } else if workspaces.pending.len() >= slot_limit {
+            // 槽位已满时等待最早 producer；这同时约束同一 stage 的提交深度。
+            // 真机 trace 证明只做 stream wait 会把 allocator/P2P 提交集中成簇，
+            // 拉长 owner completion 并把空泡传播到下游 stage。
             let slot = workspaces.pending.remove(0);
             let status = unsafe { synchronize(slot.event as HipEvent) };
             if status != HIP_SUCCESS {
@@ -366,17 +378,22 @@ fn with_deferred_workspace<R>(pool: &'static std::thread::LocalKey<RefCell<HashM
 }
 
 pub(crate) fn with_deferred_tensor_workspace<R>(device_id: i32, sizes: &[usize], run: impl FnOnce(&TensorWorkspace) -> Result<R, String>) -> Result<R, String> {
-    with_deferred_workspace(&DEFERRED_TENSOR_WORKSPACES, device_id, sizes, run)
+    with_deferred_workspace(&DEFERRED_TENSOR_WORKSPACES, DEFERRED_WORKSPACE_SLOTS, device_id, sizes, run)
 }
 
 pub(crate) fn with_deferred_moe_route_workspace<R>(device_id: i32, sizes: &[usize], run: impl FnOnce(&TensorWorkspace) -> Result<R, String>) -> Result<R, String> {
-    with_deferred_workspace(&DEFERRED_MOE_ROUTE_WORKSPACES, device_id, sizes, run)
+    with_deferred_workspace(&DEFERRED_MOE_ROUTE_WORKSPACES, DEFERRED_WORKSPACE_SLOTS, device_id, sizes, run)
+}
+
+/// cooperative MoE 的槽数与双卡组最大层数绑定，避免按 chunk 无限增长。
+pub(crate) fn with_deferred_cooperative_moe_workspace<R>(device_id: i32, sizes: &[usize], run: impl FnOnce(&TensorWorkspace) -> Result<R, String>) -> Result<R, String> {
+    with_deferred_workspace(&DEFERRED_COOPERATIVE_MOE_WORKSPACES, DEFERRED_COOPERATIVE_MOE_WORKSPACE_SLOTS, device_id, sizes, run)
 }
 
 pub(crate) fn release_deferred_tensor_workspace(device_id: i32) {
     let Ok(runtime) = RocmRuntime::open() else { return };
     let Ok(destroy) = runtime.symbol::<HipEventDestroy>(&runtime.hip, b"hipEventDestroy\0") else { return };
-    for pool in [&DEFERRED_TENSOR_WORKSPACES, &DEFERRED_MOE_ROUTE_WORKSPACES] {
+    for pool in [&DEFERRED_TENSOR_WORKSPACES, &DEFERRED_MOE_ROUTE_WORKSPACES, &DEFERRED_COOPERATIVE_MOE_WORKSPACES] {
         pool.with(|workspaces| {
             let Some(workspaces) = workspaces.borrow_mut().remove(&device_id) else {
                 return;

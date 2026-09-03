@@ -1,5 +1,6 @@
 //! GLM-5.2 × ROCm standalone/stage 组合。
 
+use crate::kernel::rocm as ops;
 use crate::runtime::{generation, pipeline, stage_artifact};
 
 use crate::runtime::glm52::rocm_swap::{Glm52CacheIdentity, Glm52CacheSnapshot, Glm52MtpCache, Glm52SwapStore, download_glm52_session, upload_glm52_session};
@@ -8,10 +9,7 @@ use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -19,7 +17,7 @@ use crate::{
     attention::rope::RopeTable,
     attention::{AttentionSpec, mla::MlaSpec},
     backend::rocm::{RocmContext, RocmDsaSelection, RocmDsaState, RocmKvCache, RocmPrefillExperts, RocmTensor, RocmWeight},
-    backend::{Backend, BackendResources, LinearWeight, SegmentedTensorBackend, StageExecutionBackend},
+    backend::{Backend, BackendResources, DecodeBackend, LinearWeight, SegmentedTensorBackend, StageExecutionBackend},
     config::{BackendConfig, Glm52StageDiagnosticsConfig, KvCacheFormat, RuntimeProcessConfig, StageModelConfig, StageTransportConfig},
     moe::{
         UncachedMoeState,
@@ -35,17 +33,16 @@ use crate::{
         glm52::dspark_rocm::attach_dspark_projections,
         glm52::stage::{
             Glm52PrefillLayer as RuntimeGlm52PrefillLayer, Glm52StageState as RuntimeGlm52StageState, build_glm52_stage_states, build_pp_prefill_chunks, drive_glm52_stream_stage_pipeline_stateful, last_token_row as last_bf16_row,
-            prepare_prefill_layers, run_glm52_stage_pipeline_stateful, run_glm52_stream_stage_pipeline_stateful,
+            prepare_prefill_layers, run_glm52_stage_pipeline_stateful,
         },
         glm52::tool::Glm52ToolFence,
         glm52::{
             Glm52DecodeLayer, Glm52Mtp, Glm52OutputHead, Glm52PrefillSegment, glm52_decode_layers, glm52_dense_prefill_layer, glm52_moe_prefill_layer, glm52_mtp_cache_segmented, glm52_mtp_decode, glm52_mtp_prefill_segmented,
-            glm52_mtp_token_ids_fenced, glm52_mtp_token_output, glm52_prefill_stage, glm52_sampled_token_ids, glm52_sampled_token_ids_fenced, glm52_token_output, prepare_glm52_decode_layers, prepare_glm52_mtp_ct, prepare_glm52_mtp_gguf,
-            prepare_glm52_output_head, prepare_glm52_output_head_quantized, print_expert_cache, print_token,
+            glm52_mtp_token_ids_fenced, glm52_mtp_token_output, glm52_prefill_stage, glm52_token_output, prepare_glm52_decode_layers, prepare_glm52_mtp_ct, prepare_glm52_mtp_gguf, prepare_glm52_output_head,
+            prepare_glm52_output_head_quantized, print_expert_cache, print_token,
         },
         output::{DraftHead, SamplingConfig, SamplingState, load_draft_vocabulary, normalized_draft_token_ids_fenced, prepare_draft_head},
         prefill::{StageSchedulerOutput, run_token_chunk_stage_pipeline},
-        speculative::verify_samples,
     },
     server::iroh::IrohConfig,
     server::stage_transport::{RequestId, StageDeviceMemory, StageMessage, StageTransport},
@@ -71,11 +68,156 @@ pub(super) fn prepare_glm52_rope_resident(contexts: &[RocmContext], rope: &RopeT
     Ok(())
 }
 
+/// 为一层 sequence-parallel attention 在两卡驻留 q_b/kv_b，并把 cooperative
+/// 路径的 o_proj 输入列按 head 对半分片。owner 另保留完整 o_proj，供普通路径使用。
+pub(super) fn prepare_cooperative_mla_layer_ct(
+    owner: &RocmContext,
+    peer: &RocmContext,
+    experts: &mut RocmPrefillExperts,
+    cfg: &Glm52Config,
+    mla: &MlaSpec,
+    layer: usize,
+    weights: crate::weight::model::glm52::CtMoeLayer,
+    owner_weights: (&RocmWeight, &RocmWeight),
+) -> Result<RocmWeight, String> {
+    let crate::weight::model::glm52::CtMoeLayer { indexer, q_b_proj, kv_b_proj, o_proj, .. } = weights;
+    let owner_o = prepare_cooperative_mla_weights_ct(owner, peer, experts, cfg, mla, layer, q_b_proj, kv_b_proj, o_proj, owner_weights)?;
+    prepare_cooperative_dsa_wq_b_ct(peer, experts, cfg, layer, indexer)?;
+    Ok(owner_o)
+}
+
+pub(super) fn prepare_cooperative_mla_dense_layer_ct(
+    owner: &RocmContext,
+    peer: &RocmContext,
+    experts: &mut RocmPrefillExperts,
+    cfg: &Glm52Config,
+    mla: &MlaSpec,
+    layer: usize,
+    weights: crate::weight::model::glm52::CtDenseLayer,
+    owner_weights: (&RocmWeight, &RocmWeight),
+) -> Result<RocmWeight, String> {
+    let crate::weight::model::glm52::CtDenseLayer { indexer, q_b_proj, kv_b_proj, o_proj, .. } = weights;
+    let owner_o = prepare_cooperative_mla_weights_ct(owner, peer, experts, cfg, mla, layer, q_b_proj, kv_b_proj, o_proj, owner_weights)?;
+    prepare_cooperative_dsa_wq_b_ct(peer, experts, cfg, layer, indexer)?;
+    Ok(owner_o)
+}
+
+fn prepare_cooperative_dsa_wq_b_ct(peer: &RocmContext, experts: &mut RocmPrefillExperts, cfg: &Glm52Config, layer: usize, indexer: Option<crate::weight::model::glm52::CtIndexerWeights>) -> Result<(), String> {
+    let Some(indexer) = indexer else { return Ok(()) };
+    peer.activate().map_err(|error| format!("激活 ROCm Indexer peer device {}: {error}", peer.device_id()))?;
+    let rows = cfg.index_heads * cfg.index_head_dim;
+    let wq_b = super::prepare_ct_linear(peer, &indexer.wq_b, rows, cfg.q_lora_rank).map_err(|error| format!("L{layer} Indexer peer wq_b device={}: {error:?}", peer.device_id()))?;
+    experts.set_cooperative_dsa_wq_b(layer, wq_b).map_err(|error| format!("L{layer} 注册 cooperative DSA wq_b: {error:?}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_cooperative_mla_weights_ct(
+    owner: &RocmContext,
+    peer: &RocmContext,
+    experts: &mut RocmPrefillExperts,
+    cfg: &Glm52Config,
+    mla: &MlaSpec,
+    layer: usize,
+    q_b_proj: crate::weight::format::compressed_tensors_hybrid::CtLinearWeight,
+    kv_b_proj: crate::weight::format::compressed_tensors_hybrid::CtLinearWeight,
+    o_proj: crate::weight::format::compressed_tensors_hybrid::CtLinearWeight,
+    owner_weights: (&RocmWeight, &RocmWeight),
+) -> Result<RocmWeight, String> {
+    if owner.device_id() == peer.device_id() {
+        return Err(format!("L{layer} cooperative MLA owner/peer 不能是同一设备"));
+    }
+    let o_head_columns = mla.q_projection_size / 2;
+    let [owner_o_head_source, peer_o_head_source] = o_proj.split_columns(o_head_columns).map_err(|error| format!("L{layer} o_proj head 分片: {error}"))?;
+    owner.activate().map_err(|error| format!("激活 ROCm device {}: {error}", owner.device_id()))?;
+    let owner_o = super::prepare_ct_linear(owner, &o_proj, cfg.hidden_size, mla.q_projection_size).map_err(|error| format!("L{layer} o_proj full device={}: {error:?}", owner.device_id()))?;
+    let owner_o_head = super::prepare_ct_linear(owner, &owner_o_head_source, cfg.hidden_size, o_head_columns).map_err(|error| format!("L{layer} o_proj owner head device={}: {error:?}", owner.device_id()))?;
+    peer.activate().map_err(|error| format!("激活 ROCm device {}: {error}", peer.device_id()))?;
+    let peer_q_b = super::prepare_ct_linear(peer, &q_b_proj, mla.q_projection_size, mla.q_lora_rank).map_err(|error| format!("L{layer} q_b full device={}: {error:?}", peer.device_id()))?;
+    let peer_kv_b = super::prepare_ct_linear(peer, &kv_b_proj, mla.kv_projection_size, mla.kv_lora_rank).map_err(|error| format!("L{layer} kv_b full device={}: {error:?}", peer.device_id()))?;
+    let peer_o_head = super::prepare_ct_linear(peer, &peer_o_head_source, cfg.hidden_size, o_head_columns).map_err(|error| format!("L{layer} o_proj peer head device={}: {error:?}", peer.device_id()))?;
+    experts.set_cooperative_mla_layer(layer, owner_weights.0.clone(), peer_q_b, owner_weights.1.clone(), peer_kv_b, owner_o_head, peer_o_head).map_err(|error| format!("L{layer} 注册 cooperative MLA: {error:?}"))?;
+    Ok(owner_o)
+}
+
+pub(super) fn prepare_cooperative_mla_layer_gguf(
+    owner: &RocmContext,
+    peer: &RocmContext,
+    experts: &mut RocmPrefillExperts,
+    cfg: &Glm52Config,
+    mla: &MlaSpec,
+    layer: usize,
+    weights: crate::weight::model::glm52::GgufMoeLayer,
+    owner_weights: (&RocmWeight, &RocmWeight),
+) -> Result<RocmWeight, String> {
+    let crate::weight::model::glm52::GgufMoeLayer { indexer, q_b_proj, kv_b_w8, o_proj, .. } = weights;
+    let owner_o = prepare_cooperative_mla_weights_gguf(owner, peer, experts, cfg, mla, layer, q_b_proj, kv_b_w8, o_proj, owner_weights)?;
+    prepare_cooperative_dsa_wq_b_gguf(peer, experts, cfg, layer, indexer)?;
+    Ok(owner_o)
+}
+
+pub(super) fn prepare_cooperative_mla_dense_layer_gguf(
+    owner: &RocmContext,
+    peer: &RocmContext,
+    experts: &mut RocmPrefillExperts,
+    cfg: &Glm52Config,
+    mla: &MlaSpec,
+    layer: usize,
+    weights: crate::weight::model::glm52::GgufDenseLayer,
+    owner_weights: (&RocmWeight, &RocmWeight),
+) -> Result<RocmWeight, String> {
+    let crate::weight::model::glm52::GgufDenseLayer { indexer, q_b_proj, kv_b_w8, o_proj, .. } = weights;
+    let owner_o = prepare_cooperative_mla_weights_gguf(owner, peer, experts, cfg, mla, layer, q_b_proj, kv_b_w8, o_proj, owner_weights)?;
+    prepare_cooperative_dsa_wq_b_gguf(peer, experts, cfg, layer, indexer)?;
+    Ok(owner_o)
+}
+
+fn prepare_cooperative_dsa_wq_b_gguf(peer: &RocmContext, experts: &mut RocmPrefillExperts, cfg: &Glm52Config, layer: usize, indexer: Option<crate::weight::model::glm52::GgufIndexerWeights>) -> Result<(), String> {
+    let Some(indexer) = indexer else { return Ok(()) };
+    peer.activate().map_err(|error| format!("激活 ROCm Indexer peer device {}: {error}", peer.device_id()))?;
+    let rows = cfg.index_heads * cfg.index_head_dim;
+    let wq_b = peer.prepare_weight(LinearWeight::gguf(&indexer.wq_b), rows, cfg.q_lora_rank).map_err(|error| format!("L{layer} GGUF Indexer peer wq_b device={}: {error:?}", peer.device_id()))?;
+    experts.set_cooperative_dsa_wq_b(layer, wq_b).map_err(|error| format!("L{layer} 注册 GGUF cooperative DSA wq_b: {error:?}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_cooperative_mla_weights_gguf(
+    owner: &RocmContext,
+    peer: &RocmContext,
+    experts: &mut RocmPrefillExperts,
+    cfg: &Glm52Config,
+    mla: &MlaSpec,
+    layer: usize,
+    q_b_proj: crate::weight::container::gguf::GgufMatrix,
+    kv_b_proj: crate::weight::format::quantization::W8A16Matrix,
+    o_proj: crate::weight::container::gguf::GgufMatrix,
+    owner_weights: (&RocmWeight, &RocmWeight),
+) -> Result<RocmWeight, String> {
+    if owner.device_id() == peer.device_id() {
+        return Err(format!("L{layer} GGUF cooperative MLA owner/peer 不能是同一设备"));
+    }
+    let o_head_columns = mla.q_projection_size / 2;
+    owner.activate().map_err(|error| format!("激活 ROCm device {}: {error}", owner.device_id()))?;
+    let owner_o = owner.prepare_weight(LinearWeight::gguf(&o_proj), cfg.hidden_size, mla.q_projection_size).map_err(|error| format!("L{layer} GGUF o_proj full device={}: {error:?}", owner.device_id()))?;
+    let owner_o_head =
+        if o_proj.tensor_type.0 == 8 { owner.prepare_gguf_q8_column_shard(&o_proj, 0..o_head_columns).map_err(|error| format!("L{layer} GGUF o_proj owner head device={}: {error:?}", owner.device_id()))? } else { owner_o.clone() };
+    peer.activate().map_err(|error| format!("激活 ROCm device {}: {error}", peer.device_id()))?;
+    let peer_q_b = peer.prepare_weight(LinearWeight::gguf(&q_b_proj), mla.q_projection_size, mla.q_lora_rank).map_err(|error| format!("L{layer} GGUF q_b full device={}: {error:?}", peer.device_id()))?;
+    let peer_kv_b = peer.prepare_mla_kv_b(LinearWeight::w8a16(&kv_b_proj), mla.kv_projection_size, mla.kv_lora_rank).map_err(|error| format!("L{layer} GGUF kv_b full device={}: {error:?}", peer.device_id()))?;
+    let peer_o = if o_proj.tensor_type.0 == 8 {
+        peer.prepare_gguf_q8_column_shard(&o_proj, o_head_columns..mla.q_projection_size).map_err(|error| format!("L{layer} GGUF o_proj peer head device={}: {error:?}", peer.device_id()))?
+    } else {
+        peer.prepare_weight(LinearWeight::gguf(&o_proj), cfg.hidden_size, mla.q_projection_size).map_err(|error| format!("L{layer} GGUF o_proj full device={}: {error:?}", peer.device_id()))?
+    };
+    experts.set_cooperative_mla_layer(layer, owner_weights.0.clone(), peer_q_b, owner_weights.1.clone(), peer_kv_b, owner_o_head, peer_o).map_err(|error| format!("L{layer} 注册 GGUF cooperative MLA: {error:?}"))?;
+    Ok(owner_o)
+}
+
 pub(super) struct RocmMtpRuntime {
     pub(super) backend: RocmContext,
     pub(super) weights: Glm52Mtp<RocmWeight>,
     pub(super) experts: RocmPrefillExperts,
     pub(super) draft_head: Option<DraftHead<RocmWeight>>,
+    pub(super) embedding: Option<std::sync::Arc<ops::hip::DeviceBuffer>>,
 }
 
 pub(super) struct RocmMtpSession {
@@ -166,8 +308,9 @@ impl RocmMtpSession {
         }
         context.activate().map_err(|error| format!("激活 MTP ROCm device {}: {error}", context.device_id()))?;
         let mut session = Self::fresh(cfg, max_seq_len)?;
+        let interleaved_pair = snapshot.kv.iter().flatten().any(|layer| layer.ownership == crate::backend::rocm::RocmKvOwnership::InterleavedPair);
         session.cache.upload_layers(context, &snapshot.kv, reserved_rows).map_err(|error| format!("恢复 MTP KV: {error:?}"))?;
-        session.dsa.upload_layers(context, &snapshot.dsa, reserved_rows).map_err(|error| format!("恢复 MTP DSA: {error:?}"))?;
+        session.dsa.upload_layers(context, &snapshot.dsa, reserved_rows, interleaved_pair).map_err(|error| format!("恢复 MTP DSA: {error:?}"))?;
         session.position = snapshot.position;
         session.pending_hidden = Some(context.tensor_from_bf16_bits(snapshot.pending_hidden, 1, cfg.hidden_size).map_err(|error| format!("恢复 MTP pending hidden: {error:?}"))?);
         session.prompt_tokens = snapshot.prompt_tokens;
@@ -180,7 +323,7 @@ impl RocmMtpSession {
 #[path = "rocm_tail.rs"]
 mod rocm_tail;
 use rocm_tail::*;
-pub(super) use rocm_tail::{RocmMtpCatchUp, RocmMtpDraftBatch, mtp_catch_up_batch, mtp_draft_batch};
+pub(super) use rocm_tail::{RocmMtpCatchUp, RocmMtpDraftBatch, gather_embedding_rows, load_resident_embedding, mtp_catch_up_batch, mtp_draft_batch, prepare_head_output_runtime};
 enum StageLink {
     Listen(IrohConfig),
     Connect { ticket: String, iroh: IrohConfig },
@@ -199,11 +342,8 @@ struct RocmEntry {
     diagnostics: Glm52StageDiagnosticsConfig,
     kv_cache_format: KvCacheFormat,
     mtp_enabled: bool,
-    mtp_draft_tokens: usize,
-    mtp_draft_vocabulary: Option<PathBuf>,
     dspark_directory: Option<PathBuf>,
     dspark_weight_quantization: ResidentWeightQuantization,
-    lm_head_quantization: LmHeadQuantization,
     scheduling: crate::config::Glm52SchedulingConfig,
 }
 
@@ -221,10 +361,10 @@ impl RocmEntry {
                     StageTransportConfig::Listen { iroh } => StageLink::Listen(iroh.runtime()?),
                     StageTransportConfig::Connect { ticket, iroh } => StageLink::Connect { ticket, iroh: iroh.runtime()? },
                 };
-                let lm_head_quantization = model.lm_head_quantization;
                 let execution = model.execution;
                 let args = Args {
                     model_dir: model.weights_directory,
+                    tokenizer_path: model.tokenizer.expect("配置加载已补全 tokenizer"),
                     prompt: generation.prompt,
                     max_seq_len: model.max_sequence_length,
                     decode_steps: generation.decode_steps,
@@ -257,11 +397,8 @@ impl RocmEntry {
                         diagnostics: execution.diagnostics,
                         kv_cache_format: execution.kv_cache_format,
                         mtp_enabled: execution.mtp,
-                        mtp_draft_tokens: execution.mtp_draft_tokens,
-                        mtp_draft_vocabulary: execution.mtp_draft_vocabulary,
                         dspark_directory: execution.dspark_directory,
                         dspark_weight_quantization: execution.dspark_weight_quantization,
-                        lm_head_quantization,
                         scheduling: execution.scheduling,
                     },
                 ))
@@ -289,11 +426,8 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         diagnostics,
         kv_cache_format,
         mtp_enabled,
-        mtp_draft_tokens,
-        mtp_draft_vocabulary,
         dspark_directory,
         dspark_weight_quantization,
-        lm_head_quantization,
         scheduling,
         ..
     } = entry;
@@ -339,7 +473,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
     if stage_end < cfg.layer_count && args.decode_steps != 0 && !distributed {
         return Err("GLM-5.2 分段执行当前先支持 prefill，请设置 --decode-steps 0".into());
     }
-    let tokenizer_path = crate::runtime::glm52::tokenizer_path(&args.model_dir, args.ct_root.as_deref(), args.nvfp4_root.as_deref());
+    let tokenizer_path = args.tokenizer_path.clone();
     let tokenizer = Tokenizer::new(&tokenizer_path)?;
     let tokens = if stage_start == 0 {
         let tokens = tokenizer.tokenize(args.prompt.as_bytes());
@@ -411,9 +545,16 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         Some(StageLink::Listen(iroh)) => Some(StageTransport::bind(iroh.clone()).map_err(|error| format!("启动 stage listener: {error}"))?),
         _ => None,
     };
+    if cooperative_expert_pairs {
+        // pair prefill 的 owner/peer 在同一 stage 内同时保活 attention 与 MoE
+        // 中间量；默认 3 GiB 软池装不下稳定工作集，会在长 prompt 中反复
+        // hipMalloc/trim。这里只提高可驱逐软水位，OOM 路径仍会主动回收。
+        crate::kernel::rocm::hip::set_device_buffer_pool_limit(8 * 1024 * 1024 * 1024)?;
+    }
     crate::kernel::rocm::hip::enable_device_buffer_reuse();
     let resident_started = Instant::now();
-    let prefill_layers = prepare_prefill_layers(&prefill_contexts, &prefill_layer_ends, stage_start, stage_end, &cfg, &mla, &weights).map_err(|error| format!("准备 prefill layers: {error:?}"))?;
+    let mut prefill_layers =
+        prepare_prefill_layers(&prefill_contexts, &prefill_layer_ends, stage_start, stage_end, &cfg, &mla, &weights, crate::kernel::rocm::hip::options().prefill_attention_cpu).map_err(|error| format!("准备 prefill layers: {error:?}"))?;
     eprintln!("[prefill-resident] layers={} wall={:.3}s", prefill_layers.len(), resident_started.elapsed().as_secs_f64(),);
     let rope = RopeTable::precompute(args.max_seq_len, mla.qk_rope_head_dim, mla.rope_theta);
     prepare_glm52_rope_resident(&prefill_contexts, &rope)?;
@@ -431,8 +572,8 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
     let expert_state_count = if pipeline_enabled || distributed { prefill_contexts.len() } else { 1 };
     let mut prefill_experts = (0..expert_state_count).map(|_| new_prefill_experts()).collect::<Result<Vec<_>, _>>()?;
     if cooperative_expert_pairs {
-        if !distributed || !preload_experts || preload_layers_per_device.is_some() || !weights.source_is_ct() || prefill_contexts.len() != cooperative_peer_contexts.len() {
-            return Err("cooperative_expert_pairs 要求 distributed CT stage、preload_experts=true、完整预载且每个逻辑 stage 有一张 peer 卡".into());
+        if !distributed || !preload_experts || preload_layers_per_device.is_some() || !(weights.source_is_ct() || weights.source_is_gguf()) || prefill_contexts.len() != cooperative_peer_contexts.len() {
+            return Err("cooperative_expert_pairs 要求 distributed CT/GGUF stage、preload_experts=true、完整预载且每个逻辑 stage 有一张 peer 卡".into());
         }
         let mut layer_start = stage_start;
         let counts = prefill_layer_ends
@@ -451,12 +592,48 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         for (stage, (experts, &peer)) in prefill_experts.iter_mut().zip(&cooperative_peer_contexts).enumerate() {
             experts.enable_cooperative_peer(peer, 0).map_err(|error| format!("配置 ROCm cooperative expert stage={stage}: {error:?}"))?;
         }
+        let mla_started = Instant::now();
+        let ct_source = weights.source_is_ct().then(|| weights.ct_source()).transpose()?;
+        let mut mla_layers = 0usize;
+        for (layer_offset, resident) in prefill_layers.iter_mut().enumerate() {
+            let layer = stage_start + layer_offset;
+            let placement = prefill_layer_ends.iter().position(|&end| layer <= end).ok_or_else(|| format!("L{layer} 没有 cooperative MLA device"))?;
+            let dense = matches!(resident, PrefillLayer::Dense(_));
+            let owner_weights = match &*resident {
+                PrefillLayer::Dense(weights) => (weights.q_b_proj.clone(), weights.kv_b_proj.clone()),
+                PrefillLayer::Moe(weights) => (weights.q_b_proj.clone(), weights.kv_b_proj.clone()),
+            };
+            let owner_o = match (dense, ct_source.as_ref()) {
+                (true, Some(source)) => {
+                    let raw = source.load_dense_layer(layer).map_err(|error| format!("加载 L{layer} dense cooperative MLA 权重: {error}"))?;
+                    prepare_cooperative_mla_dense_layer_ct(&prefill_contexts[placement], &cooperative_peer_contexts[placement], &mut prefill_experts[placement], &cfg, &mla, layer, raw, (&owner_weights.0, &owner_weights.1))?
+                }
+                (false, Some(source)) => {
+                    let raw = source.load_moe_layer(layer).map_err(|error| format!("加载 L{layer} MoE cooperative MLA 权重: {error}"))?;
+                    prepare_cooperative_mla_layer_ct(&prefill_contexts[placement], &cooperative_peer_contexts[placement], &mut prefill_experts[placement], &cfg, &mla, layer, raw, (&owner_weights.0, &owner_weights.1))?
+                }
+                (true, None) => {
+                    let raw = weights.load_dense_layer_gguf(layer).map_err(|error| format!("加载 L{layer} dense GGUF cooperative MLA 权重: {error}"))?;
+                    prepare_cooperative_mla_dense_layer_gguf(&prefill_contexts[placement], &cooperative_peer_contexts[placement], &mut prefill_experts[placement], &cfg, &mla, layer, raw, (&owner_weights.0, &owner_weights.1))?
+                }
+                (false, None) => {
+                    let raw = weights.load_moe_layer_gguf(layer).map_err(|error| format!("加载 L{layer} MoE GGUF cooperative MLA 权重: {error}"))?;
+                    prepare_cooperative_mla_layer_gguf(&prefill_contexts[placement], &cooperative_peer_contexts[placement], &mut prefill_experts[placement], &cfg, &mla, layer, raw, (&owner_weights.0, &owner_weights.1))?
+                }
+            };
+            match resident {
+                PrefillLayer::Dense(weights) => weights.o_proj = owner_o,
+                PrefillLayer::Moe(weights) => weights.o_proj = owner_o,
+            }
+            mla_layers += 1;
+        }
         eprintln!(
-            "[glm52-cooperative-experts] physical_devices={} pairs={} logical_stages={} mode=prefill+decode partition=gate-up-row/down-k-half device-route",
+            "[glm52-cooperative-experts] physical_devices={} pairs={} logical_stages={} mode=attention-sequence+moe partition=kv-block-parity+gate-up-row/down-k-half device-route",
             prefill_contexts.len() + cooperative_peer_contexts.len(),
             prefill_contexts.len(),
             prefill_contexts.len(),
         );
+        eprintln!("[glm52-cooperative-mla-resident] layers={mla_layers} wall={:.3}s", mla_started.elapsed().as_secs_f64());
     }
     // 分布式 decode 必须直接命中 GPU 常驻专家；否则 prefill 命中集合会让多数层退回 host route。
     if preload_experts && (weights.source_is_ct() || weights.source_is_gguf()) {
@@ -584,22 +761,14 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         let input_context = prefill_contexts[0];
         let output_context = *prefill_contexts.last().ok_or("tail stage 没有输出 device")?;
         crate::kernel::rocm::hip::enable_device_buffer_reuse();
-        // MTP 的 LM head/L78 必须在上报显存前固定驻留 B7；否则 A 会基于虚高的
-        // free memory 放大 KV 准入，运行后再加载权重会形成隐性超卖。
-        let (mut output_head, mut mtp_runtime) = if mtp_enabled {
-            let (head, mtp) = prepare_tail_output_runtime(&output_context, &weights, &cfg, &mla, true, mtp_draft_tokens, mtp_draft_vocabulary.as_deref(), lm_head_quantization)?;
-            (Some(head), mtp)
-        } else {
-            (None, None)
-        };
+        // LM head、采样与 MTP 全部驻留 head 首卡 A0;tail 只回传 hidden,
+        // 不再装载任何输出侧权重。
         let mut device_start = stage_start;
-        let device_count = prefill_contexts.len();
         let device_memory = prefill_contexts
             .iter()
             .zip(&prefill_layer_ends)
-            .enumerate()
-            .map(|(device_index, (context, &layer_end))| {
-                let model_units = layer_end + 1 - device_start + usize::from(mtp_enabled && device_index + 1 == device_count) * cfg.mtp_layer_count;
+            .map(|(context, &layer_end)| {
+                let model_units = layer_end + 1 - device_start;
                 device_start = layer_end + 1;
                 Ok(StageDeviceMemory {
                     device: context.device_id(),
@@ -610,7 +779,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
             })
             .collect::<Result<Vec<_>, String>>()?;
         let cache_dir = args.cache_dir.as_ref().ok_or("GLM decode 后继必须设置 model.cache_directory")?;
-        let cache_identity = Glm52CacheIdentity::new(&weights, kv_cache_format, stage_start, stage_end, mtp_enabled, mtp_enabled, args.max_seq_len, dspark_directory.as_deref());
+        let cache_identity = Glm52CacheIdentity::new(&weights, kv_cache_format, stage_start, stage_end, false, args.max_seq_len, dspark_directory.as_deref());
         let swap = Arc::new(Glm52SwapStore::open(cache_dir.join("glm52").join(format!("stage-{stage_start}-{stage_end}")), &cache_identity)?);
         let mut link = if let Some(listener) = stage_listener {
             listener.accept().map_err(|error| format!("接受 stage peer: {error}"))?
@@ -645,11 +814,6 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                 }
             };
             let request_id = frame.request_id;
-            if output_head.is_none() && matches!(&frame.message, StageMessage::Stream { .. } | StageMessage::MtpContext { .. } | StageMessage::PrefillDone { .. } | StageMessage::Decode { .. }) {
-                let (head, mtp) = prepare_tail_output_runtime(&output_context, &weights, &cfg, &mla, mtp_enabled, mtp_draft_tokens, mtp_draft_vocabulary.as_deref(), lm_head_quantization)?;
-                output_head = Some(head);
-                mtp_runtime = mtp;
-            }
             match frame.message {
                 StageMessage::ContinuousStream { requests } => {
                     if requests.is_empty() {
@@ -674,8 +838,6 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                     let mut pending_controls = HashMap::<RequestId, TailControl>::new();
                     let mut prefill_done = HashMap::<RequestId, usize>::new();
                     let mut prefill_emitted = HashMap::<RequestId, bool>::new();
-                    let mut pending_tail_heads = HashMap::<u64, TailHeadCohort>::new();
-                    let mut tail_head_requests = HashMap::<RequestId, (u64, usize)>::new();
                     let mut stream_ended = false;
                     let mut stream_control_id = None;
                     let profile_boundaries = diagnostics.profile_boundaries;
@@ -684,8 +846,6 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                     let mut decode_started = std::iter::repeat_with(VecDeque::<Instant>::new).take(session_capacity).collect::<Vec<_>>();
                     let mut chain_profile_micros = 0_u128;
                     let mut chain_profile_count = 0_usize;
-                    let mut head_profile_micros = 0_u128;
-                    let mut head_profile_count = 0_usize;
                     let mut connection_lost = false;
                     let run = drive_glm52_stream_stage_pipeline_stateful(session_states, session_capacity, &cfg, &mla, &rope, scheduler_policy, |pipeline| {
                         let backend_error = |msg: String| crate::backend::BackendError::Compute { msg };
@@ -694,7 +854,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                             while let Some(output) = pipeline.try_recv()? {
                                 progressed = true;
                                 match output {
-                                    StageSchedulerOutput::Work { cohort, session, mut position, value } => {
+                                    StageSchedulerOutput::Work { cohort, session, position, value } => {
                                         let stream_request_id = slot_requests.get(session).and_then(|request| *request).ok_or_else(|| backend_error(format!("tail continuous 输出落到空 session={session}")))?;
                                         let tail = active.get_mut(&stream_request_id).ok_or_else(|| backend_error(format!("tail continuous request={stream_request_id} 完成时消失")))?;
                                         if (value.decode || value.verify)
@@ -708,111 +868,10 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                                 chain_profile_count = 0;
                                             }
                                         }
-                                        let mut rows = value.hidden.rows;
-                                        let mut next_position = position.saturating_add(rows);
-                                        let expected_position = if value.verify { tail.verify_position.map(|base| base + tail.verify_hiddens.len()).unwrap_or(tail.position) } else { tail.position };
-                                        if position != expected_position {
-                                            return Err(backend_error(format!("tail continuous 输出边界错误: request={stream_request_id} position={position} expected={expected_position}",)));
-                                        }
-                                        if !value.decode
-                                            && !value.verify
-                                            && let (Some(runtime), Some(mtp)) = (mtp_runtime.as_mut(), tail.mtp.as_mut())
-                                            && mtp.active
-                                        {
-                                            let inputs = mtp.prompt_tokens.get(position..next_position).ok_or_else(|| backend_error(format!("MTP prompt tokens 越界: [{position},{next_position})/{}", mtp.prompt_tokens.len())))?.to_vec();
-                                            let mut batch = [RocmMtpCatchUp { session: mtp, target_position: position, target_inputs: inputs, target_hidden: value.hidden.clone() }];
-                                            mtp_catch_up_batch(runtime, &mut batch, &weights, &cfg, &mla, &rope)?;
-                                        }
-                                        if value.decode
-                                            && let (Some(runtime), Some(mtp)) = (mtp_runtime.as_mut(), tail.mtp.as_mut())
-                                            && mtp.active
-                                            && mtp.verify_inputs.len() == 1
-                                        {
-                                            let inputs = std::mem::take(&mut mtp.verify_inputs);
-                                            mtp.truncate_to_target(position)?;
-                                            let mut batch = [RocmMtpCatchUp { session: mtp, target_position: position, target_inputs: inputs, target_hidden: value.hidden.clone() }];
-                                            mtp_catch_up_batch(runtime, &mut batch, &weights, &cfg, &mla, &rope)?;
-                                        }
-                                        if value.verify && tail.tail_sampling {
-                                            let verify_rows = tail.mtp.as_ref().filter(|mtp| mtp.active).ok_or_else(|| backend_error(format!("request={stream_request_id} verify output 缺少 active MTP session")))?.verify_inputs.len();
-                                            let verify_hidden = if rows == 1 && verify_rows > 1 {
-                                                if tail.verify_position.is_none() {
-                                                    tail.verify_position = Some(position);
-                                                }
-                                                tail.verify_hiddens.push(value.hidden.clone());
-                                                if tail.verify_hiddens.len() < verify_rows {
-                                                    continue;
-                                                }
-                                                if tail.verify_hiddens.len() != verify_rows {
-                                                    return Err(backend_error(format!("B7 MTP split verify outputs={} expected={verify_rows}", tail.verify_hiddens.len())));
-                                                }
-                                                position = tail.verify_position.take().expect("split verify 已记录起点");
-                                                rows = verify_rows;
-                                                next_position = position.saturating_add(rows);
-                                                let hiddens = std::mem::take(&mut tail.verify_hiddens);
-                                                let refs = hiddens.iter().collect::<Vec<_>>();
-                                                output_context.concat_token_rows(&refs)?
-                                            } else {
-                                                if tail.verify_position.is_some() || !tail.verify_hiddens.is_empty() {
-                                                    return Err(backend_error(format!("B7 MTP verify 混入未完成 split outputs={}", tail.verify_hiddens.len())));
-                                                }
-                                                value.hidden.clone()
-                                            };
-                                            if pending_controls.contains_key(&stream_request_id) {
-                                                continue;
-                                            }
-                                            let runtime = mtp_runtime.as_mut().ok_or_else(|| backend_error("收到 verify output 但 B7 MTP runtime 未启用".to_owned()))?;
-                                            let mtp = tail.mtp.as_mut().filter(|mtp| mtp.active).ok_or_else(|| backend_error(format!("request={stream_request_id} verify output 缺少 active MTP session")))?;
-                                            if mtp.verify_inputs.len() != rows {
-                                                return Err(backend_error(format!("B7 MTP verify inputs={} rows={rows}", mtp.verify_inputs.len())));
-                                            }
-                                            if tail.pending_fences.len() < rows {
-                                                return Err(backend_error(format!("B7 MTP verify fences={} rows={rows}", tail.pending_fences.len())));
-                                            }
-                                            let fences = tail.pending_fences.drain(..rows).collect::<Vec<_>>();
-                                            let mut speculative_sampling = tail.sampling;
-                                            let sampling = (0..rows).map(|_| speculative_sampling.next()).collect::<Vec<_>>();
-                                            let target_tokens =
-                                                glm52_sampled_token_ids_fenced(&output_context, &cfg, output_head.as_ref().ok_or_else(|| backend_error("B7 MTP verify 缺少 output head".to_owned()))?, &verify_hidden, &sampling, &fences)?;
-                                            let outcome = verify_samples(&target_tokens, &mtp.verify_inputs[1..], &cfg.eos_token_ids)?;
-                                            for _ in 0..outcome.retained_rows {
-                                                tail.sampling.next();
-                                            }
-                                            let retained_hidden = output_context.slice_token_rows(&verify_hidden, 0, outcome.retained_rows)?;
-                                            let hidden = output_context.slice_token_rows(&verify_hidden, outcome.retained_rows - 1, 1)?;
-                                            let inputs = mtp.verify_inputs[..outcome.retained_rows].to_vec();
-                                            mtp.truncate_to_target(position)?;
-                                            let mut catch_up = [RocmMtpCatchUp { session: mtp, target_position: position, target_inputs: inputs, target_hidden: retained_hidden.clone() }];
-                                            mtp_catch_up_batch(runtime, &mut catch_up, &weights, &cfg, &mla, &rope)?;
-                                            tail.completion_tokens += outcome.tokens.len();
-                                            let latest = *outcome.tokens.last().expect("verify 至少输出一个 token");
-                                            let remaining = mtp.max_decode.saturating_sub(tail.completion_tokens);
-                                            let count = if outcome.eos { 0 } else { mtp.draft_tokens.min(remaining.saturating_sub(1)) };
-                                            let draft_hidden = mtp.pending_hidden.clone().ok_or_else(|| backend_error("B7 MTP verify 后缺少 target hidden".to_owned()))?;
-                                            let mut drafts = [RocmMtpDraftBatch { session: mtp, token: latest, hidden: draft_hidden, count, drafts: Vec::new(), fence: GenerationGuard::new(Glm52ToolFence::new(false), false, []) }];
-                                            mtp_draft_batch(runtime, &mut drafts, &weights, output_head.as_ref().ok_or_else(|| backend_error("B7 MTP draft 缺少 output head".to_owned()))?, &cfg, &mla, &rope)?;
-                                            let next_drafts = std::mem::take(&mut drafts[0].drafts);
-                                            drafts[0].session.verify_inputs = std::iter::once(latest).chain(next_drafts.iter().copied()).collect();
-                                            let committed_position = position + outcome.retained_rows;
-                                            tail.position = committed_position;
-                                            tail.hidden = Some(hidden);
-                                            tail.completed_hidden = Some((position, retained_hidden));
-                                            accepted_positions.insert(stream_request_id, committed_position);
-                                            if diagnostics.trace_stage_events || diagnostics.profile_boundaries {
-                                                eprintln!(
-                                                    "[glm52-mtp-verify] request_id={stream_request_id} drafts={} accepted={}/{} head_pass={} retained={}/{} output_tokens={} eos={}",
-                                                    rows - 1,
-                                                    outcome.accepted_drafts,
-                                                    rows - 1,
-                                                    rows,
-                                                    outcome.retained_rows,
-                                                    rows,
-                                                    outcome.tokens.len(),
-                                                    outcome.eos
-                                                );
-                                            }
-                                            link.send_speculative(stream_request_id, &outcome.tokens, outcome.retained_rows, &next_drafts, outcome.eos).map_err(backend_error)?;
-                                            continue;
+                                        let rows = value.hidden.rows;
+                                        let next_position = position.saturating_add(rows);
+                                        if position != tail.position {
+                                            return Err(backend_error(format!("tail continuous 输出边界错误: request={stream_request_id} position={position} expected={}", tail.position)));
                                         }
                                         let hidden = last_bf16_row(&output_context, value.hidden.clone()).map_err(|error| backend_error(format!("{error:?}")))?;
                                         if value.decode && diagnostics.trace_stage_output {
@@ -834,7 +893,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                         // A0 才能决定 DSpark 接受长度。split verify 在 B7 逐行完成时
                                         // 保留整段输出，终局没有下一轮 decode 触发 truncate_to 时，Cache
                                         // 仍能取到接受边界的 terminal hidden 并正确回滚。
-                                        tail.completed_hidden = Some(if value.verify && !tail.tail_sampling {
+                                        tail.completed_hidden = Some(if value.verify {
                                             match tail.completed_hidden.take() {
                                                 Some((start, completed)) if start.saturating_add(completed.rows) == position => (start, output_context.concat_token_rows(&[&completed, &value.hidden])?),
                                                 _ => (position, value.hidden.clone()),
@@ -842,43 +901,8 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                         } else {
                                             (position, value.hidden.clone())
                                         });
-                                        let tail_sampling = tail.tail_sampling;
-                                        let terminal_hidden = tail.hidden.as_ref().expect("刚提交 tail hidden").clone();
                                         let _ = tail;
                                         let (cohort, cohort_size) = cohort.unwrap_or((0, 1));
-                                        if value.decode && tail_sampling && pending_controls.contains_key(&stream_request_id) {
-                                            continue;
-                                        }
-                                        if value.decode && tail_sampling {
-                                            let work = TailHeadWork { request_id: stream_request_id, cohort, cohort_size, position, hidden: terminal_hidden };
-                                            if let Some(works) = push_tail_head_work(&mut pending_tail_heads, &mut tail_head_requests, work).map_err(backend_error)? {
-                                                let work_count = works.len();
-                                                let head_started = profile_boundaries.then(Instant::now);
-                                                tail_sample_batch(
-                                                    &mut link,
-                                                    &mut active,
-                                                    &output_context,
-                                                    &mut mtp_runtime,
-                                                    &weights,
-                                                    &cfg,
-                                                    &mla,
-                                                    &rope,
-                                                    output_head.as_ref().ok_or_else(|| backend_error("tail_sampling 缺少 output head".to_owned()))?,
-                                                    works,
-                                                )
-                                                .map_err(backend_error)?;
-                                                if let Some(started) = head_started {
-                                                    head_profile_micros += started.elapsed().as_micros();
-                                                    head_profile_count += work_count;
-                                                    if head_profile_count >= 32 {
-                                                        eprintln!("[glm52-boundary-b-head] tokens={head_profile_count} head_sample_send_ms={:.3}", head_profile_micros as f64 / 1000.0);
-                                                        head_profile_micros = 0;
-                                                        head_profile_count = 0;
-                                                    }
-                                                }
-                                            }
-                                            continue;
-                                        }
                                         let values = output_context.completed_tensor_to_bf16_bits(&value.hidden).map_err(|error| backend_error(format!("下载 tail continuous BF16: {error:?}")))?;
                                         let aux_values = value
                                             .aux_hidden
@@ -894,21 +918,6 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                             link.send_decode_cohort_aux(stream_request_id, cohort, cohort_size, position, cfg.hidden_size, &values, &[], &aux_values, value.aux_taps).map_err(backend_error)?;
                                         } else {
                                             link.send_prefill_aux(stream_request_id, position, rows, cfg.hidden_size, &values, &[], &aux_values, value.aux_taps).map_err(backend_error)?;
-                                            if emit_prefill && tail_sampling {
-                                                tail_sample_batch(
-                                                    &mut link,
-                                                    &mut active,
-                                                    &output_context,
-                                                    &mut mtp_runtime,
-                                                    &weights,
-                                                    &cfg,
-                                                    &mla,
-                                                    &rope,
-                                                    output_head.as_ref().ok_or_else(|| backend_error("tail_sampling 缺少 output head".to_owned()))?,
-                                                    vec![TailHeadWork { request_id: stream_request_id, cohort: 0, cohort_size: 1, position: next_position.saturating_sub(1), hidden: terminal_hidden }],
-                                                )
-                                                .map_err(backend_error)?;
-                                            }
                                         }
                                         if let Some((started, begin_us)) = trace_started {
                                             let kind = if value.verify { "Verify" } else { "Decode" };
@@ -984,12 +993,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                         request_sessions.insert(frame_request_id, session);
                                         accepted_positions.insert(frame_request_id, tail.position);
                                     }
-                                    StageMessage::Open { cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, tail_sampling } => {
-                                        if tail_sampling && output_head.is_none() {
-                                            let (head, mtp) = prepare_tail_output_runtime(&output_context, &weights, &cfg, &mla, false, mtp_draft_tokens, None, lm_head_quantization).map_err(backend_error)?;
-                                            output_head = Some(head);
-                                            mtp_runtime = mtp;
-                                        }
+                                    StageMessage::Open { cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, tail_sampling: _ } => {
                                         begin_tail_stage_open(
                                             &mut link,
                                             &mut active,
@@ -1000,13 +1004,12 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                             &templates,
                                             &cfg,
                                             args.max_seq_len,
-                                            TailOpenRequest { request_id: frame_request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, tail_sampling },
+                                            TailOpenRequest { request_id: frame_request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling },
                                         )
                                         .map_err(backend_error)?;
                                     }
-                                    StageMessage::MtpContext { prompt_tokens, max_decode, draft_tokens } => {
-                                        let tail = active.get_mut(&frame_request_id).ok_or_else(|| backend_error(format!("tail MTP context request={frame_request_id} 尚未 Open")))?;
-                                        tail_stage_mtp_context(tail, mtp_runtime.is_some(), mtp_draft_tokens, &cfg, args.max_seq_len, frame_request_id, prompt_tokens, max_decode, draft_tokens).map_err(backend_error)?;
+                                    StageMessage::MtpContext { .. } => {
+                                        return Err(backend_error("MTP 已驻留 head 首卡,tail 不再接受 MtpContext".to_owned()));
                                     }
                                     StageMessage::Prefill { position, rows, cols, values, selection, aux_values, aux_taps } => {
                                         let session = request_sessions.get(&frame_request_id).copied().ok_or_else(|| backend_error(format!("tail continuous prefill request={frame_request_id} 尚未 Assign")))?;
@@ -1061,9 +1064,6 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                             .map_err(|error| backend_error(format!("上传 tail continuous decode aux hidden: {error:?}")))?;
                                         let hidden_micros = boundary_started.map(|started| started.elapsed().as_micros()).unwrap_or(0);
                                         *expected = position.saturating_add(1);
-                                        if tail.tail_sampling && cohort != 0 && cohort_size > 1 && tail_head_requests.insert(frame_request_id, (cohort, cohort_size)).is_some() {
-                                            return Err(backend_error(format!("tail output request={frame_request_id} 重复加入 cohort")));
-                                        }
                                         if cohort == 0 {
                                             pipeline.submit_glm52_aux(session, position, true, hidden, selection, aux_hidden, aux_taps)?;
                                         } else {
@@ -1139,22 +1139,6 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                                 tail.prompt_hidden = Some(hidden.clone());
                                                 tail.prompt_position = Some(tokens);
                                                 prefill_emitted.insert(frame_request_id, true);
-                                                if tail.tail_sampling {
-                                                    let _ = tail;
-                                                    tail_sample_batch(
-                                                        &mut link,
-                                                        &mut active,
-                                                        &output_context,
-                                                        &mut mtp_runtime,
-                                                        &weights,
-                                                        &cfg,
-                                                        &mla,
-                                                        &rope,
-                                                        output_head.as_ref().ok_or_else(|| backend_error("tail_sampling 缺少 output head".to_owned()))?,
-                                                        vec![TailHeadWork { request_id: frame_request_id, cohort: 0, cohort_size: 1, position: tokens.saturating_sub(1), hidden }],
-                                                    )
-                                                    .map_err(backend_error)?;
-                                                }
                                             }
                                             eprintln!("[stage-continuous-prefill-done-unassigned] request_id={frame_request_id} tokens={tokens}");
                                             continue;
@@ -1169,47 +1153,12 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                             tail.prompt_hidden = Some(hidden.clone());
                                             tail.prompt_position = Some(tokens);
                                             prefill_emitted.insert(frame_request_id, true);
-                                            if tail.tail_sampling {
-                                                let _ = tail;
-                                                tail_sample_batch(
-                                                    &mut link,
-                                                    &mut active,
-                                                    &output_context,
-                                                    &mut mtp_runtime,
-                                                    &weights,
-                                                    &cfg,
-                                                    &mla,
-                                                    &rope,
-                                                    output_head.as_ref().ok_or_else(|| backend_error("tail_sampling 缺少 output head".to_owned()))?,
-                                                    vec![TailHeadWork { request_id: frame_request_id, cohort: 0, cohort_size: 1, position: tokens.saturating_sub(1), hidden }],
-                                                )
-                                                .map_err(backend_error)?;
-                                            }
                                         }
                                     }
-                                    StageMessage::Sample { excluded } => {
-                                        let tail = active.get_mut(&frame_request_id).ok_or_else(|| backend_error(format!("tail Sample request={frame_request_id} 尚未 Open")))?;
-                                        if !tail.tail_sampling || tail.pending_fences.len() >= mtp_draft_tokens.saturating_add(1) {
-                                            return Err(backend_error(format!("tail Sample request={frame_request_id} 状态非法: enabled={} pending={}", tail.tail_sampling, tail.pending_fences.len())));
-                                        }
-                                        tail.pending_fences.push_back(crate::backend::TokenFence::excluding(excluded));
+                                    StageMessage::Sample { .. } => {
+                                        return Err(backend_error("采样已驻留 head 首卡,tail 不再接受 Sample 围栏".to_owned()));
                                     }
                                     StageMessage::Cache { next_request_id, tokens } => {
-                                        if let Some(works) = cancel_tail_head_work(&mut pending_tail_heads, &mut tail_head_requests, frame_request_id).map_err(backend_error)? {
-                                            tail_sample_batch(
-                                                &mut link,
-                                                &mut active,
-                                                &output_context,
-                                                &mut mtp_runtime,
-                                                &weights,
-                                                &cfg,
-                                                &mla,
-                                                &rope,
-                                                output_head.as_ref().ok_or_else(|| backend_error("tail_sampling 缺少 output head".to_owned()))?,
-                                                works,
-                                            )
-                                            .map_err(backend_error)?;
-                                        }
                                         if let Some(session) = request_sessions.get(&frame_request_id).copied() {
                                             if pending_controls.insert(frame_request_id, TailControl::Cache { next_request_id, tokens }).is_some() {
                                                 return Err(backend_error(format!("tail continuous request={frame_request_id} 重复控制")));
@@ -1227,21 +1176,6 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                         }
                                     }
                                     StageMessage::Delete => {
-                                        if let Some(works) = cancel_tail_head_work(&mut pending_tail_heads, &mut tail_head_requests, frame_request_id).map_err(backend_error)? {
-                                            tail_sample_batch(
-                                                &mut link,
-                                                &mut active,
-                                                &output_context,
-                                                &mut mtp_runtime,
-                                                &weights,
-                                                &cfg,
-                                                &mla,
-                                                &rope,
-                                                output_head.as_ref().ok_or_else(|| backend_error("tail_sampling 缺少 output head".to_owned()))?,
-                                                works,
-                                            )
-                                            .map_err(backend_error)?;
-                                        }
                                         if let Some(&session) = request_sessions.get(&frame_request_id) {
                                             if pending_controls.insert(frame_request_id, TailControl::Delete).is_some() {
                                                 return Err(backend_error(format!("tail continuous request={frame_request_id} 重复控制")));
@@ -1298,187 +1232,12 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                         eprintln!("[stage-warn] tail continuous stream 结束时仍有 resident pipeline session，已忽略");
                     }
                 }
-                StageMessage::Stream { requests } => {
-                    if diagnostics.trace_stage_events {
-                        eprintln!("[stage-stream-tail] requests={}", requests.iter().map(ToString::to_string).collect::<Vec<_>>().join(","));
-                    }
-                    let stream_started = Instant::now();
-                    let request_count = requests.len();
-                    let mut positions = Vec::with_capacity(request_count);
-                    let mut accepted_positions = Vec::with_capacity(request_count);
-                    let mut prefill_done = Vec::with_capacity(request_count);
-                    let mut prefill_emitted = Vec::with_capacity(request_count);
-                    let mut session_states = Vec::with_capacity(requests.len());
-                    let mut sampling_states = Vec::with_capacity(requests.len());
-                    for &request_id in &requests {
-                        let session = active.get_mut(&request_id).ok_or_else(|| format!("tail stream request={request_id} 尚未 Open"))?;
-                        positions.push(AtomicUsize::new(session.position));
-                        accepted_positions.push(session.position);
-                        prefill_done.push(AtomicUsize::new(usize::MAX));
-                        prefill_emitted.push(AtomicUsize::new(0));
-                        session_states.push(std::mem::take(&mut session.states));
-                        sampling_states.push(session.sampling);
-                    }
-                    let request_sessions = requests.iter().copied().enumerate().map(|(session, request_id)| (request_id, session)).collect::<HashMap<_, _>>();
-                    let mut saw_decode = false;
-                    let mut stream_closed = false;
-                    let outputs = Mutex::new((0..request_count).map(|_| None).collect::<Vec<Option<RocmTensor>>>());
-                    let sampling_states = Mutex::new(sampling_states);
-                    let stream_link = &mut link;
-                    let mut connection_lost = false;
-                    let (outbound, outbound_rx) = std::sync::mpsc::channel::<(usize, u32, bool)>();
-                    // 输入闭包迁移到专用 feeder 线程后,Receiver(!Sync)按引用捕获会
-                    // 阻止闭包跨线程;包 Mutex 仅为此,排空语义与单线程时一致。
-                    let outbound_rx = std::sync::Mutex::new(outbound_rx);
-                    use crate::runtime::prefill::TokenStreamBatchPoll;
-                    let chunks = || {
-                        while let Ok((session, token, eos)) = outbound_rx.lock().expect("tail outbound 锁中毒").try_recv() {
-                            if let Err(msg) = stream_link.send_token(requests[session], token, eos) {
-                                connection_lost = true;
-                                eprintln!("[stage-warn] tail stream 发送失败，等待上游重连: {msg}");
-                                return TokenStreamBatchPoll::Closed;
-                            }
-                        }
-                        if stream_closed {
-                            return TokenStreamBatchPoll::Closed;
-                        }
-                        loop {
-                            let frame = match stream_link.try_recv() {
-                                Ok(Some(frame)) => frame,
-                                Ok(None) => return TokenStreamBatchPoll::Pending,
-                                Err(msg) => {
-                                    connection_lost = true;
-                                    eprintln!("[stage-warn] tail stream 连接断开，等待上游重连: {msg}");
-                                    return TokenStreamBatchPoll::Closed;
-                                }
-                            };
-                            if let StageMessage::Stream { requests } = &frame.message {
-                                if requests.is_empty() {
-                                    stream_closed = true;
-                                    return TokenStreamBatchPoll::Closed;
-                                }
-                                return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute { msg: format!("tail stream 中收到非法 Stream frame: requests={}", requests.len()) }));
-                            }
-                            let Some(&session_index) = request_sessions.get(&frame.request_id) else {
-                                return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute { msg: format!("tail stream 收到未声明 request={}", frame.request_id) }));
-                            };
-                            let (position, rows, cols, values, selection, decode) = match frame.message {
-                                StageMessage::Prefill { position, rows, cols, values, selection, .. } => (position, rows, cols, values, selection, false),
-                                StageMessage::Decode { position, cols, values, selection, .. } => (position, 1, cols, values, selection, true),
-                                StageMessage::PrefillDone { tokens } => {
-                                    let expected = accepted_positions[session_index];
-                                    if tokens != expected {
-                                        return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute {
-                                            msg: format!("tail stream PrefillDone 边界错误: request={} tokens={tokens} expected={expected}", frame.request_id)
-                                        }));
-                                    }
-                                    prefill_done[session_index].store(tokens, Ordering::Release);
-                                    if positions[session_index].load(Ordering::Acquire) == tokens && prefill_emitted[session_index].compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                                        let outputs = outputs.lock().unwrap();
-                                        let Some(hidden) = outputs[session_index].as_ref() else {
-                                            return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute { msg: format!("tail stream PrefillDone request={} 缺少完成 hidden", frame.request_id) }));
-                                        };
-                                        let sampling = {
-                                            let mut states = sampling_states.lock().unwrap();
-                                            [states[session_index].next()]
-                                        };
-                                        let token = match glm52_sampled_token_ids(&output_context, &cfg, output_head.as_ref().expect("legacy output head 已准备"), hidden, &sampling) {
-                                            Ok(output) => match output.into_iter().next() {
-                                                Some(token) => token,
-                                                None => return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute { msg: format!("tail ROCm GLM stream prefill output 缺少 token: sampling={} 条", sampling.len()) })),
-                                            },
-                                            Err(error) => return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute { msg: format!("tail ROCm GLM stream prefill output: {error:?}") })),
-                                        };
-                                        if outbound.send((session_index, token, cfg.eos_token_ids.contains(&token))).is_err() {
-                                            return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute { msg: "tail stream prefill token 队列已关闭".to_owned() }));
-                                        }
-                                    }
-                                    continue;
-                                }
-                                message => {
-                                    return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute {
-                                        msg: format!("tail stream request={} 收到非 Prefill/Decode/PrefillDone frame={message:?} current={}", frame.request_id, requests.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")),
-                                    }));
-                                }
-                            };
-                            saw_decode |= decode;
-                            let expected = accepted_positions[session_index];
-                            let Some(next_position) = position.checked_add(rows) else {
-                                return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute { msg: format!("tail stream position 溢出: request={} position={position} rows={rows}", frame.request_id) }));
-                            };
-                            if rows == 0 || position != expected || cols != cfg.hidden_size || next_position > args.max_seq_len {
-                                return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute {
-                                    msg: format!("tail stream 边界错误: request={} position={position} expected={expected} shape=[{rows},{cols}] decode={decode} max_seq_len={}", frame.request_id, args.max_seq_len),
-                                }));
-                            }
-                            accepted_positions[session_index] = next_position;
-                            let selection = if selection.is_empty() {
-                                None
-                            } else {
-                                match RocmDsaSelection::from_host(&input_context, rows, position, &selection) {
-                                    Ok(selection) => Some(selection),
-                                    Err(error) => return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute { msg: format!("上传 stream DSA selection: {error:?}") })),
-                                }
-                            };
-                            let hidden = match input_context.tensor_from_bf16_bits_ordered(values, rows, cols) {
-                                Ok(hidden) => hidden,
-                                Err(error) => return TokenStreamBatchPoll::Ready(Err(crate::backend::BackendError::Compute { msg: format!("上传 tail stream BF16: {error:?}") })),
-                            };
-                            return TokenStreamBatchPoll::Ready(Ok((session_index, position, decode, hidden, selection)));
-                        }
-                    };
-                    let run = run_glm52_stream_stage_pipeline_stateful(chunks, session_states, &cfg, &mla, &rope, scheduler_policy, |session, position, decode, hidden, _| {
-                        let rows = hidden.rows;
-                        let hidden = last_bf16_row(&output_context, hidden)?;
-                        let next_position = position.saturating_add(rows);
-                        // 先保存输出，再发布完成位置。PrefillDone 线程用 Acquire 读取位置后，
-                        // 必须已经能看到对应 hidden，不能观察到一半完成的 session。
-                        outputs.lock().unwrap()[session] = Some(hidden);
-                        positions[session].store(next_position, Ordering::Release);
-                        let prefill_complete = !decode && prefill_done[session].load(Ordering::Acquire) == next_position && prefill_emitted[session].compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok();
-                        if decode || prefill_complete {
-                            let outputs = outputs.lock().unwrap();
-                            let hidden = outputs[session].as_ref().expect("完成位置发布前已保存 hidden");
-                            let sampling = {
-                                let mut states = sampling_states.lock().unwrap();
-                                [states[session].next()]
-                            };
-                            let token = glm52_sampled_token_ids(&output_context, &cfg, output_head.as_ref().expect("legacy output head 已准备"), hidden, &sampling)
-                                .map_err(|error| crate::backend::BackendError::Compute { msg: format!("tail ROCm GLM stream output: {error:?}") })?
-                                .into_iter()
-                                .next()
-                                .ok_or_else(|| crate::backend::BackendError::Compute { msg: format!("tail ROCm GLM stream output 缺少 token: session={session} sampling={} 条", sampling.len()) })?;
-                            outbound.send((session, token, cfg.eos_token_ids.contains(&token))).map_err(|_| crate::backend::BackendError::Compute { msg: "tail stream token 队列已关闭".to_owned() })?;
-                        }
-                        Ok(())
-                    });
-                    let session_states = run.map_err(|error| format!("ROCm distributed tail stream: {error:?}"))?;
-                    if connection_lost {
-                        let dropped = active.len();
-                        active.clear();
-                        eprintln!("[stage-upstream-reset] 已取消旧上游的 {dropped} 个 active session，保留 {} 个 resident cache", resident.len());
-                        continue;
-                    }
-                    let mut outputs = outputs.into_inner().unwrap();
-                    let sampling_states = sampling_states.into_inner().unwrap();
-                    for (session_index, (request_id, states)) in requests.into_iter().zip(session_states).enumerate() {
-                        let hidden = outputs[session_index].take().ok_or_else(|| format!("tail stream request={request_id} 没有 stage output"))?;
-                        let session = active.get_mut(&request_id).ok_or_else(|| format!("tail stream request={request_id} 完成时 session 消失"))?;
-                        session.states = states;
-                        session.hidden = Some(hidden);
-                        session.position = positions[session_index].load(Ordering::Acquire);
-                        session.sampling = sampling_states[session_index];
-                    }
-                    if saw_decode {
-                        eprintln!("[stage-decode-batch] sessions={request_count} wall={:.3}s active={}", stream_started.elapsed().as_secs_f64(), active.len());
-                    }
+                StageMessage::Stream { .. } => {
+                    // 采样与输出已驻留 head 首卡;legacy Stream 协议依赖 tail 采样,已被
+                    // ContinuousStream + hidden 回传取代,这里显式拒绝而不是静默误路由。
+                    return Err("legacy Stream 协议依赖 tail 采样,已随 tail_sampling 一并移除;请使用 ContinuousStream".into());
                 }
-                StageMessage::Open { cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, tail_sampling } => {
-                    if tail_sampling && output_head.is_none() {
-                        let (head, mtp) = prepare_tail_output_runtime(&output_context, &weights, &cfg, &mla, false, mtp_draft_tokens, None, lm_head_quantization)?;
-                        output_head = Some(head);
-                        mtp_runtime = mtp;
-                    }
+                StageMessage::Open { cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, tail_sampling: _ } => {
                     begin_tail_stage_open(
                         &mut link,
                         &mut active,
@@ -1489,12 +1248,11 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                         &templates,
                         &cfg,
                         args.max_seq_len,
-                        TailOpenRequest { request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, tail_sampling },
+                        TailOpenRequest { request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling },
                     )?;
                 }
-                StageMessage::MtpContext { prompt_tokens, max_decode, draft_tokens } => {
-                    let session = active.get_mut(&request_id).ok_or_else(|| format!("tail MTP context request={request_id} 尚未 Open"))?;
-                    tail_stage_mtp_context(session, mtp_runtime.is_some(), mtp_draft_tokens, &cfg, args.max_seq_len, request_id, prompt_tokens, max_decode, draft_tokens)?;
+                StageMessage::MtpContext { .. } => {
+                    return Err("MTP 已驻留 head 首卡,tail 不再接受 MtpContext".into());
                 }
                 StageMessage::Prefill { position, rows, cols, values, selection, .. } => {
                     let session = active.get_mut(&request_id).ok_or_else(|| format!("tail prefill request={request_id} 尚未 Open"))?;
@@ -1522,19 +1280,9 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                     let hidden = last_bf16_row(&output_context, hidden).map_err(|error| format!("取 tail prefill 最后一行: {error:?}"))?;
                     session.prompt_hidden = Some(hidden.clone());
                     session.prompt_position = Some(tokens);
-                    let sampling = [session.sampling.next()];
-                    let token = glm52_sampled_token_ids(&output_context, &cfg, output_head.as_ref().expect("legacy output head 已准备"), &hidden, &sampling)
-                        .map_err(|error| format!("tail ROCm GLM output: {error:?}"))?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| format!("tail ROCm GLM output 缺少 token: request={request_id} sampling={} 条", sampling.len()))?;
-                    let eos = cfg.eos_token_ids.contains(&token);
-                    if let Some(mtp) = session.mtp.as_mut().filter(|mtp| mtp.active) {
-                        mtp.verify_inputs.clear();
-                        mtp.verify_inputs.push(token);
-                    }
                     session.hidden = Some(hidden);
-                    link.send_token(request_id, token, eos)?;
+                    let values = output_context.tensor_to_bf16_bits(session.hidden.as_ref().expect("刚提交 prefill hidden"))?;
+                    link.send_prefill(request_id, tokens.saturating_sub(1), 1, cfg.hidden_size, &values, &[])?;
                     eprintln!("[stage-prefill-complete] request_id={request_id} resumed={} layers={stage_start}..{stage_end} tokens={tokens} wall={:.3}s", session.resumed, session.started.elapsed().as_secs_f64());
                 }
                 StageMessage::Decode { position, cols, values, selection, .. } => {
@@ -1554,15 +1302,9 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                     .map_err(|error| format!("ROCm distributed tail decode: {error:?}"))?;
                     let hidden = last_bf16_row(&output_context, output.ok_or("tail decode 没有 stage output")?).map_err(|error| format!("取 tail decode 最后一行: {error:?}"))?;
                     session.position += 1;
-                    let sampling = [session.sampling.next()];
-                    let token = glm52_sampled_token_ids(&output_context, &cfg, output_head.as_ref().expect("legacy output head 已准备"), &hidden, &sampling)
-                        .map_err(|error| format!("tail ROCm GLM output: {error:?}"))?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| format!("tail ROCm GLM output 缺少 token: request={request_id} sampling={} 条", sampling.len()))?;
-                    let eos = cfg.eos_token_ids.contains(&token);
                     session.hidden = Some(hidden);
-                    link.send_token(request_id, token, eos)?;
+                    let values = output_context.tensor_to_bf16_bits(session.hidden.as_ref().expect("刚提交 decode hidden"))?;
+                    link.send_decode(request_id, position, cfg.hidden_size, &values, &[])?;
                     eprintln!("[stage-decode-complete] request_id={request_id} position={position} wall={:.3}s active={}", started.elapsed().as_secs_f64(), active.len());
                 }
                 StageMessage::Cache { next_request_id, tokens } => {
@@ -1665,7 +1407,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                 |experts, layer, _kind, hidden| {
                     let hidden = context.tensor_as_f32(hidden)?;
                     let output = match &layers[layer - layer_start] {
-                        PrefillLayer::Dense(resident) => glm52_dense_prefill_layer(&context, &cfg, &mla, resident, layer, Some(dsa), &hidden, &rope, Some(cache), position),
+                        PrefillLayer::Dense(resident) => glm52_dense_prefill_layer(&context, &cfg, &mla, resident, layer, Some(&*experts), Some(dsa), &hidden, &rope, Some(cache), position),
                         PrefillLayer::Moe(resident) => glm52_moe_prefill_layer(&context, &cfg, &mla, resident, layer, experts, None, Some(dsa), &hidden, &rope, Some(cache), position),
                     }?;
                     context.tensor_as_bf16(output)
@@ -1713,7 +1455,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
             layer_backend.activate().map_err(|msg| crate::backend::BackendError::Compute { msg: format!("L{layer} 激活 ROCm device 失败: {msg}") })?;
             let hidden = layer_backend.tensor_as_f32(layer_backend.tensor_on_device(hidden)?)?;
             let output = match &prefill_layers[layer] {
-                PrefillLayer::Dense(resident) => glm52_dense_prefill_layer(layer_backend, &cfg, &mla, &resident, layer, Some(&mut dsa_state), &hidden, &rope, Some(&mut cache), 0)?,
+                PrefillLayer::Dense(resident) => glm52_dense_prefill_layer(layer_backend, &cfg, &mla, &resident, layer, Some(&experts[0]), Some(&mut dsa_state), &hidden, &rope, Some(&mut cache), 0)?,
                 PrefillLayer::Moe(resident) => glm52_moe_prefill_layer(layer_backend, &cfg, &mla, &resident, layer, &mut experts[0], None, Some(&mut dsa_state), &hidden, &rope, Some(&mut cache), 0)?,
             };
             let output = layer_backend.tensor_as_bf16(output)?;
@@ -1917,7 +1659,8 @@ fn run_glm52_stage_input(backend: &RocmContext, args: &Args, cfg: &Glm52Config, 
         let placement = layer_ends.iter().position(|&end| layer <= end).ok_or_else(|| format!("L{layer} 没有 stage device"))?;
         let layer_backend = &contexts[placement];
         layer_backend.activate()?;
-        let layer_weights = crate::runtime::glm52::load_prepare_moe_prefill_layer(layer_backend, cfg, mla, weights, layer, false).map_err(|error| format!("准备 ROCm stage L{layer}: {error:?}"))?;
+        let layer_weights =
+            crate::runtime::glm52::load_prepare_moe_prefill_layer(layer_backend, cfg, mla, weights, layer, crate::kernel::rocm::hip::options().prefill_attention_cpu).map_err(|error| format!("准备 ROCm stage L{layer}: {error:?}"))?;
         resident_layers.push((placement, layer_weights));
     }
     let mut experts = contexts
@@ -1985,6 +1728,7 @@ fn forward_token(
 
 struct Args {
     model_dir: PathBuf,
+    tokenizer_path: PathBuf,
     prompt: String,
     max_seq_len: usize,
     decode_steps: usize,

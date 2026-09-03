@@ -1,6 +1,7 @@
-//! 跨节点模型 stage 的 iroh 双向流：传 BF16 hidden、采样 token 与前机下达的 cache 控制命令。
+//! 跨节点模型 stage 双向流：私网固定地址走 TCP，其他环境回退 iroh；传 BF16 hidden、采样 token 与前机下达的 cache 控制命令。
 
 use std::{
+    net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::mpsc,
     time::{Duration, Instant},
@@ -8,10 +9,14 @@ use std::{
 
 use iroh::{
     Endpoint, EndpointAddr,
-    endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, presets},
+    endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, VarInt, presets},
 };
 use iroh_tickets::endpoint::EndpointTicket;
-use tokio::{io::AsyncWriteExt, runtime::Runtime};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::{TcpListener, TcpStream, tcp::OwnedWriteHalf},
+    runtime::Runtime,
+};
 
 use super::iroh::IrohConfig;
 use crate::runtime::output::SamplingConfig;
@@ -23,6 +28,8 @@ const STREAM_OPEN: u8 = 0x5a;
 const HEADER_BYTES: usize = 48;
 const STAGE_KEEP_ALIVE: Duration = Duration::from_secs(5);
 const STAGE_MAX_IDLE: Duration = Duration::from_secs(60 * 60);
+const STAGE_STREAM_WINDOW: u32 = 128 * 1024 * 1024;
+const STAGE_CONNECTION_WINDOW: u32 = 256 * 1024 * 1024;
 // 4096-token GLM prefill 会同时携带 96 MiB 主/辅助 hidden 和 32 MiB
 // index selection；旧 128 MiB 上限连固定 4 字节 aux metadata 都容不下。
 // 这里为更大 chunk 留出余量，但发送端也必须先检查，不能写坏共享 stream。
@@ -219,37 +226,81 @@ pub struct StageFrame {
     pub message: StageMessage,
 }
 
+enum StageSend {
+    Iroh(SendStream),
+    Tcp(OwnedWriteHalf),
+}
+
+enum StageConnection {
+    Iroh {
+        endpoint: Endpoint,
+        connection: Connection,
+        listener_connections: Option<mpsc::Receiver<(Connection, SendStream, RecvStream)>>,
+        pending_listener_connection: Option<(Connection, SendStream, RecvStream)>,
+        downstream: Option<(EndpointAddr, Option<String>)>,
+    },
+    Tcp {
+        listener: Option<TcpListener>,
+        peer: SocketAddr,
+        downstream: Option<SocketAddr>,
+    },
+}
+
 pub struct StageTransport {
     runtime: Runtime,
-    _endpoint: Endpoint,
-    _connection: Connection,
-    send: SendStream,
+    connection: StageConnection,
+    send: StageSend,
     recv: mpsc::Receiver<Result<(StageFrame, Instant), String>>,
-    listener_connections: Option<mpsc::Receiver<(Connection, SendStream, RecvStream)>>,
-    pending_listener_connection: Option<(Connection, SendStream, RecvStream)>,
-    downstream: Option<(EndpointAddr, Option<String>)>,
 }
 
 /// 已发布 ticket、尚未接受上游连接的 stage 监听端。
-pub struct StageListener {
-    runtime: Runtime,
-    endpoint: Endpoint,
-    expected: Option<String>,
+pub enum StageListener {
+    Iroh { runtime: Runtime, endpoint: Endpoint, expected: Option<String> },
+    Tcp { runtime: Runtime, listener: TcpListener },
 }
 
 impl Drop for StageTransport {
     fn drop(&mut self) {
-        self._connection.close(0u32.into(), b"stage transport shutdown");
+        if let StageConnection::Iroh { connection, .. } = &self.connection {
+            connection.close(0u32.into(), b"stage transport shutdown");
+        }
     }
 }
 
 impl StageListener {
+    #[cfg(test)]
+    fn ticket(&self) -> String {
+        match self {
+            Self::Iroh { endpoint, .. } => EndpointTicket::new(endpoint.addr()).to_string(),
+            Self::Tcp { listener, .. } => format!("tcp://{}", listener.local_addr().unwrap()),
+        }
+    }
+
     pub fn accept(self) -> Result<StageTransport, String> {
-        let Self { runtime, endpoint, expected } = self;
-        let listener_connections = start_listener(&runtime, endpoint.clone(), expected);
-        let (connection, send, recv) = listener_connections.recv().map_err(|_| "stage accept 任务已经退出".to_owned())?;
-        let recv = start_receiver(&runtime, connection.clone(), recv);
-        Ok(StageTransport { runtime, _endpoint: endpoint, _connection: connection, send, recv, listener_connections: Some(listener_connections), pending_listener_connection: None, downstream: None })
+        match self {
+            Self::Iroh { runtime, endpoint, expected } => {
+                let listener_connections = start_listener(&runtime, endpoint.clone(), expected);
+                let (connection, send, recv) = listener_connections.recv().map_err(|_| "stage accept 任务已经退出".to_owned())?;
+                let recv = start_iroh_receiver(&runtime, connection.clone(), recv);
+                let transport = StageTransport {
+                    runtime,
+                    connection: StageConnection::Iroh { endpoint, connection, listener_connections: Some(listener_connections), pending_listener_connection: None, downstream: None },
+                    send: StageSend::Iroh(send),
+                    recv,
+                };
+                eprintln!("[stage-connection] {}", transport.connection_diagnostics());
+                Ok(transport)
+            }
+            Self::Tcp { runtime, listener } => {
+                let (stream, peer) = runtime.block_on(listener.accept()).map_err(|error| format!("接受 stage TCP: {error}"))?;
+                stream.set_nodelay(true).map_err(|error| format!("配置 stage TCP_NODELAY: {error}"))?;
+                let (recv, send) = stream.into_split();
+                let recv = start_receiver(&runtime, recv);
+                let transport = StageTransport { runtime, connection: StageConnection::Tcp { listener: Some(listener), peer, downstream: None }, send: StageSend::Tcp(send), recv };
+                eprintln!("[stage-connection] {}", transport.connection_diagnostics());
+                Ok(transport)
+            }
+        }
     }
 }
 
@@ -274,6 +325,14 @@ impl StageTransport {
     }
 
     pub fn bind(config: IrohConfig) -> Result<StageListener, String> {
+        if let Some(bind_addr) = private_tcp_addr(config.bind_addr.as_deref())? {
+            let runtime = runtime()?;
+            let listener = runtime.block_on(TcpListener::bind(bind_addr)).map_err(|error| format!("绑定 stage TCP {bind_addr}: {error}"))?;
+            let local_addr = listener.local_addr().map_err(|error| format!("读取 stage TCP 地址: {error}"))?;
+            let node_id = config.secret_key.as_ref().map(|secret| secret.public().to_string()).unwrap_or_else(|| "tcp".to_owned());
+            eprintln!("[stage-listen] node_id={node_id} ticket=tcp://{local_addr}");
+            return Ok(StageListener::Tcp { runtime, listener });
+        }
         let secret = config.secret_key.ok_or("stage listener 必须配置固定 secret key")?;
         let node_id = secret.public().to_string();
         let expected = config.expected_peer;
@@ -292,7 +351,7 @@ impl StageTransport {
         })?;
         let ticket = EndpointTicket::new(endpoint.addr()).to_string();
         eprintln!("[stage-listen] node_id={node_id} ticket={ticket}");
-        Ok(StageListener { runtime, endpoint, expected })
+        Ok(StageListener::Iroh { runtime, endpoint, expected })
     }
 
     pub fn listen(config: IrohConfig) -> Result<Self, String> {
@@ -300,6 +359,28 @@ impl StageTransport {
     }
 
     pub fn connect(ticket: &str, config: IrohConfig) -> Result<Self, String> {
+        if let Some(address) = ticket.strip_prefix("tcp://") {
+            let address = address.parse::<SocketAddr>().map_err(|error| format!("解析 stage TCP ticket={ticket}: {error}"))?;
+            let runtime = runtime()?;
+            let stream = runtime.block_on(async {
+                loop {
+                    match TcpStream::connect(address).await {
+                        Ok(stream) => break stream,
+                        Err(error) => {
+                            eprintln!("[stage-connect-wait] TCP 下游尚未就绪: {error}");
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    }
+                }
+            });
+            stream.set_nodelay(true).map_err(|error| format!("配置 stage TCP_NODELAY: {error}"))?;
+            let peer = stream.peer_addr().map_err(|error| format!("读取 stage TCP peer: {error}"))?;
+            let (recv, send) = stream.into_split();
+            let recv = start_receiver(&runtime, recv);
+            let transport = Self { runtime, connection: StageConnection::Tcp { listener: None, peer, downstream: Some(address) }, send: StageSend::Tcp(send), recv };
+            eprintln!("[stage-connection] {}", transport.connection_diagnostics());
+            return Ok(transport);
+        }
         let ticket = EndpointTicket::from_str(ticket).map_err(|error| format!("解析 stage ticket: {error}"))?;
         let address = ticket.endpoint_addr().clone();
         let expected = config.expected_peer;
@@ -331,17 +412,46 @@ impl StageTransport {
             send.flush().await.map_err(|error| format!("flush stage stream opener: {error}"))?;
             Ok::<_, String>((endpoint, connection, send, recv))
         })?;
-        let recv = start_receiver(&runtime, connection.clone(), recv);
-        Ok(Self { runtime, _endpoint: endpoint, _connection: connection, send, recv, listener_connections: None, pending_listener_connection: None, downstream: Some(downstream) })
+        let recv = start_iroh_receiver(&runtime, connection.clone(), recv);
+        let transport = Self { runtime, connection: StageConnection::Iroh { endpoint, connection, listener_connections: None, pending_listener_connection: None, downstream: Some(downstream) }, send: StageSend::Iroh(send), recv };
+        eprintln!("[stage-connection] {}", transport.connection_diagnostics());
+        Ok(transport)
     }
 
     /// 连接端复用原固定 UDP endpoint 建立新连接；不会触碰 listener 端的
     /// resident session。模型 runtime 仍需重新接收 DeviceMemory 握手后再发工作。
     pub fn reconnect_downstream(&mut self) -> Result<(), String> {
-        let (address, expected) = self.downstream.clone().ok_or("stage listener 端不能主动重连下游")?;
+        if let StageConnection::Tcp { downstream: Some(address), .. } = &self.connection {
+            let address = *address;
+            let stream = self.runtime.block_on(async {
+                loop {
+                    match TcpStream::connect(address).await {
+                        Ok(stream) => break stream,
+                        Err(error) => {
+                            eprintln!("[stage-reconnect-wait] TCP 下游尚未就绪: {error}");
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                        }
+                    }
+                }
+            });
+            stream.set_nodelay(true).map_err(|error| format!("配置 stage TCP_NODELAY: {error}"))?;
+            let peer = stream.peer_addr().map_err(|error| format!("读取 stage TCP peer: {error}"))?;
+            let (recv, send) = stream.into_split();
+            if let StageConnection::Tcp { peer: current_peer, .. } = &mut self.connection {
+                *current_peer = peer;
+            }
+            self.send = StageSend::Tcp(send);
+            self.recv = start_receiver(&self.runtime, recv);
+            eprintln!("[stage-downstream-reconnected] TCP 新连接已建立 peer={peer}");
+            return Ok(());
+        }
+        let (endpoint, address, expected) = match &self.connection {
+            StageConnection::Iroh { endpoint, downstream: Some((address, expected)), .. } => (endpoint.clone(), address.clone(), expected.clone()),
+            _ => return Err("stage listener 端不能主动重连下游".to_owned()),
+        };
         let (connection, send, recv) = self.runtime.block_on(async {
             let connection = loop {
-                match self._endpoint.connect(address.clone(), STAGE_ALPN).await {
+                match endpoint.connect(address.clone(), STAGE_ALPN).await {
                     Ok(connection) => break connection,
                     Err(error) => {
                         eprintln!("[stage-reconnect-wait] 下游尚未就绪: {error}");
@@ -355,18 +465,32 @@ impl StageTransport {
             send.flush().await.map_err(|error| format!("flush 重连 stage stream opener: {error}"))?;
             Ok::<_, String>((connection, send, recv))
         })?;
-        self._connection.close(0u32.into(), b"downstream reconnect");
-        self._connection = connection.clone();
-        self.send = send;
-        self.recv = start_receiver(&self.runtime, connection.clone(), recv);
+        if let StageConnection::Iroh { connection: current, .. } = &mut self.connection {
+            current.close(0u32.into(), b"downstream reconnect");
+            *current = connection.clone();
+        }
+        self.send = StageSend::Iroh(send);
+        self.recv = start_iroh_receiver(&self.runtime, connection, recv);
         eprintln!("[stage-downstream-reconnected] 新连接已建立");
         Ok(())
     }
 
     /// listener 端保留原 endpoint 与 resident state，始终让最后到达的上游接管。
     pub fn accept_reconnect(&mut self) -> Result<(), String> {
-        let connections = self.listener_connections.as_ref().ok_or("stage connect 端不能接受上游重连")?;
-        let mut next = match self.pending_listener_connection.take() {
+        if let StageConnection::Tcp { listener: Some(listener), peer: current_peer, .. } = &mut self.connection {
+            let (stream, peer) = self.runtime.block_on(listener.accept()).map_err(|error| format!("接受重连 stage TCP: {error}"))?;
+            stream.set_nodelay(true).map_err(|error| format!("配置 stage TCP_NODELAY: {error}"))?;
+            let (recv, send) = stream.into_split();
+            *current_peer = peer;
+            self.send = StageSend::Tcp(send);
+            self.recv = start_receiver(&self.runtime, recv);
+            eprintln!("[stage-upstream-takeover] TCP 新上游已接管 peer={peer}");
+            return Ok(());
+        }
+        let StageConnection::Iroh { connection, listener_connections: Some(connections), pending_listener_connection, .. } = &mut self.connection else {
+            return Err("stage connect 端不能接受上游重连".to_owned());
+        };
+        let mut next = match pending_listener_connection.take() {
             Some(next) => next,
             None => connections.recv().map_err(|_| "stage accept 任务已经退出".to_owned())?,
         };
@@ -374,18 +498,20 @@ impl StageTransport {
             next.0.close(0u32.into(), b"superseded before activation");
             next = newer;
         }
-        self._connection.close(0u32.into(), b"superseded by new upstream");
+        connection.close(0u32.into(), b"superseded by new upstream");
         let (connection, send, recv) = next;
-        self._connection = connection.clone();
-        self.send = send;
-        self.recv = start_receiver(&self.runtime, connection.clone(), recv);
+        if let StageConnection::Iroh { connection: current, .. } = &mut self.connection {
+            *current = connection.clone();
+        }
+        self.send = StageSend::Iroh(send);
+        self.recv = start_iroh_receiver(&self.runtime, connection, recv);
         eprintln!("[stage-upstream-takeover] 新上游已接管");
         Ok(())
     }
 
     /// 新连接先于旧连接的待收 frame 生效；调用方收到错误后回到统一 reconnect 点。
     fn notice_new_listener_connection(&mut self) -> bool {
-        let Some(connections) = self.listener_connections.as_ref() else {
+        let StageConnection::Iroh { connection, listener_connections: Some(connections), pending_listener_connection, .. } = &mut self.connection else {
             return false;
         };
         let Ok(mut next) = connections.try_recv() else {
@@ -395,10 +521,10 @@ impl StageTransport {
             next.0.close(0u32.into(), b"superseded before activation");
             next = newer;
         }
-        if let Some(pending) = self.pending_listener_connection.replace(next) {
+        if let Some(pending) = pending_listener_connection.replace(next) {
             pending.0.close(0u32.into(), b"superseded before activation");
         }
-        self._connection.close(0u32.into(), b"superseded by new upstream");
+        connection.close(0u32.into(), b"superseded by new upstream");
         true
     }
 
@@ -565,7 +691,10 @@ impl StageTransport {
     }
 
     pub fn connection_diagnostics(&self) -> String {
-        connection_diagnostics(&self._connection)
+        match &self.connection {
+            StageConnection::Tcp { peer, .. } => format!("transport=tcp peer={peer}"),
+            StageConnection::Iroh { connection, .. } => format!("transport=iroh {}", connection_diagnostics(connection)),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -620,20 +749,24 @@ impl StageTransport {
         header[36..40].copy_from_slice(&cols.to_le_bytes());
         header[40..44].copy_from_slice(&value.to_le_bytes());
         header[44..48].copy_from_slice(&payload_len.to_le_bytes());
-        let send = &mut self.send;
         let started = Instant::now();
-        let result = self.runtime.block_on(async move {
-            send.write_all(&header).await.map_err(|error| format!("写入 stage header: {error}"))?;
-            send.write_all(payload).await.map_err(|error| format!("写入 stage payload: {error}"))?;
-            send.write_all(trailing).await.map_err(|error| format!("写入 stage trailing payload: {error}"))?;
-            send.flush().await.map_err(|error| format!("flush stage stream: {error}"))
-        });
+        let result = match &mut self.send {
+            StageSend::Iroh(send) => self.runtime.block_on(write_stage_frame(send, &header, payload, trailing)),
+            StageSend::Tcp(send) => self.runtime.block_on(write_stage_frame(send, &header, payload, trailing)),
+        };
         let elapsed = started.elapsed();
         if elapsed >= Duration::from_millis(500) {
             eprintln!("[stage-send-slow] request_id={request_id} kind={kind} position={position} rows={rows} payload_bytes={payload_len} wall_ms={:.3}", elapsed.as_secs_f64() * 1000.0,);
         }
         result
     }
+}
+
+async fn write_stage_frame<W: AsyncWrite + Unpin>(send: &mut W, header: &[u8], payload: &[u8], trailing: &[u8]) -> Result<(), String> {
+    send.write_all(header).await.map_err(|error| format!("写入 stage header: {error}"))?;
+    send.write_all(payload).await.map_err(|error| format!("写入 stage payload: {error}"))?;
+    send.write_all(trailing).await.map_err(|error| format!("写入 stage trailing payload: {error}"))?;
+    send.flush().await.map_err(|error| format!("flush stage stream: {error}"))
 }
 
 fn connection_diagnostics(connection: &Connection) -> String {
@@ -665,12 +798,29 @@ fn connection_diagnostics(connection: &Connection) -> String {
     )
 }
 
-fn start_receiver(runtime: &Runtime, connection: Connection, recv: RecvStream) -> mpsc::Receiver<Result<(StageFrame, Instant), String>> {
+fn start_receiver<R>(runtime: &Runtime, recv: R) -> mpsc::Receiver<Result<(StageFrame, Instant), String>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    start_receiver_inner(runtime, recv, None)
+}
+
+fn start_iroh_receiver(runtime: &Runtime, connection: Connection, recv: RecvStream) -> mpsc::Receiver<Result<(StageFrame, Instant), String>> {
+    start_receiver_inner(runtime, recv, Some(connection))
+}
+
+fn start_receiver_inner<R>(runtime: &Runtime, recv: R, connection: Option<Connection>) -> mpsc::Receiver<Result<(StageFrame, Instant), String>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     let (frames, receiver) = mpsc::channel();
     runtime.spawn(async move {
         let mut recv = recv;
         loop {
-            let frame = receive_frame(&mut recv).await.map(|frame| (frame, Instant::now())).map_err(|error| format!("{error}; close_reason={:?}; {}", connection.close_reason(), connection_diagnostics(&connection)));
+            let frame = receive_frame(&mut recv).await.map(|frame| (frame, Instant::now())).map_err(|error| match &connection {
+                Some(connection) => format!("{error}; close_reason={:?}; {}", connection.close_reason(), connection_diagnostics(connection)),
+                None => error,
+            });
             let failed = frame.is_err();
             if frames.send(frame).is_err() || failed {
                 break;
@@ -728,7 +878,7 @@ fn validate_stage_payload_len(payload_len: usize) -> Result<(), String> {
     Ok(())
 }
 
-async fn receive_frame(recv: &mut RecvStream) -> Result<StageFrame, String> {
+async fn receive_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<StageFrame, String> {
     let mut header = [0_u8; HEADER_BYTES];
     recv.read_exact(&mut header).await.map_err(|error| format!("读取 stage header: {error}"))?;
     if u32::from_le_bytes(header[0..4].try_into().unwrap()) != MAGIC {
@@ -906,11 +1056,34 @@ fn runtime() -> Result<Runtime, String> {
     tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|error| format!("创建 stage tokio runtime: {error}"))
 }
 
+/// 显式绑定私网地址的 stage 走内网 TCP；未绑定或公网地址继续使用 iroh。
+/// 这样不增加新的配置实体，现有固定 `bind_addr` 配置即可明确选择数据面。
+fn private_tcp_addr(bind_addr: Option<&str>) -> Result<Option<SocketAddr>, String> {
+    let Some(value) = bind_addr else {
+        return Ok(None);
+    };
+    let address = value.parse::<SocketAddr>().map_err(|error| format!("解析 stage bind_addr={value}: {error}"))?;
+    let private = match address.ip() {
+        IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
+    };
+    Ok(private.then_some(address))
+}
+
 fn stage_quic_transport_config() -> Result<QuicTransportConfig, String> {
     // stage 是长期复用的内网双向流。Iroh 默认 30 秒 connection idle 在模型加载或
-    // 低流量服务期过短；显式 keepalive 维持路径，较长上限仍允许故障最终收口。
+    // 低流量服务期过短；默认约 1.25MiB 的单流窗口也会让 12MiB GLM chunk
+    // 反复等待流控更新。窗口覆盖 pipeline 在途 chunk，避免把内网 RTT 放大成
+    // stage 空泡；较长 idle 上限仍允许故障最终收口。
     let idle = STAGE_MAX_IDLE.try_into().map_err(|error| format!("stage QUIC idle timeout 无效: {error}"))?;
-    Ok(QuicTransportConfig::builder().max_idle_timeout(Some(idle)).keep_alive_interval(STAGE_KEEP_ALIVE).build())
+    Ok(QuicTransportConfig::builder()
+        .max_idle_timeout(Some(idle))
+        .keep_alive_interval(STAGE_KEEP_ALIVE)
+        .stream_receive_window(VarInt::from_u32(STAGE_STREAM_WINDOW))
+        .receive_window(VarInt::from_u32(STAGE_CONNECTION_WINDOW))
+        .send_window(u64::from(STAGE_CONNECTION_WINDOW))
+        .initial_rtt(Duration::from_millis(1))
+        .build())
 }
 
 #[cfg(test)]
@@ -971,6 +1144,41 @@ mod tests {
     }
 
     #[test]
+    fn private_bind_addr_selects_tcp() {
+        assert_eq!(private_tcp_addr(Some("10.5.10.38:18889")).unwrap(), Some("10.5.10.38:18889".parse().unwrap()));
+        assert_eq!(private_tcp_addr(Some("127.0.0.1:0")).unwrap(), Some("127.0.0.1:0".parse().unwrap()));
+        assert_eq!(private_tcp_addr(Some("8.8.8.8:18889")).unwrap(), None);
+    }
+
+    #[test]
+    fn tcp_hidden_roundtrips() {
+        let listener = StageTransport::bind(IrohConfig { secret_key: None, bind_addr: Some("127.0.0.1:0".to_owned()), expected_peer: None }).unwrap();
+        let ticket = listener.ticket();
+        assert!(ticket.starts_with("tcp://127.0.0.1:"));
+        let accepted = std::thread::spawn(move || listener.accept().unwrap());
+        let mut sender = StageTransport::connect(&ticket, IrohConfig::default()).unwrap();
+        let mut receiver = accepted.join().unwrap();
+        let request = RequestId::generate_for_test();
+        sender.send_prefill(request, 17, 2, 2, &[1, 2, 3, 4], &[9]).unwrap();
+        assert!(matches!(receiver.recv().unwrap().message, StageMessage::Prefill { position: 17, rows: 2, cols: 2, values, selection, .. } if values == [1, 2, 3, 4] && selection == [9]));
+    }
+
+    #[test]
+    fn tcp_reconnect_preempts_old_stream() {
+        let listener = StageTransport::bind(IrohConfig { secret_key: None, bind_addr: Some("127.0.0.1:0".to_owned()), expected_peer: None }).unwrap();
+        let ticket = listener.ticket();
+        let accepted = std::thread::spawn(move || listener.accept().unwrap());
+        let mut client = StageTransport::connect(&ticket, IrohConfig::default()).unwrap();
+        let mut server = accepted.join().unwrap();
+
+        client.reconnect_downstream().unwrap();
+        assert!(server.recv().unwrap_err().contains("读取 stage header"));
+        server.accept_reconnect().unwrap();
+        server.send_device_memory(&[StageDeviceMemory { device: 0, model_units: 40, available_bytes: 17, total_bytes: 48 }], Some(8)).unwrap();
+        assert!(matches!(client.recv().unwrap().message, StageMessage::DeviceMemory { devices, session_capacity: Some(8) } if devices.len() == 1 && devices[0].model_units == 40));
+    }
+
+    #[test]
     fn glm52_prefill_aux_selection_payload_is_legal() {
         let payload = 4096 * 6144 * 2 * 2 + 4096 * 2048 * 4 + 4;
         assert_eq!(payload, 128 * 1024 * 1024 + 4);
@@ -980,7 +1188,7 @@ mod tests {
     #[test]
     fn decode_verify_cohort_metadata_roundtrips() {
         let listener = StageTransport::bind(IrohConfig { secret_key: Some(iroh::SecretKey::from_bytes(&[9; 32])), bind_addr: None, expected_peer: None }).unwrap();
-        let ticket = EndpointTicket::new(listener.endpoint.addr()).to_string();
+        let ticket = listener.ticket();
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let mut sender = StageTransport::connect(&ticket, IrohConfig::default()).unwrap();
         let mut receiver = accepted.join().unwrap();
@@ -994,7 +1202,7 @@ mod tests {
     #[test]
     fn dspark_aux_hidden_roundtrips() {
         let listener = StageTransport::bind(IrohConfig { secret_key: Some(iroh::SecretKey::from_bytes(&[7; 32])), bind_addr: None, expected_peer: None }).unwrap();
-        let ticket = EndpointTicket::new(listener.endpoint.addr()).to_string();
+        let ticket = listener.ticket();
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let mut sender = StageTransport::connect(&ticket, IrohConfig::default()).unwrap();
         let mut receiver = accepted.join().unwrap();
@@ -1010,7 +1218,7 @@ mod tests {
     #[test]
     fn tail_sampling_messages_roundtrip() {
         let listener = StageTransport::bind(IrohConfig { secret_key: Some(iroh::SecretKey::from_bytes(&[6; 32])), bind_addr: None, expected_peer: None }).unwrap();
-        let ticket = EndpointTicket::new(listener.endpoint.addr()).to_string();
+        let ticket = listener.ticket();
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let mut head = StageTransport::connect(&ticket, IrohConfig::default()).unwrap();
         let mut tail = accepted.join().unwrap();
@@ -1028,7 +1236,7 @@ mod tests {
     #[test]
     fn continuous_stream_end_ack_roundtrips_with_independent_control_id() {
         let listener = StageTransport::bind(IrohConfig { secret_key: Some(iroh::SecretKey::from_bytes(&[8; 32])), bind_addr: None, expected_peer: None }).unwrap();
-        let ticket = EndpointTicket::new(listener.endpoint.addr()).to_string();
+        let ticket = listener.ticket();
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let mut head = StageTransport::connect(&ticket, IrohConfig::default()).unwrap();
         let mut tail = accepted.join().unwrap();
@@ -1048,7 +1256,7 @@ mod tests {
     #[test]
     fn shutdown_roundtrips_and_waits_for_ready() {
         let listener = StageTransport::bind(IrohConfig { secret_key: Some(iroh::SecretKey::from_bytes(&[5; 32])), bind_addr: None, expected_peer: None }).unwrap();
-        let ticket = EndpointTicket::new(listener.endpoint.addr()).to_string();
+        let ticket = listener.ticket();
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let mut head = StageTransport::connect(&ticket, IrohConfig::default()).unwrap();
         let mut tail = accepted.join().unwrap();
@@ -1063,7 +1271,7 @@ mod tests {
     #[test]
     fn downstream_reconnect_reuses_endpoint_and_preempts_old_stream() {
         let listener = StageTransport::bind(IrohConfig { secret_key: Some(iroh::SecretKey::from_bytes(&[7; 32])), bind_addr: None, expected_peer: None }).unwrap();
-        let ticket = EndpointTicket::new(listener.endpoint.addr()).to_string();
+        let ticket = listener.ticket();
         let accepted = std::thread::spawn(move || listener.accept().unwrap());
         let mut client = StageTransport::connect(&ticket, IrohConfig::default()).unwrap();
         let mut server = accepted.join().unwrap();

@@ -164,7 +164,7 @@ impl<W> DeepSeekV4LayerCache<W> {
     }
 }
 
-#[cfg(feature = "with-rocm")]
+#[cfg(all(target_os = "linux", feature = "with-rocm"))]
 pub mod dspark_rocm;
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
 pub mod rocm_engine;

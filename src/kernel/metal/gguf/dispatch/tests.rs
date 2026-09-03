@@ -33,6 +33,38 @@ mod q6k_gemv_tests {
         }
     }
 
+    /// 多行(5 行,跨 8 行批边界内)走 q4_0 专用 gemv 的 8 输入行批路径,
+    /// 与 CPU dequant 点积对拍;覆盖 MTP verify / 短 prefill 的 multirow 分支。
+    #[test]
+    fn q4_0_multirow_gemv_matches_cpu_dequant() {
+        let ctx = MetalContext::new_default().unwrap();
+        let (input_rows, rows, columns, row_bytes) = (5, 19, 384, 216);
+        let input_values = (0..input_rows * columns).map(|index| ((index as f32 + 1.0) * 0.0061).sin()).collect::<Vec<_>>();
+        let rounded_input = input_values.iter().map(|&value| f16::from_f32(value).to_f32()).collect::<Vec<_>>();
+        let input = ctx.tensor_from_f32(&input_values, input_rows, columns).unwrap();
+        let mut weights = vec![0u8; rows * row_bytes];
+        for row in 0..rows {
+            for block in 0..columns / 32 {
+                let bytes = &mut weights[row * row_bytes + block * 18..row * row_bytes + (block + 1) * 18];
+                bytes[..2].copy_from_slice(&f16::from_f32(0.03125 + row as f32 * 0.0009765625).to_bits().to_le_bytes());
+                for (index, value) in bytes[2..].iter_mut().enumerate() {
+                    *value = index.wrapping_mul(29).wrapping_add(row * 11).wrapping_add(block * 7) as u8;
+                }
+            }
+        }
+        let blob = ctx.resident_byte_weight_buffer(&weights);
+        let actual = gguf_matmul_tensor_resident(&ctx, &input, &blob, 2, row_bytes, rows, columns).unwrap();
+        let actual = ctx.tensor_to_f32(&actual);
+        let decoded = crate::weight::codec::ggml::dequantize(2, &weights, rows * columns).unwrap();
+        for input_row in 0..input_rows {
+            for row in 0..rows {
+                let expected = decoded[row * columns..(row + 1) * columns].iter().zip(&rounded_input[input_row * columns..(input_row + 1) * columns]).map(|(weight, input)| weight * input).sum::<f32>();
+                let value = actual[input_row * rows + row];
+                assert!((value - expected).abs() <= 0.1, "input_row={input_row} row={row} actual={value} expected={expected}");
+            }
+        }
+    }
+
     #[test]
     fn q4k_three_input_rows_matches_cpu_dequant() {
         let ctx = MetalContext::new_default().unwrap();
@@ -406,6 +438,13 @@ mod gguf_quant_tests {
     pub(super) fn block(tensor_type: u32) -> Vec<u8> {
         let mut bytes = vec![0; metal_block_layout(tensor_type).unwrap().1];
         match tensor_type {
+            2 => {
+                // Q4_0 平铺 block:d(2B) + qs[16B nibble 对] = 18B per 32 weights
+                bytes[..2].copy_from_slice(&0x2400u16.to_le_bytes());
+                for (index, value) in bytes[2..].iter_mut().enumerate() {
+                    *value = index.wrapping_mul(13) as u8;
+                }
+            }
             8 => {
                 bytes[..2].copy_from_slice(&0x3000u16.to_le_bytes());
                 for (index, value) in bytes[2..].iter_mut().enumerate() {
@@ -562,6 +601,7 @@ mod gguf_quant_tests {
         let ctx = MetalContext::new_default().unwrap();
         for (tensor_type, columns, bytes) in [
             (8, 32, block(8)),
+            (2, 32, block(2)),
             (11, 256, block(11)),
             (12, 256, block(12)),
             (13, 256, block(13)),

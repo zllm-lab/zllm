@@ -292,6 +292,7 @@ impl NodeEngine for Glm53FlashNodeEngine {
         _intake: &mut dyn FnMut(usize) -> Vec<NodeBatchRequest>,
         on_token: &mut dyn FnMut(&str, u32, String) -> bool,
         _on_tool_call_delta: &mut dyn FnMut(&str, crate::runtime::session::ToolCallDelta) -> bool,
+        _on_runtime_changed: &mut dyn FnMut(),
         _on_result: &mut dyn FnMut(NodeBatchResult),
     ) -> Vec<NodeBatchResult> {
         requests.into_iter().map(|request| self.generate_one(request, on_token)).collect()

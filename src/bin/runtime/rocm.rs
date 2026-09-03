@@ -137,11 +137,15 @@ fn configure_backend(backend: &zllm::config::RocmBackendConfig, kv_f16: bool) ->
         backend.hiprtc_cache_directory.clone(),
         kv_f16,
         backend.mla_decode_split_threshold,
+        backend.mla_decode_wmma,
+        backend.cooperative_mla_sequence_split,
         backend.dsa_hadamard_i8,
         backend.dsa_hadamard_shadow_samples,
         backend.dsa_hisa_shadow_samples,
         backend.dsa_cpu_select,
         backend.mla_cpu_hot_rows,
+        backend.prefill_attention_cpu,
+        backend.mla_hot_trace,
         backend.precise_router,
     );
     zllm::kernel::rocm::hip::configure(options)?;

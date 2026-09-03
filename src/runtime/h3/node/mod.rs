@@ -271,6 +271,7 @@ impl NodeEngine for H3Engine {
         _intake: &mut dyn FnMut(usize) -> Vec<crate::server::node::NodeBatchRequest>,
         _on_token: &mut dyn FnMut(&str, u32, String) -> bool,
         _on_tool_call_delta: &mut dyn FnMut(&str, crate::runtime::session::ToolCallDelta) -> bool,
+        _on_runtime_changed: &mut dyn FnMut(),
         _on_result: &mut dyn FnMut(crate::server::node::NodeBatchResult),
     ) -> Vec<crate::server::node::NodeBatchResult> {
         requests

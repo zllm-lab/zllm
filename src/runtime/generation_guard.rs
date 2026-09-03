@@ -37,6 +37,15 @@ impl<P: TokenFenceProgram> TokenFenceProgram for Option<P> {
     }
 }
 
+/// 空协议程序：只想要循环检测、没有语法围栏状态的调用方（embedded 通用接线）。
+impl TokenFenceProgram for () {
+    fn fence(&self) -> TokenFence {
+        TokenFence::default()
+    }
+
+    fn advance(&mut self, _token: u32) {}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoopKind {
     RepeatedToken,
@@ -141,6 +150,17 @@ impl<P> GenerationGuard<P> {
         self.segment_end_tokens.sort_unstable();
         self.segment_end_tokens.dedup();
         self
+    }
+
+    /// 顺序发射路径的提交前检查：推进一个 token 并检测。返回 Some(kind) 表示
+    /// 该 token 使历史进入失控循环，调用方应停止生成并以 repetition 收口；
+    /// speculative 多行路径用 recover 批量探测，不走这里。
+    pub fn advance_and_check(&mut self, token: u32) -> Option<LoopKind>
+    where
+        P: TokenFenceProgram,
+    {
+        TokenFenceProgram::advance(self, token);
+        self.detected_loop()
     }
 
     /// 在候选 token 正式提交前逐行模拟围栏。thinking 中把触发循环的最后一行
@@ -470,5 +490,22 @@ mod tests {
         assert!(guard.fence().is_open());
         let mut candidates = vec![7];
         assert_eq!(guard.recover(&mut candidates, Some(99)), None);
+    }
+
+    /// 顺序发射路径（embedded 通用接线）的逐 token 提交前检查：
+    /// 第 10 个相同 token 触发 RepeatedToken；三份结构块不触发。
+    #[test]
+    fn advance_and_check_stops_sequential_repetition() {
+        let mut guard = GenerationGuard::new((), true, []);
+        for _ in 0..9 {
+            assert_eq!(guard.advance_and_check(7), None);
+        }
+        assert_eq!(guard.advance_and_check(7), Some(LoopKind::RepeatedToken));
+
+        let mut guard = GenerationGuard::new((), true, []);
+        let block = (100..112).collect::<Vec<_>>();
+        for token in block.iter().cycle().take(block.len() * 3) {
+            assert_eq!(guard.advance_and_check(*token), None);
+        }
     }
 }

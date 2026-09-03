@@ -10,6 +10,11 @@ mod metal_session;
 pub mod multimodal;
 pub mod protocol;
 
+/// MTP draft 头的 RoPE 表上限：ensure_mtp 按它封顶构建，请求跨度（prompt +
+/// completion）越过它的请求由 engine 级禁用 MTP 回落普通重放 decode——draft
+/// kernel 按表索引，越界读会楔死 GPU 命令队列。
+pub const MTP_MAX_POSITIONS: usize = 8192;
+
 use half::{bf16, f16};
 
 use crate::{

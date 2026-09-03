@@ -1613,8 +1613,7 @@ where
                     // 中间 stage 立即把有序交接工作送到下一 stage，由 backend
                     // completion capability 串起源计算、搬运和目标计算；最终 stage
                     // 必须等完成后再把 tensor 暴露给 host/采样回调。
-                    let defer_handoff = concurrent_submissions && kind == StageWorkKind::Prefill;
-                    let output = if stage + 1 < stage_count && !defer_handoff {
+                    let output = if stage + 1 < stage_count {
                         let (cohort, wave) = group.map_or((None, None), QueuedGroup::message_parts);
                         if sender.send(Ok(StageSchedulerMessage::Work { queued_at: Instant::now(), cohort, wave, items: output })).is_err() {
                             break;
@@ -2298,7 +2297,7 @@ mod tests {
     }
 
     #[test]
-    fn 后台prefill等待源stage完成后再跨stage交接() {
+    fn 后台prefill通过device_event直接跨stage交接() {
         let first = ConcurrentTestBackend::new();
         let second = ConcurrentTestBackend::new();
         let dispatches = Mutex::new(Vec::<usize>::new());
@@ -2331,15 +2330,12 @@ mod tests {
                     assert!(std::time::Instant::now() < deadline, "首 stage prefill 未提交");
                     std::thread::yield_now();
                 }
-                for _ in 0..1_000 {
-                    assert_eq!(*dispatches.lock().unwrap(), [0], "后台 prefill 在源 completion 前进入下一 stage");
-                    std::thread::yield_now();
-                }
-                first.complete(0);
                 while dispatches.lock().unwrap().len() < 2 {
-                    assert!(std::time::Instant::now() < deadline, "源 completion 后未交接下一 stage");
+                    assert!(std::time::Instant::now() < deadline, "后台 prefill 等待了源 completion，未直接交接下一 stage");
                     std::thread::yield_now();
                 }
+                assert_eq!(*dispatches.lock().unwrap(), [0, 1]);
+                first.complete(0);
                 while second.recorded() < 1 {
                     assert!(std::time::Instant::now() < deadline, "下一 stage 未记录 completion");
                     std::thread::yield_now();

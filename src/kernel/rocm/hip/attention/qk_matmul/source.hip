@@ -51,12 +51,21 @@ extern "C" __global__ void qk_matmul_f32(
     if (output_row >= output_rows) return;
 
     const unsigned int blocks_per_row = columns >> 8;
-    const unsigned int block_bytes = tensor_type == 12 ? 144 : 176;
+    const unsigned int block_bytes = zllm_gguf_block_bytes(tensor_type);
     const unsigned long long row_bytes = (unsigned long long)blocks_per_row * block_bytes;
     const unsigned char *weight_row = weight + (unsigned long long)output_row * row_bytes;
     float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
 
     for (unsigned int column = lane; column < columns; column += 256) {
+        if (tensor_type == 11u || tensor_type == 21u || tensor_type == 23u) {
+            const float value = zllm_gguf_extra_value(weight_row, tensor_type, column);
+            #pragma unroll
+            for (unsigned int row = 0; row < 8; ++row) {
+                if (input_base + row < input_rows)
+                    sums[row] += qk_input(input, (unsigned long long)(input_base + row) * columns + column, input_is_bf16) * value;
+            }
+            continue;
+        }
         const unsigned int local = column & 255;
         const unsigned int group = local >> 5;
         const unsigned int index = local & 31;
@@ -185,7 +194,7 @@ struct GgufExpertMeta {
 
 __device__ __forceinline__ unsigned int qk_block_bytes(const unsigned int tensor_type)
 {
-    return tensor_type == 12 ? 144u : (tensor_type == 13 ? 176u : 210u);
+    return zllm_gguf_block_bytes(tensor_type);
 }
 
 // 行基址：weight 为 [rows, cols] 的 K-quant 打包，每行 (cols>>8) 个块。
@@ -199,6 +208,8 @@ __device__ __forceinline__ float gguf_kq_dequant(const unsigned char *row_base, 
 {
     const unsigned char *block = row_base + (unsigned long long)(column >> 8) * qk_block_bytes(tensor_type);
     const unsigned int local = column & 255;
+    if (tensor_type == 11u || tensor_type == 21u || tensor_type == 23u)
+        return zllm_gguf_extra_value(row_base, tensor_type, column);
     if (tensor_type == 14) {
         const unsigned int half = local >> 7;
         const unsigned int remaining = local & 127;
@@ -228,4 +239,74 @@ __device__ __forceinline__ float gguf_kq_dequant(const unsigned char *row_base, 
     unsigned int quant = (group & 1) == 0 ? packed & 0x0f : packed >> 4;
     if (tensor_type == 13 && (block[16 + index] & (1u << group)) != 0) quant += 16;
     return gguf_f16(block) * float(scale * quant) - gguf_f16(block + 2) * float(minimum);
+}
+
+// ===== decode 少行 fdot2 快路径：与 CT W8 家族对齐的数值形态 =====
+typedef __bf16 __attribute__((ext_vector_type(2))) qk_bf16x2;
+
+__device__ __forceinline__ unsigned int qk_bf16_pair(const float low, const float high)
+{
+    return ((__float_as_uint(high) >> 16) << 16) | (__float_as_uint(low) >> 16);
+}
+
+// 与 qk_matmul_f32 相同的 GGUF 块解码(gguf_kq_dequant)，但反量化值经 bf16 舍入后
+// 用 fdot2 累加，每个 workgroup 处理一个输出行、最多 8 个输入行（decode 主路径）。
+// 数值与 CT W8 GEMV 同族（bf16 舍入 + fdot2），跨后端容差沿用 1e-2。
+extern "C" __global__ void qk_matmul_fdot2(
+    const void *__restrict__ input,
+    const unsigned char *__restrict__ weight,
+    float *__restrict__ output,
+    const unsigned int input_rows,
+    const unsigned int columns,
+    const unsigned int output_rows,
+    const unsigned int tensor_type,
+    const unsigned int input_is_bf16)
+{
+    const unsigned int output_row = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    if (output_row >= output_rows || input_rows == 0u || input_rows > 8u) return;
+
+    const unsigned int blocks_per_row = columns >> 8;
+    const unsigned int block_bytes = zllm_gguf_block_bytes(tensor_type);
+    const unsigned char *weight_row = weight + (unsigned long long)output_row * blocks_per_row * block_bytes;
+    float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    // 列成对分配：lane 处理 (2*lane, 2*lane+1)，步进 512；columns 为 256 倍数，无尾列。
+    for (unsigned int pair = lane; pair * 2u + 1u < columns; pair += 256u) {
+        const unsigned int c0 = pair * 2u;
+        const unsigned int weight_pair = qk_bf16_pair(
+            gguf_kq_dequant(weight_row, tensor_type, c0),
+            gguf_kq_dequant(weight_row, tensor_type, c0 + 1u));
+        const qk_bf16x2 weight_value = *reinterpret_cast<const qk_bf16x2 *>(&weight_pair);
+        #pragma unroll
+        for (unsigned int row = 0; row < 8; ++row) {
+            if (row < input_rows) {
+                const unsigned int input_pair = qk_bf16_pair(
+                    qk_input(input, (unsigned long long)row * columns + c0, input_is_bf16),
+                    qk_input(input, (unsigned long long)row * columns + c0 + 1u, input_is_bf16));
+                const qk_bf16x2 input_value = *reinterpret_cast<const qk_bf16x2 *>(&input_pair);
+                sums[row] = __builtin_amdgcn_fdot2_f32_bf16(input_value, weight_value, sums[row], false);
+            }
+        }
+    }
+
+    __shared__ float fdot2_partial[8][256];
+    #pragma unroll
+    for (unsigned int row = 0; row < 8; ++row) fdot2_partial[row][lane] = sums[row];
+    __syncthreads();
+    for (unsigned int stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            #pragma unroll
+            for (unsigned int row = 0; row < 8; ++row) fdot2_partial[row][lane] += fdot2_partial[row][lane + stride];
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (unsigned int row = 0; row < 8; ++row) {
+            if (row < input_rows) {
+                output[(unsigned long long)row * output_rows + output_row] = fdot2_partial[row][0];
+            }
+        }
+    }
 }

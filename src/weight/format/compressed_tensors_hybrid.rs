@@ -170,6 +170,40 @@ pub enum CtLinearWeight {
     F32(Vec<f32>),
 }
 
+impl CtLinearWeight {
+    pub(crate) fn split_rows(&self, boundary: usize) -> Result<[Self; 2], String> {
+        let rows = match self {
+            Self::Quantized(matrix) => matrix.rows(),
+            Self::Bf16(bytes) => bytes.len() / 2,
+            Self::F32(values) => values.len(),
+        };
+        if boundary == 0 || boundary >= rows {
+            return Err(format!("CT row split={boundary}/{rows} 非法"));
+        }
+        match self {
+            Self::Quantized(CtMatrix::W4(matrix)) => Ok([Self::Quantized(CtMatrix::W4(matrix.slice_rows(0..boundary)?)), Self::Quantized(CtMatrix::W4(matrix.slice_rows(boundary..rows)?))]),
+            Self::Quantized(CtMatrix::W8(matrix)) => Ok([Self::Quantized(CtMatrix::W8(matrix.slice_rows(0..boundary)?)), Self::Quantized(CtMatrix::W8(matrix.slice_rows(boundary..rows)?))]),
+            // dense tensor 的真实列数只能由调用方提供，不能仅按总元素推导行界。
+            Self::Bf16(_) | Self::F32(_) => Err("CT dense row split 需要显式矩阵 shape".to_owned()),
+        }
+    }
+
+    pub(crate) fn split_columns(&self, boundary: usize) -> Result<[Self; 2], String> {
+        let cols = match self {
+            Self::Quantized(matrix) => matrix.cols(),
+            Self::Bf16(_) | Self::F32(_) => return Err("CT dense column split 需要显式矩阵 shape".to_owned()),
+        };
+        if boundary == 0 || boundary >= cols {
+            return Err(format!("CT column split={boundary}/{cols} 非法"));
+        }
+        match self {
+            Self::Quantized(CtMatrix::W4(matrix)) => Ok([Self::Quantized(CtMatrix::W4(matrix.slice_columns(0..boundary)?)), Self::Quantized(CtMatrix::W4(matrix.slice_columns(boundary..cols)?))]),
+            Self::Quantized(CtMatrix::W8(matrix)) => Ok([Self::Quantized(CtMatrix::W8(matrix.slice_columns(0..boundary)?)), Self::Quantized(CtMatrix::W8(matrix.slice_columns(boundary..cols)?))]),
+            Self::Bf16(_) | Self::F32(_) => unreachable!("dense 已提前返回"),
+        }
+    }
+}
+
 impl CompressedTensorsSource {
     /// 加载一个线性层：量化权重和 BF16 均保持原始存储，避免无效展开。
     pub(crate) fn load_linear(&self, name: &str) -> Result<CtLinearWeight, String> {
@@ -200,5 +234,31 @@ mod tests {
         assert_eq!(packed_bits("regular expert", "I32", &[6144, 256], 6144, 2048).unwrap(), 4);
         assert_eq!(packed_bits("MTP expert", "I32", &[6144, 512], 6144, 2048).unwrap(), 8);
         assert!(packed_bits("broken", "I32", &[6144, 1024], 6144, 2048).is_err());
+    }
+
+    #[test]
+    fn w8_tensor_parallel_slices_preserve_matrix_values() {
+        let rows = 4;
+        let cols = 8;
+        let group = 4;
+        let packed = (0..rows * cols).map(|value| value as u8).collect::<Vec<_>>();
+        let one = half::bf16::from_f32(1.0).to_bits().to_le_bytes();
+        let scales = (0..rows * cols / group).flat_map(|_| one).collect::<Vec<_>>();
+        let matrix = W8A16Matrix::new(packed, scales, ScaleDType::Bf16, group, rows, cols).unwrap();
+        let original = matrix.decode().unwrap();
+        let [low_rows, high_rows] = CtLinearWeight::Quantized(CtMatrix::W8(matrix.clone())).split_rows(2).unwrap();
+        let [low_cols, high_cols] = CtLinearWeight::Quantized(CtMatrix::W8(matrix)).split_columns(4).unwrap();
+        let decode = |weight: CtLinearWeight| match weight {
+            CtLinearWeight::Quantized(matrix) => matrix.decode().unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(decode(low_rows), original[..2 * cols]);
+        assert_eq!(decode(high_rows), original[2 * cols..]);
+        let low_cols = decode(low_cols);
+        let high_cols = decode(high_cols);
+        for row in 0..rows {
+            assert_eq!(&low_cols[row * 4..row * 4 + 4], &original[row * cols..row * cols + 4]);
+            assert_eq!(&high_cols[row * 4..row * 4 + 4], &original[row * cols + 4..row * cols + 8]);
+        }
     }
 }

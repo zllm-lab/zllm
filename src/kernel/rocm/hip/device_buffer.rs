@@ -194,8 +194,15 @@ pub(crate) mod hip_api_stats {
         }
     }
 
+    /// 诊断开关：`kernel_profile` 会附带各相位设备同步，纯主机侧 API 统计只需要
+    /// 本开关（ZLLM_HIP_API_STATS=1），不引入任何同步点。
+    fn env_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("ZLLM_HIP_API_STATS").is_ok_and(|value| value == "1"))
+    }
+
     pub(crate) fn start() -> Option<Instant> {
-        crate::kernel::rocm::hip::options().kernel_profile.then(Instant::now)
+        (crate::kernel::rocm::hip::options().kernel_profile || env_enabled()).then(Instant::now)
     }
 
     pub(crate) fn counted(kind: usize, started: Option<Instant>) {
@@ -215,7 +222,7 @@ pub(crate) mod hip_api_stats {
     }
 
     fn report_labeled(label: Option<&str>) {
-        if !crate::kernel::rocm::hip::options().kernel_profile || REPORTING.swap(true, Ordering::AcqRel) {
+        if !(crate::kernel::rocm::hip::options().kernel_profile || env_enabled()) || REPORTING.swap(true, Ordering::AcqRel) {
             return;
         }
         let mut line = String::new();
@@ -768,8 +775,8 @@ pub(super) struct PinnedHostBuffer {
     bytes: usize,
 }
 
-/// 在当前 compute stream 上提交 D2H 后，把等待移动到消费线程。
-/// staging 与 event 常驻复用，避免每层重新分配页锁定内存或创建 HIP event。
+/// 在 compute stream 上提交 D2H 后，把等待移动到消费线程。
+/// staging 与 event 常驻复用；分段接口避免额外的 device pack buffer。
 pub(crate) struct AsyncHostDownload {
     device_id: i32,
     event: HipEvent,
@@ -801,14 +808,27 @@ impl AsyncHostDownload {
     }
 
     pub(crate) fn enqueue(&mut self, source: &DeviceBuffer, bytes: usize) -> Result<(), String> {
+        self.enqueue_segments(&[(source, 0, bytes)])
+    }
+
+    /// 在同一 producer 边界后把多个 device 片段直接拼入 pinned staging，
+    /// 避免先在 compute stream 上做小块 D2D pack。
+    pub(crate) fn enqueue_segments(&mut self, sources: &[(&DeviceBuffer, usize, usize)]) -> Result<(), String> {
         if self.pending {
             return Err("async D2H 上一份传输尚未完成".to_owned());
         }
-        if source.device_id != self.device_id {
-            return Err(format!("async D2H device 不一致: transfer={} source={}", self.device_id, source.device_id));
+        if sources.is_empty() {
+            return Err("async D2H segments 不能为空".to_owned());
         }
-        if bytes > source.bytes {
-            return Err(format!("async D2H 字节数 {bytes}，buffer 容量 {}", source.bytes));
+        let mut bytes = 0usize;
+        for &(source, offset, length) in sources {
+            if source.device_id != self.device_id {
+                return Err(format!("async D2H device 不一致: transfer={} source={}", self.device_id, source.device_id));
+            }
+            if offset.checked_add(length).is_none_or(|end| end > source.bytes) {
+                return Err(format!("async D2H segment 越界: offset={offset} bytes={length} source={}", source.bytes));
+            }
+            bytes = bytes.checked_add(length).ok_or("async D2H segments 大小溢出")?;
         }
         if bytes > self.staging.bytes {
             self.staging = PinnedHostBuffer::allocate(bytes)?;
@@ -818,11 +838,15 @@ impl AsyncHostDownload {
         let copy = runtime.memcpy_async()?;
         let record = runtime.event_record()?;
         let stream = crate::kernel::rocm::hip::active_compute_stream();
-        let stats_started = hip_api_stats::start();
-        let status = unsafe { copy(self.staging.pointer, source.pointer, bytes, HIP_MEMORY_COPY_DEVICE_TO_HOST, stream) };
-        hip_api_stats::counted(hip_api_stats::MEMCPY_ASYNC, stats_started);
-        if status != HIP_SUCCESS {
-            return Err(runtime.hip_error(status, "hipMemcpyAsync async D2H"));
+        let mut destination_offset = 0usize;
+        for &(source, source_offset, length) in sources {
+            let stats_started = hip_api_stats::start();
+            let status = unsafe { copy(self.staging.pointer.cast::<u8>().add(destination_offset).cast(), source.pointer.cast::<u8>().add(source_offset).cast(), length, HIP_MEMORY_COPY_DEVICE_TO_HOST, stream) };
+            hip_api_stats::counted(hip_api_stats::MEMCPY_ASYNC, stats_started);
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipMemcpyAsync segmented D2H"));
+            }
+            destination_offset += length;
         }
         let stats_started = hip_api_stats::start();
         let status = unsafe { record(self.event, stream) };
@@ -858,6 +882,98 @@ impl AsyncHostDownload {
 }
 
 impl Drop for AsyncHostDownload {
+    fn drop(&mut self) {
+        if set_device(self.device_id).is_err() {
+            return;
+        }
+        let Ok(runtime) = RocmRuntime::open() else { return };
+        if self.pending
+            && let Ok(synchronize) = runtime.event_synchronize()
+        {
+            let _ = unsafe { synchronize(self.event) };
+        }
+        if let Ok(destroy) = runtime.event_destroy() {
+            let _ = unsafe { destroy(self.event) };
+        }
+    }
+}
+
+/// CPU prefill 输出的单槽 pinned H2D。下一次上传前只等待上一份 H2D event，
+/// staging 可以跨层复用，不必把每层 host buffer 保留到 stage completion。
+pub(crate) struct AsyncHostUpload {
+    device_id: i32,
+    event: HipEvent,
+    staging: PinnedHostBuffer,
+    pending: bool,
+}
+
+unsafe impl Send for AsyncHostUpload {}
+
+impl AsyncHostUpload {
+    pub(crate) fn new(device_id: i32, bytes: usize) -> Result<Self, String> {
+        set_device(device_id)?;
+        let runtime = RocmRuntime::open()?;
+        let create = runtime.event_create()?;
+        let destroy = runtime.event_destroy()?;
+        let mut event = ptr::null_mut();
+        let status = unsafe { create(&mut event, HIP_EVENT_DISABLE_TIMING) };
+        if status != HIP_SUCCESS {
+            return Err(runtime.hip_error(status, "hipEventCreateWithFlags async H2D"));
+        }
+        match PinnedHostBuffer::allocate(bytes.max(1)) {
+            Ok(staging) => Ok(Self { device_id, event, staging, pending: false }),
+            Err(error) => {
+                let _ = unsafe { destroy(event) };
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn upload(&mut self, input: &[u8]) -> Result<DeviceBuffer, String> {
+        set_device(self.device_id)?;
+        let runtime = RocmRuntime::open()?;
+        if self.pending {
+            let synchronize = runtime.event_synchronize()?;
+            let status = unsafe { synchronize(self.event) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventSynchronize async H2D"));
+            }
+            self.pending = false;
+        }
+        if input.len() > self.staging.bytes {
+            self.staging = PinnedHostBuffer::allocate(input.len())?;
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(input.as_ptr(), self.staging.pointer.cast(), input.len());
+        }
+        // attention 输出只活到紧随其后的 o_proj；走 stream-ordered 临时分配，
+        // 显式复用池 miss 会调用同步 hipMalloc，把同卡其它 pipeline stream 一起卡住。
+        let output = DeviceBuffer::allocate(self.device_id, input.len())?;
+        let copy = runtime.memcpy_async()?;
+        let record = runtime.event_record()?;
+        let stream = crate::kernel::rocm::hip::active_compute_stream();
+        let stats_started = hip_api_stats::start();
+        let status = unsafe { copy(output.pointer, self.staging.pointer, input.len(), HIP_MEMORY_COPY_HOST_TO_DEVICE, stream) };
+        hip_api_stats::counted(hip_api_stats::MEMCPY_ASYNC, stats_started);
+        if status != HIP_SUCCESS {
+            return Err(runtime.hip_error(status, "hipMemcpyAsync CPU prefill H2D"));
+        }
+        let stats_started = hip_api_stats::start();
+        let status = unsafe { record(self.event, stream) };
+        hip_api_stats::counted(hip_api_stats::EVENT_RECORD, stats_started);
+        if status != HIP_SUCCESS {
+            if let Ok(synchronize) = runtime.stream_synchronize() {
+                let _ = unsafe { synchronize(stream) };
+            }
+            return Err(runtime.hip_error(status, "hipEventRecord CPU prefill H2D"));
+        }
+        self.pending = true;
+        record_host_transfer(true, input.len());
+        Ok(output)
+    }
+}
+
+impl Drop for AsyncHostUpload {
     fn drop(&mut self) {
         if set_device(self.device_id).is_err() {
             return;
@@ -1157,15 +1273,21 @@ impl DeviceBuffer {
     /// H2D 延迟到 stage0 的真实 consumer stream 上提交。
     #[track_caller]
     pub fn upload_ordered(device_id: i32, bytes: &[u8]) -> Result<Self, String> {
-        if bytes.is_empty() {
+        Self::upload_ordered_with(device_id, bytes.len(), |staging| staging.copy_from_slice(bytes))
+    }
+
+    /// 直接在 pinned staging 中构造有序上传内容，避免调用方先写 pageable Vec、
+    /// 再完整复制一次。闭包返回后 staging 由 stage completion 保活。
+    #[track_caller]
+    pub(crate) fn upload_ordered_with(device_id: i32, bytes: usize, fill: impl FnOnce(&mut [u8])) -> Result<Self, String> {
+        if bytes == 0 {
             return Err("ROCm device buffer 大小不能为 0".to_owned());
         }
-        let mut buffer = Self::allocate_peer(device_id, bytes.len())?;
+        let mut buffer = Self::allocate_peer(device_id, bytes)?;
         buffer.retain_until_stage_completion = true;
-        let staging = CachedPinnedHostBuffer::allocate(bytes.len())?;
-        unsafe {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), staging.pointer.cast(), bytes.len());
-        }
+        let staging = CachedPinnedHostBuffer::allocate(bytes)?;
+        let staging_bytes = unsafe { std::slice::from_raw_parts_mut(staging.pointer.cast(), bytes) };
+        fill(staging_bytes);
         buffer.deferred_host = Some(staging);
         Ok(buffer)
     }
@@ -1210,7 +1332,7 @@ impl DeviceBuffer {
         let request_start_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
         let log_slow_request = |path: &str| {
             let elapsed = request_started.elapsed();
-            if elapsed >= std::time::Duration::from_millis(100) {
+            if elapsed >= std::time::Duration::from_millis(5) {
                 let complete_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
                 eprintln!(
                     "[rocm-buffer-allocate-slow] ts_us={request_start_us} device={device_id} bytes={bytes} path={path} wall_ms={:.3} caller={}:{} complete_us={complete_us}",
@@ -1274,7 +1396,7 @@ impl DeviceBuffer {
         let allocation_start_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
         let mut status = unsafe { malloc(&mut pointer, bytes) };
         let allocation_micros = allocation_started.elapsed().as_micros();
-        if allocation_micros >= 100_000 {
+        if allocation_micros >= 5_000 {
             let complete_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
             eprintln!(
                 "[rocm-slow-allocation] ts_us={allocation_start_us} device={device_id} bytes={bytes} wall_ms={:.3} caller={}:{} complete_us={complete_us}",
@@ -1510,15 +1632,68 @@ impl DeviceBuffer {
     /// 双卡 MoE 的 owner completion 已经依赖 peer 结果回传，因此它也覆盖
     /// owner→peer activation 的读取生命周期，无需为 peer 单独同步或建 completion。
     pub(crate) fn copy_stable_to_device_ordered_async_retained_by(self: &std::sync::Arc<Self>, device_id: i32, completion_device_id: i32) -> Result<Self, String> {
-        self.copy_stable_to_device_ordered_async_retained_by_inner(device_id, completion_device_id, false)
+        self.copy_stable_to_device_ordered_async_retained_by_inner(device_id, completion_device_id, false, None)
+    }
+
+    /// 只建立跨设备 producer→consumer event 依赖，不复制数据。consumer
+    /// kernel 通过 peer BAR 只读一次来源 buffer 时，这比先复制再读取少一次
+    /// 大块显存写入；来源仍由 consumer completion 保活。
+    pub(crate) fn wait_stable_on_device_ordered_on_streams_retained_by(self: &std::sync::Arc<Self>, device_id: i32, completion_device_id: i32, source_stream: usize, destination_stream: usize) -> Result<(), String> {
+        if self.async_allocated {
+            return Err("ordered peer wait source 不能是 async allocation".to_owned());
+        }
+        let runtime = RocmRuntime::open()?;
+        enable_peer_access(device_id, self.device_id)?;
+        let create: Symbol<HipEventCreateWithFlags> = runtime.symbol(&runtime.hip, b"hipEventCreateWithFlags\0")?;
+        let record: Symbol<HipEventRecord> = runtime.symbol(&runtime.hip, b"hipEventRecord\0")?;
+        let wait: Symbol<HipStreamWaitEvent> = runtime.symbol(&runtime.hip, b"hipStreamWaitEvent\0")?;
+        let destroy: Symbol<HipEventDestroy> = runtime.symbol(&runtime.hip, b"hipEventDestroy\0")?;
+        let mut event = device_buffer_pool(self.device_id).and_then(|pool| pool.lock().ok()?.available_events.pop()).map(|event| event as HipEvent).unwrap_or(ptr::null_mut());
+        set_device(self.device_id)?;
+        if event.is_null() {
+            let status = unsafe { create(&mut event, HIP_EVENT_DISABLE_TIMING) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventCreateWithFlags ordered peer wait"));
+            }
+        }
+        let result = (|| {
+            let status = unsafe { record(event, source_stream as *mut c_void) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventRecord ordered peer wait source"));
+            }
+            set_device(device_id)?;
+            let status = unsafe { wait(destination_stream as *mut c_void, event, 0) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipStreamWaitEvent ordered peer wait destination"));
+            }
+            PENDING_P2P_SOURCES.with(|sources| {
+                sources.borrow_mut().entry(completion_device_id).or_default().push(PendingP2pSource { sources: vec![self.clone()], event: event as usize });
+            });
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = set_device(self.device_id).and_then(|()| {
+                let status = unsafe { destroy(event) };
+                if status == HIP_SUCCESS { Ok(()) } else { Err(runtime.hip_error(status, "hipEventDestroy ordered peer wait")) }
+            });
+        }
+        result?;
+        set_device(device_id)
     }
 
     /// 只等待源 producer event；P2P copy 与 consumer 仍在目标 stream 异步执行。
     pub(crate) fn copy_stable_to_device_after_event_retained_by(self: &std::sync::Arc<Self>, device_id: i32, completion_device_id: i32) -> Result<Self, String> {
-        self.copy_stable_to_device_ordered_async_retained_by_inner(device_id, completion_device_id, true)
+        self.copy_stable_to_device_ordered_async_retained_by_inner(device_id, completion_device_id, true, None)
     }
 
-    fn copy_stable_to_device_ordered_async_retained_by_inner(self: &std::sync::Arc<Self>, device_id: i32, completion_device_id: i32, synchronize_source_event: bool) -> Result<Self, String> {
+    /// cooperative peer 没有 pipeline stage，因此它的 producer 可以合法位于
+    /// null stream。显式传入两端 stream，避免把“peer default”误判成“缺少
+    /// 与 owner 对应的 stage-prefill stream”。
+    pub(crate) fn copy_stable_to_device_after_event_on_streams_retained_by(self: &std::sync::Arc<Self>, device_id: i32, completion_device_id: i32, source_stream: usize, destination_stream: usize) -> Result<Self, String> {
+        self.copy_stable_to_device_ordered_async_retained_by_inner(device_id, completion_device_id, true, Some((source_stream, destination_stream)))
+    }
+
+    fn copy_stable_to_device_ordered_async_retained_by_inner(self: &std::sync::Arc<Self>, device_id: i32, completion_device_id: i32, synchronize_source_event: bool, explicit_streams: Option<(usize, usize)>) -> Result<Self, String> {
         if self.async_allocated {
             return Err("ordered P2P source 不能是 async allocation".to_owned());
         }
@@ -1533,12 +1708,14 @@ impl DeviceBuffer {
         let copy_ready: Symbol<HipMemcpyPeer> = runtime.symbol(&runtime.hip, b"hipMemcpyPeer\0")?;
         let destroy: Symbol<HipEventDestroy> = runtime.symbol(&runtime.hip, b"hipEventDestroy\0")?;
         let mut event = device_buffer_pool(self.device_id).and_then(|pool| pool.lock().ok()?.available_events.pop()).map(|event| event as HipEvent).unwrap_or(ptr::null_mut());
-        let destination_stream = compute_stream_for(device_id);
+        let destination_stream = explicit_streams.map_or_else(|| compute_stream_for(device_id), |(_, stream)| stream as *mut c_void);
         // background prefill 的 stage 各在线程中提交，目标线程的 TLS 没有源卡
         // stream 映射。若目标正使用 stage-prefill stream，显式取同类源 stream；
         // 否则沿用 latency/default 或调用方已经绑定的 source stream。
         let mapped_source_stream = compute_stream_for(self.device_id);
-        let source_stream = if !mapped_source_stream.is_null() {
+        let source_stream = if let Some((stream, _)) = explicit_streams {
+            stream as *mut c_void
+        } else if !mapped_source_stream.is_null() {
             mapped_source_stream
         } else if !destination_stream.is_null() && initialized_background_stage_stream(device_id) == Some(destination_stream as usize) {
             initialized_background_stage_stream(self.device_id).ok_or_else(|| format!("ROCm ordered P2P 缺少 source stage-prefill stream: source={} destination={device_id}", self.device_id))? as *mut c_void
@@ -1588,11 +1765,11 @@ impl DeviceBuffer {
                 if status != HIP_SUCCESS {
                     return Err(format!("{}: source_device={} destination_device={device_id} bytes={}", runtime.hip_error(status, "hipMemcpyPeer event-ready activation"), self.device_id, self.bytes));
                 }
-            } else if self.bytes % 16 == 0 {
+            } else if self.bytes % 16 == 0 && crate::kernel::rocm::hip::active_compute_stream() == destination_stream {
                 super::peer_copy::try_peer_copy_kernel_ordered(device_id, output.pointer, self.pointer, self.bytes)?;
             } else {
                 let stats_started = hip_api_stats::start();
-                let status = unsafe { copy(output.pointer, device_id, self.pointer, self.device_id, self.bytes, crate::kernel::rocm::hip::active_compute_stream()) };
+                let status = unsafe { copy(output.pointer, device_id, self.pointer, self.device_id, self.bytes, destination_stream) };
                 hip_api_stats::counted(hip_api_stats::MEMCPY_PEER_ASYNC, stats_started);
                 if status != HIP_SUCCESS {
                     return Err(format!("{}: source_device={} destination_device={device_id} bytes={}", runtime.hip_error(status, "hipMemcpyPeerAsync ordered activation"), self.device_id, self.bytes));
@@ -1630,10 +1807,11 @@ impl DeviceBuffer {
         enable_peer_access(device_id, source_device_id)?;
         let create: Symbol<HipEventCreateWithFlags> = runtime.symbol(&runtime.hip, b"hipEventCreateWithFlags\0")?;
         let record: Symbol<HipEventRecord> = runtime.symbol(&runtime.hip, b"hipEventRecord\0")?;
-        let synchronize = runtime.event_synchronize()?;
-        let copy: Symbol<HipMemcpyPeer> = runtime.symbol(&runtime.hip, b"hipMemcpyPeer\0")?;
+        let wait: Symbol<HipStreamWaitEvent> = runtime.symbol(&runtime.hip, b"hipStreamWaitEvent\0")?;
+        let copy: Symbol<HipMemcpyPeerAsync> = runtime.symbol(&runtime.hip, b"hipMemcpyPeerAsync\0")?;
         let destroy: Symbol<HipEventDestroy> = runtime.symbol(&runtime.hip, b"hipEventDestroy\0")?;
         let source_stream = compute_stream_for(source_device_id);
+        let destination_stream = compute_stream_for(device_id);
         let mut event = device_buffer_pool(source_device_id).and_then(|pool| pool.lock().ok()?.available_events.pop()).map(|event| event as HipEvent).unwrap_or(ptr::null_mut());
         set_device(source_device_id)?;
         if event.is_null() {
@@ -1647,18 +1825,20 @@ impl DeviceBuffer {
             if status != HIP_SUCCESS {
                 return Err(runtime.hip_error(status, "hipEventRecord grouped ordered P2P source"));
             }
-            // 只等待 producer event，不扩大成 hipDeviceSynchronize；当前先用
-            // 带 peer 一致性语义的 runtime copy 验证 direct BAR 可见性。
-            let status = unsafe { synchronize(event) };
-            if status != HIP_SUCCESS {
-                return Err(runtime.hip_error(status, "hipEventSynchronize grouped ordered P2P source"));
-            }
             set_device(device_id)?;
+            let status = unsafe { wait(destination_stream, event, 0) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipStreamWaitEvent grouped ordered P2P destination"));
+            }
             super::device_profile_operator(device_id, "handoff_copy")?;
             for (source, output) in sources.iter().zip(&outputs) {
-                let status = unsafe { copy(output.pointer, device_id, source.pointer, source_device_id, source.bytes) };
-                if status != HIP_SUCCESS {
-                    return Err(format!("{}: source_device={source_device_id} destination_device={device_id} bytes={}", runtime.hip_error(status, "hipMemcpyPeer grouped event-ready P2P"), source.bytes));
+                if source.bytes % 16 == 0 && crate::kernel::rocm::hip::active_compute_stream() == destination_stream {
+                    super::peer_copy::try_peer_copy_kernel_ordered(device_id, output.pointer, source.pointer, source.bytes)?;
+                } else {
+                    let status = unsafe { copy(output.pointer, device_id, source.pointer, source_device_id, source.bytes, destination_stream) };
+                    if status != HIP_SUCCESS {
+                        return Err(format!("{}: source_device={source_device_id} destination_device={device_id} bytes={}", runtime.hip_error(status, "hipMemcpyPeerAsync grouped ordered P2P"), source.bytes));
+                    }
                 }
             }
             PENDING_P2P_SOURCES.with(|pending| {
@@ -1675,6 +1855,167 @@ impl DeviceBuffer {
         result?;
         set_device(device_id)?;
         Ok(outputs)
+    }
+
+    /// 双向 P2P 交换先在两边 producer stream 都记录 ready event，
+    /// 再分别向对端排队。若连续调用两次单向 copy，第二边的
+    /// producer event 会落在第一边的入向 copy 之后，导致本可并行的两个传输串行。
+    pub(crate) fn exchange_stable_groups_ordered_async_retained_by(left: &[std::sync::Arc<Self>], right: &[std::sync::Arc<Self>], completion_device_id: i32) -> Result<(Vec<Self>, Vec<Self>), String> {
+        let left_device_id = left.first().ok_or("ordered P2P left buffer 组不能为空")?.device_id;
+        let right_device_id = right.first().ok_or("ordered P2P right buffer 组不能为空")?.device_id;
+        if left_device_id == right_device_id || left.iter().any(|source| source.device_id != left_device_id || source.async_allocated) || right.iter().any(|source| source.device_id != right_device_id || source.async_allocated) {
+            return Err("ordered P2P 双向 buffer 组必须来自不同 device 的显式 allocation".to_owned());
+        }
+        let left_on_right = left.iter().map(|source| Self::allocate_peer(right_device_id, source.bytes)).collect::<Result<Vec<_>, _>>()?;
+        let right_on_left = right.iter().map(|source| Self::allocate_peer(left_device_id, source.bytes)).collect::<Result<Vec<_>, _>>()?;
+        let runtime = RocmRuntime::open()?;
+        enable_peer_access(right_device_id, left_device_id)?;
+        enable_peer_access(left_device_id, right_device_id)?;
+        let create: Symbol<HipEventCreateWithFlags> = runtime.symbol(&runtime.hip, b"hipEventCreateWithFlags\0")?;
+        let record: Symbol<HipEventRecord> = runtime.symbol(&runtime.hip, b"hipEventRecord\0")?;
+        let wait: Symbol<HipStreamWaitEvent> = runtime.symbol(&runtime.hip, b"hipStreamWaitEvent\0")?;
+        let copy: Symbol<HipMemcpyPeerAsync> = runtime.symbol(&runtime.hip, b"hipMemcpyPeerAsync\0")?;
+        let destroy: Symbol<HipEventDestroy> = runtime.symbol(&runtime.hip, b"hipEventDestroy\0")?;
+        let left_stream = compute_stream_for(left_device_id);
+        let right_stream = compute_stream_for(right_device_id);
+        let mut left_event = device_buffer_pool(left_device_id).and_then(|pool| pool.lock().ok()?.available_events.pop()).map(|event| event as HipEvent).unwrap_or(ptr::null_mut());
+        let create_event = |device_id: i32, event: &mut HipEvent| -> Result<(), String> {
+            set_device(device_id)?;
+            if event.is_null() {
+                let status = unsafe { create(event, HIP_EVENT_DISABLE_TIMING) };
+                if status != HIP_SUCCESS {
+                    return Err(runtime.hip_error(status, "hipEventCreateWithFlags bidirectional ordered P2P"));
+                }
+            }
+            Ok(())
+        };
+        create_event(left_device_id, &mut left_event)?;
+        let mut right_event = device_buffer_pool(right_device_id).and_then(|pool| pool.lock().ok()?.available_events.pop()).map(|event| event as HipEvent).unwrap_or(ptr::null_mut());
+        if let Err(error) = create_event(right_device_id, &mut right_event) {
+            set_device(left_device_id)?;
+            let _ = unsafe { destroy(left_event) };
+            return Err(error);
+        }
+        let result = (|| {
+            set_device(left_device_id)?;
+            let status = unsafe { record(left_event, left_stream) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventRecord bidirectional P2P left"));
+            }
+            set_device(right_device_id)?;
+            let status = unsafe { record(right_event, right_stream) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventRecord bidirectional P2P right"));
+            }
+
+            // 两个 ready marker 都已入队；此后的两个目标 stream 不再
+            // 依赖对向 copy，可以在两张卡上同时读取对端 BAR。
+            let copy_group = |sources: &[std::sync::Arc<Self>], outputs: &[Self], source_device_id: i32, destination_device_id: i32, destination_stream: *mut c_void, event: HipEvent| -> Result<(), String> {
+                set_device(destination_device_id)?;
+                let status = unsafe { wait(destination_stream, event, 0) };
+                if status != HIP_SUCCESS {
+                    return Err(runtime.hip_error(status, "hipStreamWaitEvent bidirectional P2P destination"));
+                }
+                super::device_profile_operator(destination_device_id, "handoff_copy")?;
+                for (source, output) in sources.iter().zip(outputs) {
+                    if source.bytes % 16 == 0 && crate::kernel::rocm::hip::active_compute_stream() == destination_stream {
+                        super::peer_copy::try_peer_copy_kernel_ordered(destination_device_id, output.pointer, source.pointer, source.bytes)?;
+                    } else {
+                        let status = unsafe { copy(output.pointer, destination_device_id, source.pointer, source_device_id, source.bytes, destination_stream) };
+                        if status != HIP_SUCCESS {
+                            return Err(format!("{}: source_device={source_device_id} destination_device={destination_device_id} bytes={}", runtime.hip_error(status, "hipMemcpyPeerAsync bidirectional ordered P2P"), source.bytes,));
+                        }
+                    }
+                }
+                Ok(())
+            };
+            copy_group(left, &left_on_right, left_device_id, right_device_id, right_stream, left_event)?;
+            copy_group(right, &right_on_left, right_device_id, left_device_id, left_stream, right_event)?;
+            PENDING_P2P_SOURCES.with(|pending| {
+                let mut pending = pending.borrow_mut();
+                let entries = pending.entry(completion_device_id).or_default();
+                entries.push(PendingP2pSource { sources: left.to_vec(), event: left_event as usize });
+                entries.push(PendingP2pSource { sources: right.to_vec(), event: right_event as usize });
+            });
+            Ok(())
+        })();
+        if result.is_err() {
+            for (device_id, event) in [(left_device_id, left_event), (right_device_id, right_event)] {
+                let _ = set_device(device_id).and_then(|()| {
+                    let status = unsafe { destroy(event) };
+                    if status == HIP_SUCCESS { Ok(()) } else { Err(runtime.hip_error(status, "hipEventDestroy bidirectional ordered P2P")) }
+                });
+            }
+        }
+        result?;
+        set_device(completion_device_id)?;
+        Ok((left_on_right, right_on_left))
+    }
+
+    /// 与 grouped ordered P2P 相同，但直接写入调用方持有的固定目标地址。
+    /// pair-native cache 用它把增量落到 peer cache offset，省掉临时 P2P
+    /// allocation 与随后一次同卡 D2D。
+    pub(crate) fn copy_stable_group_into_device_ordered_async_retained_by(sources: &[std::sync::Arc<Self>], destinations: &[(&Self, usize)], device_id: i32, completion_device_id: i32) -> Result<(), String> {
+        let source_device_id = sources.first().ok_or("ordered P2P buffer 组不能为空")?.device_id;
+        if sources.len() != destinations.len()
+            || sources.iter().any(|source| source.device_id != source_device_id || source.async_allocated)
+            || destinations.iter().zip(sources).any(|((destination, offset), source)| destination.device_id != device_id || offset.checked_add(source.bytes).is_none_or(|end| end > destination.bytes))
+        {
+            return Err("ordered P2P buffer 组来源或固定目标非法".to_owned());
+        }
+        let runtime = RocmRuntime::open()?;
+        enable_peer_access(device_id, source_device_id)?;
+        let create: Symbol<HipEventCreateWithFlags> = runtime.symbol(&runtime.hip, b"hipEventCreateWithFlags\0")?;
+        let record: Symbol<HipEventRecord> = runtime.symbol(&runtime.hip, b"hipEventRecord\0")?;
+        let wait: Symbol<HipStreamWaitEvent> = runtime.symbol(&runtime.hip, b"hipStreamWaitEvent\0")?;
+        let copy: Symbol<HipMemcpyPeerAsync> = runtime.symbol(&runtime.hip, b"hipMemcpyPeerAsync\0")?;
+        let destroy: Symbol<HipEventDestroy> = runtime.symbol(&runtime.hip, b"hipEventDestroy\0")?;
+        let source_stream = compute_stream_for(source_device_id);
+        let destination_stream = compute_stream_for(device_id);
+        let mut event = device_buffer_pool(source_device_id).and_then(|pool| pool.lock().ok()?.available_events.pop()).map(|event| event as HipEvent).unwrap_or(ptr::null_mut());
+        set_device(source_device_id)?;
+        if event.is_null() {
+            let status = unsafe { create(&mut event, HIP_EVENT_DISABLE_TIMING) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventCreateWithFlags grouped ordered P2P"));
+            }
+        }
+        let result = (|| {
+            let status = unsafe { record(event, source_stream) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventRecord grouped ordered P2P source"));
+            }
+            set_device(device_id)?;
+            let status = unsafe { wait(destination_stream, event, 0) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipStreamWaitEvent grouped ordered P2P destination"));
+            }
+            super::device_profile_operator(device_id, "handoff_copy")?;
+            for (source, (destination, offset)) in sources.iter().zip(destinations) {
+                let destination_pointer = unsafe { destination.pointer.cast::<u8>().add(*offset).cast() };
+                if source.bytes % 16 == 0 && crate::kernel::rocm::hip::active_compute_stream() == destination_stream {
+                    super::peer_copy::try_peer_copy_kernel_ordered(device_id, destination_pointer, source.pointer, source.bytes)?;
+                } else {
+                    let status = unsafe { copy(destination_pointer, device_id, source.pointer, source_device_id, source.bytes, destination_stream) };
+                    if status != HIP_SUCCESS {
+                        return Err(format!("{}: source_device={source_device_id} destination_device={device_id} bytes={}", runtime.hip_error(status, "hipMemcpyPeerAsync grouped ordered P2P"), source.bytes));
+                    }
+                }
+            }
+            PENDING_P2P_SOURCES.with(|pending| {
+                pending.borrow_mut().entry(completion_device_id).or_default().push(PendingP2pSource { sources: sources.to_vec(), event: event as usize });
+            });
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = set_device(source_device_id).and_then(|()| {
+                let status = unsafe { destroy(event) };
+                if status == HIP_SUCCESS { Ok(()) } else { Err(runtime.hip_error(status, "hipEventDestroy grouped ordered P2P")) }
+            });
+        }
+        result?;
+        set_device(device_id)?;
+        Ok(())
     }
 
     /// 在当前 submission stream 尾部把阶段结果稳定到显式池；后续 completion
@@ -1907,7 +2248,7 @@ impl Drop for DeviceBuffer {
                 let start_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
                 let _ = unsafe { free(self.pointer) };
                 let duration_us = started.elapsed().as_micros();
-                if duration_us >= 20_000 {
+                if duration_us >= 5_000 {
                     let complete_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
                     eprintln!("[rocm-buffer-retire-slow] ts_us={start_us} device={} bytes={} path=hipFree duration_us={duration_us} complete_us={complete_us}", self.device_id, self.capacity_bytes);
                 }

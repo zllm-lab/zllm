@@ -164,7 +164,7 @@ where
         |experts, layer, _kind, hidden| {
             let started = diagnose.then(Instant::now);
             let output = match &layers[layer - layer_start] {
-                Glm52PrefillLayer::Dense(resident) => glm52_dense_prefill_layer(&backend, cfg, mla, resident, layer, Some(dsa), &hidden, rope, Some(cache), position),
+                Glm52PrefillLayer::Dense(resident) => glm52_dense_prefill_layer(&backend, cfg, mla, resident, layer, Some(&*experts), Some(dsa), &hidden, rope, Some(cache), position),
                 Glm52PrefillLayer::Moe(resident) => glm52_moe_prefill_layer(&backend, cfg, mla, resident, layer, experts, None, Some(dsa), &hidden, rope, Some(cache), position),
             }?;
             let output = backend.compact_stage_tensor(output)?;
@@ -391,7 +391,7 @@ where
         let mut segments =
             states.iter_mut().enumerate().filter_map(|(session, state)| metadata[session].map(|(position, rows, _, _, _, _)| Glm52PrefillSegment { position, rows, cache: &mut state.cache, dsa: &mut state.dsa })).collect::<Vec<_>>();
         let output = match &layers[layer - layer_start] {
-            Glm52PrefillLayer::Dense(resident) => glm52_dense_prefill_layer_segmented(&backend, cfg, mla, resident, layer, &hidden, rope, &mut segments),
+            Glm52PrefillLayer::Dense(resident) => glm52_dense_prefill_layer_segmented(&backend, cfg, mla, resident, layer, &*experts, &hidden, rope, &mut segments),
             Glm52PrefillLayer::Moe(resident) => glm52_moe_prefill_layer_segmented(&backend, cfg, mla, resident, layer, &mut *experts, &hidden, rope, &mut segments),
         }
         .map_err(|error| BackendError::Compute { msg: format!("distributed batch stage={stage} backend={backend_label} layer={layer} rows={total_rows}: {error:?}") })?;
@@ -581,6 +581,24 @@ where
     sessions.pop().flatten().ok_or_else(|| BackendError::Compute { msg: "GLM stage pipeline 丢失 session state".to_owned() })
 }
 
+/// 单进程完整层链的一份同步工作。与 distributed scheduler 共用同一 stage
+/// 执行函数，只省掉跨进程边界和多 session 调度；decode 标志保持真实热路径。
+pub fn run_glm52_stage_work_stateful<B>(states: Vec<Glm52StageState<B>>, position: usize, hidden: B::Tensor, decode: bool, cfg: &Glm52Config, mla: &MlaSpec, rope: &RopeTable) -> Result<(Vec<Glm52StageState<B>>, B::Tensor), BackendError>
+where
+    B: DsaStageBackend + ExpertPrefillBackend + Clone + Send + Sync,
+    B::Tensor: Send,
+    B::Weight: Send + Sync,
+    B::Cache: Send,
+    B::DsaState: Send,
+    B::PrefillExperts: Send,
+{
+    let backends = states.iter().map(|state| state.backend.clone()).collect::<Vec<_>>();
+    let (_, value, states) = run_single_stage_chain(&backends, states, position, Glm52StageValue { decode, verify: false, truncate_to: None, hidden, selection: None, aux_hidden: None, aux_taps: 0 }, |_, states, stage, batch| {
+        run_glm52_dynamic_stage_batch(states, stage, batch, cfg, mla, rope)
+    })?;
+    Ok((states, value.hidden))
+}
+
 /// 连续流式 stage 流水线。输入闭包在专用 feeder 线程持续拉取并提交；输出在
 /// drive 线程按完成顺序回调——两个方向并发，调用方在输出回调里产出 token、
 /// 上游据此发来下一帧时不能让任何一侧阻塞另一侧。输入 Closed 或出错后等全部
@@ -745,7 +763,16 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn prepare_prefill_layers<B>(backends: &[B], layer_ends: &[usize], layer_start: usize, layer_end: usize, cfg: &Glm52Config, mla: &MlaSpec, weights: &Glm52Weights) -> Result<Vec<Glm52PrefillLayer<B::Weight>>, BackendError>
+pub fn prepare_prefill_layers<B>(
+    backends: &[B],
+    layer_ends: &[usize],
+    layer_start: usize,
+    layer_end: usize,
+    cfg: &Glm52Config,
+    mla: &MlaSpec,
+    weights: &Glm52Weights,
+    mla_decode_resident: bool,
+) -> Result<Vec<Glm52PrefillLayer<B::Weight>>, BackendError>
 where
     B: DsaStageBackend + ExpertPrefillBackend,
 {
@@ -758,10 +785,10 @@ where
         let backend = &backends[placement];
         backend.activate_stage()?;
         if layer < cfg.dense_layer_count {
-            let resident = load_prepare_dense_prefill_layer(backend, cfg, mla, weights, layer, false).map_err(|error| BackendError::Compute { msg: format!("准备 prefill L{layer}: {error:?}") })?;
+            let resident = load_prepare_dense_prefill_layer(backend, cfg, mla, weights, layer, mla_decode_resident).map_err(|error| BackendError::Compute { msg: format!("准备 prefill L{layer}: {error:?}") })?;
             layers.push(Glm52PrefillLayer::Dense(resident));
         } else {
-            let resident = load_prepare_moe_prefill_layer(backend, cfg, mla, weights, layer, false).map_err(|error| BackendError::Compute { msg: format!("准备 prefill L{layer}: {error:?}") })?;
+            let resident = load_prepare_moe_prefill_layer(backend, cfg, mla, weights, layer, mla_decode_resident).map_err(|error| BackendError::Compute { msg: format!("准备 prefill L{layer}: {error:?}") })?;
             layers.push(Glm52PrefillLayer::Moe(resident));
         }
     }

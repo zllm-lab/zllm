@@ -84,6 +84,7 @@ pub trait NodeEngine {
         _intake: &mut dyn FnMut(usize) -> Vec<NodeBatchRequest>,
         on_token: &mut dyn FnMut(&str, u32, String) -> bool,
         _on_tool_call_delta: &mut dyn FnMut(&str, ToolCallDelta) -> bool,
+        _on_runtime_changed: &mut dyn FnMut(),
         _on_result: &mut dyn FnMut(NodeBatchResult),
     ) -> Vec<NodeBatchResult> {
         requests
@@ -393,6 +394,12 @@ impl ExecutionCommand {
             },
             &mut |request_id, token_id, text| commands.borrow().iter().find(|command| command.request_id == request_id).is_some_and(|command| command.events.try_event(request_id, InferenceEvent::Token { token_id, text })),
             &mut |request_id, delta| commands.borrow().iter().find(|command| command.request_id == request_id).is_some_and(|command| command.events.try_event(request_id, InferenceEvent::ToolCallDelta { delta })),
+            &mut || {
+                if let Some(command) = commands.borrow().first() {
+                    let runtime = runtime_status(&command.runtime, &command.compute_steps, &command.accelerator_allocated);
+                    let _ = command.events.send_control_reliable(NodeMessage::RuntimeChanged { runtime });
+                }
+            },
             &mut |result| {
                 if completed.borrow().contains(&result.request_id) {
                     return;

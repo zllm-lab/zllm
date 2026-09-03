@@ -6,7 +6,7 @@
 //! - **跨请求 KV 复用**：`TerminalCache<Glm52HeadState>`，线性会话只留最长。
 //! - **PP 编排**：A 跑 L0..L38，B 跑 L39..L77；B 只回传最终 hidden。
 //! - **输出环**：默认由 A0 执行 final norm、LM head、sampling 与 MTP L78；
-//!   `tail_sampling` 则由 B 尾卡按 A 的围栏采样，decode 只回传 token。
+//!   输出/采样/MTP 由本机首卡 A0 执行,decode 回传 hidden。
 //!
 //! ⚠️ PP 编排时序（send_prefill/recv token/cancel 解锁）需 16 卡 + GLM-5.2 真权重
 //! 端到端验证；本文件编译通过 + 结构对齐 rocm front stage（`zllm-rt-rocm` 已跑通）。
@@ -42,7 +42,7 @@ use crate::runtime::session::{AtomicCounterU64, BatchTokenGuard, GenerationSumma
 use crate::runtime::{
     Model,
     generation_guard::{GenerationGuard, LoopKind, TokenFenceProgram, build_token_signatures},
-    glm52::{Glm52, Glm52Config, Glm52OutputHead, glm52_sampled_token_ids_fenced, prepare_glm52_mtp_ct, prepare_glm52_mtp_gguf, prepare_glm52_output_head_quantized},
+    glm52::{Glm52, Glm52Config, Glm52OutputHead, glm52_sampled_token_ids_fenced},
     output::{SamplingConfig, SamplingState},
     rocm_chain,
     speculative::{verify_samples, verify_samples_prefix},
@@ -55,7 +55,7 @@ use crate::weight::Glm52Weights;
 
 use super::dspark_cpu::{CpuDsparkExecutor, CpuDsparkJob, CpuDsparkRuntime};
 use super::dspark_rocm::{RocmDsparkDraftBatch, RocmDsparkRuntime, attach_dspark_projections};
-use super::rocm::{RocmMtpCatchUp, RocmMtpDraftBatch, RocmMtpRuntime, RocmMtpSession, mtp_catch_up_batch, mtp_draft_batch, prepare_glm52_rope_resident};
+use super::rocm::{RocmMtpCatchUp, RocmMtpDraftBatch, RocmMtpRuntime, RocmMtpSession, gather_embedding_rows, load_resident_embedding, mtp_catch_up_batch, mtp_draft_batch, prepare_glm52_rope_resident, prepare_head_output_runtime};
 use crate::runtime::dspark::{DsparkTargetCache, DsparkTargetCacheSnapshot, DsparkTargetLayerSnapshot};
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
@@ -64,6 +64,10 @@ type Glm52StageState = RuntimeGlm52StageState<RocmContext>;
 #[path = "terminal.rs"]
 mod terminal;
 use terminal::Glm52HeadState;
+#[path = "rocm_single.rs"]
+mod rocm_single;
+use rocm_single::Glm52SingleEngine;
+
 pub async fn run(model: crate::config::Glm52NodeModelConfig, backend: crate::config::RocmBackendConfig, config: crate::server::node::NodeConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let model_path = model.weights_directory;
     let compressed_tensors_directory = model.compressed_tensors_directory;
@@ -76,7 +80,7 @@ pub async fn run(model: crate::config::Glm52NodeModelConfig, backend: crate::con
     let stage_end = model.head.stage_end;
     let layer_ends = model.head.layer_ends;
     let downstream_ticket = model.head.downstream.ticket;
-    let downstream_iroh = model.head.downstream.iroh.runtime()?;
+    let downstream_iroh = (stage_end < crate::runtime::glm52::Glm52Config::standard().layer_count).then(|| model.head.downstream.iroh.runtime()).transpose()?;
     let devices = backend.devices;
     let cache_dir = config.cache_dir.clone();
     let persist_kv_cache = config.persist_kv_cache;
@@ -85,23 +89,28 @@ pub async fn run(model: crate::config::Glm52NodeModelConfig, backend: crate::con
             crate::runtime::glm52::open_weights(&crate::runtime::glm52::Glm52Config::standard(), &model_path, compressed_tensors_directory.as_deref(), nvfp4_directory.as_deref(), gguf_directory.as_deref())
                 .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { error.into() })?,
         );
-        Glm52Engine::load(
-            weights,
-            &cache_dir,
-            persist_kv_cache,
-            devices.clone(),
-            layer_ends.clone(),
-            stage_end,
-            &downstream_ticket,
-            downstream_iroh.clone(),
-            &tokenizer_path,
-            max_seq_len,
-            execution,
-            lm_head_quantization,
-            runtime,
-            compute_steps,
-        )
-        .map(|engine| Box::new(engine) as Box<dyn crate::server::node::NodeEngine>)
+        if stage_end == crate::runtime::glm52::Glm52Config::standard().layer_count {
+            Glm52SingleEngine::load(weights, devices.clone(), layer_ends.clone(), &tokenizer_path, max_seq_len, execution, lm_head_quantization, runtime, compute_steps)
+                .map(|engine| Box::new(engine) as Box<dyn crate::server::node::NodeEngine>)
+        } else {
+            Glm52Engine::load(
+                weights,
+                &cache_dir,
+                persist_kv_cache,
+                devices.clone(),
+                layer_ends.clone(),
+                stage_end,
+                &downstream_ticket,
+                downstream_iroh.clone().expect("分段模式已解析 downstream iroh"),
+                &tokenizer_path,
+                max_seq_len,
+                execution,
+                lm_head_quantization,
+                runtime,
+                compute_steps,
+            )
+            .map(|engine| Box::new(engine) as Box<dyn crate::server::node::NodeEngine>)
+        }
     });
     crate::server::node::run_node(config, factory).await
 }
@@ -133,6 +142,8 @@ pub struct Glm52Engine {
     runtime: Arc<Mutex<NodeRuntime>>,
     compute_steps: Arc<AtomicCounterU64>,
     output_head: Option<Glm52OutputHead<RocmWeight>>,
+    /// 首卡常驻 BF16 embedding 表;decode/verify/draft/prefill 的行 gather 全部设备侧完成。
+    embedding_table: Option<std::sync::Arc<crate::kernel::rocm::hip::DeviceBuffer>>,
     mtp_runtime: Option<RocmMtpRuntime>,
     dspark_runtime: Option<RocmDsparkRuntime>,
     cpu_dspark_executor: Option<CpuDsparkExecutor>,
@@ -160,36 +171,6 @@ impl Glm52Engine {
         })
     }
 
-    /// 尾端输出必须拿到每一个 target row 对应的围栏。verify 的第 0 行沿用
-    /// 当前正式状态，后续行只在临时副本上推进 draft，不污染真正的生成状态。
-    fn send_tail_sampling_fences(&mut self, task: &Glm52BatchTask, inputs: &[u32]) -> Result<(), String> {
-        if !self.options.tail_sampling {
-            return Ok(());
-        }
-        let mut fence = task.token_fence.clone();
-        for row in 0..inputs.len() {
-            self.link.send_sample(task.stage_id, fence.fence().excluded())?;
-            if let Some(&draft) = inputs.get(row + 1) {
-                fence.advance(draft);
-            }
-        }
-        Ok(())
-    }
-
-    /// late-binding verify 的 anchor 已经发送过第 0 行 fence；suffix 的第一个
-    /// verifier row 读取 d1 后的状态，不能再次发送未推进的初始 fence。
-    fn send_tail_sampling_fences_suffix(&mut self, task: &Glm52BatchTask, drafts: &[u32]) -> Result<(), String> {
-        if !self.options.tail_sampling {
-            return Ok(());
-        }
-        let mut fence = task.token_fence.clone();
-        for &draft in drafts {
-            fence.advance(draft);
-            self.link.send_sample(task.stage_id, fence.fence().excluded())?;
-        }
-        Ok(())
-    }
-
     /// 构造下一份 decode/verify 工作。只做容量预留与 embedding 上传，不动任务的
     /// 逻辑位置；`cached_tokens` / `pending_verify_rows` 由调用方在 submit 成功后
     /// 用返回的 inputs 提交，保证失败路径上任务状态与实际执行保持一致。
@@ -211,9 +192,12 @@ impl Glm52Engine {
         let required_tokens = task.cached_tokens.len().saturating_add(rows);
         self.grow_kv_reservation(&mut task.kv_reservation, required_tokens).map_err(backend_error)?;
         let position = task.cached_tokens.len();
-        let embedding = self.contexts[0]
-            .tensor_from_f32(weights.embedding_rows(&inputs).map_err(|error| backend_error(format!("embedding: {error:?}")))?, rows, self.cfg.hidden_size)
-            .map_err(|error| backend_error(format!("上传 continuous decode embedding: {error:?}")))?;
+        let embedding = match self.embedding_table.as_ref() {
+            Some(table) => gather_embedding_rows(&self.contexts[0], table, &inputs, self.cfg.hidden_size).map_err(backend_error)?,
+            None => self.contexts[0]
+                .tensor_from_f32(weights.embedding_rows(&inputs).map_err(|error| backend_error(format!("embedding: {error:?}")))?, rows, self.cfg.hidden_size)
+                .map_err(|error| backend_error(format!("上传 continuous decode embedding: {error:?}")))?,
+        };
         let works = if verify {
             // verify 行按 verify_group_rows 分组提交:组间保持逐组流水重叠
             // (row0 组进入下一 stage 时本 stage 立即推进下一组),组内共享一次
@@ -451,6 +435,7 @@ impl Glm52Engine {
         input_context: &RocmContext,
         weights: &Glm52Weights,
         cfg: &Glm52Config,
+        embedding: Option<&std::sync::Arc<crate::kernel::rocm::hip::DeviceBuffer>>,
     ) -> Result<(), crate::backend::BackendError> {
         if slots.is_empty() {
             return Ok(());
@@ -480,8 +465,13 @@ impl Glm52Engine {
             let segment_budget = if decode_limited { (work_window - *in_flight).div_ceil(eligible_sessions) } else { 1 };
             let segments = prefill_token_segments(position, end - position, segment_budget);
             for segment in &segments {
-                let hidden = build_pp_prefill_chunk(input_context, weights, cfg, &task.tokens[segment.clone()], segment.start)
-                    .map_err(|error| crate::backend::BackendError::Compute { msg: format!("准备 continuous prefill segment: {error:?}") })?;
+                let hidden = match embedding {
+                    Some(table) => {
+                        gather_embedding_rows(input_context, table, &task.tokens[segment.clone()], cfg.hidden_size).map_err(|error| crate::backend::BackendError::Compute { msg: format!("准备 continuous prefill segment: {error}") })?
+                    }
+                    None => build_pp_prefill_chunk(input_context, weights, cfg, &task.tokens[segment.clone()], segment.start)
+                        .map_err(|error| crate::backend::BackendError::Compute { msg: format!("准备 continuous prefill segment: {error:?}") })?,
+                };
                 pipeline.submit_glm52(session, segment.start, false, hidden, None)?;
             }
             submitted[session] = end;
@@ -537,42 +527,11 @@ impl Glm52Engine {
             (crate::runtime::rocm_chain::RocmDeviceChain::new(&devices, layer_ends.clone(), stage_end - 1, false).map_err(|error| -> DynError { format!("GLM-5.2 设备链: {error}").into() })?.contexts, Vec::new())
         };
         let output_context = contexts[0];
-        let output_head = if options.tail_sampling {
-            None
-        } else {
-            let final_norm = weights.final_norm()?;
-            let lm_head = weights.lm_head_bf16_bytes()?;
-            Some(
-                prepare_glm52_output_head_quantized(&output_context, &cfg, &final_norm, LinearWeight::Bf16Bytes(&lm_head), lm_head_quantization)
-                    .map_err(|error| -> DynError { format!("准备 A0 ROCm GLM output head: {error:?}").into() })?,
-            )
-        };
-        let mtp_runtime = if options.mtp && !options.tail_sampling {
-            if weights.source_is_ct() {
-                let started = Instant::now();
-                output_context.activate()?;
-                let source = weights.ct_source()?;
-                let layer = source.load_mtp_layer(cfg.layer_count)?;
-                let mtp_weights = prepare_glm52_mtp_ct(&output_context, &cfg, &mla, &layer).map_err(|error| -> DynError { format!("准备 A0 ROCm MTP: {error:?}").into() })?;
-                let mut experts = RocmPrefillExperts::ct(source);
-                experts.preload_layer(&output_context, cfg.layer_count, cfg.expert_count).map_err(|error| -> DynError { format!("常驻 A0 ROCm MTP experts: {error:?}").into() })?;
-                eprintln!("[glm52-mtp-resident] device={} layer={} drafts={} wall={:.3}s", output_context.device_id(), cfg.layer_count, options.mtp_draft_tokens, started.elapsed().as_secs_f64());
-                Some(RocmMtpRuntime { backend: output_context, weights: mtp_weights, experts, draft_head: None })
-            } else if weights.source_is_gguf() {
-                let started = Instant::now();
-                output_context.activate()?;
-                let layer = weights.load_mtp_layer_gguf().map_err(|error| -> DynError { format!("加载 MTP GGUF L{}: {error}", cfg.layer_count).into() })?;
-                let mtp_weights = prepare_glm52_mtp_gguf(&output_context, &cfg, &mla, &layer).map_err(|error| -> DynError { format!("准备 A0 ROCm MTP: {error:?}").into() })?;
-                let mut experts = RocmPrefillExperts::gguf(weights.gguf_source().map_err(|error| -> DynError { error.into() })?);
-                experts.preload_layer(&output_context, cfg.layer_count, cfg.expert_count).map_err(|error| -> DynError { format!("常驻 A0 ROCm MTP experts: {error:?}").into() })?;
-                eprintln!("[glm52-mtp-resident] device={} layer={} drafts={} wall={:.3}s", output_context.device_id(), cfg.layer_count, options.mtp_draft_tokens, started.elapsed().as_secs_f64());
-                Some(RocmMtpRuntime { backend: output_context, weights: mtp_weights, experts, draft_head: None })
-            } else {
-                return Err("GLM-5.2 distributed MTP 当前只支持 compressed-tensors/GGUF 权重".into());
-            }
-        } else {
-            None
-        };
+        let embedding_table = load_resident_embedding(&output_context, &weights, &cfg).map_err(|error| -> DynError { error.into() })?;
+        // LM head、采样与 MTP 全部驻留 A0;输出运行时由 rocm_tail 的统一装配入口
+        // 提供(含 FR-Spec draft head 与 lm_head 量化),不再有尾端采样形态。
+        let (output_head, mtp_runtime) =
+            prepare_head_output_runtime(&output_context, &weights, &cfg, &mla, options.mtp, options.mtp_draft_tokens, None, lm_head_quantization, embedding_table.clone()).map_err(|error| -> DynError { error.into() })?;
         let dspark_runtime = options
             .dspark_directory
             .as_deref()
@@ -638,7 +597,7 @@ impl Glm52Engine {
         // resident terminal cache 由 KV token budget 淘汰，不再设固定条目上限。
         let terminal_limit = options.terminal_cache_entries;
         let kv_reservation_page_tokens = options.kv_reservation_page_tokens;
-        let cache_identity = Glm52CacheIdentity::new(&weights, options.kv_cache_format, 0, stage_end, options.mtp, options.tail_sampling, max_seq_len, options.dspark_directory.as_deref());
+        let cache_identity = Glm52CacheIdentity::new(&weights, options.kv_cache_format, 0, stage_end, options.mtp, max_seq_len, options.dspark_directory.as_deref());
         let swap = persist_kv_cache.then(|| Glm52SwapStore::open(cache_dir.join("glm52").join(format!("stage-0-{stage_end}")), &cache_identity).map(Arc::new)).transpose()?;
         let mut engine = Self {
             cfg,
@@ -661,7 +620,8 @@ impl Glm52Engine {
             capabilities,
             runtime,
             compute_steps,
-            output_head,
+            output_head: Some(output_head),
+            embedding_table,
             mtp_runtime,
             dspark_runtime,
             cpu_dspark_executor,
@@ -699,12 +659,13 @@ impl Glm52Engine {
     /// 初始化跨会话共享的 layer 和 expert 权重；每个 session 只复制 cache/DSA 状态。
     fn ensure_resident_states(&mut self) -> Result<(), String> {
         if self.resident_states.is_none() {
-            let layers = prepare_prefill_layers(&self.contexts, &self.layer_ends, 0, self.stage_end, &self.cfg, &self.mla, &self.weights).map_err(|error| format!("准备 prefill layers: {error:?}"))?;
+            let mut layers = prepare_prefill_layers(&self.contexts, &self.layer_ends, 0, self.stage_end, &self.cfg, &self.mla, &self.weights, crate::kernel::rocm::hip::options().prefill_attention_cpu)
+                .map_err(|error| format!("准备 prefill layers: {error:?}"))?;
             let mut experts = (0..self.contexts.len()).map(|_| self.new_experts()).collect::<Result<Vec<_>, _>>()?;
             let preload_experts = self.options.preload_experts;
             if self.options.cooperative_expert_pairs {
-                if !preload_experts || self.options.preload_layers_per_device.is_some() || !self.weights.source_is_ct() || self.contexts.len() != self.cooperative_peer_contexts.len() {
-                    return Err("cooperative_expert_pairs 要求 CT 权重、preload_experts=true、完整预载且每个逻辑 stage 有一张 peer 卡".to_owned());
+                if !preload_experts || self.options.preload_layers_per_device.is_some() || !(self.weights.source_is_ct() || self.weights.source_is_gguf()) || self.contexts.len() != self.cooperative_peer_contexts.len() {
+                    return Err("cooperative_expert_pairs 要求 CT/GGUF 权重、preload_experts=true、完整预载且每个逻辑 stage 有一张 peer 卡".to_owned());
                 }
                 let mut layer_start = 0usize;
                 let counts = self
@@ -724,12 +685,83 @@ impl Glm52Engine {
                 for (stage, (expert, &peer)) in experts.iter_mut().zip(&self.cooperative_peer_contexts).enumerate() {
                     expert.enable_cooperative_peer(peer, 0).map_err(|error| format!("配置 ROCm cooperative expert stage={stage}: {error:?}"))?;
                 }
+                let mla_started = Instant::now();
+                let ct_source = self.weights.source_is_ct().then(|| self.weights.ct_source()).transpose()?;
+                let mut mla_layers = 0usize;
+                for (layer, resident) in layers.iter_mut().enumerate() {
+                    let placement = self.layer_ends.iter().position(|&end| layer <= end).ok_or_else(|| format!("L{layer} 没有 head cooperative MLA device"))?;
+                    let dense = matches!(resident, glm52_stage::Glm52PrefillLayer::Dense(_));
+                    let owner_weights = match &*resident {
+                        glm52_stage::Glm52PrefillLayer::Dense(weights) => (weights.q_b_proj.clone(), weights.kv_b_proj.clone()),
+                        glm52_stage::Glm52PrefillLayer::Moe(weights) => (weights.q_b_proj.clone(), weights.kv_b_proj.clone()),
+                    };
+                    let owner_o = match (dense, ct_source.as_ref()) {
+                        (true, Some(source)) => {
+                            let weights = source.load_dense_layer(layer).map_err(|error| format!("加载 L{layer} dense cooperative MLA 权重: {error}"))?;
+                            super::rocm::prepare_cooperative_mla_dense_layer_ct(
+                                &self.contexts[placement],
+                                &self.cooperative_peer_contexts[placement],
+                                &mut experts[placement],
+                                &self.cfg,
+                                &self.mla,
+                                layer,
+                                weights,
+                                (&owner_weights.0, &owner_weights.1),
+                            )?
+                        }
+                        (false, Some(source)) => {
+                            let weights = source.load_moe_layer(layer).map_err(|error| format!("加载 L{layer} MoE cooperative MLA 权重: {error}"))?;
+                            super::rocm::prepare_cooperative_mla_layer_ct(
+                                &self.contexts[placement],
+                                &self.cooperative_peer_contexts[placement],
+                                &mut experts[placement],
+                                &self.cfg,
+                                &self.mla,
+                                layer,
+                                weights,
+                                (&owner_weights.0, &owner_weights.1),
+                            )?
+                        }
+                        (true, None) => {
+                            let weights = self.weights.load_dense_layer_gguf(layer).map_err(|error| format!("加载 L{layer} dense GGUF cooperative MLA 权重: {error}"))?;
+                            super::rocm::prepare_cooperative_mla_dense_layer_gguf(
+                                &self.contexts[placement],
+                                &self.cooperative_peer_contexts[placement],
+                                &mut experts[placement],
+                                &self.cfg,
+                                &self.mla,
+                                layer,
+                                weights,
+                                (&owner_weights.0, &owner_weights.1),
+                            )?
+                        }
+                        (false, None) => {
+                            let weights = self.weights.load_moe_layer_gguf(layer).map_err(|error| format!("加载 L{layer} MoE GGUF cooperative MLA 权重: {error}"))?;
+                            super::rocm::prepare_cooperative_mla_layer_gguf(
+                                &self.contexts[placement],
+                                &self.cooperative_peer_contexts[placement],
+                                &mut experts[placement],
+                                &self.cfg,
+                                &self.mla,
+                                layer,
+                                weights,
+                                (&owner_weights.0, &owner_weights.1),
+                            )?
+                        }
+                    };
+                    match resident {
+                        glm52_stage::Glm52PrefillLayer::Dense(weights) => weights.o_proj = owner_o,
+                        glm52_stage::Glm52PrefillLayer::Moe(weights) => weights.o_proj = owner_o,
+                    }
+                    mla_layers += 1;
+                }
                 eprintln!(
-                    "[glm52-cooperative-experts] physical_devices={} pairs={} logical_stages={} mode=prefill+decode partition=gate-up-row/down-k-half device-route",
+                    "[glm52-cooperative-experts] physical_devices={} pairs={} logical_stages={} mode=attention-sequence+moe partition=kv-block-parity+gate-up-row/down-k-half device-route",
                     self.contexts.len() + self.cooperative_peer_contexts.len(),
                     self.contexts.len(),
                     self.contexts.len(),
                 );
+                eprintln!("[glm52-cooperative-mla-resident] layers={mla_layers} wall={:.3}s", mla_started.elapsed().as_secs_f64());
             }
             if preload_experts && (self.weights.source_is_ct() || self.weights.source_is_gguf()) {
                 let started = Instant::now();
@@ -783,7 +815,7 @@ impl Glm52Engine {
     }
 
     fn output_context(&self) -> RocmContext {
-        // 非 tail_sampling 才在 A0 执行输出；尾端采样时这里只承接 A 的 cache 边界。
+        // 输出/采样/MTP 固定驻留 A0 执行。
         self.contexts[0]
     }
 
@@ -935,12 +967,16 @@ impl Glm52Engine {
         // 链头不知道下游的物理分层，部署可以用整条流水线最大单卡层数覆盖。
         let admission_layers = self.options.kv_admission_layers_per_device;
         let latent_bytes = if self.options.kv_cache_format == KvCacheFormat::F16 { self.mla.kv_lora_rank * 2 } else { self.mla.kv_lora_rank + self.mla.kv_lora_rank / crate::kv_cache::DEFAULT_GROUP_SIZE * 2 };
-        let kv_bytes_per_layer_token = latent_bytes + self.mla.qk_rope_head_dim * 2 + self.cfg.index_head_dim * 2;
+        let mla_bytes = latent_bytes + self.mla.qk_rope_head_dim * 2;
+        let index_bytes = self.cfg.index_head_dim * 2;
+        // pair 卡按固定 block parity 各持有一半 MLA KV；DSA 为按 query rows
+        // 并行扫描完整历史，Indexer cache 仍各保留一份。
+        let kv_bytes_per_layer_token = if self.options.cooperative_expert_pairs { mla_bytes.div_ceil(2) + index_bytes } else { mla_bytes + index_bytes };
         let mut layer_start = 0usize;
         let mut token_capacity = usize::MAX;
         let mut devices = Vec::with_capacity(self.contexts.len() + self.downstream_memory.len());
         for (device_index, (context, &layer_end)) in self.contexts.iter().zip(&self.layer_ends).enumerate() {
-            let layers = layer_end + 1 - layer_start + usize::from(device_index == 0 && self.options.mtp && !self.options.tail_sampling) * self.cfg.mtp_layer_count;
+            let layers = layer_end + 1 - layer_start + usize::from(device_index == 0 && self.options.mtp) * self.cfg.mtp_layer_count;
             layer_start = layer_end + 1;
             let free = context.stage_available_bytes().map_err(|error| format!("查询 ROCm device {} 可用显存: {error:?}", context.device_id()))?;
             let total = context.stage_total_bytes().map_err(|error| format!("查询 ROCm device {} 总显存: {error:?}", context.device_id()))?;
@@ -1004,7 +1040,7 @@ impl Glm52Engine {
     }
 
     fn send_open_with_reconnect(&mut self, request_id: RequestId, cache_request_id: Option<RequestId>, cached_tokens: usize, reserved_rows: usize, cache_hit: bool, sampling: SamplingConfig) -> Result<(), String> {
-        let first_error = match self.link.send_open_reserved(request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, self.options.tail_sampling) {
+        let first_error = match self.link.send_open_reserved(request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, false) {
             Ok(()) => return Ok(()),
             Err(error) => error,
         };
@@ -1018,7 +1054,7 @@ impl Glm52Engine {
             return Err(format!("下游 stage 重连后 session capacity 改变: {:?} -> {:?}", self.downstream_session_capacity, session_capacity));
         }
         self.downstream_memory = devices;
-        self.link.send_open_reserved(request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, self.options.tail_sampling).map_err(|error| format!("下游 stage 重连后再次 Open 失败: {error}"))
+        self.link.send_open_reserved(request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, false).map_err(|error| format!("下游 stage 重连后再次 Open 失败: {error}"))
     }
 }
 
@@ -1036,6 +1072,10 @@ impl NodeEngine for Glm52Engine {
     fn refresh_runtime(&self) {
         if let Ok(mut runtime) = self.runtime.lock() {
             crate::runtime::session::refresh_cache_runtime(&mut runtime, self.terminal_states.states().map(|state| &state.info), self.max_seq_len);
+            runtime.memory_cache_ids = self.terminal_states.states().map(|state| state.info.cache_id.clone()).collect();
+            runtime.memory_cache_ids.sort();
+            runtime.ssd_cache_ids = self.swap.as_ref().map_or_else(Vec::new, |swap| swap.infos().into_iter().map(|info| info.cache_id).collect());
+            runtime.ssd_cache_ids.sort();
         }
     }
 
@@ -1095,9 +1135,10 @@ impl NodeEngine for Glm52Engine {
         intake: &mut dyn FnMut(usize) -> Vec<NodeBatchRequest>,
         on_token: &mut dyn FnMut(&str, u32, String) -> bool,
         on_tool_call_delta: &mut dyn FnMut(&str, ToolCallDelta) -> bool,
+        on_runtime_changed: &mut dyn FnMut(),
         on_result: &mut dyn FnMut(NodeBatchResult),
     ) -> Vec<NodeBatchResult> {
-        self.generate_glm52_batch(requests, intake, on_token, on_tool_call_delta, on_result)
+        self.generate_glm52_batch(requests, intake, on_token, on_tool_call_delta, on_runtime_changed, on_result)
     }
 }
 
@@ -1108,6 +1149,7 @@ impl Glm52Engine {
         intake: &mut dyn FnMut(usize) -> Vec<NodeBatchRequest>,
         on_token: &mut dyn FnMut(&str, u32, String) -> bool,
         on_tool_call_delta: &mut dyn FnMut(&str, ToolCallDelta) -> bool,
+        on_runtime_changed: &mut dyn FnMut(),
         on_result: &mut dyn FnMut(NodeBatchResult),
     ) -> Vec<NodeBatchResult> {
         let capacity = self.max_concurrency();
@@ -1178,18 +1220,9 @@ impl Glm52Engine {
             return Vec::new();
         }
         for task in slots[..initial_count].iter_mut().filter_map(Option::as_mut).filter(|task| task.cached_output_ready) {
-            if self.options.tail_sampling
-                && let Err(message) = self.link.send_sample(task.stage_id, task.token_fence.fence().excluded())
-            {
-                on_result(NodeBatchResult { request_id: task.request_id.clone(), result: Err(message) });
-                return Vec::new();
-            }
             if let Err(message) = self.link.send_prefill_done(task.stage_id, task.cached_tokens.len()) {
                 on_result(NodeBatchResult { request_id: task.request_id.clone(), result: Err(message) });
                 return Vec::new();
-            }
-            if self.options.tail_sampling {
-                task.cached_output_ready = false;
             }
         }
         let initial_states = slots[..initial_count].iter_mut().map(|task| std::mem::take(&mut task.as_mut().expect("初始 slot 连续").states)).collect::<Vec<_>>();
@@ -1275,9 +1308,39 @@ impl Glm52Engine {
                 &self.contexts[0],
                 &weights,
                 &cfg,
+                self.embedding_table.as_ref(),
             )?;
 
+            let mut reported_load = None;
             loop {
+                let load = slots.iter().flatten().fold((0usize, 0usize, 0usize), |mut load, task| {
+                    if task.prefill_position >= task.tokens.len() {
+                        load.2 += 1;
+                    } else if task.prefill_suffix_start == 0 {
+                        load.0 += 1;
+                    } else {
+                        load.1 += 1;
+                    }
+                    load
+                });
+                let dspark = crate::runtime::session::effective_dspark_draft_tokens(self.options.dspark_draft_tokens, load.2);
+                let mut memory_cache_ids = self.terminal_states.states().map(|state| state.info.cache_id.clone()).collect::<Vec<_>>();
+                memory_cache_ids.sort();
+                let mut ssd_cache_ids = self.swap.as_ref().map_or_else(Vec::new, |swap| swap.infos().into_iter().map(|info| info.cache_id).collect());
+                ssd_cache_ids.sort();
+                let current = (load.0, load.1, load.2, dspark, memory_cache_ids.clone(), ssd_cache_ids.clone());
+                if reported_load.as_ref() != Some(&current) {
+                    if let Ok(mut runtime) = self.runtime.lock() {
+                        runtime.new_prefill = load.0;
+                        runtime.append_prefill = load.1;
+                        runtime.decode = load.2;
+                        runtime.dspark_draft_tokens = dspark;
+                        runtime.memory_cache_ids = memory_cache_ids;
+                        runtime.ssd_cache_ids = ssd_cache_ids;
+                    }
+                    reported_load = Some(current);
+                    on_runtime_changed();
+                }
                 let mut progressed = false;
                 while let Some(output) = pipeline.try_recv()? {
                     progressed = true;
@@ -1358,9 +1421,6 @@ impl Glm52Engine {
                             task.cached_tokens.extend_from_slice(&task.tokens[position..end]);
                             task.prefill_position = end;
                             if end == task.tokens.len() {
-                                if self.options.tail_sampling {
-                                    self.link.send_sample(task.stage_id, task.token_fence.fence().excluded()).map_err(backend_error)?;
-                                }
                                 self.link.send_prefill_done(task.stage_id, end).map_err(backend_error)?;
                             }
                         }
@@ -1442,7 +1502,6 @@ impl Glm52Engine {
                         let works = self.prepare_cpu_verify_suffix(result.session, task, suffix, &weights)?;
                         let suffix_us = suffix_started.map(|started| started.elapsed().as_micros()).unwrap_or(0);
                         let fence_started = diagnostics.trace_stage_events.then(Instant::now);
-                        self.send_tail_sampling_fences_suffix(task, suffix).map_err(backend_error)?;
                         let fence_us = fence_started.map(|started| started.elapsed().as_micros()).unwrap_or(0);
                         if profile_boundaries {
                             decode_started[result.session].extend(std::iter::repeat_n(Instant::now(), works.len()));
@@ -1525,9 +1584,10 @@ impl Glm52Engine {
                     }
                     let boundary_started = profile_boundaries.then(Instant::now);
                     let active_decode = slots.iter().enumerate().filter(|(session, task)| !closing[*session] && task.as_ref().is_some_and(|task| task.prefill_position >= task.tokens.len())).count();
-                    let minimum_dspark_drafts = active_decode.checked_sub(1).map_or(0, |_| decode_pipeline_stage_count.div_ceil(active_decode).saturating_sub(1));
+                    let maximum_dspark_drafts = crate::runtime::session::effective_dspark_draft_tokens(self.options.dspark_draft_tokens, active_decode);
+                    let minimum_dspark_drafts = active_decode.checked_sub(1).map_or(0, |_| decode_pipeline_stage_count.div_ceil(active_decode).saturating_sub(1)).min(maximum_dspark_drafts);
                     let ready_count = tail_ready.len();
-                    let decisions = self.accept_tail_batch(&mut slots, tail_ready, minimum_dspark_drafts, profile_completion, on_token, on_tool_call_delta).map_err(backend_error)?;
+                    let decisions = self.accept_tail_batch(&mut slots, tail_ready, minimum_dspark_drafts, maximum_dspark_drafts, profile_completion, on_token, on_tool_call_delta).map_err(backend_error)?;
                     if crate::kernel::rocm::hip::options().kernel_profile && allocation_profile_round < 2 {
                         crate::kernel::rocm::hip::hip_api_stats::report_phase(&format!("glm52-round-{allocation_profile_round}-post-accept"));
                         allocation_profile_round += 1;
@@ -1652,8 +1712,7 @@ impl Glm52Engine {
                         let mut pending = Vec::with_capacity(split_verify.len());
                         let mut work_count = 0usize;
                         for (works, session, inputs) in split_verify {
-                            let task = slots[session].as_ref().ok_or_else(|| backend_error(format!("MTP split verify session={session} 消失")))?;
-                            self.send_tail_sampling_fences(task, &inputs).map_err(backend_error)?;
+                            slots[session].as_ref().ok_or_else(|| backend_error(format!("MTP split verify session={session} 消失")))?;
                             if let Some(started) = boundary_started {
                                 decode_started[session].extend(std::iter::repeat_n(started, works.len()));
                             }
@@ -1680,9 +1739,8 @@ impl Glm52Engine {
                         // 与 DeepSeek 一致：ready session 形成一个有序输入波次，但每份
                         // work 保持独立 completion。stage 可从自然 backlog 合批读取
                         // 权重，慢 session 不会形成跨卡 cohort barrier。
-                        for (session, inputs) in &commits {
-                            let task = slots[*session].as_ref().ok_or_else(|| backend_error(format!("tail sample session={} 消失", *session)))?;
-                            self.send_tail_sampling_fences(task, inputs).map_err(backend_error)?;
+                        for (session, _) in &commits {
+                            slots[*session].as_ref().ok_or_else(|| backend_error(format!("cohort decode session={} 消失", *session)))?;
                             if let Some(started) = boundary_started {
                                 decode_started[*session].push_back(started);
                             }
@@ -1749,20 +1807,10 @@ impl Glm52Engine {
                         continue;
                     }
                     if task.cached_output_ready {
-                        if self.options.tail_sampling
-                            && let Err(message) = self.link.send_sample(task.stage_id, task.token_fence.fence().excluded())
-                        {
-                            let _ = self.link.send_delete(task.stage_id);
-                            on_result(NodeBatchResult { request_id, result: Err(message) });
-                            continue;
-                        }
                         if let Err(message) = self.link.send_prefill_done(task.stage_id, task.cached_tokens.len()) {
                             let _ = self.link.send_delete(task.stage_id);
                             on_result(NodeBatchResult { request_id, result: Err(message) });
                             continue;
-                        }
-                        if self.options.tail_sampling {
-                            task.cached_output_ready = false;
                         }
                     }
                     let states = std::mem::take(&mut task.states);
@@ -1777,6 +1825,7 @@ impl Glm52Engine {
                     request_sessions.insert(stage_id, session);
                     submitted_prefill[session] = task.prefill_position;
                     slots[session] = Some(task);
+                    decode_scheduler.extend_initial_batch(session + 1);
                 }
                 let decode_active = slots.iter().flatten().any(|task| task.prefill_position >= task.tokens.len());
                 let (mut prefill_target, prefill_work_window, prefill_chunk_limit) = prefill_admission.limits(
@@ -1806,6 +1855,7 @@ impl Glm52Engine {
                     &self.contexts[0],
                     &weights,
                     &cfg,
+                    self.embedding_table.as_ref(),
                 )?;
 
                 if slots.iter().all(Option::is_none) && pending.is_empty() {
@@ -1870,6 +1920,13 @@ impl Glm52Engine {
                 on_result(NodeBatchResult { request_id, result: Err(message.clone()) });
             }
         }
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.new_prefill = 0;
+            runtime.append_prefill = 0;
+            runtime.decode = 0;
+            runtime.dspark_draft_tokens = 0;
+        }
+        on_runtime_changed();
         Vec::new()
     }
 
@@ -1878,9 +1935,7 @@ impl Glm52Engine {
         self.wait_ready(task.stage_id, ready)?;
         // B 的 SSD restore 完成并建立 active session 后再下发依赖该 session 的消息。
         // 这样一批 Open 可以先全部到达 B，host 读盘才能并行。
-        if self.options.mtp && self.options.tail_sampling {
-            self.link.send_mtp_context(task.stage_id, &task.tokens, task.max_decode, self.options.mtp_draft_tokens).map_err(|error| format!("命令尾端建立 MTP context: {error}"))?;
-        }
+        // MTP context 由本机 A0 持有,不再向尾端下发。
         Ok(())
     }
 
@@ -1994,7 +2049,7 @@ impl Glm52Engine {
             }
         }
         let mut cache_hit = false;
-        let head_mtp_enabled = self.options.mtp && !self.options.tail_sampling;
+        let head_mtp_enabled = self.options.mtp;
         let dspark_enabled = self.dspark_runtime.is_some();
         let (mut states, last_hidden, cached_tokens, prefill_position, mut mtp, mut dspark_aux_history, mut dspark_aux_history_start, mut dspark_target_cache) = if let Some((matched_id, cached_tokens, state, resume_assistant)) = resident {
             if let Some(assistant) = resume_assistant {
@@ -2453,6 +2508,7 @@ impl Glm52Engine {
         slots: &mut [Option<Glm52BatchTask>],
         ready: Vec<Glm52TailReady>,
         minimum_dspark_drafts: usize,
+        maximum_dspark_drafts: usize,
         profile_completion: bool,
         on_token: &mut dyn FnMut(&str, u32, String) -> bool,
         on_tool_call_delta: &mut dyn FnMut(&str, ToolCallDelta) -> bool,
@@ -2607,9 +2663,6 @@ impl Glm52Engine {
                     }
                     task.prompt_dspark_aux_history = Some(history.clone());
                     task.prompt_dspark_aux_history_start = task.dspark_aux_history_start;
-                }
-                if self.options.tail_sampling {
-                    continue;
                 }
                 head_ranges[session] = Some((sampling.len(), 1));
                 sampling.push(task.sampling.next());
@@ -2954,7 +3007,7 @@ impl Glm52Engine {
                         task.cached_tokens.len().saturating_sub(1),
                     ));
                 }
-                cpu_jobs.push(CpuDsparkJob { session, id, anchor, max_drafts: remaining - 1, cache, history, target_position, block_position, minimum_drafts: minimum_dspark_drafts });
+                cpu_jobs.push(CpuDsparkJob { session, id, anchor, max_drafts: (remaining - 1).min(maximum_dspark_drafts), cache, history, target_position, block_position, minimum_drafts: minimum_dspark_drafts });
                 task.dspark_cpu_pending = Some(id);
                 task.dspark_cpu_anchor_in_flight = true;
                 task.dspark_cpu_window = minimum_dspark_drafts.saturating_add(1);
@@ -3003,7 +3056,7 @@ impl Glm52Engine {
             for (session, remaining, anchor, drafts) in drafted {
                 let outcome = outcomes[session].as_mut().expect("DSpark draft outcome 已检查");
                 let task = slots[session].as_mut().expect("DSpark draft session 已检查");
-                outcome.drafts = drafts.into_iter().take(remaining - 1).collect();
+                outcome.drafts = drafts.into_iter().take((remaining - 1).min(maximum_dspark_drafts)).collect();
                 task.dspark_verify_inputs = std::iter::once(anchor).chain(outcome.drafts.iter().copied()).collect();
             }
         }

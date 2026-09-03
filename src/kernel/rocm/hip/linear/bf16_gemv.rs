@@ -704,6 +704,12 @@ mod dense_tile_tests {
         let (first, second) = try_ct_dual_gemv_bf16(0, 8, &[], Some(&input), columns, 1, &packed, &scales, 0, 128, output_rows, &packed, &scales64, 0, 64, output_rows).expect("dual W8 fallback BF16 input");
         assert_eq!(first.download_f32(output_rows).unwrap(), vec![0.0; output_rows]);
         assert_eq!(second.download_f32(output_rows).unwrap(), vec![0.0; output_rows]);
+
+        let scales32 = vec![half::f16::from_f32(1.0).to_ne_bytes(); output_rows * 4].into_iter().flatten().collect::<Vec<_>>();
+        let scales32 = DeviceBuffer::upload(0, &scales32).expect("upload dual W8 G32 scales");
+        let (first, second) = try_ct_dual_gemv_bf16(0, 8, &[], Some(&input), columns, 1, &packed, &scales32, 1, 32, output_rows, &packed, &scales32, 1, 32, output_rows).expect("dual W8 G32 BF16 input");
+        assert_eq!(first.download_f32(output_rows).unwrap(), vec![0.0; output_rows]);
+        assert_eq!(second.download_f32(output_rows).unwrap(), vec![0.0; output_rows]);
     }
 
     #[test]
@@ -807,7 +813,7 @@ mod dense_tile_tests {
     }
 
     #[test]
-    fn rocm_cooperative_decode_matches_single_device_bitwise() {
+    fn rocm_cooperative_decode_matches_single_device_oracle() {
         if !super::super::is_hip_available() {
             eprintln!("[cooperative-decode] 跳过：本机未检测到 ROCm 运行时");
             return;
@@ -895,7 +901,7 @@ mod dense_tile_tests {
             .expect("download single-device shared MoE batch");
         let expected = residual.iter().zip(&shared_expected).zip(&routed_expected).map(|((&residual, &shared), &routed)| residual + (shared + routed)).collect::<Vec<_>>();
         let sharded = |device_id: i32, intermediate_start: usize| {
-            (0..expert_count)
+            (0..=expert_count)
                 .map(|expert| Expert {
                     gate: Weight::new_rows_on(device_id, hidden, expert * 3, intermediate_start, intermediate / 2),
                     up: Weight::new_rows_on(device_id, hidden, expert * 3 + 1, intermediate_start, intermediate / 2),
@@ -907,12 +913,8 @@ mod dense_tile_tests {
         let high_experts = sharded(0, intermediate / 2);
         let low_grouped = low_experts.iter().map(|expert| CtGroupedExpertRef { gate: expert.gate.grouped(hidden), up: expert.up.grouped(hidden), down: expert.down.grouped(intermediate) }).collect::<Vec<_>>();
         let high_grouped = high_experts.iter().map(|expert| CtGroupedExpertRef { gate: expert.gate.grouped(hidden), up: expert.up.grouped(hidden), down: expert.down.grouped(intermediate) }).collect::<Vec<_>>();
-        let low_gate = try_ct_cooperative_gate_up_bf16(0, &input, input_rows, hidden, intermediate / 2, &routes_device, &weights_device, routes.len(), top_k, &low_grouped).expect("sharded low gate/up");
-        let high_gate = try_ct_cooperative_gate_up_bf16(0, &input, input_rows, hidden, intermediate / 2, &routes_device, &weights_device, routes.len(), top_k, &high_grouped).expect("sharded high gate/up");
-        let low_output_device =
-            try_ct_cooperative_sharded_down_bf16(0, &low_gate, low_gate.activated(), low_gate.activated(), &routes_device, &weights_device, input_rows, routes.len(), top_k, intermediate / 2, 0, hidden).expect("sharded low down");
-        let high_output_device =
-            try_ct_cooperative_sharded_down_bf16(0, &high_gate, high_gate.activated(), high_gate.activated(), &routes_device, &weights_device, input_rows, routes.len(), top_k, intermediate / 2, 0, hidden).expect("sharded high down");
+        let low_output_device = try_ct_cooperative_routed_bf16(0, &input, input_rows, hidden, intermediate / 2, &routes_device, &weights_device, routes.len(), top_k, &low_grouped[..expert_count], hidden).expect("sharded low down");
+        let high_output_device = try_ct_cooperative_routed_bf16(0, &input, input_rows, hidden, intermediate / 2, &routes_device, &weights_device, routes.len(), top_k, &high_grouped[..expert_count], hidden).expect("sharded high down");
         let low_output = low_output_device.download_f32(input_rows * hidden).expect("download sharded low down");
         let high_output = high_output_device.download_f32(input_rows * hidden).expect("download sharded high down");
         for token in 0..input_rows {
@@ -922,12 +924,12 @@ mod dense_tile_tests {
                 assert!(actual.is_finite() && (actual - expected).abs() <= 1.0e-4, "sharded token={token} column={column} actual={actual} expected={expected}");
             }
         }
-        let shared_output_device = try_ct_cooperative_shared_bf16(0, &input, input_rows, hidden, intermediate, &grouped[expert_count]).expect("standalone cooperative shared");
-        let joined = try_ct_cooperative_partial_join_f32(0, &low_output_device, &high_output_device, &shared_output_device, &residual_device, input_rows, hidden)
-            .expect("join sharded output")
-            .download_f32(input_rows * hidden)
-            .expect("download joined sharded output");
-        assert!(joined.iter().zip(&expected).all(|(&actual, &expected)| actual.is_finite() && (actual - expected).abs() <= 1.0e-4), "joined sharded output differs from integrated oracle");
+        let low_shared_output = try_ct_cooperative_shared_bf16(0, &input, input_rows, hidden, intermediate / 2, &low_grouped[expert_count]).expect("low cooperative shared");
+        let high_shared_output = try_ct_cooperative_shared_bf16(0, &input, input_rows, hidden, intermediate / 2, &high_grouped[expert_count]).expect("high cooperative shared");
+        let low_combined = crate::kernel::rocm::hip::try_add_resident_f32(0, &low_output_device, &low_shared_output, input_rows * hidden, 1.0).expect("combine low routed/shared");
+        let high_combined_bf16 = try_ct_cooperative_combine_partial_bf16(0, &high_output_device, &high_shared_output, input_rows * hidden).expect("fused combine high routed/shared");
+        let joined = try_ct_cooperative_partial_join_f32(0, &low_combined, &high_combined_bf16, &residual_device, input_rows, hidden).expect("join sharded output").download_f32(input_rows * hidden).expect("download joined sharded output");
+        assert!(joined.iter().zip(&expected).all(|(&actual, &expected)| actual.is_finite() && (actual - expected).abs() <= 2.0e-2), "joined sharded output differs from integrated oracle");
 
         if let Err(error) = set_device(1) {
             eprintln!("[cooperative-decode] 跳过双卡 oracle：{error}");
@@ -941,22 +943,23 @@ mod dense_tile_tests {
         let stable_input = std::sync::Arc::new(input.copy_to_stable_deferred().expect("stabilize cooperative input"));
         let stable_routes = std::sync::Arc::new(routes_device.copy_to_stable_deferred().expect("stabilize cooperative routes"));
         let stable_weights = std::sync::Arc::new(weights_device.copy_to_stable_deferred().expect("stabilize cooperative route weights"));
-        super::super::activate_cooperative_peer_stream(0, 1).expect("activate matching peer stream");
+        super::super::activate_compute_stream(1, 0).expect("activate peer default stream");
         let [peer_input, peer_routes, peer_weights]: [DeviceBuffer; 3] =
             DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&[stable_input, stable_routes, stable_weights], 1, 0).expect("event-ordered cooperative inputs").try_into().expect("three cooperative inputs");
         let peer_high_experts = sharded(1, intermediate / 2);
         let peer_high_grouped = peer_high_experts.iter().map(|expert| CtGroupedExpertRef { gate: expert.gate.grouped(hidden), up: expert.up.grouped(hidden), down: expert.down.grouped(intermediate) }).collect::<Vec<_>>();
-        let peer_high_gate = try_ct_cooperative_gate_up_bf16(1, &peer_input, input_rows, hidden, intermediate / 2, &peer_routes, &peer_weights, routes.len(), top_k, &peer_high_grouped).expect("peer sharded high gate/up");
-        let high_output_device = try_ct_cooperative_sharded_down_bf16(1, &peer_high_gate, peer_high_gate.activated(), peer_high_gate.activated(), &peer_routes, &peer_weights, input_rows, routes.len(), top_k, intermediate / 2, 0, hidden)
-            .expect("two-device sharded high down");
-        let stable_high_output = std::sync::Arc::new(high_output_device.copy_to_stable_deferred().expect("stabilize peer high partial"));
+        let high_output_device =
+            try_ct_cooperative_routed_bf16(1, &peer_input, input_rows, hidden, intermediate / 2, &peer_routes, &peer_weights, routes.len(), top_k, &peer_high_grouped[..expert_count], hidden).expect("two-device sharded high down");
+        let high_shared_output_device = try_ct_cooperative_shared_bf16(1, &peer_input, input_rows, hidden, intermediate / 2, &peer_high_grouped[expert_count]).expect("two-device sharded high shared");
+        let stable_high_combined = std::sync::Arc::new(try_ct_cooperative_combine_partial_bf16(1, &high_output_device, &high_shared_output_device, input_rows * hidden).expect("fused stable peer partial"));
         super::super::activate_compute_stream(0, owner_stream).expect("restore owner background stream");
-        let high_output_on_owner = stable_high_output.copy_stable_to_device_ordered_async_retained_by(0, 0).expect("event-ordered high partial to owner");
-        let joined = try_ct_cooperative_partial_join_f32(0, &low_output_device, &high_output_on_owner, &shared_output_device, &residual_device, input_rows, hidden)
+        let low_combined = crate::kernel::rocm::hip::try_add_resident_f32(0, &low_output_device, &low_shared_output, input_rows * hidden, 1.0).expect("combine owner routed/shared");
+        stable_high_combined.wait_stable_on_device_ordered_on_streams_retained_by(0, 0, 0, owner_stream).expect("wait peer combined on owner");
+        let joined = try_ct_cooperative_partial_join_f32(0, &low_combined, &stable_high_combined, &residual_device, input_rows, hidden)
             .expect("join two-device sharded output")
             .download_f32(input_rows * hidden)
             .expect("download joined two-device sharded output");
-        assert!(joined.iter().zip(&expected).all(|(&actual, &expected)| actual.is_finite() && (actual - expected).abs() <= 1.0e-4), "two-device joined output differs from integrated oracle");
+        assert!(joined.iter().zip(&expected).all(|(&actual, &expected)| actual.is_finite() && (actual - expected).abs() <= 2.0e-2), "two-device joined output differs from integrated oracle");
         super::super::retire_pending_p2p_sources(0);
         super::super::activate_compute_stream(1, 0).expect("restore peer default stream");
         super::super::activate_compute_stream(0, 0).expect("restore owner default stream");
@@ -1133,6 +1136,39 @@ mod dense_tile_tests {
     }
 
     #[test]
+    fn rocm_dense_dsa_query_epilogue_matches_projection_rope_cast() {
+        if !super::super::is_hip_available() {
+            eprintln!("[dense-dsa-query] 跳过：本机未检测到 ROCm 运行时");
+            return;
+        }
+        let rows = 129usize;
+        let columns = 64usize;
+        let head_count = 2usize;
+        let head_dim = 128usize;
+        let rotary_dim = 64usize;
+        let output_rows = head_count * head_dim;
+        let position = 3usize;
+        let input = (0..rows * columns).map(|index| (index as f32 * 0.013).sin() * 0.25).collect::<Vec<_>>();
+        let weight = (0..output_rows * columns).flat_map(|index| bf16((index as f32 * 0.019).cos() * 0.125).to_ne_bytes()).collect::<Vec<_>>();
+        let half = rotary_dim / 2;
+        let table_rows = position + rows;
+        let cosine = (0..table_rows * half).map(|index| (index as f32 * 0.0007).cos()).collect::<Vec<_>>();
+        let sine = (0..table_rows * half).map(|index| (index as f32 * 0.0007).sin()).collect::<Vec<_>>();
+        let input = DeviceBuffer::upload(0, f32_bytes(&input)).expect("upload DSA query input");
+        let weight = DeviceBuffer::upload(0, &weight).expect("upload DSA query weight");
+        let projected = try_dense_matmul_bf16_f32(0, &input, &weight, rows, columns, output_rows).expect("dense DSA query baseline projection");
+        for layout in [RotaryLayout::Interleaved, RotaryLayout::SplitHalf] {
+            let rotated = try_rope_resident_f32(0, &projected, rows, output_rows, head_count, rotary_dim, layout, position, &cosine, &sine, true).expect("dense DSA query baseline RoPE");
+            let expected = try_cast_f32_to_bf16_resident(0, &rotated, rows * output_rows).expect("dense DSA query baseline cast").download_u16(rows * output_rows).expect("download DSA query baseline");
+            let actual = try_dense_matmul_bf16_dsa_query(0, &input, &weight, rows, columns, head_count, head_dim, rotary_dim, layout, position, &cosine, &sine)
+                .expect("dense DSA query fused")
+                .download_u16(rows * output_rows)
+                .expect("download fused DSA query");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
     fn rocm_w8_g128_register_fragment_maps_every_k_column_and_input_tile() {
         if !super::super::is_hip_available() {
             eprintln!("[w8-register-fragment] 跳过：本机未检测到 ROCm 运行时");
@@ -1174,6 +1210,91 @@ mod dense_tile_tests {
                 let scale = bf16_value(2.0f32.powi(-6 + (output_row % 3) as i32));
                 let code = packed[output_row * columns + row % columns];
                 let expected = bf16_value((i32::from(code) - 128) as f32 * scale);
+                let value = actual[row * output_rows + output_row];
+                let ulp = value.to_bits().abs_diff(expected.to_bits());
+                if ulp > max_ulp {
+                    max_ulp = ulp;
+                    worst = (row, output_row, value, expected);
+                }
+            }
+        }
+        assert!(max_ulp <= 1, "max_ulp={max_ulp} row={} output={} actual={} expected={}", worst.0, worst.1, worst.2, worst.3);
+    }
+
+    #[test]
+    fn rocm_w4_g128_register_fragment_maps_every_k_column_and_input_tile() {
+        if !super::super::is_hip_available() {
+            eprintln!("[w4-register-fragment] 跳过：本机未检测到 ROCm 运行时");
+            return;
+        }
+        let rows = 129usize;
+        let columns = 128usize;
+        let output_rows = 32usize;
+        let mut input = vec![0.0f32; rows * columns];
+        for row in 0..rows {
+            input[row * columns + row % columns] = 1.0;
+        }
+        let codes = (0..output_rows * columns).map(|index| ((index * 5 + 3) % 16) as u8).collect::<Vec<_>>();
+        let mut packed = vec![0u8; codes.len() / 2];
+        for (index, &code) in codes.iter().enumerate() {
+            packed[index / 2] |= code << ((index % 2) * 4);
+        }
+        let scales = (0..output_rows).flat_map(|row| bf16(2.0f32.powi(-6 + (row % 3) as i32)).to_ne_bytes()).collect::<Vec<_>>();
+        let packed_device = DeviceBuffer::upload(0, &packed).expect("upload W4 packed");
+        let scales_device = DeviceBuffer::upload(0, &scales).expect("upload W4 scales");
+        let actual =
+            try_ct_quantized_matmul_bf16(0, 4, &input, None, &packed_device, &scales_device, 0, 128, rows, columns, output_rows).expect("ROCm W4 register fragment").download_f32(rows * output_rows).expect("download W4 register fragment");
+        let mut max_ulp = 0;
+        let mut worst = (0, 0, 0.0, 0.0);
+        for row in 0..rows {
+            for output_row in 0..output_rows {
+                let scale = bf16_value(2.0f32.powi(-6 + (output_row % 3) as i32));
+                let code = codes[output_row * columns + row % columns];
+                let expected = bf16_value((i32::from(code) - 8) as f32 * scale);
+                let value = actual[row * output_rows + output_row];
+                let ulp = value.to_bits().abs_diff(expected.to_bits());
+                if ulp > max_ulp {
+                    max_ulp = ulp;
+                    worst = (row, output_row, value, expected);
+                }
+            }
+        }
+        assert!(max_ulp <= 1, "max_ulp={max_ulp} row={} output={} actual={} expected={}", worst.0, worst.1, worst.2, worst.3);
+    }
+
+    #[test]
+    fn rocm_w4_g128_k64_maps_every_segment_with_sixteen_waves() {
+        if !super::super::is_hip_available() {
+            eprintln!("[w4-register-fragment-k64] 跳过：本机未检测到 ROCm 运行时");
+            return;
+        }
+        let rows = 17usize;
+        let columns = 128usize;
+        let output_rows = 12_288usize;
+        let mut input = vec![0.0f32; rows * columns];
+        for row in 0..rows {
+            input[row * columns + row * 7 % columns] = 1.0;
+        }
+        let codes = (0..output_rows * columns).map(|index| ((index * 5 + 3) % 16) as u8).collect::<Vec<_>>();
+        let mut packed = vec![0u8; codes.len() / 2];
+        for (index, &code) in codes.iter().enumerate() {
+            packed[index / 2] |= code << ((index % 2) * 4);
+        }
+        let scales = (0..output_rows).flat_map(|row| bf16(2.0f32.powi(-6 + (row % 3) as i32)).to_ne_bytes()).collect::<Vec<_>>();
+        let packed_device = DeviceBuffer::upload(0, &packed).expect("upload W4 K64 packed");
+        let scales_device = DeviceBuffer::upload(0, &scales).expect("upload W4 K64 scales");
+        let actual = try_ct_quantized_matmul_bf16(0, 4, &input, None, &packed_device, &scales_device, 0, 128, rows, columns, output_rows)
+            .expect("ROCm W4 K64 register fragment")
+            .download_f32(rows * output_rows)
+            .expect("download W4 K64 register fragment");
+        let mut max_ulp = 0;
+        let mut worst = (0, 0, 0.0, 0.0);
+        for row in 0..rows {
+            for output_row in 0..output_rows {
+                let scale = bf16_value(2.0f32.powi(-6 + (output_row % 3) as i32));
+                let column = row * 7 % columns;
+                let code = codes[output_row * columns + column];
+                let expected = bf16_value((i32::from(code) - 8) as f32 * scale);
                 let value = actual[row * output_rows + output_row];
                 let ulp = value.to_bits().abs_diff(expected.to_bits());
                 if ulp > max_ulp {

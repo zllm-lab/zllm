@@ -64,9 +64,10 @@ pub(crate) fn try_peer_copy_kernel_ordered(device_id: i32, destination: *mut c_v
     let mut vectors_arg = vectors_u32;
     let mut arguments = [(&mut d_source as *mut *mut c_void).cast(), (&mut d_target as *mut *mut c_void).cast(), (&mut vectors_arg as *mut u32).cast()];
     let block = 256u32;
-    // 固定大 grid(而非每向量一线程):配合 kernel 内 grid-stride 展开保持
-    // 足够的在途负载,不随传输大小退化。
-    let grid = 2048u32;
+    // 大 hidden 保持足够在途负载，但 route ids/weights 只有几十 KiB；固定
+    // 2048 blocks 会为小 handoff 启动五十多万个线程，反而占满 peer 队列。
+    // 按实际向量数缩小 grid，上限仍保留已验证的大块 BAR 吞吐配置。
+    let grid = vectors_u32.div_ceil(block).clamp(1, 2048);
     let runtime = RocmRuntime::open()?;
     let launch = crate::kernel::rocm::hip::kernel_launch_trampoline;
     let profile_started = options().kernel_profile.then(std::time::Instant::now);

@@ -685,6 +685,17 @@ impl GgufExpertSource for Glm52Gguf {
             down: self.reader.read_matrix_slice(&format!("blk.{layer}.ffn_down_exps.weight"), expert)?,
         })
     }
+
+    fn load_shared_expert_gguf(&self, layer: usize) -> Result<GgufExpertWeights, String> {
+        if layer >= self.cfg.layer_count + self.cfg.mtp_layer_count {
+            return Err(format!("GLM-5.2 GGUF shared expert 层越界: layer={layer}/{}", self.cfg.layer_count + self.cfg.mtp_layer_count));
+        }
+        Ok(GgufExpertWeights {
+            gate: self.reader.read_matrix(&format!("blk.{layer}.ffn_gate_shexp.weight"))?,
+            up: self.reader.read_matrix(&format!("blk.{layer}.ffn_up_shexp.weight"))?,
+            down: self.reader.read_matrix(&format!("blk.{layer}.ffn_down_shexp.weight"))?,
+        })
+    }
 }
 
 enum WeightSource {
@@ -764,6 +775,38 @@ impl Glm52Weights {
 
     pub fn source_is_gguf(&self) -> bool {
         matches!(self.source, WeightSource::Gguf(_))
+    }
+
+    /// CPU 输出头直接消费 GGUF packed matrix，避免先展开为约 3.8GB F32/BF16
+    /// 临时副本；GPU 输出路径仍可沿用既有 resident 转换。
+    pub fn gguf_lm_head(&self) -> Result<GgufMatrix, String> {
+        self.gguf()?.reader().read_matrix("output.weight")
+    }
+
+    /// 全表一次性解码 token embedding 为 BF16 字节(行主序 [vocab, hidden]),
+    /// 供 ROCm 引擎常驻首卡后按 token id 设备 gather;非 GGUF 源返回 None。
+    pub fn embedding_table_bf16(&self) -> Result<Option<Vec<u8>>, String> {
+        if !self.source_is_gguf() {
+            return Ok(None);
+        }
+        let values = self.gguf()?.reader().read_tensor_f32("token_embd.weight")?;
+        let mut bytes = Vec::with_capacity(values.len() * 2);
+        for value in &values {
+            bytes.extend_from_slice(&half::bf16::from_f32(*value).to_le_bytes());
+        }
+        Ok(Some(bytes))
+    }
+
+    /// 单进程 ROCm/CPU 组合只接受已经有完整执行路径的 GGUF 类型。
+    /// 在加载任何大张量前一次性审计，避免运行到中间层才隐式回退或失败。
+    pub fn validate_glm_dsa_gguf_types(&self) -> Result<(), String> {
+        let source = self.gguf()?;
+        for tensor in source.reader().tensors() {
+            if !matches!(tensor.tensor_type.0, 0 | 8 | 11 | 12 | 13 | 14 | 21 | 23) {
+                return Err(format!("GLM-Dsa GGUF tensor {} type={}({}) shape={:?} 没有完整 CPU/ROCm 算子路径", tensor.name, tensor.tensor_type.0, tensor.tensor_type.name(), tensor.dims));
+            }
+        }
+        Ok(())
     }
 
     /// 返回 GGUF source 的 clone(runtime 用于构造 expert source 与 tokenizer)。

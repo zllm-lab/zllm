@@ -6,7 +6,7 @@ pub(super) fn ct_quantized_code() -> Result<&'static [u8], String> {
     static CODE: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
     CODE.get_or_init(|| {
         compile_hip_source(
-            &[super::super::hiprtc::DEVICE_CONVERSIONS_PREAMBLE, super::ct_common::SOURCE, super::ct_dense::SOURCE, super::ct_grouped::SOURCE, super::convrot::SOURCE, super::gguf::SOURCE].concat(),
+            &[super::super::hiprtc::DEVICE_CONVERSIONS_PREAMBLE, super::gguf::QUANT_SOURCE, super::ct_common::SOURCE, super::ct_dense::SOURCE, super::ct_grouped::SOURCE, super::convrot::SOURCE, super::gguf::SOURCE].concat(),
             "zllm_rocm_ct_quantized.hip",
         )
     })
@@ -20,8 +20,10 @@ pub(super) struct CtFunctions {
     pub(super) wavefront_size: u32,
     pub(super) cast: usize,
     pub(super) expand: usize,
+    pub(super) gather_bf16_rows: usize,
     pub(super) dense: usize,
     pub(super) dense_aligned: usize,
+    pub(super) dense_dsa_query: usize,
     pub(super) scalar: usize,
     pub(super) w8_scalar: usize,
     pub(super) w8_rows2: usize,
@@ -36,8 +38,11 @@ pub(super) struct CtFunctions {
     pub(super) w4_dual: usize,
     pub(super) w4_dual_rows8: usize,
     pub(super) w8_dual: usize,
+    pub(super) w8_dual_g32: usize,
     pub(super) wmma: usize,
     pub(super) wmma_w8_g128: usize,
+    pub(super) wmma_w4_g128: usize,
+    pub(super) wmma_w4_g128_k64: usize,
     pub(super) grouped_linear: usize,
     pub(super) grouped_gate_up_wmma: usize,
     pub(super) grouped_zero: usize,
@@ -61,10 +66,17 @@ pub(super) struct CtFunctions {
     pub(super) gguf_routes: usize,
     pub(super) gguf_gate_up_wmma: usize,
     pub(super) gguf_grouped_down: usize,
+    pub(super) gguf_grouped_down_iq4xs: usize,
     pub(super) gguf_fused_gate_up: usize,
     pub(super) gguf_fused_down: usize,
+    pub(super) gguf_fused_gate_up_iq3s: usize,
+    pub(super) gguf_fused_gate_up_iq4xs: usize,
+    pub(super) gguf_fused_down_iq4xs: usize,
+    pub(super) gguf_fused_gate_up_q8_0: usize,
+    pub(super) gguf_fused_down_q8_0: usize,
     pub(super) cooperative_merge_activation: usize,
     pub(super) cooperative_sharded_down: usize,
+    pub(super) cooperative_combine_partial: usize,
     pub(super) cooperative_partial_join: usize,
 }
 
@@ -135,9 +147,21 @@ pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, Stri
             "ct_quantized_dual_gemv_bf16_w4_rows8",
             "ct_cooperative_merge_activation_bf16",
             "ct_cooperative_sharded_down_bf16",
+            "ct_cooperative_combine_partial_bf16",
             "ct_cooperative_partial_join_f32",
+            "ct_quantized_matmul_bf16_w4_g128_wmma",
+            "ct_quantized_matmul_bf16_w4_g128_wmma_k64",
+            "dense_matmul_bf16_dsa_query_wmma",
+            "gguf_grouped_down_iq4xs_f32",
+            "ct_quantized_dual_gemv_bf16_w8_g32",
+            "gguf_fused_gate_up_iq4xs_f32",
+            "gguf_fused_down_iq4xs_f32",
+            "gguf_fused_gate_up_iq3s_f32",
+            "gguf_fused_gate_up_q8_0_f32",
+            "gguf_fused_down_q8_0_f32",
+            "gather_bf16_rows_f32",
         ];
-        let mut handles = [ptr::null_mut(); 48];
+        let mut handles = [ptr::null_mut(); 60];
         for (handle, name) in handles.iter_mut().zip(names) {
             let name = CString::new(name).unwrap();
             let status = unsafe { module_get_function(handle, module, name.as_ptr()) };
@@ -162,6 +186,7 @@ pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, Stri
                 expand: handles[1] as usize,
                 dense: handles[2] as usize,
                 dense_aligned: handles[16] as usize,
+                dense_dsa_query: handles[51] as usize,
                 scalar: handles[3] as usize,
                 w8_scalar: handles[9] as usize,
                 w8_rows2: handles[34] as usize,
@@ -176,8 +201,12 @@ pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, Stri
                 w4_rows8: handles[42] as usize,
                 _w4_rows2: handles[43] as usize,
                 w8_dual: handles[14] as usize,
+                w8_dual_g32: handles[53] as usize,
+                gather_bf16_rows: handles[59] as usize,
                 wmma: handles[4] as usize,
                 wmma_w8_g128: handles[28] as usize,
+                wmma_w4_g128: handles[49] as usize,
+                wmma_w4_g128_k64: handles[50] as usize,
                 grouped_linear: handles[5] as usize,
                 grouped_gate_up_wmma: handles[15] as usize,
                 grouped_zero: handles[6] as usize,
@@ -201,11 +230,18 @@ pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, Stri
                 gguf_routes: handles[29] as usize,
                 gguf_gate_up_wmma: handles[30] as usize,
                 gguf_grouped_down: handles[31] as usize,
+                gguf_grouped_down_iq4xs: handles[52] as usize,
                 gguf_fused_gate_up: handles[32] as usize,
                 gguf_fused_down: handles[33] as usize,
+                gguf_fused_gate_up_iq3s: handles[56] as usize,
+                gguf_fused_gate_up_iq4xs: handles[54] as usize,
+                gguf_fused_down_iq4xs: handles[55] as usize,
+                gguf_fused_gate_up_q8_0: handles[57] as usize,
+                gguf_fused_down_q8_0: handles[58] as usize,
                 cooperative_merge_activation: handles[45] as usize,
                 cooperative_sharded_down: handles[46] as usize,
-                cooperative_partial_join: handles[47] as usize,
+                cooperative_combine_partial: handles[47] as usize,
+                cooperative_partial_join: handles[48] as usize,
             },
         ))
     })();
@@ -226,7 +262,7 @@ pub(crate) fn try_gguf_grouped_wmma_experts(
     route_ids: &DeviceBuffer,
     route_weights: &DeviceBuffer,
     route_count: usize,
-    metas: &DeviceBuffer,
+    metas: &super::ct_grouped::GgufGroupedMetas,
     expert_count: usize,
 ) -> Result<DeviceBuffer, String> {
     if input_rows == 0 || expert_count == 0 || expert_count > 256 || route_count != input_rows.checked_mul(top_k).ok_or("GGUF WMMA route 数溢出")? {
@@ -248,8 +284,18 @@ pub(crate) fn try_gguf_grouped_wmma_experts(
     let runtime = RocmRuntime::open()?;
     let module_launch = runtime.module_launch()?;
     let functions = ct_quantized_functions(device_id)?;
+    let profile_sample = if options().kernel_profile {
+        static SAMPLES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        SAMPLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16
+    } else {
+        false
+    };
+    if profile_sample {
+        synchronize_device(device_id, "GGUF grouped profile begin")?;
+    }
 
     // decode 链的 expert 输入常为设备 F32(rmsnorm_f32)；WMMA kernel 只吃 BF16，用 cast kernel 原地转换。
+    let cast_started = profile_sample.then(std::time::Instant::now);
     let d_input_bf16;
     let input_bf16: &DeviceBuffer = if input.bytes == input_bytes_bf16 {
         input
@@ -257,9 +303,20 @@ pub(crate) fn try_gguf_grouped_wmma_experts(
         d_input_bf16 = try_cast_f32_to_bf16_resident(device_id, input, input_elements)?;
         &d_input_bf16
     };
+    let cast_wall = if let Some(started) = cast_started {
+        synchronize_device(device_id, "GGUF grouped cast profile")?;
+        started.elapsed().as_secs_f64()
+    } else {
+        0.0
+    };
 
-    let d_metas = metas;
-    // 7 个临时 buffer 走 deferred workspace 复用(参照 try_ct_grouped_experts_bf16);
+    let d_metas = &metas.buffer;
+    let down_function = if matches!(metas.uniform_types, Some([_, _, 23])) { functions.gguf_grouped_down_iq4xs } else { functions.gguf_grouped_down };
+    // shared expert 的 route 数由 host 完整已知；沿 y 维拆开 128-row tile，
+    // 避免仅有 intermediate/64 个 block 时让单个 block 串行扫完整 chunk。
+    // routed expert 的各自 route 数只在 compact 后可见，仍由 kernel 内循环覆盖。
+    let gate_grid_y = if expert_count == 1 && top_k == 1 && route_count == input_rows { u32::try_from(input_rows.div_ceil(128)).map_err(|_| "GGUF WMMA shared grid 超过 u32".to_owned())? } else { 1 };
+    // 临时 buffer 走 deferred workspace 复用(参照 try_ct_grouped_experts_bf16);
     // d_output 返回给调用方,保持独立 allocation。
     let grouped_metas_bytes = expert_count * std::mem::size_of::<super::GgufGroupedExpertMeta>();
     let activated_bytes = route_count.checked_mul(intermediate_size).and_then(|n| n.checked_mul(2)).ok_or("GGUF WMMA activated 溢出")?;
@@ -276,6 +333,7 @@ pub(crate) fn try_gguf_grouped_wmma_experts(
         let mut route_count = u32::try_from(route_count).map_err(|_| "GGUF WMMA route 数超过 u32".to_owned())?;
         let mut top_k = u32::try_from(top_k).map_err(|_| "GGUF WMMA top_k 超过 u32".to_owned())?;
         let mut expert_count = u32::try_from(expert_count).map_err(|_| "GGUF WMMA expert 数超过 u32".to_owned())?;
+        let routes_started = profile_sample.then(std::time::Instant::now);
         {
             let mut route_ids_pointer = route_ids.pointer;
             let mut route_weights_pointer = route_weights.pointer;
@@ -306,6 +364,13 @@ pub(crate) fn try_gguf_grouped_wmma_experts(
                 return Err(runtime.hip_error(status, "hipModuleLaunchKernel GGUF routes"));
             }
         }
+        let routes_wall = if let Some(started) = routes_started {
+            synchronize_device(device_id, "GGUF grouped routes profile")?;
+            started.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+        let gate_started = profile_sample.then(std::time::Instant::now);
         {
             let mut input_pointer = input_bf16.pointer;
             let mut grouped_tokens_pointer = d_grouped_tokens.pointer;
@@ -327,39 +392,66 @@ pub(crate) fn try_gguf_grouped_wmma_experts(
                 (&mut expert_count as *mut u32).cast(),
             ];
             let grid_x = u32::try_from(intermediate_size / 64).map_err(|_| "GGUF WMMA grid 超过 u32".to_owned())?;
-            let grid_y = u32::try_from(input_rows.div_ceil(128)).map_err(|_| "GGUF WMMA grid 超过 u32".to_owned())?;
-            let status = unsafe { module_launch(functions.gguf_gate_up_wmma as *mut c_void, grid_x, grid_y, expert_count, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
+            let status = unsafe { module_launch(functions.gguf_gate_up_wmma as *mut c_void, grid_x, gate_grid_y, expert_count, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
             if status != HIP_SUCCESS {
                 return Err(runtime.hip_error(status, "hipModuleLaunchKernel GGUF gate_up WMMA"));
             }
         }
+        let gate_wall = if let Some(started) = gate_started {
+            synchronize_device(device_id, "GGUF grouped gate/up profile")?;
+            started.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+        let down_started = profile_sample.then(std::time::Instant::now);
         {
-            let mut activated_pointer = d_activated.pointer;
-            let mut grouped_metas_pointer = d_grouped_metas.pointer;
-            let mut grouped_experts_pointer = d_grouped_experts.pointer;
-            let mut grouped_weights_pointer = d_grouped_weights.pointer;
-            let mut route_to_grouped_pointer = d_route_to_grouped.pointer;
+            let output_elements = input_rows.checked_mul(hidden_size).ok_or("GGUF WMMA output elements 溢出")?;
             let mut output_pointer = d_output.pointer;
-            let mut tokens = u32::try_from(input_rows).map_err(|_| "GGUF WMMA tokens 超过 u32".to_owned())?;
+            let mut output_elements_u32 = u32::try_from(output_elements).map_err(|_| "GGUF WMMA output elements 超过 u32".to_owned())?;
+            let mut zero_arguments = [(&mut output_pointer as *mut *mut c_void).cast(), (&mut output_elements_u32 as *mut u32).cast()];
+            let status =
+                unsafe { module_launch(functions.grouped_zero as *mut c_void, output_elements_u32.div_ceil(256), 1, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), zero_arguments.as_mut_ptr(), ptr::null_mut()) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipModuleLaunchKernel GGUF grouped output zero"));
+            }
+
+            let mut activated_pointer = d_activated.pointer;
+            let mut grouped_tokens_pointer = d_grouped_tokens.pointer;
+            let mut grouped_weights_pointer = d_grouped_weights.pointer;
+            let mut grouped_metas_pointer = d_grouped_metas.pointer;
+            let mut grouped_offsets_pointer = d_grouped_offsets.pointer;
             let mut hidden = u32::try_from(hidden_size).map_err(|_| "GGUF WMMA hidden 超过 u32".to_owned())?;
             let mut intermediate = u32::try_from(intermediate_size).map_err(|_| "GGUF WMMA intermediate 超过 u32".to_owned())?;
+            let mut base = 0_u32;
             let mut arguments = [
                 (&mut activated_pointer as *mut *mut c_void).cast(),
-                (&mut grouped_metas_pointer as *mut *mut c_void).cast(),
-                (&mut grouped_experts_pointer as *mut *mut c_void).cast(),
+                (&mut grouped_tokens_pointer as *mut *mut c_void).cast(),
                 (&mut grouped_weights_pointer as *mut *mut c_void).cast(),
-                (&mut route_to_grouped_pointer as *mut *mut c_void).cast(),
+                (&mut grouped_metas_pointer as *mut *mut c_void).cast(),
+                (&mut grouped_offsets_pointer as *mut *mut c_void).cast(),
                 (&mut output_pointer as *mut *mut c_void).cast(),
-                (&mut tokens as *mut u32).cast(),
-                (&mut top_k as *mut u32).cast(),
-                (&mut hidden as *mut u32).cast(),
                 (&mut intermediate as *mut u32).cast(),
+                (&mut hidden as *mut u32).cast(),
+                (&mut base as *mut u32).cast(),
+                (&mut expert_count as *mut u32).cast(),
             ];
-            let grid_x = u32::try_from(hidden_size / 8).map_err(|_| "GGUF WMMA grid 超过 u32".to_owned())?;
-            let status = unsafe { module_launch(functions.gguf_grouped_down as *mut c_void, grid_x, tokens, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
+            let grid_x = u32::try_from(hidden_size.div_ceil(128)).map_err(|_| "GGUF WMMA grid 超过 u32".to_owned())?;
+            // down 的 48 个 x tile 已能占满 W7900；保留 y=1 可让每个 block
+            // 跨 128-row tile 复用同一 weight fragment，拆 y 反而重复读权重。
+            let status = unsafe { module_launch(down_function as *mut c_void, grid_x, 1, expert_count, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
             if status != HIP_SUCCESS {
                 return Err(runtime.hip_error(status, "hipModuleLaunchKernel GGUF grouped down"));
             }
+        }
+        if let Some(started) = down_started {
+            synchronize_device(device_id, "GGUF grouped down profile")?;
+            eprintln!(
+                "[rocm-kernel] gguf-grouped device={device_id} rows={input_rows} routes={} top_k={} experts={} intermediate={intermediate_size} cast={cast_wall:.6}s compact={routes_wall:.6}s gate_up={gate_wall:.6}s down={:.6}s",
+                route_count,
+                top_k,
+                expert_count,
+                started.elapsed().as_secs_f64(),
+            );
         }
         // 与 CT grouped 一致：纯异步提交。
         Ok(d_output)

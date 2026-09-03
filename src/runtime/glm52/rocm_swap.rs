@@ -19,9 +19,9 @@ use crate::{
     weight::Glm52Weights,
 };
 
-use crate::backend::rocm::{DsaLayerSerde, MlaLayerSerde, RocmContext};
+use crate::backend::rocm::{DsaLayerSerde, MlaLayerSerde, RocmContext, RocmKvOwnership};
 
-const VERSION: u32 = 8;
+const VERSION: u32 = 9;
 const INFO_MAGIC: [u8; 8] = *b"ZGLM5I01";
 const MANIFEST_MAGIC: [u8; 8] = *b"ZGLM5M01";
 
@@ -90,8 +90,9 @@ pub fn upload_glm52_session(states: &mut [Glm52StageState<RocmContext>], snapsho
         }
         state.backend.activate().map_err(|error| format!("激活 ROCm device {}: {error}", state.backend.device_id()))?;
         state.reset_session(cfg, max_seq_len).map_err(|error| format!("重置 L{} session: {error:?}", state.layer_start))?;
+        let interleaved_pair = cached.kv.iter().flatten().any(|layer| layer.ownership == RocmKvOwnership::InterleavedPair);
         state.cache.upload_layers(&state.backend, &cached.kv, reserved_rows).map_err(|error| format!("恢复 L{} KV: {error:?}", state.layer_start))?;
-        state.dsa.upload_layers(&state.backend, &cached.dsa, reserved_rows).map_err(|error| format!("恢复 L{} DSA: {error:?}", state.layer_start))?;
+        state.dsa.upload_layers(&state.backend, &cached.dsa, reserved_rows, interleaved_pair).map_err(|error| format!("恢复 L{} DSA: {error:?}", state.layer_start))?;
     }
     Ok(())
 }
@@ -390,7 +391,7 @@ pub struct Glm52CacheIdentity {
 }
 
 impl Glm52CacheIdentity {
-    pub fn new(weights: &Glm52Weights, kv_cache_format: KvCacheFormat, layer_start: usize, layer_end: usize, mtp: bool, tail_sampling: bool, max_seq_len: usize, dspark_source: Option<&std::path::Path>) -> Self {
+    pub fn new(weights: &Glm52Weights, kv_cache_format: KvCacheFormat, layer_start: usize, layer_end: usize, mtp: bool, max_seq_len: usize, dspark_source: Option<&std::path::Path>) -> Self {
         let cfg = weights.cfg();
         let mut metadata = vec![
             ("schema_version".to_owned(), "2".to_owned()),
@@ -408,7 +409,6 @@ impl Glm52CacheIdentity {
             ("layer_start".to_owned(), layer_start.to_string()),
             ("layer_end".to_owned(), layer_end.to_string()),
             ("mtp".to_owned(), mtp.to_string()),
-            ("tail_sampling".to_owned(), tail_sampling.to_string()),
             ("dsa_cache_format".to_owned(), if crate::kernel::rocm::hip::options().dsa_hadamard_i8 { "hadamard_q8" } else { "q8" }.to_owned()),
             ("max_sequence_length".to_owned(), max_seq_len.to_string()),
             ("model_layout".to_owned(), format!("layers={};hidden={};kv_lora={};qk_rope={}", cfg.layer_count, cfg.hidden_size, cfg.kv_lora_rank, cfg.qk_rope_head_dim)),
@@ -811,6 +811,15 @@ fn new_generation() -> u64 {
 
 fn write_mla_layer(writer: &mut impl Write, layer: &MlaLayerSerde) -> Result<(), String> {
     write_usize(writer, layer.rows)?;
+    writer
+        .write_all(&[match layer.ownership {
+            RocmKvOwnership::Full => 0,
+            RocmKvOwnership::BlockParity(0) => 1,
+            RocmKvOwnership::BlockParity(1) => 2,
+            RocmKvOwnership::BlockParity(parity) => return Err(format!("GLM cache KV parity={parity} 非法")),
+            RocmKvOwnership::InterleavedPair => 3,
+        }])
+        .map_err(io_error)?;
     write_usize(writer, layer.latent_cols)?;
     write_usize(writer, layer.rope_cols)?;
     write_usize(writer, layer.latent_group_size)?;
@@ -835,13 +844,20 @@ fn write_dsa_layer(writer: &mut impl Write, layer: &DsaLayerSerde) -> Result<(),
 
 fn read_mla_layer(reader: &mut CacheReader<impl Read>) -> Result<MlaLayerSerde, String> {
     let rows = reader.usize()?;
+    let ownership = match reader.byte()? {
+        0 => RocmKvOwnership::Full,
+        1 => RocmKvOwnership::BlockParity(0),
+        2 => RocmKvOwnership::BlockParity(1),
+        3 => RocmKvOwnership::InterleavedPair,
+        value => return Err(format!("GLM cache KV ownership={value} 非法")),
+    };
     let latent_cols = reader.usize()?;
     let rope_cols = reader.usize()?;
     let latent_group_size = reader.usize()?;
     let latent = reader.bytes()?;
     let latent_scales = if reader.flag()? { Some(reader.bytes()?) } else { None };
     let rope = reader.bytes()?;
-    Ok(MlaLayerSerde { rows, latent_cols, rope_cols, latent_group_size, latent, latent_scales, rope })
+    Ok(MlaLayerSerde { rows, ownership, latent_cols, rope_cols, latent_group_size, latent, latent_scales, rope })
 }
 
 fn read_dsa_layer(reader: &mut CacheReader<impl Read>) -> Result<DsaLayerSerde, String> {
@@ -885,13 +901,17 @@ impl<R: Read> CacheReader<R> {
     }
 
     fn flag(&mut self) -> Result<bool, String> {
-        let mut byte = [0_u8; 1];
-        self.read_exact(&mut byte)?;
-        match byte[0] {
+        match self.byte()? {
             0 => Ok(false),
             1 => Ok(true),
             value => Err(format!("GLM cache flag={value} 非法")),
         }
+    }
+
+    fn byte(&mut self) -> Result<u8, String> {
+        let mut byte = [0_u8; 1];
+        self.read_exact(&mut byte)?;
+        Ok(byte[0])
     }
 
     fn bytes(&mut self) -> Result<Vec<u8>, String> {
@@ -928,14 +948,14 @@ mod tests {
             last_hidden: vec![10, 20],
             stages: vec![Glm52StageCache {
                 layer_start: 40,
-                kv: vec![Some(MlaLayerSerde { rows: 3, latent_cols: 2, rope_cols: 1, latent_group_size: 0, latent: vec![1; 12], latent_scales: None, rope: vec![2; 6] })],
+                kv: vec![Some(MlaLayerSerde { rows: 3, ownership: RocmKvOwnership::InterleavedPair, latent_cols: 2, rope_cols: 1, latent_group_size: 0, latent: vec![1; 12], latent_scales: None, rope: vec![2; 6] })],
                 dsa: vec![Some(DsaLayerSerde { rows: 3, key_group_size: 2, hadamard: true, keys: vec![3; 6], scales: vec![4; 6] })],
             }],
             mtp: Some(Glm52MtpCache {
                 position: 2,
                 pending_hidden: vec![30, 40],
                 prompt_tokens: vec![1, 2, 3],
-                kv: vec![Some(MlaLayerSerde { rows: 2, latent_cols: 2, rope_cols: 1, latent_group_size: 0, latent: vec![5; 8], latent_scales: None, rope: vec![6; 4] })],
+                kv: vec![Some(MlaLayerSerde { rows: 2, ownership: RocmKvOwnership::Full, latent_cols: 2, rope_cols: 1, latent_group_size: 0, latent: vec![5; 8], latent_scales: None, rope: vec![6; 4] })],
                 dsa: vec![Some(DsaLayerSerde { rows: 2, key_group_size: 2, hadamard: true, keys: vec![7; 4], scales: vec![8; 4] })],
             }),
             dspark_aux: Some(Glm52DsparkAuxCache { start_position: 1, rows: 2, columns: 2, values: vec![9, 10, 11, 12] }),
@@ -967,6 +987,7 @@ mod tests {
         assert_eq!(restored.last_hidden, vec![10, 20]);
         assert_eq!(restored.stages[0].layer_start, 40);
         assert_eq!(restored.stages[0].kv[0].as_ref().unwrap().latent, vec![1; 12]);
+        assert_eq!(restored.stages[0].kv[0].as_ref().unwrap().ownership, RocmKvOwnership::InterleavedPair);
         let mtp = restored.mtp.unwrap();
         assert_eq!(mtp.position, 2);
         assert_eq!(mtp.pending_hidden, vec![30, 40]);

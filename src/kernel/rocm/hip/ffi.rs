@@ -131,6 +131,7 @@ pub(super) struct RocmRuntime {
 static INDEPENDENT_COMPUTE_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
 static BACKGROUND_STAGE_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
 static COOPERATIVE_PEER_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
+static COOPERATIVE_SHARED_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
 
 fn low_priority_compute_stream(device_id: i32, registry: &'static OnceLock<Mutex<HashMap<i32, usize>>>, label: &'static str) -> Result<usize, String> {
     let mut streams = registry.get_or_init(|| Mutex::new(HashMap::new())).lock().map_err(|_| format!("ROCm {label} stream 注册表已损坏"))?;
@@ -174,6 +175,12 @@ pub(crate) fn background_stage_stream(device_id: i32) -> Result<usize, String> {
 /// event handoff 会形成环，也会把本应并发的两份计算重新串行。
 pub(crate) fn cooperative_peer_stream(device_id: i32) -> Result<usize, String> {
     low_priority_compute_stream(device_id, &COOPERATIVE_PEER_STREAMS, "cooperative-peer")
+}
+
+/// shared expert 与 routed experts 只共享输入，在本卡独立队列中先行提交，
+/// 让 shared gate/down 填充 routed 小 expert GEMM 留下的执行空隙。
+pub(crate) fn cooperative_shared_stream(device_id: i32) -> Result<usize, String> {
+    low_priority_compute_stream(device_id, &COOPERATIVE_SHARED_STREAMS, "cooperative-shared")
 }
 
 pub(crate) fn initialized_background_stage_stream(device_id: i32) -> Option<usize> {
@@ -417,7 +424,12 @@ pub fn set_device(device_id: i32) -> Result<(), String> {
         return Err(format!("HIP device {device_id} 越界，可用设备数={count}"));
     }
     let hip_set_device: Symbol<HipSetDevice> = runtime.symbol(&runtime.hip, b"hipSetDevice\0")?;
+    let started = std::time::Instant::now();
     let set_status = unsafe { hip_set_device(device_id) };
+    let duration_us = started.elapsed().as_micros();
+    if duration_us >= 5_000 {
+        eprintln!("[rocm-set-device-slow] device={device_id} duration_us={duration_us}");
+    }
     if set_status != HIP_SUCCESS {
         return Err(runtime.hip_error(set_status, &format!("hipSetDevice({device_id})")));
     }

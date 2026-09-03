@@ -34,6 +34,11 @@ fn dsa_cpu_ids() -> Vec<usize> {
     }
     for cores in packages.values_mut() {
         cores.sort_unstable();
+        // 每个 NUMA package 预留最后一个物理核：decode 提交线程与 hot-MLA host
+        // 工作不与绑核 worker 同核争用；worker 自旋时它们仍能全速运行。
+        if cores.len() > 4 {
+            cores.pop();
+        }
     }
     let mut physical = Vec::new();
     for core_index in 0..packages.values().map(Vec::len).max().unwrap_or(0) {
@@ -73,18 +78,31 @@ fn dsa_pool() -> &'static rayon::ThreadPool {
 
 type DsaTeamCallback = unsafe fn(usize, usize);
 
-struct DsaTeamJob {
-    generation: u64,
-    callback: DsaTeamCallback,
-    context: usize,
-    active_workers: usize,
+/// 自旋保活窗口：每次任务提交后续命。decode 期间 indexer 层间隔(约 5-8ms)远小于
+/// 该值，64 个绑核 worker 全程自旋、唤醒延迟 ~1us；长 prefill 间隔下自然回落
+/// futex 睡眠，只在长空闲后的首个任务付一次全量唤醒成本。
+const DSA_TEAM_SPIN_KEEPALIVE_MICROS: u64 = 50_000;
+/// 提交线程等待完成前的自旋预算；Q8 打分一轮约 0.1-0.5ms，自旋几乎总能命中。
+const DSA_TEAM_SUBMIT_SPINS: u32 = 1 << 16;
+
+fn dsa_team_micros() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
 }
 
 struct DsaTeamShared {
-    job: Mutex<DsaTeamJob>,
+    /// 只作为睡眠 worker 的守卫与唤醒通道；任务字段全部走原子发布。
+    job: Mutex<()>,
     ready: Condvar,
     complete: Condvar,
     pending: std::sync::atomic::AtomicUsize,
+    /// Release 发布 generation；worker Acquire 读到新值后 callback/context/active 可见。
+    published: std::sync::atomic::AtomicU64,
+    callback: std::sync::atomic::AtomicUsize,
+    context: std::sync::atomic::AtomicUsize,
+    active: std::sync::atomic::AtomicUsize,
+    /// 自旋截止时刻(微秒，进程起点基准)；提交任务时续命。
+    spin_until: std::sync::atomic::AtomicU64,
 }
 
 struct DsaTeam {
@@ -101,7 +119,17 @@ impl DsaTeam {
         let cpu_ids = (0..std::thread::available_parallelism().map_or(1, usize::from)).collect::<Vec<_>>();
         let cpu_ids = &cpu_ids[..cpu_ids.len().clamp(1, 64)];
         unsafe fn idle(_: usize, _: usize) {}
-        let shared = Arc::new(DsaTeamShared { job: Mutex::new(DsaTeamJob { generation: 0, callback: idle, context: 0, active_workers: 0 }), ready: Condvar::new(), complete: Condvar::new(), pending: std::sync::atomic::AtomicUsize::new(0) });
+        let shared = Arc::new(DsaTeamShared {
+            job: Mutex::new(()),
+            ready: Condvar::new(),
+            complete: Condvar::new(),
+            pending: std::sync::atomic::AtomicUsize::new(0),
+            published: std::sync::atomic::AtomicU64::new(0),
+            callback: std::sync::atomic::AtomicUsize::new(idle as *const () as usize),
+            context: std::sync::atomic::AtomicUsize::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            spin_until: std::sync::atomic::AtomicU64::new(0),
+        });
         for (index, &_cpu_id) in cpu_ids.iter().enumerate() {
             let shared = Arc::clone(&shared);
             std::thread::Builder::new()
@@ -109,22 +137,38 @@ impl DsaTeam {
                 .spawn(move || {
                     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
                     super::set_current_thread_affinity(&_cpu_id.to_string()).expect("CPU DSA direct worker affinity 设置失败");
-                    let mut generation = 0_u64;
+                    let mut seen = 0_u64;
+                    let mut spin_probe = 0_u32;
                     loop {
-                        let (callback, context, active_workers) = {
-                            let mut job = shared.job.lock().expect("CPU DSA direct job mutex 已损坏");
-                            while job.generation == generation {
-                                job = shared.ready.wait(job).expect("CPU DSA direct worker wait 失败");
+                        // 等待新 generation：自旋为主，截止时刻过后持锁 futex 睡眠。
+                        'seek: loop {
+                            let current = shared.published.load(std::sync::atomic::Ordering::Acquire);
+                            if current != seen {
+                                seen = current;
+                                break 'seek;
                             }
-                            generation = job.generation;
-                            (job.callback, job.context, job.active_workers)
-                        };
+                            spin_probe = spin_probe.wrapping_add(1);
+                            if spin_probe & 31 == 0 && dsa_team_micros() >= shared.spin_until.load(std::sync::atomic::Ordering::Relaxed) {
+                                let mut guard = shared.job.lock().expect("CPU DSA direct job mutex 已损坏");
+                                // 持锁复查，杜绝发布与入睡之间的丢失唤醒。
+                                if shared.published.load(std::sync::atomic::Ordering::Acquire) != seen {
+                                    continue 'seek;
+                                }
+                                guard = shared.ready.wait(guard).expect("CPU DSA direct worker wait 失败");
+                                continue 'seek;
+                            }
+                            std::hint::spin_loop();
+                        }
+                        spin_probe = 0;
+                        let callback = unsafe { std::mem::transmute::<usize, DsaTeamCallback>(shared.callback.load(std::sync::atomic::Ordering::Relaxed)) };
+                        let context = shared.context.load(std::sync::atomic::Ordering::Relaxed);
+                        let active_workers = shared.active.load(std::sync::atomic::Ordering::Relaxed);
                         if index >= active_workers {
                             continue;
                         }
                         unsafe { callback(context, index) };
                         if shared.pending.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-                            let _job = shared.job.lock().expect("CPU DSA direct completion mutex 已损坏");
+                            let _guard = shared.job.lock().expect("CPU DSA direct completion mutex 已损坏");
                             shared.complete.notify_one();
                         }
                     }
@@ -147,16 +191,30 @@ impl DsaTeam {
         // context 指向调用栈上的 closure；run 在 pending 归零前不返回，且 submission
         // 串行化全部调用，因此 worker 不会观察到失效或被下一份 job 覆盖的地址。
         let _submission = self.submission.lock().expect("CPU DSA direct submission mutex 已损坏");
-        let mut state = self.shared.job.lock().expect("CPU DSA direct job mutex 已损坏");
         assert_eq!(self.shared.pending.load(std::sync::atomic::Ordering::Acquire), 0);
+        self.shared.callback.store(invoke::<F> as *const () as usize, std::sync::atomic::Ordering::Relaxed);
+        self.shared.context.store((&job as *const _) as usize, std::sync::atomic::Ordering::Relaxed);
+        self.shared.active.store(active_workers, std::sync::atomic::Ordering::Relaxed);
+        self.shared.spin_until.store(dsa_team_micros() + DSA_TEAM_SPIN_KEEPALIVE_MICROS, std::sync::atomic::Ordering::Relaxed);
         self.shared.pending.store(active_workers, std::sync::atomic::Ordering::Release);
-        state.callback = invoke::<F>;
-        state.context = (&job as *const _) as usize;
-        state.active_workers = active_workers;
-        state.generation = state.generation.wrapping_add(1);
-        self.shared.ready.notify_all();
+        self.shared.published.fetch_add(1, std::sync::atomic::Ordering::Release);
+        {
+            // 已入睡的 worker 持着旧 generation；发布后再持锁 notify，保证不丢唤醒。
+            let _guard = self.shared.job.lock().expect("CPU DSA direct job mutex 已损坏");
+            self.shared.ready.notify_all();
+        }
+        let mut spins = 0_u32;
         while self.shared.pending.load(std::sync::atomic::Ordering::Acquire) != 0 {
-            state = self.shared.complete.wait(state).expect("CPU DSA direct completion wait 失败");
+            if spins < DSA_TEAM_SUBMIT_SPINS {
+                std::hint::spin_loop();
+                spins += 1;
+                continue;
+            }
+            let mut guard = self.shared.job.lock().expect("CPU DSA direct completion mutex 已损坏");
+            if self.shared.pending.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                break;
+            }
+            guard = self.shared.complete.wait(guard).expect("CPU DSA direct completion wait 失败");
         }
     }
 }
@@ -171,9 +229,11 @@ fn ordered_score(score: f32) -> u32 {
     bits ^ if bits & 0x8000_0000 != 0 { 0xffff_ffff } else { 0x8000_0000 }
 }
 
+/// final Top-K 的 13-bit 高位 radix；并行版与串行版共用。
+const RADIX_BITS: u32 = 13;
+const RADIX_SIZE: usize = 1 << RADIX_BITS;
+
 fn stable_topk_into(scores: &[u32], top_k: usize, selected: &mut Vec<u32>) {
-    const RADIX_BITS: u32 = 13;
-    const RADIX_SIZE: usize = 1 << RADIX_BITS;
     let mut histogram = [0_u32; RADIX_SIZE];
     for &score in scores {
         histogram[(score >> (32 - RADIX_BITS)) as usize] += 1;
@@ -203,6 +263,137 @@ fn stable_topk(scores: &[u32], top_k: usize) -> Vec<u32> {
     let mut selected = Vec::new();
     stable_topk_into(scores, top_k, &mut selected);
     selected
+}
+
+/// 感知反向 barrier：team 单次 run 内做多阶段同步，全部 worker 都会到达。
+struct TopkBarrier {
+    arrivals: std::sync::atomic::AtomicU32,
+    epoch: std::sync::atomic::AtomicU32,
+}
+
+impl Default for TopkBarrier {
+    fn default() -> Self {
+        Self { arrivals: std::sync::atomic::AtomicU32::new(0), epoch: std::sync::atomic::AtomicU32::new(0) }
+    }
+}
+
+impl TopkBarrier {
+    fn wait(&self, threads: u32) {
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        if self.arrivals.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1 == threads {
+            self.arrivals.store(0, std::sync::atomic::Ordering::Relaxed);
+            self.epoch.store(epoch.wrapping_add(1), std::sync::atomic::Ordering::Release);
+        } else {
+            while self.epoch.load(std::sync::atomic::Ordering::Acquire) == epoch {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// 并行 final Top-K 的复用空间；行区间与打分阶段同 worker，scores 读取保持 NUMA 本地。
+#[derive(Default)]
+pub struct Q8TopkScratch {
+    partials: Vec<Vec<u32>>,
+    reduced: Vec<u32>,
+    staging: Vec<Vec<u32>>,
+    threshold: std::sync::atomic::AtomicU32,
+    barrier: TopkBarrier,
+    /// worker 0 在打分 barrier 后记录时刻，供融合路径拆分 score/topk 耗时。
+    phase_micros: std::sync::atomic::AtomicU64,
+    /// 融合路径专用：共享原子直方图、(score,token) 对 staging 与尾排序缓冲。
+    hist: Vec<std::sync::atomic::AtomicU32>,
+    fused_staging: Vec<Vec<(u32, u32)>>,
+    pairs: Vec<(u32, u32)>,
+}
+
+/// `stable_topk_into` 的 team 并行版：直方图按 worker 分块统计后列归约，
+/// 阈值扫描与幸存者过滤语义同串行实现，输出逐字节一致。
+fn parallel_stable_topk_into(scores: &[u32], top_k: usize, selected: &mut Vec<u32>, scratch: &mut Q8TopkScratch) {
+    let rows = scores.len();
+    let blocks = rows.div_ceil(DSA_ROW_BLOCK);
+    let threads = dsa_team().workers().min(blocks.div_ceil(128).max(1));
+    if threads <= 1 {
+        stable_topk_into(scores, top_k, selected);
+        return;
+    }
+    if scratch.partials.len() != threads {
+        scratch.partials = (0..threads).map(|_| vec![0_u32; RADIX_SIZE]).collect();
+        scratch.reduced = vec![0_u32; RADIX_SIZE];
+        scratch.staging = (0..threads).map(|_| Vec::with_capacity(4096)).collect();
+    }
+    let chunk_blocks = blocks.div_ceil(threads);
+    let chunk_rows = chunk_blocks * DSA_ROW_BLOCK;
+    let scores_address = scores.as_ptr() as usize;
+    let partials_address = scratch.partials.as_ptr() as usize;
+    let reduced_address = scratch.reduced.as_mut_ptr() as usize;
+    let staging_address = scratch.staging.as_mut_ptr() as usize;
+    let barrier = &scratch.barrier;
+    let threshold = &scratch.threshold;
+    let buckets_per_worker = RADIX_SIZE.div_ceil(threads);
+    dsa_team().run(threads, move |worker| {
+        let scores = unsafe { std::slice::from_raw_parts(scores_address as *const u32, rows) };
+        let first_row = worker * chunk_rows;
+        // 阶段 1：清零并统计本 worker 的 partial 直方图；无行的 worker 也必须清零。
+        let partial = unsafe { &mut *(partials_address as *mut Vec<u32>).add(worker) };
+        partial.fill(0);
+        if first_row < rows {
+            let rows = chunk_rows.min(rows - first_row);
+            for &score in &scores[first_row..first_row + rows] {
+                partial[(score >> (32 - RADIX_BITS)) as usize] += 1;
+            }
+        }
+        barrier.wait(threads as u32);
+        // 阶段 2：列归约，各 worker 负责一段 bucket，跨 worker 求和。
+        let bucket_first = worker * buckets_per_worker;
+        let bucket_end = (bucket_first + buckets_per_worker).min(RADIX_SIZE);
+        for bucket in bucket_first..bucket_end {
+            let mut total = 0_u32;
+            for partial in 0..threads {
+                let partial = unsafe { &*(partials_address as *const Vec<u32>).add(partial) };
+                total += partial[bucket];
+            }
+            unsafe { *(reduced_address as *mut u32).add(bucket) = total };
+        }
+        barrier.wait(threads as u32);
+        // 阶段 3：worker 0 找 threshold bucket，语义与串行扫描一致。
+        if worker == 0 {
+            let mut rank = top_k;
+            let mut found = 0_usize;
+            for bucket in (0..RADIX_SIZE).rev() {
+                let count = unsafe { *(reduced_address as *const u32).add(bucket) } as usize;
+                if count < rank {
+                    rank -= count;
+                } else {
+                    found = bucket;
+                    break;
+                }
+            }
+            threshold.store(found as u32, std::sync::atomic::Ordering::Release);
+        }
+        barrier.wait(threads as u32);
+        let found = threshold.load(std::sync::atomic::Ordering::Acquire) as usize;
+        // 阶段 4：幸存者按 token 顺序写入本 worker staging。
+        let staging = unsafe { &mut *(staging_address as *mut Vec<u32>).add(worker) };
+        staging.clear();
+        if first_row < rows {
+            let rows = chunk_rows.min(rows - first_row);
+            for (offset, &score) in scores[first_row..first_row + rows].iter().enumerate() {
+                if (score >> (32 - RADIX_BITS)) as usize >= found {
+                    staging.push((first_row + offset) as u32);
+                }
+            }
+        }
+    });
+    selected.clear();
+    for worker in 0..threads {
+        selected.extend_from_slice(&scratch.staging[worker]);
+    }
+    // 尾部与串行版完全一致：全序排序、截断、kth tie 重排。
+    selected.sort_unstable_by(|&left, &right| scores[right as usize].cmp(&scores[left as usize]).then_with(|| left.cmp(&right)));
+    selected.truncate(top_k);
+    let threshold = scores[selected[top_k - 1] as usize];
+    selected.sort_unstable_by_key(|&token| (scores[token as usize] == threshold, token));
 }
 
 /// 候选粗排不需要 CPU 内部精确排序：保留包含第 minimum 名的完整 21-bit radix bucket，
@@ -395,6 +586,7 @@ impl Bf16KeyBlocks {
 /// key 加 128 后直接供 AVX512-VNNI 的 unsigned×signed dot 使用。
 pub struct Q8KeyBlocks {
     rows: usize,
+    available_rows: usize,
     head_dim: usize,
     values: Vec<u8>,
     scales: Vec<f32>,
@@ -449,11 +641,20 @@ impl Q8KeyBlocks {
         let values = unsafe { Vec::from_raw_parts(values.as_mut_ptr().cast::<u8>(), values.len(), values.capacity()) };
         let mut scales = std::mem::ManuallyDrop::new(scales);
         let scales = unsafe { Vec::from_raw_parts(scales.as_mut_ptr().cast::<f32>(), scales.len(), scales.capacity()) };
-        Ok(Self { rows, head_dim, values, scales })
+        Ok(Self { rows, available_rows: rows, head_dim, values, scales })
     }
 
     pub fn rows(&self) -> usize {
         self.rows
+    }
+
+    /// Prefill batch 按每个 query 的绝对 causal 终点递增暴露同一份完整 blocked history。
+    pub fn set_logical_rows(&mut self, rows: usize) -> Result<(), String> {
+        if rows == 0 || rows > self.available_rows {
+            return Err(format!("CPU DSA Q8 logical rows={rows} 超过可用历史 {}", self.available_rows));
+        }
+        self.rows = rows;
+        Ok(())
     }
 
     pub fn append_q8_row(&mut self, key: &[i8], scale_bits: u16) -> Result<(), String> {
@@ -475,6 +676,7 @@ impl Q8KeyBlocks {
         }
         self.scales[block * DSA_ROW_BLOCK + lane] = HalfBf16::from_bits(scale_bits).to_f32();
         self.rows += 1;
+        self.available_rows = self.available_rows.max(self.rows);
         Ok(())
     }
 
@@ -515,6 +717,10 @@ pub struct Q8DsaWorkspace {
     query_corrections: Vec<i32>,
     scores: Vec<u32>,
     selection: Vec<u32>,
+    exact_keys: Vec<HalfBf16>,
+    exact_workspace: Bf16DsaWorkspace,
+    exact_selection: Vec<u32>,
+    topk: Q8TopkScratch,
 }
 
 fn score_row_scalar(key: &[HalfBf16], query: &[HalfBf16], weights: &[f32], heads: usize, head_dim: usize) -> f32 {
@@ -687,10 +893,65 @@ fn quantize_q8_query(query: &[f32], heads: usize, head_dim: usize, workspace: &m
     Ok(())
 }
 
-fn select_q8_blocked_workspace_profile(keys: &Q8KeyBlocks, query: &[f32], weights: &[f32], heads: usize, head_dim: usize, top_k: usize, workspace: &mut Q8DsaWorkspace) -> Result<(f64, f64), String> {
-    if heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(4) || top_k == 0 || top_k > keys.rows || keys.head_dim != head_dim || query.len() != heads.checked_mul(head_dim).ok_or("CPU DSA Q8 query 大小溢出")? || weights.len() != heads
-    {
-        return Err(format!("CPU DSA Q8 shape rows={} key_dim={} query={} weights={} heads={heads} dim={head_dim} top_k={top_k} 非法", keys.rows, keys.head_dim, query.len(), weights.len()));
+/// 单个 chunk 的打分：VNNI 双 tile 或标量回退；score 与融合 top-k 共用。
+#[allow(clippy::too_many_arguments)]
+fn score_q8_chunk(
+    use_vnni: bool,
+    keys: &Q8KeyBlocks,
+    _query_quads: &[u32],
+    query_codes: &[i8],
+    query_scales: &[f32],
+    _query_corrections: &[i32],
+    weights: &[f32],
+    heads: usize,
+    head_dim: usize,
+    chunk_blocks: usize,
+    chunk: usize,
+    output: &mut [u32],
+) {
+    let first_block = chunk * chunk_blocks;
+    if use_vnni {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            let block_count = output.len().div_ceil(DSA_ROW_BLOCK);
+            let block_keys = keys.values.as_ptr().add(first_block * head_dim * DSA_ROW_BLOCK);
+            let block_scales = keys.scales.as_ptr().add(first_block * DSA_ROW_BLOCK);
+            score_q8_head_tile_range_vnni::<false>(block_keys, block_scales, block_count, output.len(), head_dim, heads, _query_quads.as_ptr(), query_scales.as_ptr(), _query_corrections.as_ptr(), weights.as_ptr(), output.as_mut_ptr());
+            score_q8_head_tile_range_vnni::<true>(
+                block_keys,
+                block_scales,
+                block_count,
+                output.len(),
+                head_dim,
+                heads,
+                _query_quads.as_ptr().add(16),
+                query_scales.as_ptr().add(16),
+                _query_corrections.as_ptr().add(16),
+                weights.as_ptr().add(16),
+                output.as_mut_ptr(),
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        unreachable!()
+    } else {
+        for (local_row, output) in output.iter_mut().enumerate() {
+            let row = first_block * DSA_ROW_BLOCK + local_row;
+            let mut score = 0.0_f32;
+            for head in 0..heads {
+                let mut dot = 0_i32;
+                for column in 0..head_dim {
+                    dot += i32::from(keys.code(row, column)) * i32::from(query_codes[head * head_dim + column]);
+                }
+                score += weights[head] * (dot as f32 * keys.scales[row / DSA_ROW_BLOCK * DSA_ROW_BLOCK + row % DSA_ROW_BLOCK] * query_scales[head]).max(0.0);
+            }
+            *output = ordered_score(score);
+        }
+    }
+}
+
+pub fn score_q8_blocked_workspace(keys: &Q8KeyBlocks, query: &[f32], weights: &[f32], heads: usize, head_dim: usize, workspace: &mut Q8DsaWorkspace) -> Result<f64, String> {
+    if heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(4) || keys.head_dim != head_dim || query.len() != heads.checked_mul(head_dim).ok_or("CPU DSA Q8 query 大小溢出")? || weights.len() != heads {
+        return Err(format!("CPU DSA Q8 shape rows={} key_dim={} query={} weights={} heads={heads} dim={head_dim} 非法", keys.rows, keys.head_dim, query.len(), weights.len()));
     }
     let score_started = std::time::Instant::now();
     quantize_q8_query(query, heads, head_dim, workspace)?;
@@ -704,68 +965,136 @@ fn select_q8_blocked_workspace_profile(keys: &Q8KeyBlocks, query: &[f32], weight
     let chunk_rows = chunk_blocks * DSA_ROW_BLOCK;
     workspace.scores.resize(keys.rows, 0);
     let scores = &mut workspace.scores;
-    let score_chunk = |chunk: usize, output: &mut [u32]| {
-        let first_block = chunk * chunk_blocks;
-        if use_vnni {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                let block_count = output.len().div_ceil(DSA_ROW_BLOCK);
-                let block_keys = keys.values.as_ptr().add(first_block * head_dim * DSA_ROW_BLOCK);
-                let block_scales = keys.scales.as_ptr().add(first_block * DSA_ROW_BLOCK);
-                score_q8_head_tile_range_vnni::<false>(
-                    block_keys,
-                    block_scales,
-                    block_count,
-                    output.len(),
-                    head_dim,
-                    heads,
-                    workspace.query_quads.as_ptr(),
-                    workspace.query_scales.as_ptr(),
-                    workspace.query_corrections.as_ptr(),
-                    weights.as_ptr(),
-                    output.as_mut_ptr(),
-                );
-                score_q8_head_tile_range_vnni::<true>(
-                    block_keys,
-                    block_scales,
-                    block_count,
-                    output.len(),
-                    head_dim,
-                    heads,
-                    workspace.query_quads.as_ptr().add(16),
-                    workspace.query_scales.as_ptr().add(16),
-                    workspace.query_corrections.as_ptr().add(16),
-                    weights.as_ptr().add(16),
-                    output.as_mut_ptr(),
-                );
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            unreachable!()
-        } else {
-            for (local_row, output) in output.iter_mut().enumerate() {
-                let row = first_block * DSA_ROW_BLOCK + local_row;
-                let mut score = 0.0_f32;
-                for head in 0..heads {
-                    let mut dot = 0_i32;
-                    for column in 0..head_dim {
-                        dot += i32::from(keys.code(row, column)) * i32::from(workspace.query_codes[head * head_dim + column]);
-                    }
-                    score += weights[head] * (dot as f32 * keys.scales[row / DSA_ROW_BLOCK * DSA_ROW_BLOCK + row % DSA_ROW_BLOCK] * workspace.query_scales[head]).max(0.0);
-                }
-                *output = ordered_score(score);
-            }
-        }
-    };
     let scores_address = scores.as_mut_ptr() as usize;
     dsa_team().run(threads, |chunk| {
         let first_row = chunk * chunk_rows;
         let rows = chunk_rows.min(keys.rows - first_row);
         let output = unsafe { std::slice::from_raw_parts_mut((scores_address as *mut u32).add(first_row), rows) };
-        score_chunk(chunk, output);
+        score_q8_chunk(use_vnni, keys, &workspace.query_quads, &workspace.query_codes, &workspace.query_scales, &workspace.query_corrections, weights, heads, head_dim, chunk_blocks, chunk, output);
     });
-    let score_ms = score_started.elapsed().as_secs_f64() * 1e3;
+    Ok(score_started.elapsed().as_secs_f64() * 1e3)
+}
+
+/// 生产 decode 的融合路径：全历史 Q8 打分与 final Top-K 在同一次 team run 内完成，
+/// 打分与四个 top-k 阶段之间用 barrier 衔接，省去第二次分发同步。输出与
+/// `score_q8_blocked_workspace` + `finish_q8_blocked_topk` 逐字节一致。
+pub fn score_q8_blocked_topk<'a>(keys: &Q8KeyBlocks, query: &[f32], weights: &[f32], heads: usize, head_dim: usize, top_k: usize, workspace: &'a mut Q8DsaWorkspace) -> Result<(&'a [u32], f64, f64), String> {
+    if heads == 0 || head_dim == 0 || !head_dim.is_multiple_of(4) || keys.head_dim != head_dim || query.len() != heads.checked_mul(head_dim).ok_or("CPU DSA Q8 query 大小溢出")? || weights.len() != heads {
+        return Err(format!("CPU DSA Q8 shape rows={} key_dim={} query={} weights={} heads={heads} dim={head_dim} 非法", keys.rows, keys.head_dim, query.len(), weights.len()));
+    }
+    if top_k == 0 || top_k > keys.rows {
+        return Err(format!("CPU DSA Q8 final top_k={top_k}，rows={}", keys.rows));
+    }
+    let score_started = std::time::Instant::now();
+    quantize_q8_query(query, heads, head_dim, workspace)?;
+    #[cfg(target_arch = "x86_64")]
+    let use_vnni = heads == 32 && std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("avx512bw") && std::arch::is_x86_feature_detected!("avx512vnni") && std::arch::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_vnni = false;
+    let blocks = keys.rows.div_ceil(DSA_ROW_BLOCK);
+    let threads = dsa_team().workers().min(blocks.div_ceil(128).max(1));
+    let chunk_blocks = blocks.div_ceil(threads);
+    let chunk_rows = chunk_blocks * DSA_ROW_BLOCK;
+    workspace.scores.resize(keys.rows, 0);
+    let topk = &mut workspace.topk;
+    if topk.fused_staging.len() != threads {
+        topk.fused_staging = (0..threads).map(|_| Vec::with_capacity(4096)).collect();
+    }
+    if topk.hist.len() != RADIX_SIZE {
+        topk.hist = (0..RADIX_SIZE).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+    }
+    for bucket in &topk.hist {
+        bucket.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    let rows = keys.rows;
+    let query_quads = workspace.query_quads.clone();
+    let query_codes = workspace.query_codes.clone();
+    let query_scales = workspace.query_scales.clone();
+    let query_corrections = workspace.query_corrections.clone();
+    let scores_address = workspace.scores.as_mut_ptr() as usize;
+    let hist_address = topk.hist.as_ptr() as usize;
+    let staging_address = topk.fused_staging.as_mut_ptr() as usize;
+    let barrier = &topk.barrier;
+    let threshold = &topk.threshold;
+    let phase_micros = &topk.phase_micros;
+    let start_micros = dsa_team_micros();
+    dsa_team().run(threads, move |worker| {
+        // 打分阶段：chunk 划分与 score_q8_blocked_workspace 完全一致。
+        let first_row = worker * chunk_rows;
+        if first_row < rows {
+            let chunk_rows = chunk_rows.min(rows - first_row);
+            let output = unsafe { std::slice::from_raw_parts_mut((scores_address as *mut u32).add(first_row), chunk_rows) };
+            score_q8_chunk(use_vnni, keys, &query_quads, &query_codes, &query_scales, &query_corrections, weights, heads, head_dim, chunk_blocks, worker, output);
+        }
+        barrier.wait(threads as u32);
+        if worker == 0 {
+            phase_micros.store(dsa_team_micros(), std::sync::atomic::Ordering::Release);
+        }
+        // 阶段 1：本 chunk 直接原子累加进共享直方图；真实分数分布下每桶平均
+        // 16 次累加，无热点桶，免去跨 NUMA 的列归约整阶段。
+        let scores = unsafe { std::slice::from_raw_parts(scores_address as *const u32, rows) };
+        if first_row < rows {
+            let chunk_rows = chunk_rows.min(rows - first_row);
+            for &score in &scores[first_row..first_row + chunk_rows] {
+                unsafe {
+                    (*(hist_address as *mut std::sync::atomic::AtomicU32).add((score >> (32 - RADIX_BITS)) as usize)).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        barrier.wait(threads as u32);
+        if worker == 0 {
+            let mut rank = top_k;
+            let mut found = 0_usize;
+            for bucket in (0..RADIX_SIZE).rev() {
+                let count = unsafe { (*(hist_address as *const std::sync::atomic::AtomicU32).add(bucket)).load(std::sync::atomic::Ordering::Relaxed) } as usize;
+                if count < rank {
+                    rank -= count;
+                } else {
+                    found = bucket;
+                    break;
+                }
+            }
+            threshold.store(found as u32, std::sync::atomic::Ordering::Release);
+        }
+        barrier.wait(threads as u32);
+        let found = threshold.load(std::sync::atomic::Ordering::Acquire) as usize;
+        let staging = unsafe { &mut *(staging_address as *mut Vec<(u32, u32)>).add(worker) };
+        staging.clear();
+        if first_row < rows {
+            let chunk_rows = chunk_rows.min(rows - first_row);
+            for (offset, &score) in scores[first_row..first_row + chunk_rows].iter().enumerate() {
+                if (score >> (32 - RADIX_BITS)) as usize >= found {
+                    staging.push((score, (first_row + offset) as u32));
+                }
+            }
+        }
+    });
+    let total_ms = score_started.elapsed().as_secs_f64() * 1e3;
+    let score_ms = phase_micros.load(std::sync::atomic::Ordering::Acquire).saturating_sub(start_micros) as f64 / 1000.0;
+    // 尾部语义与 stable_topk_into 一致：(score desc, token asc) 全序排序后截断，
+    // 再按 (==kth, token) 重排；对内比较全为寄存器比较，无 scores 间接寻址。
+    let Q8DsaWorkspace { exact_selection, topk, .. } = workspace;
+    let pairs = &mut topk.pairs;
+    pairs.clear();
+    for worker in 0..threads {
+        pairs.extend_from_slice(&topk.fused_staging[worker]);
+    }
+    pairs.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    pairs.truncate(top_k);
+    let threshold = pairs[top_k - 1].0;
+    pairs.sort_unstable_by(|left, right| (left.0 == threshold, left.1).cmp(&(right.0 == threshold, right.1)));
+    exact_selection.clear();
+    exact_selection.extend(pairs.iter().map(|&(_, token)| token));
+    Ok((exact_selection, score_ms, total_ms - score_ms))
+}
+
+fn select_q8_blocked_workspace_profile(keys: &Q8KeyBlocks, query: &[f32], weights: &[f32], heads: usize, head_dim: usize, top_k: usize, workspace: &mut Q8DsaWorkspace) -> Result<(f64, f64), String> {
+    if top_k == 0 || top_k > keys.rows {
+        return Err(format!("CPU DSA Q8 candidate top_k={top_k}，rows={}", keys.rows));
+    }
+    let score_ms = score_q8_blocked_workspace(keys, query, weights, heads, head_dim, workspace)?;
     let topk_started = std::time::Instant::now();
-    radix_candidate_superset_into(scores, top_k, &mut workspace.selection);
+    radix_candidate_superset_into(&workspace.scores, top_k, &mut workspace.selection);
     let topk_ms = topk_started.elapsed().as_secs_f64() * 1e3;
     Ok((score_ms, topk_ms))
 }
@@ -774,6 +1103,47 @@ fn select_q8_blocked_workspace_profile(keys: &Q8KeyBlocks, query: &[f32], weight
 pub fn select_q8_blocked_candidates<'a>(keys: &Q8KeyBlocks, query: &[f32], weights: &[f32], heads: usize, head_dim: usize, candidate_count: usize, workspace: &'a mut Q8DsaWorkspace) -> Result<(&'a [u32], f64, f64), String> {
     let (score_ms, topk_ms) = select_q8_blocked_workspace_profile(keys, query, weights, heads, head_dim, candidate_count, workspace)?;
     Ok((&workspace.selection, score_ms, topk_ms))
+}
+
+/// 对刚完成的全历史 Q8 score 直接做稳定 Top-K，不再展开候选并重复评分。
+pub fn finish_q8_blocked_topk(top_k: usize, workspace: &mut Q8DsaWorkspace) -> Result<&[u32], String> {
+    if top_k == 0 || top_k > workspace.scores.len() {
+        return Err(format!("CPU DSA Q8 final top_k={top_k}，score rows={}", workspace.scores.len()));
+    }
+    parallel_stable_topk_into(&workspace.scores, top_k, &mut workspace.exact_selection, &mut workspace.topk);
+    Ok(&workspace.exact_selection)
+}
+
+/// 对粗排候选使用生产 Q8 key、BF16 query 重新评分，并按 global token id
+/// 保持与 GPU radix 相同的稳定输出顺序。该路径只展开候选，不扫描或复制全历史。
+pub fn rerank_q8_blocked_candidates<'a>(keys: &Q8KeyBlocks, query: &[f32], weights: &[f32], heads: usize, head_dim: usize, candidates: &[u32], top_k: usize, workspace: &'a mut Q8DsaWorkspace) -> Result<&'a [u32], String> {
+    if heads == 0
+        || head_dim == 0
+        || keys.head_dim != head_dim
+        || query.len() != heads.checked_mul(head_dim).ok_or("CPU DSA exact query 大小溢出")?
+        || weights.len() != heads
+        || top_k == 0
+        || top_k > candidates.len()
+        || candidates.windows(2).any(|pair| pair[0] >= pair[1])
+        || candidates.last().is_some_and(|&token| token as usize >= keys.rows)
+    {
+        return Err(format!("CPU DSA exact shape rows={} dim={} query={} weights={} candidates={} top_k={top_k} 非法", keys.rows, keys.head_dim, query.len(), weights.len(), candidates.len()));
+    }
+    workspace.exact_keys.resize(candidates.len() * head_dim, HalfBf16::ZERO);
+    for (candidate, &token) in candidates.iter().enumerate() {
+        let token = token as usize;
+        let scale = keys.scales[token];
+        for column in 0..head_dim {
+            workspace.exact_keys[candidate * head_dim + column] = HalfBf16::from_f32(keys.code(token, column) as f32 * scale);
+        }
+    }
+    let exact_keys = Bf16KeyBlocks::from_row_major(&workspace.exact_keys, head_dim)?;
+    workspace.exact_selection.clear();
+    workspace.exact_selection.extend_from_slice(select_bf16_blocked(&exact_keys, query, weights, heads, head_dim, top_k, &mut workspace.exact_workspace)?);
+    for token in &mut workspace.exact_selection {
+        *token = candidates[*token as usize];
+    }
+    Ok(&workspace.exact_selection)
 }
 
 fn validate_shape(keys: &Bf16KeyBlocks, query: &[f32], weights: &[f32], heads: usize, head_dim: usize, top_k: usize) -> Result<(), String> {
@@ -938,6 +1308,51 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fused_score_topk_matches_staged_path() {
+        let heads = 32;
+        let head_dim = 128;
+        let rows = 150_000;
+        let codes = (0..rows * head_dim).map(|index| ((index * 37 + 11) % 251) as i16 - 125).map(|value| value as i8).collect::<Vec<_>>();
+        let scale_bits = (0..rows).map(|index| HalfBf16::from_f32(0.002 + (index % 97) as f32 * 0.00003).to_bits()).collect::<Vec<_>>();
+        let keys = Q8KeyBlocks::from_q8_row_major(&codes, &scale_bits, head_dim).unwrap();
+        let query = (0..heads * head_dim).map(|index| ((index as f32 * 0.013).cos() * 1.9).clamp(-1.8, 1.8)).collect::<Vec<_>>();
+        let weights = (0..heads).map(|head| 0.008 + head as f32 * 0.00021).collect::<Vec<_>>();
+        let mut staged = Q8DsaWorkspace::default();
+        score_q8_blocked_workspace(&keys, &query, &weights, heads, head_dim, &mut staged).unwrap();
+        let staged_selection = finish_q8_blocked_topk(2048, &mut staged).unwrap().to_vec();
+        let mut fused = Q8DsaWorkspace::default();
+        let (fused_selection, _, _) = score_q8_blocked_topk(&keys, &query, &weights, heads, head_dim, 2048, &mut fused).unwrap();
+        assert_eq!(staged_selection, fused_selection);
+        assert_eq!(staged.scores, fused.scores);
+    }
+
+    #[test]
+    fn parallel_topk_matches_serial_stable_topk() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for (rows, top_k, mode) in [(150_000, 2048, 0), (150_000, 2048, 1), (150_000, 2048, 2), (4_096, 512, 1)] {
+            let scores = (0..rows)
+                .map(|_index| match mode {
+                    // 0: 均匀随机；1: 高位集中制造大 tie bucket；2: 全同分极端情形。
+                    0 => (next() >> 40) as u32,
+                    1 => ((next() >> 60) as u32) << 28,
+                    _ => 0x1234_5600,
+                })
+                .collect::<Vec<_>>();
+            let mut serial = Vec::new();
+            stable_topk_into(&scores, top_k, &mut serial);
+            let mut parallel = Vec::new();
+            parallel_stable_topk_into(&scores, top_k, &mut parallel, &mut Q8TopkScratch::default());
+            assert_eq!(serial, parallel, "rows={rows} top_k={top_k} mode={mode}");
+        }
+    }
+
+    #[test]
     fn high_radix_topk_matches_full_order() {
         let scores = (0..10_003)
             .map(|index| {
@@ -991,6 +1406,31 @@ mod tests {
         weights[0] = 1.0;
         let (_, selected, _, _) = select_bf16_blocked_profile(&keys, &query, &weights, heads, head_dim, 4).unwrap();
         assert_eq!(selected, vec![126, 127, 124, 125]);
+    }
+
+    #[test]
+    fn q8_candidate_rerank_returns_global_stable_tokens() {
+        let heads = 32;
+        let head_dim = 128;
+        let rows = 32;
+        let mut codes = vec![0_i8; rows * head_dim];
+        for row in 0..rows {
+            codes[row * head_dim] = (row / 2) as i8;
+        }
+        let scales = vec![HalfBf16::from_f32(1.0).to_bits(); rows];
+        let keys = Q8KeyBlocks::from_q8_row_major(&codes, &scales, head_dim).unwrap();
+        let mut query = vec![0.0_f32; heads * head_dim];
+        query[0] = 1.0;
+        let mut weights = vec![0.0_f32; heads];
+        weights[0] = 1.0;
+        let candidates = vec![2, 3, 8, 9, 20, 21, 30, 31];
+        let mut workspace = Q8DsaWorkspace::default();
+        let selected = rerank_q8_blocked_candidates(&keys, &query, &weights, heads, head_dim, &candidates, 4, &mut workspace).unwrap();
+        assert_eq!(selected, [30, 31, 20, 21]);
+        score_q8_blocked_workspace(&keys, &query, &weights, heads, head_dim, &mut workspace).unwrap();
+        assert_eq!(finish_q8_blocked_topk(4, &mut workspace).unwrap(), [30, 31, 28, 29]);
+        select_q8_blocked_candidates(&keys, &query, &weights, heads, head_dim, 8, &mut workspace).unwrap();
+        assert_eq!(finish_q8_blocked_topk(4, &mut workspace).unwrap(), [30, 31, 28, 29]);
     }
 
     #[test]

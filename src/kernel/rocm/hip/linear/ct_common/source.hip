@@ -18,21 +18,43 @@ extern "C" __global__ void bf16_to_f32(
     if (index < elements) output[index] = zllm_bf16_to_f32(input[index]);
 }
 
+// 常驻 BF16 embedding 表按 token id 行 gather 并展开为 F32;
+// decode 每 token 一个 24KB 读,消除 host 反量化 + 同步 H2D。
+extern "C" __global__ void gather_bf16_rows_f32(
+    const unsigned short* __restrict__ table,
+    const unsigned int* __restrict__ ids,
+    float* __restrict__ output,
+    const unsigned int cols)
+{
+    const unsigned int row = blockIdx.x;
+    const unsigned long long base = (unsigned long long)ids[row] * cols;
+    const unsigned long long out_base = (unsigned long long)row * cols;
+    for (unsigned int col = threadIdx.x; col < cols; col += blockDim.x) {
+        output[out_base + col] = __uint_as_float(((unsigned int)table[base + col]) << 16);
+    }
+}
+
 union ZllmDenseScratch {
     unsigned short input[8][16 * 64];
     float output[8][16 * 16];
 };
 
 // 一个 workgroup 的八个 wave 各算 16 个输出通道，同时覆盖 128 个 token row。
-template <bool Aligned>
+template <bool Aligned, bool DsaQuery>
 __device__ __forceinline__ void zllm_dense_matmul_bf16_f32_wmma(
     const unsigned short* input,
     const unsigned short* weight,
-    float* output,
+    void* output,
     unsigned int input_rows,
     unsigned int input_columns,
     unsigned int output_rows,
     unsigned int input_row_block_offset,
+    const float* cosine,
+    const float* sine,
+    unsigned int head_count,
+    unsigned int rotary_dim,
+    unsigned int position,
+    unsigned int split_half,
     ZllmDenseScratch& scratch,
     unsigned short* zero_weight)
 {
@@ -96,21 +118,56 @@ __device__ __forceinline__ void zllm_dense_matmul_bf16_f32_wmma(
         if constexpr (Aligned) {
             const unsigned int input_row = input_base + tile * 16;
             store_matrix_sync(
-                output + (unsigned long long)input_row * output_rows + output_base,
+                (float*)output + (unsigned long long)input_row * output_rows + output_base,
                 accumulators[tile],
                 output_rows,
                 mem_row_major);
         } else {
             store_matrix_sync(scratch.output[wave], accumulators[tile], 16, mem_row_major);
-            __syncwarp();
-            for (unsigned int index = lane; index < 16 * 16; index += warpSize) {
-                const unsigned int input_row = input_base + tile * 16 + index / 16;
-                const unsigned int output_row = output_base + index % 16;
-                if (input_row < input_rows && output_row < output_rows) {
-                    output[(unsigned long long)input_row * output_rows + output_row] = scratch.output[wave][index];
+            if constexpr (DsaQuery) {
+                // 八个 wave 恰好覆盖连续 128 个 query 通道；在 LDS 汇合成对
+                // accumulator 后完成 RoPE，最终只写消费者需要的 BF16。
+                __syncthreads();
+                for (unsigned int flat = threadIdx.x; flat < 16u * 128u; flat += blockDim.x) {
+                    const unsigned int local_row = flat / 128u;
+                    const unsigned int block_column = flat % 128u;
+                    const unsigned int input_row = input_base + tile * 16u + local_row;
+                    const unsigned int output_row = blockIdx.x * 128u + block_column;
+                    if (input_row >= input_rows || output_row >= output_rows) continue;
+                    const unsigned int source_wave = block_column / 16u;
+                    const unsigned int source_column = block_column % 16u;
+                    float value = scratch.output[source_wave][local_row * 16u + source_column];
+                    const unsigned int head_dim = output_rows / head_count;
+                    const unsigned int head_local = output_row % head_dim;
+                    if (head_local < rotary_dim) {
+                        const unsigned int half = rotary_dim / 2u;
+                        const unsigned int pair = split_half ? head_local % half : head_local / 2u;
+                        const unsigned int real_local = split_half ? pair : pair * 2u;
+                        const unsigned int imag_local = split_half ? half + pair : real_local + 1u;
+                        const unsigned int head_start = output_row - head_local;
+                        const unsigned int block_start = blockIdx.x * 128u;
+                        const unsigned int real_block = head_start + real_local - block_start;
+                        const unsigned int imag_block = head_start + imag_local - block_start;
+                        const float real = scratch.output[real_block / 16u][local_row * 16u + real_block % 16u];
+                        const float imaginary = scratch.output[imag_block / 16u][local_row * 16u + imag_block % 16u];
+                        const float c = cosine[(unsigned long long)(position + input_row) * half + pair];
+                        const float s = sine[(unsigned long long)(position + input_row) * half + pair];
+                        value = head_local == real_local ? real * c - imaginary * s : imaginary * c + real * s;
+                    }
+                    ((unsigned short*)output)[(unsigned long long)input_row * output_rows + output_row] = zllm_f32_to_bf16(value);
                 }
+                __syncthreads();
+            } else {
+                __syncwarp();
+                for (unsigned int index = lane; index < 16 * 16; index += warpSize) {
+                    const unsigned int input_row = input_base + tile * 16 + index / 16;
+                    const unsigned int output_row = output_base + index % 16;
+                    if (input_row < input_rows && output_row < output_rows) {
+                        ((float*)output)[(unsigned long long)input_row * output_rows + output_row] = scratch.output[wave][index];
+                    }
+                }
+                __syncwarp();
             }
-            __syncwarp();
         }
     }
 }
@@ -126,7 +183,7 @@ extern "C" __global__ void dense_matmul_bf16_f32_wmma(
 {
     __shared__ ZllmDenseScratch scratch;
     __shared__ unsigned short zero_weight[16 * 16];
-    zllm_dense_matmul_bf16_f32_wmma<false>(input, weight, output, input_rows, input_columns, output_rows, input_row_block_offset, scratch, zero_weight);
+    zllm_dense_matmul_bf16_f32_wmma<false, false>(input, weight, output, input_rows, input_columns, output_rows, input_row_block_offset, nullptr, nullptr, 0u, 0u, 0u, 0u, scratch, zero_weight);
 }
 
 extern "C" __global__ void dense_matmul_bf16_f32_wmma_aligned(
@@ -139,7 +196,27 @@ extern "C" __global__ void dense_matmul_bf16_f32_wmma_aligned(
     unsigned int input_row_block_offset)
 {
     __shared__ ZllmDenseScratch scratch;
-    zllm_dense_matmul_bf16_f32_wmma<true>(input, weight, output, input_rows, input_columns, output_rows, input_row_block_offset, scratch, nullptr);
+    zllm_dense_matmul_bf16_f32_wmma<true, false>(input, weight, output, input_rows, input_columns, output_rows, input_row_block_offset, nullptr, nullptr, 0u, 0u, 0u, 0u, scratch, nullptr);
+}
+
+extern "C" __global__ void dense_matmul_bf16_dsa_query_wmma(
+    const unsigned short* input,
+    const unsigned short* weight,
+    unsigned short* output,
+    unsigned int input_rows,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int input_row_block_offset,
+    const float* cosine,
+    const float* sine,
+    unsigned int head_count,
+    unsigned int rotary_dim,
+    unsigned int position,
+    unsigned int split_half)
+{
+    __shared__ ZllmDenseScratch scratch;
+    __shared__ unsigned short zero_weight[16 * 16];
+    zllm_dense_matmul_bf16_f32_wmma<false, true>(input, weight, output, input_rows, input_columns, output_rows, input_row_block_offset, cosine, sine, head_count, rotary_dim, position, split_half, scratch, zero_weight);
 }
 
 // compressed-tensors W4A16/W8A16：压缩权重原地解码，每个 block 同时计算十六个 token row。
@@ -450,12 +527,12 @@ __device__ __forceinline__ void zllm_w8_rows_shared_wave32(
             const unsigned int column = active * 128u + lane * 4u;
             const unsigned int codes = packed[packed_base + word];
             const zllm_ct_bf16x2 w01 = {
-                zllm_ct_i8_to_bf16(codes),
-                zllm_ct_i8_to_bf16(codes >> 8u)
+                zllm_ct_i8_bf16[codes & 0xffu],
+                zllm_ct_i8_bf16[(codes >> 8) & 0xffu]
             };
             const zllm_ct_bf16x2 w23 = {
-                zllm_ct_i8_to_bf16(codes >> 16u),
-                zllm_ct_i8_to_bf16(codes >> 24u)
+                zllm_ct_i8_bf16[(codes >> 16) & 0xffu],
+                zllm_ct_i8_bf16[(codes >> 24) & 0xffu]
             };
             #pragma unroll
             for (int r = 0; r < ROWS; ++r) {
@@ -722,6 +799,61 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_scalar(
             const unsigned long long output_index =
                 (unsigned long long)input_row * output_rows + output_row32;
             output[output_index] = residual ? residual[output_index] + sum32 : sum32;
+        }
+        return;
+    }
+    // GGUF Q8_0 每 32 列只有八个 packed word。旧 16-lane subgroup 的后八个
+    // lane 在每个 group 都空转；按八 lane 映射后一个 wave 同时覆盖四个输出行，
+    // 保持每行原有的 group 累加顺序和 8-lane 归约顺序。
+    if (group_size == 32u) {
+        const unsigned int lane8 = threadIdx.x & 7u;
+        const unsigned int subgroup8 = threadIdx.x >> 3u;
+        const unsigned int outputs_per_block8 = blockDim.x >> 3u;
+        const unsigned int output_row8 =
+            blockIdx.x * outputs_per_block8 + subgroup8;
+        if (output_row8 >= output_rows) return;
+        const unsigned long long packed_base8 =
+            (unsigned long long)output_row8 * (input_columns / 4u);
+        const unsigned long long scale_base8 =
+            (unsigned long long)output_row8 * group_count;
+        float sum8 = 0.0f;
+        for (unsigned int group = 0u; group < group_count; ++group) {
+            const unsigned int word = group * 8u + lane8;
+            const unsigned int codes = packed[packed_base8 + word];
+            const unsigned int column = group * 32u + lane8 * 4u;
+            const zllm_ct_bf16x2 x01 = {
+                input[input_base + column], input[input_base + column + 1u]
+            };
+            const zllm_ct_bf16x2 x23 = {
+                input[input_base + column + 2u], input[input_base + column + 3u]
+            };
+            const zllm_ct_bf16x2 w01 = {
+                zllm_ct_i8_to_bf16(codes),
+                zllm_ct_i8_to_bf16(codes >> 8u)
+            };
+            const zllm_ct_bf16x2 w23 = {
+                zllm_ct_i8_to_bf16(codes >> 16u),
+                zllm_ct_i8_to_bf16(codes >> 24u)
+            };
+            float word_sum = __builtin_amdgcn_fdot2_f32_bf16(
+                x01, w01, 0.0f, false
+            );
+            word_sum = __builtin_amdgcn_fdot2_f32_bf16(
+                x23, w23, word_sum, false
+            );
+            sum8 += word_sum * zllm_scale(
+                scales, scale_base8 + group, scale_dtype
+            );
+        }
+        for (unsigned int offset = 4u; offset > 0u; offset >>= 1u) {
+            sum8 += __shfl_down(sum8, offset, 8);
+        }
+        if (lane8 == 0u) {
+            const unsigned long long output_index =
+                (unsigned long long)input_row * output_rows + output_row8;
+            output[output_index] = residual
+                ? residual[output_index] + sum8
+                : sum8;
         }
         return;
     }
@@ -1218,7 +1350,8 @@ extern "C" __global__ void ct_quantized_matmul_bf16_wmma(
 }
 
 // GFX11 的 16x16 B fragment 每 lane 持有同一输出行连续八个 K 元素。
-// W8 group128 直接在寄存器中解码，避免 weight tile 写入 LDS 后再读回。
+// W8 的 group 边界按 16 列对齐时直接在寄存器中解码，避免 weight tile
+// 写入 LDS 后再读回；G32/G128 只在 scale 索引上不同。
 extern "C" __global__ void ct_quantized_matmul_bf16_w8_g128_wmma(
     const unsigned short* input,
     const unsigned int* packed,
@@ -1237,8 +1370,6 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_g128_wmma(
     using BFragment = fragment<matrix_b, 16, 16, 16, bfloat16_t, col_major>;
     using CFragment = fragment<accumulator, 16, 16, 16, float>;
     static_assert(BFragment::num_elements == 8, "GFX11 W8 B fragment lane layout 已改变");
-    (void)group_size;
-    (void)scale_dtype;
     (void)bits;
 
     const unsigned int lane = threadIdx.x % warpSize;
@@ -1247,7 +1378,7 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_g128_wmma(
     const unsigned int output_base =
         (blockIdx.x * (blockDim.x / warpSize) + wave) * 16;
     const unsigned long long packed_columns = input_columns / 4u;
-    const unsigned long long groups = input_columns / 128u;
+    const unsigned long long groups = input_columns / group_size;
 
     __shared__ unsigned short input_tiles[8][16 * 16];
     __shared__ float output_scratch[16][16 * 16];
@@ -1282,8 +1413,10 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_g128_wmma(
                 (unsigned long long)output_row * packed_columns;
             word0 = packed[row_words + lane_column / 4u];
             word1 = packed[row_words + lane_column / 4u + 1u];
-            tile_scale = zllm_bf16_to_f32(((const unsigned short*)scales)[
-                (unsigned long long)output_row * groups + column_base / 128u]);
+            tile_scale = zllm_scale(
+                scales,
+                (unsigned long long)output_row * groups + column_base / group_size,
+                scale_dtype);
         }
 
         BFragment weight_fragment;
@@ -1327,6 +1460,182 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_g128_wmma(
         }
         __syncwarp();
     }
+}
+
+// GFX11 的 W4 group128 直接填充 B fragment；每 lane 一次读取八个连续权重。
+// 避免通用路径为每个 16x16 K tile 建 LUT、写 LDS，再由 rocWMMA 读回。
+template <unsigned int SEGMENTS>
+__device__ __forceinline__ void ct_quantized_matmul_bf16_w4_g128_wmma_impl(
+    const unsigned short* input,
+    const unsigned int* packed,
+    const unsigned char* scales,
+    float* output,
+    unsigned int input_rows,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int group_size,
+    unsigned int scale_dtype,
+    unsigned int bits,
+    const unsigned short* residual,
+    unsigned short* input_tiles,
+    float* output_scratch)
+{
+    using namespace rocwmma;
+    using AFragment = fragment<matrix_a, 16, 16, 16, bfloat16_t, row_major>;
+    using BFragment = fragment<matrix_b, 16, 16, 16, bfloat16_t, col_major>;
+    using CFragment = fragment<accumulator, 16, 16, 16, float>;
+    static_assert(BFragment::num_elements == 8, "GFX11 W4 B fragment lane layout 已改变");
+    (void)group_size;
+    (void)scale_dtype;
+    (void)bits;
+    (void)residual;
+
+    const unsigned int lane = threadIdx.x % warpSize;
+    const unsigned int wave = threadIdx.x / warpSize;
+    const unsigned int input_base = blockIdx.y * 128;
+    const unsigned int output_base =
+        (blockIdx.x * (blockDim.x / warpSize) + wave) * 16;
+    const unsigned long long packed_columns = input_columns / 8u;
+    const unsigned long long groups = input_columns / 128u;
+
+    CFragment accumulator_fragments[8];
+    #pragma unroll
+    for (unsigned int tile = 0; tile < 8; ++tile) {
+        fill_fragment(accumulator_fragments[tile], 0.0f);
+    }
+
+    for (unsigned int column_base = 0;
+         column_base < input_columns;
+         column_base += SEGMENTS * 16u) {
+        const unsigned int local = threadIdx.x;
+        if (local < 16u * 16u) {
+            const unsigned int input_row = local / 16u;
+            #pragma unroll
+            for (unsigned int segment = 0; segment < SEGMENTS; ++segment) {
+                const unsigned int input_column =
+                    column_base + segment * 16u + local % 16u;
+                #pragma unroll
+                for (unsigned int tile = 0; tile < 8; ++tile) {
+                    input_tiles[(segment * 8u + tile) * 16u * 16u + local]
+                        = input_base + tile * 16u + input_row < input_rows
+                        ? input[(unsigned long long)(input_base + tile * 16u + input_row)
+                            * input_columns + input_column]
+                        : 0;
+                }
+            }
+        }
+
+        const unsigned int output_row = output_base + (lane & 15u);
+        const unsigned int lane_column = column_base + (lane >> 4u) * 8u;
+        unsigned int words[SEGMENTS];
+        #pragma unroll
+        for (unsigned int segment = 0; segment < SEGMENTS; ++segment) {
+            words[segment] = 0x88888888u;
+        }
+        float tile_scale = 0.0f;
+        if (output_row < output_rows) {
+            const unsigned long long row_words =
+                (unsigned long long)output_row * packed_columns;
+            #pragma unroll
+            for (unsigned int segment = 0; segment < SEGMENTS; ++segment) {
+                words[segment] = packed[
+                    row_words + lane_column / 8u + segment * 2u];
+            }
+            tile_scale = zllm_bf16_to_f32(((const unsigned short*)scales)[
+                (unsigned long long)output_row * groups + column_base / 128u]);
+        }
+
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int segment = 0; segment < SEGMENTS; ++segment) {
+            BFragment weight_fragment;
+            #pragma unroll
+            for (unsigned int element = 0; element < 8; ++element) {
+                const unsigned int code = (words[segment] >> (element * 4u)) & 15u;
+                weight_fragment[element].data =
+                    zllm_f32_to_bf16((float)((int)code - 8) * tile_scale);
+            }
+            #pragma unroll
+            for (unsigned int tile = 0; tile < 8; ++tile) {
+                AFragment input_fragment;
+                load_matrix_sync(
+                    input_fragment,
+                    (const bfloat16_t*)(input_tiles
+                        + (segment * 8u + tile) * 16u * 16u),
+                    16);
+                mma_sync(
+                    accumulator_fragments[tile],
+                    input_fragment,
+                    weight_fragment,
+                    accumulator_fragments[tile]);
+            }
+        }
+        __syncthreads();
+    }
+
+    #pragma unroll
+    for (unsigned int tile = 0; tile < 8; ++tile) {
+        store_matrix_sync(
+            output_scratch + wave * 16u * 16u,
+            accumulator_fragments[tile],
+            16,
+            mem_row_major);
+        __syncwarp();
+        for (unsigned int index = lane; index < 16u * 16u; index += warpSize) {
+            const unsigned int input_row = input_base + tile * 16u + index / 16u;
+            const unsigned int output_row = output_base + index % 16u;
+            if (input_row < input_rows && output_row < output_rows) {
+                output[(unsigned long long)input_row * output_rows + output_row]
+                    = output_scratch[wave * 16u * 16u + index];
+            }
+        }
+        __syncwarp();
+    }
+}
+
+// 8-wave 小输出保持 32 列，维持四个 workgroup/CU 的 LDS 档位。
+extern "C" __global__ void ct_quantized_matmul_bf16_w4_g128_wmma(
+    const unsigned short* input,
+    const unsigned int* packed,
+    const unsigned char* scales,
+    float* output,
+    unsigned int input_rows,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int group_size,
+    unsigned int scale_dtype,
+    unsigned int bits,
+    const unsigned short* residual)
+{
+    __shared__ unsigned short input_tiles[16][16 * 16];
+    __shared__ float output_scratch[16][16 * 16];
+    ct_quantized_matmul_bf16_w4_g128_wmma_impl<2>(
+        input, packed, scales, output, input_rows, input_columns, output_rows,
+        group_size, scale_dtype, bits, residual, &input_tiles[0][0],
+        &output_scratch[0][0]);
+}
+
+// 16-wave paired q_b/o_proj 已由 wave 数限制为每 CU 两个 workgroup；把同一
+// G128 scale 的四段 K 合成一次 LDS barrier，不再降低实际 occupancy。
+extern "C" __global__ void ct_quantized_matmul_bf16_w4_g128_wmma_k64(
+    const unsigned short* input,
+    const unsigned int* packed,
+    const unsigned char* scales,
+    float* output,
+    unsigned int input_rows,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int group_size,
+    unsigned int scale_dtype,
+    unsigned int bits,
+    const unsigned short* residual)
+{
+    __shared__ unsigned short input_tiles[32][16 * 16];
+    __shared__ float output_scratch[16][16 * 16];
+    ct_quantized_matmul_bf16_w4_g128_wmma_impl<4>(
+        input, packed, scales, output, input_rows, input_columns, output_rows,
+        group_size, scale_dtype, bits, residual, &input_tiles[0][0],
+        &output_scratch[0][0]);
 }
 
 struct ZllmCtWeightMeta {

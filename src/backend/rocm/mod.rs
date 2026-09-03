@@ -34,6 +34,15 @@ use crate::weight::{
     container::gguf::GgufMatrix,
     format::quantization::{QuantizedMatrixRef, ScaleDType},
 };
+
+thread_local! {
+    /// CPU prefill 把同一层 Q/KV/RoPE 合并到一个 pinned D2H，避免三次
+    /// pageable 传输各自同步 compute stream。
+    static CPU_PREFILL_BF16_DOWNLOADS: std::cell::RefCell<HashMap<i32, ops::hip::AsyncHostDownload>> = std::cell::RefCell::new(HashMap::new());
+    /// 每个 device worker 只保留一个 CPU attention 输出 staging；上一份 H2D
+    /// 完成后立即复用，不随层数增长 pinned 内存。
+    static CPU_PREFILL_BF16_UPLOADS: std::cell::RefCell<HashMap<i32, ops::hip::AsyncHostUpload>> = std::cell::RefCell::new(HashMap::new());
+}
 use crate::weight::{
     expert_source::{GgufExpertSource, Mxfp4ExpertSource, Mxfp4ExpertWeights},
     format::compressed_tensors_hybrid::CompressedTensorsSource,
@@ -45,7 +54,7 @@ pub use dsa::{DsaLayerSerde, RocmDsaSelection, RocmDsaState};
 pub use expert::RocmPrefillExperts;
 pub use gated_delta_net::RocmGatedDeltaNetStorage;
 pub use kda::RocmKdaStorage;
-pub use kv_cache::{MlaLayerSerde, RocmKvCache};
+pub use kv_cache::{MlaLayerSerde, RocmKvCache, RocmKvOwnership};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RocmTensorDType {
@@ -146,6 +155,11 @@ pub struct RocmWeight {
     pub(crate) rows: usize,
     pub(crate) cols: usize,
     inner: RocmWeightInner,
+    /// expert decode 可额外保留原始 GGUF block；普通 linear 继续使用其
+    /// prefill 友好的 resident 布局。
+    expert_gguf: Option<(Arc<ops::hip::DeviceBuffer>, u32)>,
+    /// CPU prefill 的 MLA 吸收路径只给 kv_b 保留 host F32 视图；普通权重不复制。
+    cpu_mla_data: Option<Arc<Vec<f32>>>,
 }
 
 impl RocmWeight {
@@ -166,11 +180,46 @@ impl RocmWeight {
         self.cols
     }
 
+    pub(crate) fn cpu_mla_data(&self) -> Option<&[f32]> {
+        self.cpu_mla_data.as_deref().map(Vec::as_slice)
+    }
+
     pub fn quantized(&self) -> Option<&RocmQuantizedWeight> {
         match &self.inner {
             RocmWeightInner::Quantized(weight) => Some(weight),
             _ => None,
         }
+    }
+
+    pub(crate) fn expert_gguf(&self) -> Option<(&Arc<ops::hip::DeviceBuffer>, u32)> {
+        self.expert_gguf.as_ref().map(|(codes, tensor_type)| (codes, *tensor_type)).or_else(|| match &self.inner {
+            RocmWeightInner::Quantized(RocmQuantizedWeight::GgufPacked { codes, tensor_type }) => Some((codes, *tensor_type)),
+            _ => None,
+        })
+    }
+
+    /// 为 decode 的输出行分片建立零复制 W8 view。packed/scales 都按行连续，
+    /// 因此只需保留原 allocation，无需再占一份 q_b 显存。
+    pub(crate) fn w8_row_view(&self, range: std::ops::Range<usize>) -> Result<Option<Self>, BackendError> {
+        if range.start >= range.end || range.end > self.rows {
+            return Err(compute_error(format!("ROCm W8 row view={range:?}/{} 非法", self.rows)));
+        }
+        let RocmWeightInner::Quantized(RocmQuantizedWeight::W8A16 { packed, scales, scale_dtype, group_size }) = &self.inner else {
+            return Ok(None);
+        };
+        if *group_size == 0 || !self.cols.is_multiple_of(*group_size) {
+            return Err(compute_error(format!("ROCm W8 row view columns={} group_size={} 非法", self.cols, group_size)));
+        }
+        let rows = range.len();
+        let packed_row_bytes = self.cols;
+        let scale_row_bytes = (self.cols / group_size).checked_mul(scale_dtype.bytes()).ok_or_else(|| compute_error("ROCm W8 row view scale 行大小溢出"))?;
+        let packed_offset = range.start.checked_mul(packed_row_bytes).ok_or_else(|| compute_error("ROCm W8 row view packed offset 溢出"))?;
+        let packed_bytes = rows.checked_mul(packed_row_bytes).ok_or_else(|| compute_error("ROCm W8 row view packed 大小溢出"))?;
+        let scale_offset = range.start.checked_mul(scale_row_bytes).ok_or_else(|| compute_error("ROCm W8 row view scale offset 溢出"))?;
+        let scale_bytes = rows.checked_mul(scale_row_bytes).ok_or_else(|| compute_error("ROCm W8 row view scale 大小溢出"))?;
+        let packed = Arc::new(ops::hip::DeviceBuffer::view(packed.clone(), packed_offset, packed_bytes).map_err(compute_error)?);
+        let scales = Arc::new(ops::hip::DeviceBuffer::view(scales.clone(), scale_offset, scale_bytes).map_err(compute_error)?);
+        Ok(Some(Self { rows, cols: self.cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::W8A16 { packed, scales, scale_dtype: *scale_dtype, group_size: *group_size }), expert_gguf: None, cpu_mla_data: None }))
     }
 
     pub fn gguf(&self) -> Option<&GgufMatrix> {
@@ -278,6 +327,11 @@ impl RocmBlockTable {
     }
 
     /// `tag` 只用于错误信息区分调用方（KV / DSA）。
+    ///
+    /// 表内容固定是 identity（block i -> 物理块 i），与 required_rows 无关，
+    /// 因此一旦需要（重）建就直接按 `capacity` 建全量：decode 单行 append
+    /// 每 64 行就会跨一次块边界，若按 required 精确重建，每次都会在深队列
+    /// 的流上做一次带 hipStreamSynchronize 的上传，把提交线程卡住。
     fn get(&mut self, tag: &str, capacity: usize, device_id: i32, required_rows: usize) -> Result<Arc<ops::hip::DeviceBuffer>, BackendError> {
         if self.device_id.is_some_and(|device| device != device_id) {
             return Err(compute_error(format!("ROCm {tag} cache 已绑定 device {:?}，不能用于 {device_id}", self.device_id)));
@@ -292,6 +346,7 @@ impl RocmBlockTable {
         {
             return Ok(table.clone());
         }
+        let blocks = capacity.div_ceil(ROCM_KV_BLOCK_SIZE).max(blocks);
         let ids = (0..blocks).map(|block| u32::try_from(block).map_err(|_| compute_error(format!("ROCm {tag} block ID 超过 u32")))).collect::<Result<Vec<_>, _>>()?;
         let bytes = unsafe { std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), std::mem::size_of_val(ids.as_slice())) };
         let table = Arc::new(ops::hip::DeviceBuffer::upload(device_id, bytes).map_err(compute_error)?);
@@ -486,6 +541,45 @@ impl RocmContext {
         tensor.device.as_deref().ok_or_else(|| compute_error("ROCm BF16 tensor 缺少 device buffer"))?.download_u16(elements).map_err(compute_error)
     }
 
+    /// 把若干 tensor 按参数顺序下载到同一块 pinned host staging，并在 staging
+    /// 有效期间消费 BF16 切片。所有 cast 和 D2H 都排在当前 compute stream，
+    /// 只等待一个完成 event。
+    pub(crate) fn with_tensors_bf16_bits<R>(&self, tensors: &[&RocmTensor], consume: impl FnOnce(&[&[u16]]) -> Result<R, BackendError>) -> Result<R, BackendError> {
+        if tensors.is_empty() {
+            return Err(compute_error("ROCm BF16 segmented download 不能为空"));
+        }
+        let tensors = tensors.iter().map(|tensor| self.tensor_as_bf16((*tensor).clone())).collect::<Result<Vec<_>, _>>()?;
+        let mut lengths = Vec::with_capacity(tensors.len());
+        let mut segments = Vec::with_capacity(tensors.len());
+        let mut bytes = 0usize;
+        for tensor in &tensors {
+            let elements = checked_elements(tensor.rows, tensor.cols, "ROCm BF16 segmented download")?;
+            let tensor_bytes = elements.checked_mul(std::mem::size_of::<u16>()).ok_or_else(|| compute_error("ROCm BF16 segmented download 大小溢出"))?;
+            let device = tensor.device.as_deref().ok_or_else(|| compute_error("ROCm BF16 segmented tensor 缺少 device buffer"))?;
+            lengths.push(elements);
+            segments.push((device, 0, tensor_bytes));
+            bytes = bytes.checked_add(tensor_bytes).ok_or_else(|| compute_error("ROCm BF16 segmented download 总大小溢出"))?;
+        }
+        CPU_PREFILL_BF16_DOWNLOADS.with(|downloads| {
+            let mut downloads = downloads.borrow_mut();
+            if !downloads.contains_key(&self.device_id) {
+                downloads.insert(self.device_id, ops::hip::AsyncHostDownload::new(self.device_id, bytes).map_err(compute_error)?);
+            }
+            let download = downloads.get_mut(&self.device_id).expect("CPU prefill D2H 已插入");
+            download.enqueue_segments(&segments).map_err(compute_error)?;
+            let packed = download.wait().map_err(compute_error)?;
+            let mut offset = 0usize;
+            let mut slices = Vec::with_capacity(lengths.len());
+            for elements in lengths {
+                let slice = unsafe { std::slice::from_raw_parts(packed.as_ptr().add(offset).cast::<u16>(), elements) };
+                slices.push(slice);
+                offset += elements * std::mem::size_of::<u16>();
+            }
+            debug_assert_eq!(offset, packed.len());
+            consume(&slices)
+        })
+    }
+
     /// 融合 logits 选行、bias 相加与分片 argmax，避免两个词表宽度临时张量。
     pub fn argmax_add_rows(&self, logits: &RocmTensor, rows: &[u32], bias: &RocmTensor) -> Result<Vec<u32>, BackendError> {
         let logits = self.tensor_as_f32(logits.clone())?;
@@ -521,6 +615,22 @@ impl RocmContext {
         }
         let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values.as_slice())) };
         let device = ops::hip::DeviceBuffer::upload(self.device_id, bytes).map_err(compute_error)?;
+        Ok(device_tensor_bf16(device, rows, cols))
+    }
+
+    pub(crate) fn tensor_from_bf16_bits_streamed(&self, values: Vec<u16>, rows: usize, cols: usize) -> Result<RocmTensor, BackendError> {
+        let elements = checked_elements(rows, cols, "ROCm streamed BF16 upload")?;
+        if values.len() != elements {
+            return Err(compute_error(format!("ROCm streamed BF16 upload shape=[{rows},{cols}]，实际元素={}", values.len())));
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values.as_slice())) };
+        let device = CPU_PREFILL_BF16_UPLOADS.with(|uploads| {
+            let mut uploads = uploads.borrow_mut();
+            if !uploads.contains_key(&self.device_id) {
+                uploads.insert(self.device_id, ops::hip::AsyncHostUpload::new(self.device_id, bytes.len()).map_err(compute_error)?);
+            }
+            uploads.get_mut(&self.device_id).expect("CPU prefill H2D 已插入").upload(bytes).map_err(compute_error)
+        })?;
         Ok(device_tensor_bf16(device, rows, cols))
     }
 

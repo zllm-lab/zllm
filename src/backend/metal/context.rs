@@ -300,15 +300,19 @@ impl MetalContext {
 
     /// 取(用途,槽位,尺寸)对应的池化 workspace;同尺寸多实例并存时用槽位区分,
     /// 例如 PLE 每步 42 个同宽切片必须同时存活,不能按尺寸折叠到同一块 buffer。
-    pub fn cached_zero_buffer_slot(&self, tag: &'static str, slot: usize, len: usize) -> Buffer {
+    fn pooled_buffer(&self, tag: &'static str, slot: usize, len: usize) -> Result<Buffer, String> {
         let mut pool = self.scratch_pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let key = (tag, len, slot);
         if let Some(buffer) = pool.get(&key) {
-            return buffer.clone();
+            return Ok(buffer.clone());
         }
-        let buffer = self.shared_buffer_zeros(len);
+        let buffer = self.try_shared_buffer_zeros(len)?;
         pool.insert(key, buffer.clone());
-        buffer
+        Ok(buffer)
+    }
+
+    pub fn cached_zero_buffer_slot(&self, tag: &'static str, slot: usize, len: usize) -> Buffer {
+        <Self as crate::backend::MemoryPool>::allocate_memory(self, crate::backend::MemoryRequest::scratch(tag, len).with_slot(slot)).unwrap_or_else(|error| panic!("{error}"))
     }
 
     /// 取(用途,尺寸)对应的池化 workspace:命中直接复用,未命中分配后登记。
@@ -912,5 +916,26 @@ impl MetalContext {
             .collect();
         out.sort_by(|a, b| b.gpu_seconds.total_cmp(&a.gpu_seconds).then_with(|| a.operator.cmp(&b.operator)).then_with(|| a.shape.cmp(&b.shape)));
         out
+    }
+}
+
+impl crate::backend::MemoryPool for MetalContext {
+    type Memory = Buffer;
+
+    fn allocate_memory(&self, request: crate::backend::MemoryRequest) -> Result<Self::Memory, crate::backend::BackendError> {
+        let request = request.validate()?;
+        if request.alignment != 1 {
+            return Err(crate::backend::BackendError::Compute { msg: format!("Metal memory pool 尚不支持 alignment={}", request.alignment) });
+        }
+        if matches!(request.lifetime, crate::backend::MemoryLifetime::Operation | crate::backend::MemoryLifetime::Stage)
+            && let Some(tag) = request.tag
+        {
+            return self.pooled_buffer(tag, request.slot, request.bytes).map_err(|msg| crate::backend::BackendError::Compute { msg });
+        }
+        self.try_shared_buffer_uninit(request.bytes).map_err(|msg| crate::backend::BackendError::Compute { msg })
+    }
+
+    fn memory_bytes(&self, memory: &Self::Memory) -> u64 {
+        memory.length()
     }
 }

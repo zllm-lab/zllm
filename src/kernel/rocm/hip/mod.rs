@@ -45,7 +45,7 @@ pub(crate) fn active_compute_stream() -> *mut c_void {
     ACTIVE_COMPUTE_STREAM.get() as *mut c_void
 }
 
-pub(super) fn compute_stream_for(device_id: i32) -> *mut c_void {
+pub(crate) fn compute_stream_for(device_id: i32) -> *mut c_void {
     ACTIVE_COMPUTE_STREAMS.with(|streams| streams.borrow().get(&device_id).copied().unwrap_or_default() as *mut c_void)
 }
 

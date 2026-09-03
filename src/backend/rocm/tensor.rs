@@ -137,9 +137,16 @@ impl Backend for RocmContext {
                 _ => None,
             };
             if let Some((packed, tensor_type)) = gguf_codes {
-                // 设备输入(F32/BF16)直用，host 输入才上传；kernel 内联反量化，无同步。
-                let output = ops::hip::try_qk_matmul_resident_f32(self.device_id, tensor_type, &input.data, input.device.as_deref(), packed, input.rows, input.cols, weight.rows)
-                    .map_err(|error| compute_error(format!("ROCm GGUF QK linear launch 失败: input=[{},{}] output_rows={} type={tensor_type}: {error}", input.rows, input.cols, weight.rows)))?;
+                // decode 少行(≤8)走 fdot2 快路径(bf16 舍入+fdot2，与 CT W8 家族同
+                // 数值形态)；prefill(rows>8)沿用标量 qk_matmul。
+                let output = if input.rows <= 8 && matches!(tensor_type, 11 | 12 | 13 | 14 | 21 | 23) {
+                    ops::hip::try_qk_matmul_fdot2_resident_f32(self.device_id, tensor_type, &input.data, input.device.as_deref(), packed, input.rows, input.cols, weight.rows)
+                        .map_err(|error| compute_error(format!("ROCm GGUF fdot2 linear launch 失败: input=[{},{}] output_rows={} type={tensor_type}: {error}", input.rows, input.cols, weight.rows)))?
+                } else {
+                    // 设备输入(F32/BF16)直用，host 输入才上传；kernel 内联反量化，无同步。
+                    ops::hip::try_qk_matmul_resident_f32(self.device_id, tensor_type, &input.data, input.device.as_deref(), packed, input.rows, input.cols, weight.rows)
+                        .map_err(|error| compute_error(format!("ROCm GGUF QK linear launch 失败: input=[{},{}] output_rows={} type={tensor_type}: {error}", input.rows, input.cols, weight.rows)))?
+                };
                 return Ok(device_tensor_f32(output, input.rows, weight.rows));
             }
             let (bits, packed, scales, scale_dtype, group_size) = match quantized {
@@ -794,7 +801,8 @@ impl Backend for RocmContext {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::rocm::RocmContext;
+    use crate::backend::{Backend, BackendResources, LinearWeight, rocm::RocmContext};
+    use crate::weight::format::quantization::{ScaleDType, W8A16Matrix};
 
     #[test]
     #[ignore = "需要 ROCm device 0"]
@@ -808,5 +816,25 @@ mod tests {
         let (numerator, denominator) = context.relative_l1_delta_partial(&current, &zero, &previous).unwrap();
         assert!((numerator - 5.5).abs() < 1.0e-6, "numerator={numerator}");
         assert!((denominator - 8.5).abs() < 1.0e-6, "denominator={denominator}");
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm device 0"]
+    fn w8_row_view_linear_matches_full_rows() {
+        let context = RocmContext::new(0).unwrap();
+        let rows = 4;
+        let cols = 32;
+        let packed = (0..rows).flat_map(|row| std::iter::repeat_n(129 + row as u8, cols)).collect::<Vec<_>>();
+        let scales = (0..rows).flat_map(|row| half::f16::from_f32(0.125 * (row + 1) as f32).to_le_bytes()).collect::<Vec<_>>();
+        let matrix = W8A16Matrix::new(packed, scales, ScaleDType::F16, cols, rows, cols).unwrap();
+        let weight = context.prepare_weight(LinearWeight::w8a16(&matrix), rows, cols).unwrap();
+        let shard = weight.w8_row_view(2..4).unwrap().unwrap();
+        let input = context.tensor_from_f32((0..cols).map(|column| (column + 1) as f32 / 64.0).collect(), 1, cols).unwrap();
+        let full = context.tensor_to_f32(&context.linear(&input, &weight).unwrap()).unwrap();
+        let sharded = context.tensor_to_f32(&context.linear(&input, &shard).unwrap()).unwrap();
+        assert_eq!(sharded.len(), 2);
+        for (index, (&actual, &expected)) in sharded.iter().zip(&full[2..]).enumerate() {
+            assert!((actual - expected).abs() <= 1.0e-5, "row={index} actual={actual} expected={expected}");
+        }
     }
 }

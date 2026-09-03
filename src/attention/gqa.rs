@@ -213,13 +213,13 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(all(target_os = "linux", feature = "with-rocm"))]
+#[cfg(feature = "with-rocm")]
 pub(crate) fn prefill_attention_at_f32(query: &[f32], key: &[f32], value: &[f32], query_tokens: usize, kv_start: usize, kv_end: usize, position: usize, spec: &GqaSpec, output: &mut [f32]) -> Result<(), String> {
     prefill_attention_at_visible_f32(query, key, value, query_tokens, kv_start, kv_end, position, spec, None, output)
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(all(target_os = "linux", feature = "with-rocm"))]
+#[cfg(feature = "with-rocm")]
 pub(crate) fn prefill_attention_at_visible_f32(
     query: &[f32],
     key: &[f32],

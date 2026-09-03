@@ -337,12 +337,13 @@ pub fn prepare_moe_prefill_layer_nvfp4<B: DecodeBackend>(backend: &B, cfg: &Glm5
 }
 
 #[allow(clippy::too_many_arguments)]
-fn glm52_prefill_indexer<B: DsaPrefillBackend>(
+fn glm52_prefill_indexer<B: DsaPrefillBackend + ExpertPrefillBackend>(
     backend: &B,
     cfg: &Glm52Config,
     mla: &MlaSpec,
     indexer: Option<&Glm52IndexerDecodeWeights<B::Weight>>,
     layer: usize,
+    experts: Option<&B::PrefillExperts>,
     state: &mut B::DsaState,
     normalized_hidden: &B::Tensor,
     normalized_q_lora: &B::Tensor,
@@ -354,6 +355,7 @@ fn glm52_prefill_indexer<B: DsaPrefillBackend>(
     backend.profile_device_operator("glm_index_key")?;
     prefill_select(
         backend,
+        experts,
         state,
         normalized_hidden,
         normalized_q_lora,
@@ -442,7 +444,7 @@ pub fn prepare_dense_prefill_layer<B: DecodeBackend>(backend: &B, cfg: &Glm52Con
     })
 }
 
-fn prepare_ct_linear<B: crate::backend::Backend>(backend: &B, weight: &CtLinearWeight, rows: usize, cols: usize) -> Result<B::Weight, BackendError> {
+pub(crate) fn prepare_ct_linear<B: crate::backend::Backend>(backend: &B, weight: &CtLinearWeight, rows: usize, cols: usize) -> Result<B::Weight, BackendError> {
     match weight {
         CtLinearWeight::Quantized(CtMatrix::W4(matrix)) => backend.prepare_weight(LinearWeight::w4a16(matrix), rows, cols),
         CtLinearWeight::Quantized(CtMatrix::W8(matrix)) => backend.prepare_weight(LinearWeight::w8a16(matrix), rows, cols),
@@ -451,7 +453,7 @@ fn prepare_ct_linear<B: crate::backend::Backend>(backend: &B, weight: &CtLinearW
     }
 }
 
-fn prepare_ct_kv_b<B: DecodeBackend>(backend: &B, weight: &CtLinearWeight, rows: usize, cols: usize) -> Result<B::Weight, BackendError> {
+pub(crate) fn prepare_ct_kv_b<B: DecodeBackend>(backend: &B, weight: &CtLinearWeight, rows: usize, cols: usize) -> Result<B::Weight, BackendError> {
     match weight {
         CtLinearWeight::Quantized(CtMatrix::W4(matrix)) => backend.prepare_mla_kv_b(LinearWeight::w4a16(matrix), rows, cols),
         CtLinearWeight::Quantized(CtMatrix::W8(matrix)) => backend.prepare_mla_kv_b(LinearWeight::w8a16(matrix), rows, cols),
@@ -576,9 +578,9 @@ pub fn prepare_moe_prefill_layer_gguf<B: DecodeBackend>(backend: &B, cfg: &Glm52
         post_attn_norm: backend.prepare_f32(&weights.post_attn_norm, 1, cfg.hidden_size)?,
         router_weight: backend.prepare_f32(&weights.router_weight, cfg.expert_count, cfg.hidden_size)?,
         router_bias: backend.prepare_f32(&weights.router_bias, 1, cfg.expert_count)?,
-        shared_gate: prepare_gguf_linear(backend, &weights.shared_gate, cfg.expert_intermediate_size, cfg.hidden_size)?,
-        shared_up: prepare_gguf_linear(backend, &weights.shared_up, cfg.expert_intermediate_size, cfg.hidden_size)?,
-        shared_down: prepare_gguf_linear(backend, &weights.shared_down, cfg.hidden_size, cfg.expert_intermediate_size)?,
+        shared_gate: backend.prepare_expert_weight(LinearWeight::gguf(&weights.shared_gate), cfg.expert_intermediate_size, cfg.hidden_size)?,
+        shared_up: backend.prepare_expert_weight(LinearWeight::gguf(&weights.shared_up), cfg.expert_intermediate_size, cfg.hidden_size)?,
+        shared_down: backend.prepare_expert_weight(LinearWeight::gguf(&weights.shared_down), cfg.hidden_size, cfg.expert_intermediate_size)?,
     })
 }
 
@@ -665,12 +667,13 @@ pub fn prepare_moe_prefill_layer<B: DecodeBackend>(backend: &B, cfg: &Glm52Confi
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn glm52_dense_prefill_layer<B: DsaPrefillBackend>(
+pub fn glm52_dense_prefill_layer<B: DsaPrefillBackend + ExpertPrefillBackend>(
     backend: &B,
     cfg: &Glm52Config,
     mla: &MlaSpec,
     weights: &Glm52DensePrefillLayer<B::Weight>,
     layer: usize,
+    experts: Option<&B::PrefillExperts>,
     dsa_state: Option<&mut B::DsaState>,
     hidden: &B::Tensor,
     rope: &RopeTable,
@@ -696,16 +699,21 @@ pub fn glm52_dense_prefill_layer<B: DsaPrefillBackend>(
     let q_a = backend.linear(&normed, &weights.q_a_proj)?;
     let input_micros = mark_phase();
     backend.profile_device_operator("glm_attn_query")?;
+    // cooperative MLA 同时覆盖 prefill 与 decode：单行仍有完整的 q_b、
+    // indexed MLA 和 o_proj，若只让 owner 执行，peer 会在整段 attention 空转。
+    let cooperative_mla = experts.is_some_and(|experts| backend.supports_cooperative_mla_prefill(layer, experts));
     let mut dsa_state = dsa_state;
-    let query = if weights.indexer.is_some() {
+    let (normalized_q_lora, query) = if weights.indexer.is_some() {
         let q_a = backend.rmsnorm_quantized(&q_a, &weights.q_a_norm, cfg.rms_eps)?;
         if let Some(state) = dsa_state.as_deref_mut() {
-            glm52_prefill_indexer(backend, cfg, mla, weights.indexer.as_ref(), layer, state, &normed, &q_a, rope, position)?;
+            glm52_prefill_indexer(backend, cfg, mla, weights.indexer.as_ref(), layer, experts, state, &normed, &q_a, rope, position)?;
         }
-        backend.linear(&q_a, &weights.q_b_proj)?
+        if cooperative_mla { (Some(q_a), None) } else { (None, Some(backend.linear(&q_a, &weights.q_b_proj)?)) }
+    } else if cooperative_mla {
+        (Some(backend.rmsnorm_quantized(&q_a, &weights.q_a_norm, cfg.rms_eps)?), None)
     } else {
         // IndexShare 层复用最近 full indexer 的 selection，不能退回 dense MLA。
-        backend.rmsnorm_linear(&q_a, &weights.q_a_norm, cfg.rms_eps, &weights.q_b_proj)?
+        (None, Some(backend.rmsnorm_linear(&q_a, &weights.q_a_norm, cfg.rms_eps, &weights.q_b_proj)?))
     };
     let query_micros = mark_phase();
 
@@ -713,23 +721,39 @@ pub fn glm52_dense_prefill_layer<B: DsaPrefillBackend>(
     let kv_a = backend.linear(&normed, &weights.kv_a_proj)?;
     let (latent, k_rope) = backend.split_columns(&kv_a, mla.kv_lora_rank)?;
     let latent = backend.rmsnorm(&latent, &weights.kv_a_norm, cfg.rms_eps)?;
-    let query = backend.rope(&query, mla.num_heads, mla.qk_rope_head_dim, mla.rotary_layout, position, &rope.cos, &rope.sin)?;
     let kv_micros = mark_phase();
 
     let dsa = glm52_dsa_spec(cfg, mla);
     backend.profile_device_operator("glm_attn_mla")?;
-    let attention = mla_causal_prefill_rope(backend, &query, &latent, &k_rope, &weights.kv_b_proj, cache, layer, position, &rope.cos, &rope.sin, mla, &dsa, dsa_state)?;
+    let out = if cooperative_mla {
+        backend.cooperative_mla_prefill_add(
+            layer,
+            experts.expect("cooperative dense MLA 必须提供 experts"),
+            normalized_q_lora.as_ref().expect("cooperative dense MLA 必须保留 q_lora"),
+            &latent,
+            &k_rope,
+            hidden,
+            cache,
+            dsa_state.as_deref(),
+            position,
+            &rope.cos,
+            &rope.sin,
+            mla,
+            &dsa,
+        )?
+    } else {
+        let query = backend.rope(query.as_ref().expect("普通 dense MLA 必须生成完整 query"), mla.num_heads, mla.qk_rope_head_dim, mla.rotary_layout, position, &rope.cos, &rope.sin)?;
+        let attention = mla_causal_prefill_rope(backend, &query, &latent, &k_rope, &weights.kv_b_proj, cache, layer, position, &rope.cos, &rope.sin, mla, &dsa, dsa_state)?;
+        backend.linear_add(&attention, &weights.o_proj, hidden)?
+    };
     let mla_micros = mark_phase();
     backend.profile_device_operator("glm_attn_out")?;
-    let out = backend.linear_add(&attention, &weights.o_proj, hidden)?;
     let out_micros = mark_phase();
 
     backend.profile_device_operator("glm_ffn")?;
     let mlp_normed = backend.rmsnorm_quantized(&out, &weights.post_attn_norm, cfg.rms_eps)?;
     backend.profile_device_operator("glm_dense_gate_up")?;
-    let gate = backend.linear(&mlp_normed, &weights.gate_proj)?;
-    let up = backend.linear(&mlp_normed, &weights.up_proj)?;
-    let activated = backend.gated_activation(&gate, &up, &Activation::Silu)?;
+    let activated = backend.gated_linear(&mlp_normed, &weights.gate_proj, &weights.up_proj, &Activation::Silu)?;
     let gate_micros = mark_phase();
     backend.profile_device_operator("glm_dense_down")?;
     let down = backend.linear(&activated, &weights.down_proj)?;
@@ -797,8 +821,9 @@ fn segmented_mla<B: DsaPrefillBackend + SegmentedTensorBackend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn glm52_segmented_attention<B: DsaPrefillBackend + SegmentedTensorBackend>(
+fn glm52_segmented_attention<B: DsaPrefillBackend + ExpertPrefillBackend + SegmentedTensorBackend>(
     backend: &B,
+    experts: Option<&B::PrefillExperts>,
     cfg: &Glm52Config,
     mla: &MlaSpec,
     weights: Glm52PrefillAttentionWeights<'_, B::Weight>,
@@ -813,36 +838,83 @@ fn glm52_segmented_attention<B: DsaPrefillBackend + SegmentedTensorBackend>(
         return Err(BackendError::Compute { msg: format!("GLM segmented attention rows={total_rows}，hidden={}", backend.token_rows(hidden)) });
     }
 
+    let cooperative_mla = experts.is_some_and(|experts| backend.supports_cooperative_mla_prefill(layer, experts));
     let normed = backend.rmsnorm_quantized(hidden, weights.input_norm, cfg.rms_eps)?;
     let q_a = backend.linear(&normed, weights.q_a_proj)?;
     backend.profile_device_operator("glm_attn_query")?;
-    let query = if weights.indexer.is_some() {
+    let (normalized_q_lora, query) = if weights.indexer.is_some() {
         let q_a = backend.rmsnorm_quantized(&q_a, weights.q_a_norm, cfg.rms_eps)?;
-        glm52_prefill_indexer_segmented(backend, cfg, mla, weights.indexer, layer, &normed, &q_a, rope, segments)?;
-        backend.linear(&q_a, weights.q_b_proj)?
+        if cooperative_mla {
+            let mut offset = 0usize;
+            for segment in segments.iter_mut() {
+                let segment_hidden = backend.slice_token_rows(&normed, offset, segment.rows)?;
+                let segment_q = backend.slice_token_rows(&q_a, offset, segment.rows)?;
+                glm52_prefill_indexer(backend, cfg, mla, weights.indexer, layer, experts, &mut *segment.dsa, &segment_hidden, &segment_q, rope, segment.position)?;
+                offset += segment.rows;
+            }
+            (Some(q_a), None)
+        } else {
+            glm52_prefill_indexer_segmented(backend, cfg, mla, weights.indexer, layer, &normed, &q_a, rope, segments)?;
+            (None, Some(backend.linear(&q_a, weights.q_b_proj)?))
+        }
+    } else if cooperative_mla {
+        (Some(backend.rmsnorm_quantized(&q_a, weights.q_a_norm, cfg.rms_eps)?), None)
     } else {
-        backend.rmsnorm_linear(&q_a, weights.q_a_norm, cfg.rms_eps, weights.q_b_proj)?
+        (None, Some(backend.rmsnorm_linear(&q_a, weights.q_a_norm, cfg.rms_eps, weights.q_b_proj)?))
     };
     backend.profile_device_operator("glm_attn_kv")?;
     let kv_a = backend.linear(&normed, weights.kv_a_proj)?;
     let (latent, k_rope) = backend.split_columns(&kv_a, mla.kv_lora_rank)?;
     let latent = backend.rmsnorm(&latent, weights.kv_a_norm, cfg.rms_eps)?;
-    let rope_segments = segments.iter().map(|segment| crate::backend::TokenSegment { position: segment.position, rows: segment.rows }).collect::<Vec<_>>();
-    let (query, k_rope) = backend.rope_segmented_pair(&query, mla.num_heads, &k_rope, 1, mla.qk_rope_head_dim, mla.rotary_layout, false, &rope_segments, &rope.cos, &rope.sin)?;
-
     backend.profile_device_operator("glm_attn_mla")?;
-    let attention = segmented_mla(backend, &query, &latent, &k_rope, weights.kv_b_proj, layer, mla, cfg, segments)?;
-    backend.profile_device_operator("glm_attn_out")?;
-    backend.linear_add(&attention, weights.o_proj, hidden)
+    if cooperative_mla {
+        let experts = experts.expect("cooperative segmented MLA 必须提供 experts");
+        let normalized_q_lora = normalized_q_lora.as_ref().expect("cooperative segmented MLA 必须保留 q_lora");
+        let dsa = glm52_dsa_spec(cfg, mla);
+        let mut outputs = Vec::with_capacity(segments.len());
+        let mut offset = 0usize;
+        for segment in segments.iter_mut() {
+            let segment_q = backend.slice_token_rows(normalized_q_lora, offset, segment.rows)?;
+            let segment_latent = backend.slice_token_rows(&latent, offset, segment.rows)?;
+            let segment_rope = backend.slice_token_rows(&k_rope, offset, segment.rows)?;
+            let segment_hidden = backend.slice_token_rows(hidden, offset, segment.rows)?;
+            outputs.push(backend.cooperative_mla_prefill_add(
+                layer,
+                experts,
+                &segment_q,
+                &segment_latent,
+                &segment_rope,
+                &segment_hidden,
+                Some(&mut *segment.cache),
+                Some(&*segment.dsa),
+                segment.position,
+                &rope.cos,
+                &rope.sin,
+                mla,
+                &dsa,
+            )?);
+            offset += segment.rows;
+        }
+        let outputs = outputs.iter().collect::<Vec<_>>();
+        backend.concat_token_rows(&outputs)
+    } else {
+        let query = query.as_ref().expect("普通 segmented MLA 必须生成 query");
+        let rope_segments = segments.iter().map(|segment| crate::backend::TokenSegment { position: segment.position, rows: segment.rows }).collect::<Vec<_>>();
+        let (query, k_rope) = backend.rope_segmented_pair(query, mla.num_heads, &k_rope, 1, mla.qk_rope_head_dim, mla.rotary_layout, false, &rope_segments, &rope.cos, &rope.sin)?;
+        let attention = segmented_mla(backend, &query, &latent, &k_rope, weights.kv_b_proj, layer, mla, cfg, segments)?;
+        backend.profile_device_operator("glm_attn_out")?;
+        backend.linear_add(&attention, weights.o_proj, hidden)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn glm52_dense_prefill_layer_segmented<B: DsaPrefillBackend + SegmentedTensorBackend>(
+pub fn glm52_dense_prefill_layer_segmented<B: DsaPrefillBackend + ExpertPrefillBackend + SegmentedTensorBackend>(
     backend: &B,
     cfg: &Glm52Config,
     mla: &MlaSpec,
     weights: &Glm52DensePrefillLayer<B::Weight>,
     layer: usize,
+    experts: &B::PrefillExperts,
     hidden: &B::Tensor,
     rope: &RopeTable,
     segments: &mut [Glm52PrefillSegment<'_, B>],
@@ -850,6 +922,7 @@ pub fn glm52_dense_prefill_layer_segmented<B: DsaPrefillBackend + SegmentedTenso
     backend.profile_device_operator("glm_attention")?;
     let out = glm52_segmented_attention(
         backend,
+        Some(experts),
         cfg,
         mla,
         Glm52PrefillAttentionWeights {
@@ -871,9 +944,7 @@ pub fn glm52_dense_prefill_layer_segmented<B: DsaPrefillBackend + SegmentedTenso
     backend.profile_device_operator("glm_ffn")?;
     let mlp_normed = backend.rmsnorm_quantized(&out, &weights.post_attn_norm, cfg.rms_eps)?;
     backend.profile_device_operator("glm_dense_gate_up")?;
-    let gate = backend.linear(&mlp_normed, &weights.gate_proj)?;
-    let up = backend.linear(&mlp_normed, &weights.up_proj)?;
-    let activated = backend.gated_activation(&gate, &up, &Activation::Silu)?;
+    let activated = backend.gated_linear(&mlp_normed, &weights.gate_proj, &weights.up_proj, &Activation::Silu)?;
     backend.profile_device_operator("glm_dense_down")?;
     let down = backend.linear(&activated, &weights.down_proj)?;
     backend.profile_device_operator("glm_dense_residual")?;
@@ -895,6 +966,7 @@ pub fn glm52_moe_prefill_layer_segmented<B: ExpertPrefillBackend + DsaPrefillBac
     backend.profile_device_operator("glm_attention")?;
     let out = glm52_segmented_attention(
         backend,
+        Some(experts),
         cfg,
         mla,
         Glm52PrefillAttentionWeights {
@@ -974,30 +1046,39 @@ pub fn glm52_moe_prefill_layer<B: ExpertPrefillBackend + DsaPrefillBackend>(
     };
     let input_micros = mark_phase();
     backend.profile_device_operator("glm_attn_query")?;
+    // 单行也沿 query head 拆分；peer KV 由 cooperative append 同步推进。
+    let cooperative_mla = backend.supports_cooperative_mla_prefill(layer, experts);
     let mut dsa_state = dsa_state;
-    let query = if weights.indexer.is_some() {
+    let (normalized_q_lora, query) = if weights.indexer.is_some() {
         let normed = normed.as_ref().expect("indexer 层必须保留归一化输入");
         let q_a = backend.rmsnorm_quantized(&q_a, &weights.q_a_norm, cfg.rms_eps)?;
         if let Some(state) = dsa_state.as_deref_mut() {
-            glm52_prefill_indexer(backend, cfg, mla, weights.indexer.as_ref(), layer, state, normed, &q_a, rope, position)?;
+            glm52_prefill_indexer(backend, cfg, mla, weights.indexer.as_ref(), layer, Some(&*experts), state, normed, &q_a, rope, position)?;
         }
-        backend.linear(&q_a, &weights.q_b_proj)?
+        if cooperative_mla { (Some(q_a), None) } else { (None, Some(backend.linear(&q_a, &weights.q_b_proj)?)) }
+    } else if cooperative_mla {
+        // IndexShare 只复用 owner 最近一次 selection；q_b 从这里开始才拆给 peer。
+        (Some(backend.rmsnorm_quantized(&q_a, &weights.q_a_norm, cfg.rms_eps)?), None)
     } else {
         // IndexShare 层复用最近 full indexer 的 selection，不能退回 dense MLA。
-        backend.rmsnorm_linear(&q_a, &weights.q_a_norm, cfg.rms_eps, &weights.q_b_proj)?
+        (None, Some(backend.rmsnorm_linear(&q_a, &weights.q_a_norm, cfg.rms_eps, &weights.q_b_proj)?))
     };
     let query_micros = mark_phase();
     backend.profile_device_operator("glm_attn_kv")?;
     let (latent, k_rope) = backend.split_columns(&kv_a, mla.kv_lora_rank)?;
     let latent = backend.rmsnorm(&latent, &weights.kv_a_norm, cfg.rms_eps)?;
-    let query = backend.rope(&query, mla.num_heads, mla.qk_rope_head_dim, mla.rotary_layout, position, &rope.cos, &rope.sin)?;
     let kv_micros = mark_phase();
     let dsa = glm52_dsa_spec(cfg, mla);
     backend.profile_device_operator("glm_attn_mla")?;
-    let attention = mla_causal_prefill_rope(backend, &query, &latent, &k_rope, &weights.kv_b_proj, cache, layer, position, &rope.cos, &rope.sin, mla, &dsa, dsa_state)?;
+    let out = if cooperative_mla {
+        backend.cooperative_mla_prefill_add(layer, experts, normalized_q_lora.as_ref().expect("cooperative MLA 必须保留 q_lora"), &latent, &k_rope, hidden, cache, dsa_state.as_deref(), position, &rope.cos, &rope.sin, mla, &dsa)?
+    } else {
+        let query = backend.rope(query.as_ref().expect("普通 MLA 必须生成完整 query"), mla.num_heads, mla.qk_rope_head_dim, mla.rotary_layout, position, &rope.cos, &rope.sin)?;
+        let attention = mla_causal_prefill_rope(backend, &query, &latent, &k_rope, &weights.kv_b_proj, cache, layer, position, &rope.cos, &rope.sin, mla, &dsa, dsa_state)?;
+        backend.linear_add(&attention, &weights.o_proj, hidden)?
+    };
     let mla_micros = mark_phase();
     backend.profile_device_operator("glm_attn_out")?;
-    let out = backend.linear_add(&attention, &weights.o_proj, hidden)?;
     let out_micros = mark_phase();
 
     backend.profile_device_operator("glm_ffn")?;
@@ -1444,8 +1525,9 @@ pub fn decode_select_begin<B: DecodeBackend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prefill_select<B: DsaPrefillBackend>(
+fn prefill_select<B: DsaPrefillBackend + ExpertPrefillBackend>(
     backend: &B,
+    experts: Option<&B::PrefillExperts>,
     state: &mut B::DsaState,
     hidden: &B::Tensor,
     q_lora: &B::Tensor,
@@ -1456,17 +1538,47 @@ fn prefill_select<B: DsaPrefillBackend>(
     sin: &[f32],
     spec: &DsaSpec,
 ) -> Result<(), BackendError> {
+    let diagnose = backend.token_rows(hidden) == 1;
+    let mut phase_started = diagnose.then(Instant::now);
+    let mut mark_phase = || {
+        phase_started.as_mut().map_or(0, |started| {
+            let elapsed = started.elapsed().as_micros();
+            *started = Instant::now();
+            elapsed
+        })
+    };
     let key = backend.linear(hidden, weights.wk)?;
-    if !backend.append_dsa_keys_layernorm_rope(state, layer, position, &key, weights.k_norm_weight, weights.k_norm_bias, 1.0e-6, cos, sin, spec)? {
+    let key_micros = mark_phase();
+    let cooperative_append = if let Some(experts) = experts { backend.cooperative_dsa_append_keys_layernorm_rope(layer, experts, state, position, &key, weights.k_norm_weight, weights.k_norm_bias, 1.0e-6, cos, sin, spec)? } else { false };
+    if !cooperative_append && !backend.append_dsa_keys_layernorm_rope(state, layer, position, &key, weights.k_norm_weight, weights.k_norm_bias, 1.0e-6, cos, sin, spec)? {
         let key = backend.layernorm_bias(&key, weights.k_norm_weight, weights.k_norm_bias, 1.0e-6)?;
         let key = backend.rope_prefix(&key, 1, spec.rope_dim, spec.rotary_layout, position, cos, sin)?;
         backend.append_dsa_keys(state, layer, position, &key, spec)?;
     }
+    let append_micros = mark_phase();
+    if position.saturating_add(backend.token_rows(hidden)) <= spec.top_k {
+        if key_micros >= 5_000 || append_micros >= 5_000 {
+            eprintln!("[glm-indexer-step] layer={layer} position={position} key_ms={:.3} append_ms={:.3}", key_micros as f64 / 1000.0, append_micros as f64 / 1000.0,);
+        }
+        // 候选数尚未超过 Top-K 时 MLA 直接使用完整历史；head projection 没有
+        // 消费者。单 token decode 不能继续沿用 prefill 的无条件投影。
+        return Ok(());
+    }
     backend.profile_device_operator("glm_index_query")?;
-    let query = backend.linear(q_lora, weights.wq_b)?;
-    let query = backend.rope_prefix(&query, spec.num_heads, spec.rope_dim, spec.rotary_layout, position, cos, sin)?;
     let head_weights = backend.linear(hidden, weights.weights_proj)?;
     backend.profile_device_operator("glm_index_select")?;
+    if let Some(experts) = experts
+        && backend.cooperative_dsa_project_select_prefill(layer, experts, state, q_lora, weights.wq_b, &head_weights, position, cos, sin, spec)?
+    {
+        return Ok(());
+    }
+    let query = backend.linear(q_lora, weights.wq_b)?;
+    let query = backend.rope_prefix(&query, spec.num_heads, spec.rope_dim, spec.rotary_layout, position, cos, sin)?;
+    if let Some(experts) = experts
+        && backend.cooperative_dsa_select_prefill(layer, experts, state, &query, &head_weights, spec)?
+    {
+        return Ok(());
+    }
     backend.dsa_select_prefill(state, layer, &query, &head_weights, spec)
 }
 

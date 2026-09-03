@@ -2511,6 +2511,9 @@ kernel void gqa_decode_flash_f16_position_2h(
 
     threadgroup half query_tile[heads_per_group * 256];
     threadgroup float weights[heads_per_group * tile_tokens];
+    // QK 已经得到每个 token 的完整 KV 基址；PV 复用它，避免 128 个
+    // half2 lane 重复执行环形取模和 KV-head 地址乘加。
+    threadgroup ulong value_offsets[tile_tokens];
     threadgroup float reduction[256];
     threadgroup float state[heads_per_group * 4];
     for (uint index = thread_index; index < heads_per_group * head_dim; index += 256) {
@@ -2522,13 +2525,17 @@ kernel void gqa_decode_flash_f16_position_2h(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float accumulated[heads_per_group] = {0.0f, 0.0f};
+    // PV 每 lane 保持两个相邻维度的独立 F32 累加链，token 顺序不变。
+    const uint value_dimension = thread_index * 2;
+    const bool value_active = value_dimension < head_dim;
+    float2 accumulated[heads_per_group] = {float2(0.0f), float2(0.0f)};
     for (uint tile_begin = partition_begin; tile_begin < partition_end; tile_begin += tile_tokens) {
         const uint rows = min(tile_tokens, partition_end - tile_begin);
         for (uint token = simd_group; token < rows; token += simd_groups) {
             const uint source = first_visible + tile_begin + token;
             const uint slot = source % kv_capacity;
             const ulong key_base = (ulong(slot) * kv_head_count + kv_head) * head_dim;
+            if (simd_lane == 0) value_offsets[token] = key_base;
             const uint dimension = simd_lane * 8;
             const half4 k0 = *((device const half4 *)(key + key_base + dimension));
             const half4 k1 = *((device const half4 *)(key + key_base + dimension + 4));
@@ -2584,20 +2591,21 @@ kernel void gqa_decode_flash_f16_position_2h(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        float tile_accumulated[heads_per_group] = {0.0f, 0.0f};
-        for (uint token = 0; token < rows; ++token) {
-            const uint source = first_visible + tile_begin + token;
-            const uint slot = source % kv_capacity;
-            const ulong value_index = (ulong(slot) * kv_head_count + kv_head) * head_dim + thread_index;
-            const float value_element = float(value[value_index]);
-            for (uint head = 0; head < heads_per_group; ++head) {
-                tile_accumulated[head] += weights[head * tile_tokens + token] * value_element;
+        float2 tile_accumulated[heads_per_group] = {float2(0.0f), float2(0.0f)};
+        if (value_active) {
+            for (uint token = 0; token < rows; ++token) {
+                const float2 value_element = float2(*((device const half2 *)(value + value_offsets[token] + value_dimension)));
+                for (uint head = 0; head < heads_per_group; ++head) {
+                    tile_accumulated[head] += weights[head * tile_tokens + token] * value_element;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint head = 0; head < heads_per_group; ++head) {
-            const uint state_base = head * 4;
-            accumulated[head] = accumulated[head] * state[state_base + 2] + tile_accumulated[head] * state[state_base + 3];
+        if (value_active) {
+            for (uint head = 0; head < heads_per_group; ++head) {
+                const uint state_base = head * 4;
+                accumulated[head] = accumulated[head] * state[state_base + 2] + tile_accumulated[head] * state[state_base + 3];
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -2609,8 +2617,10 @@ kernel void gqa_decode_flash_f16_position_2h(
             statistics[statistic] = state[head * 4];
             statistics[statistic + 1] = state[head * 4 + 1];
         }
-        const ulong partial = (ulong(query_head) * partition_count + partition) * head_dim + thread_index;
-        partial_values[partial] = accumulated[head];
+        if (value_active) {
+            const ulong partial = (ulong(query_head) * partition_count + partition) * head_dim + value_dimension;
+            *((device float2 *)(partial_values + partial)) = accumulated[head];
+        }
     }
 }
 
@@ -3244,9 +3254,10 @@ pub(crate) fn gqa_decode_attention_position_tensor(ctx: &MetalContext, query: &M
         const THREADS: u64 = 256;
         let retained_rows = view.rows.saturating_sub(view.start);
         let recorded_visible = if sliding_window == 0 { retained_rows } else { retained_rows.min(sliding_window as usize) };
-        // 至少 8 个 persistent partition 保持短 prompt 的 GPU 并行度；长 prompt
-        // 按 256-token tile 增长，封顶 32 后由 worker 内循环继续承接上下文。
-        let default_partitions = recorded_visible.div_ceil(128).clamp(8, 48);
+        // 至少 8 个 persistent partition 保持短 prompt 的 GPU 并行度；按
+        // 128-token worker 目标增长并向上对齐到 8 个组，避免末尾不足一轮
+        // 调度波。长上下文封顶 48，之后由 worker 内循环继续承接。
+        let default_partitions = recorded_visible.div_ceil(128).next_multiple_of(8).clamp(8, 48);
         #[cfg(test)]
         let partitions = std::env::var("ZLLM_GEMMA4_GLOBAL_ATTN_PARTITIONS").ok().and_then(|value| value.parse::<usize>().ok()).filter(|value| (1..=64).contains(value)).unwrap_or(default_partitions);
         #[cfg(not(test))]
@@ -3300,7 +3311,9 @@ pub(crate) fn gqa_decode_attention_position_tensor(ctx: &MetalContext, query: &M
         const THREADS: u64 = 256;
         let retained_rows = view.rows.saturating_sub(view.start);
         let recorded_visible = if sliding_window == 0 { retained_rows } else { retained_rows.min(sliding_window as usize) };
-        let default_partitions = recorded_visible.div_ceil(256).clamp(4, 8);
+        // 2-head kernel 的 threadgroup 占用较低；让每个 worker 目标承担
+        // 128 tokens，1,024-token 滑窗使用 8 partitions 才能铺满 M5。
+        let default_partitions = recorded_visible.div_ceil(128).clamp(4, 8);
         #[cfg(test)]
         let partitions = std::env::var("ZLLM_GEMMA4_LOCAL_ATTN_PARTITIONS").ok().and_then(|value| value.parse::<usize>().ok()).filter(|value| (1..=16).contains(value)).unwrap_or(default_partitions);
         #[cfg(not(test))]

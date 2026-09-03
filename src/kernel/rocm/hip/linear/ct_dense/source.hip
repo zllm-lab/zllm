@@ -227,6 +227,74 @@ extern "C" __global__ void ct_quantized_dual_gemv_bf16_w8_scalar(
     if (lane == 0u) output[output_row] = sum;
 }
 
+// GGUF Q8_0 的双投影单行路径。八 lane 恰好消费一个 32-column group，
+// grid.z 复用一次 dispatch 分别覆盖 q_a/kv_a，避免通用 fallback 连发两次。
+extern "C" __global__ void ct_quantized_dual_gemv_bf16_w8_g32(
+    const unsigned short* input,
+    const unsigned int* first_packed,
+    const unsigned char* first_scales,
+    float* first_output,
+    unsigned int first_output_rows,
+    unsigned int first_scale_dtype,
+    const unsigned int* second_packed,
+    const unsigned char* second_scales,
+    float* second_output,
+    unsigned int second_output_rows,
+    unsigned int second_scale_dtype,
+    unsigned int input_columns
+) {
+    const bool second = blockIdx.z != 0u;
+    const unsigned int* packed = second ? second_packed : first_packed;
+    const unsigned char* scales = second ? second_scales : first_scales;
+    float* output = second ? second_output : first_output;
+    const unsigned int output_rows =
+        second ? second_output_rows : first_output_rows;
+    const unsigned int scale_dtype =
+        second ? second_scale_dtype : first_scale_dtype;
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int outputs_per_block = blockDim.x >> 3u;
+    const unsigned int output_row =
+        blockIdx.x * outputs_per_block + subgroup;
+    if (output_row >= output_rows) return;
+
+    const unsigned int group_count = input_columns / 32u;
+    const unsigned long long packed_base =
+        (unsigned long long)output_row * (input_columns / 4u);
+    const unsigned long long scale_base =
+        (unsigned long long)output_row * group_count;
+    float sum = 0.0f;
+    for (unsigned int group = 0u; group < group_count; ++group) {
+        const unsigned int codes = packed[
+            packed_base + (unsigned long long)group * 8u + lane
+        ];
+        const unsigned int column = group * 32u + lane * 4u;
+        const zllm_ct_bf16x2 x01 = { input[column], input[column + 1u] };
+        const zllm_ct_bf16x2 x23 = { input[column + 2u], input[column + 3u] };
+        const zllm_ct_bf16x2 w01 = {
+            zllm_ct_i8_bf16[codes & 0xffu],
+            zllm_ct_i8_bf16[(codes >> 8) & 0xffu]
+        };
+        const zllm_ct_bf16x2 w23 = {
+            zllm_ct_i8_bf16[(codes >> 16) & 0xffu],
+            zllm_ct_i8_bf16[(codes >> 24) & 0xffu]
+        };
+        float word_sum = __builtin_amdgcn_fdot2_f32_bf16(
+            x01, w01, 0.0f, false
+        );
+        word_sum = __builtin_amdgcn_fdot2_f32_bf16(
+            x23, w23, word_sum, false
+        );
+        sum += word_sum * zllm_scale(
+            scales, scale_base + group, scale_dtype
+        );
+    }
+    for (unsigned int offset = 4u; offset > 0u; offset >>= 1u) {
+        sum += __shfl_down(sum, offset, 8);
+    }
+    if (lane == 0u) output[output_row] = sum;
+}
+
 // 两个独立 W4G128 projection 共用一次 dispatch 和 activation 转换。
 // grid.z 只选择权重，单个 16-lane subgroup 的累加顺序与单路快路径一致。
 extern "C" __global__ void ct_quantized_dual_gemv_bf16_w4_scalar(
@@ -616,7 +684,7 @@ extern "C" __global__ void ct_grouped_linear_bf16(
 {
     __shared__ unsigned short zllm_fused_i4_bf16[16];
     const bool zllm_singleton_pass = gridDim.x != output_rows;
-    // 单 token 时 gate/up 独立读同一 hidden；在一个 kernel 中并行累加，
+    // 小 route 时 gate/up 独立读同一 hidden；在一个 kernel 中并行累加，
     // 保留两份独立权重语义，只消除重复 input 读取与第二次完整 projection。
     if (zllm_singleton_pass
         && blockIdx.y == 0u
@@ -633,15 +701,16 @@ extern "C" __global__ void ct_grouped_linear_bf16(
             experts[zllm_fused_expert].up;
         const unsigned int zllm_fused_group_size =
             zllm_fused_gate_weight.group_size;
-        if (zllm_fused_route_end == zllm_fused_route + 1u
+        if (zllm_fused_route_end > zllm_fused_route
+            && zllm_fused_route_end <= zllm_fused_route + 3u
             && zllm_fused_group_size != 0u
             && zllm_fused_up_weight.group_size == zllm_fused_group_size
             && zllm_fused_gate_weight.scale_dtype == 0u
             && zllm_fused_up_weight.scale_dtype == 0u
             && input_columns % zllm_fused_group_size == 0u
             && zllm_fused_group_size % 8u == 0u) {
-            // projection=0 已经同时生成 activated，projection=1 只保留
-            // 原有 host 调度边界，避免改变 backend/runtime 接口。
+            // projection=0 同时生成 activated；兼容 fallback 即使仍发射
+            // projection=1，也会在这里直接返回。
             if (projection != 0u) return;
             if (threadIdx.x < 16u) {
                 zllm_fused_i4_bf16[threadIdx.x] =
@@ -653,10 +722,6 @@ extern "C" __global__ void ct_grouped_linear_bf16(
             const unsigned int zllm_fused_output_row =
                 blockIdx.x * 16u + zllm_fused_subgroup;
             if (zllm_fused_output_row >= output_rows) return;
-            const unsigned int zllm_fused_token =
-                token_ids
-                    ? token_ids[zllm_fused_route]
-                    : zllm_fused_route;
             const unsigned int* zllm_fused_gate_packed =
                 (const unsigned int*)zllm_fused_gate_weight.packed;
             const unsigned int* zllm_fused_up_packed =
@@ -671,11 +736,18 @@ extern "C" __global__ void ct_grouped_linear_bf16(
                 input_columns / zllm_fused_group_size;
             const unsigned int zllm_fused_words_per_group =
                 zllm_fused_group_size / 8u;
-            float zllm_fused_gate_sum = 0.0f;
-            float zllm_fused_up_sum = 0.0f;
-            for (unsigned int zllm_fused_group = 0u;
-                 zllm_fused_group < zllm_fused_groups;
-                 ++zllm_fused_group) {
+            for (unsigned int zllm_fused_route_index = zllm_fused_route;
+                 zllm_fused_route_index < zllm_fused_route_end;
+                 ++zllm_fused_route_index) {
+                const unsigned int zllm_fused_token =
+                    token_ids
+                        ? token_ids[zllm_fused_route_index]
+                        : zllm_fused_route_index;
+                float zllm_fused_gate_sum = 0.0f;
+                float zllm_fused_up_sum = 0.0f;
+                for (unsigned int zllm_fused_group = 0u;
+                     zllm_fused_group < zllm_fused_groups;
+                     ++zllm_fused_group) {
                 const unsigned long long zllm_fused_scale_index =
                     (unsigned long long)zllm_fused_output_row
                         * zllm_fused_groups
@@ -803,30 +875,31 @@ extern "C" __global__ void ct_grouped_linear_bf16(
                         zllm_fused_up_word_sum
                             * zllm_fused_up_scale;
                 }
-            }
-            for (unsigned int zllm_fused_offset = 8u;
-                 zllm_fused_offset;
-                 zllm_fused_offset >>= 1u) {
-                zllm_fused_gate_sum += __shfl_down(
-                    zllm_fused_gate_sum,
-                    zllm_fused_offset,
-                    16);
-                zllm_fused_up_sum += __shfl_down(
-                    zllm_fused_up_sum,
-                    zllm_fused_offset,
-                    16);
-            }
-            if (zllm_fused_lane == 0u) {
-                const unsigned long long zllm_fused_output_index =
-                    (unsigned long long)zllm_fused_route
-                        * output_rows
-                        + zllm_fused_output_row;
-                const float zllm_fused_value =
-                    (zllm_fused_gate_sum
-                        / (1.0f + expf(-zllm_fused_gate_sum)))
-                        * zllm_fused_up_sum;
-                activated[zllm_fused_output_index] =
-                    zllm_f32_to_bf16(zllm_fused_value);
+                }
+                for (unsigned int zllm_fused_offset = 8u;
+                     zllm_fused_offset;
+                     zllm_fused_offset >>= 1u) {
+                    zllm_fused_gate_sum += __shfl_down(
+                        zllm_fused_gate_sum,
+                        zllm_fused_offset,
+                        16);
+                    zllm_fused_up_sum += __shfl_down(
+                        zllm_fused_up_sum,
+                        zllm_fused_offset,
+                        16);
+                }
+                if (zllm_fused_lane == 0u) {
+                    const unsigned long long zllm_fused_output_index =
+                        (unsigned long long)zllm_fused_route_index
+                            * output_rows
+                            + zllm_fused_output_row;
+                    const float zllm_fused_value =
+                        (zllm_fused_gate_sum
+                            / (1.0f + expf(-zllm_fused_gate_sum)))
+                            * zllm_fused_up_sum;
+                    activated[zllm_fused_output_index] =
+                        zllm_f32_to_bf16(zllm_fused_value);
+                }
             }
             return;
         }
@@ -1112,6 +1185,8 @@ extern "C" __global__ void ct_grouped_gate_up_wmma_bf16(
         }
     };
     stage_prefetch(0);
+    unsigned long long cached_w4_scale_group = ~0ull;
+    float cached_w4_scale = 0.0f;
     for (unsigned int column_base = 0; column_base < input_columns; column_base += 32) {
         // 装载 32 列进 16 个 tile：half 0/1 写低 16 列（tile 0-7），half 2/3 写高 16 列（tile 8-15）。
         #pragma unroll
@@ -1160,11 +1235,15 @@ extern "C" __global__ void ct_grouped_gate_up_wmma_bf16(
                 const unsigned long long row_words
                     = (unsigned long long)output_row * packed_columns;
                 word = packed[row_words + lane_column / 8u];
-                scale = zllm_scale(
-                    scales,
-                    (unsigned long long)output_row * groups
-                        + seg_column_base / weight_meta.group_size,
-                    weight_meta.scale_dtype);
+                const unsigned long long scale_group = seg_column_base / weight_meta.group_size;
+                if (scale_group != cached_w4_scale_group) {
+                    cached_w4_scale = zllm_scale(
+                        scales,
+                        (unsigned long long)output_row * groups + scale_group,
+                        weight_meta.scale_dtype);
+                    cached_w4_scale_group = scale_group;
+                }
+                scale = cached_w4_scale;
             }
             #pragma unroll
             for (unsigned int element = 0; element < 8; ++element) {
@@ -1604,12 +1683,24 @@ extern "C" __global__ void ct_cooperative_sharded_down_bf16(
         output[(unsigned long long)token * output_rows + output_row] = sum;
 }
 
-// down K 维两半各自产生完整 hidden partial；owner 完成一次 all-reduce 与
-// shared/residual epilogue。partial 先相加，明确固定跨卡归约顺序。
+// peer 侧直接把 routed/shared 的 F32 partial 相加并压成稳定 BF16；避免先写
+// 一份 F32 combined、再单独 cast，owner 随后直接跨 PCIe 读取这份结果。
+extern "C" __global__ void ct_cooperative_combine_partial_bf16(
+    const float* routed,
+    const float* shared,
+    unsigned short* output,
+    unsigned int elements)
+{
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= elements) return;
+    output[index] = zllm_f32_to_bf16(routed[index] + shared[index]);
+}
+
+// peer partial 用 BF16 跨 PCIe 读取；owner 不生成恢复 buffer，直接在最终
+// join 中转换并与本地 partial、residual 做 F32 累加。
 extern "C" __global__ void ct_cooperative_partial_join_f32(
     const float* local_partial,
-    const float* peer_partial,
-    const float* shared,
+    const unsigned short* peer_partial,
     const float* residual,
     float* output,
     unsigned int input_rows,
@@ -1618,8 +1709,8 @@ extern "C" __global__ void ct_cooperative_partial_join_f32(
     const unsigned long long index =
         (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (index >= (unsigned long long)input_rows * hidden_size) return;
-    const float routed = local_partial[index] + peer_partial[index];
-    output[index] = residual[index] + (shared[index] + routed);
+    output[index] = residual[index] +
+        (local_partial[index] + zllm_bf16_to_f32(peer_partial[index]));
 }
 
 // MTP L78 的 compressed-tensors expert 是逐行 scale 的 W8。单路直接消费
@@ -2103,7 +2194,7 @@ extern "C" __global__ void ct_grouped_down_scatter_wmma_bf16(
     const unsigned long long packed_columns = ((unsigned long long)input_columns + 7) / 8;
     const unsigned long long groups = input_columns / weight_meta.group_size;
     const unsigned long long fp8_scale_columns = (input_columns + weight_meta.group_size - 1u) / weight_meta.group_size;
-    __shared__ unsigned short input_tiles[8][16 * 16];
+    __shared__ unsigned short input_tiles[16][16 * 16];
     __shared__ float output_scratch[8][16 * 16];
     for (unsigned int input_base = first_input_base;
          input_base < input_rows;
@@ -2115,24 +2206,47 @@ extern "C" __global__ void ct_grouped_down_scatter_wmma_bf16(
             fill_fragment(accumulator_fragments[tile], 0.0f);
         }
     }
-    for (unsigned int column_base = 0; column_base < input_columns; column_base += 16) {
-        const unsigned int flat = threadIdx.x;
-        const unsigned int local_row = flat / 16;
-        const unsigned int column = column_base + flat % 16;
+    // 与 gate/up 相同，每次预取连续 32 列。两个 16 列 WMMA segment 共用
+    // 一次 LDS 装载 barrier，并在计算当前 stage 时提前读取下一 stage。
+    const unsigned int stage_row = (threadIdx.x >> 2) & 15u;
+    const unsigned int stage_chunk = threadIdx.x & 3u;
+    const unsigned int stage_group = threadIdx.x >> 6;
+    uint2 stage_data[4];
+    unsigned int stage_valid[4] = {0u, 0u, 0u, 0u};
+    auto stage_prefetch = [&](unsigned int prefetch_base) {
         #pragma unroll
-        for (unsigned int tile = 0; tile < 8; ++tile) {
-            const unsigned int route_row = input_base + tile * 16 + local_row;
-            if (route_row < input_rows) {
-                input_tiles[tile][flat]
-                    = input[(unsigned long long)(route_begin + route_row) * input_columns + column];
-            }
+        for (unsigned int half = 0; half < 4; ++half) {
+            const unsigned int tile = stage_group + half * 4;
+            const unsigned int column_offset = (half >> 1) * 16u;
+            const unsigned int route_row = input_base + (tile & 7u) * 16u + stage_row;
+            const unsigned int column = prefetch_base + column_offset + stage_chunk * 4u;
+            stage_valid[half] = route_row < input_rows && column + 3u < input_columns;
+            stage_data[half] = stage_valid[half]
+                ? *reinterpret_cast<const uint2*>(
+                    input + (unsigned long long)(route_begin + route_row) * input_columns + column)
+                : make_uint2(0u, 0u);
         }
-        __syncwarp();
+    };
+    stage_prefetch(0u);
+    for (unsigned int column_base = 0; column_base < input_columns; column_base += 32u) {
+        #pragma unroll
+        for (unsigned int half = 0; half < 4; ++half) {
+            const unsigned int tile = stage_group + half * 4;
+            *reinterpret_cast<uint2*>(
+                &input_tiles[tile][stage_row * 16u + stage_chunk * 4u])
+                = stage_data[half];
+        }
+        if (column_base + 32u < input_columns) stage_prefetch(column_base + 32u);
+        __syncthreads();
+        #pragma unroll
+        for (unsigned int segment = 0; segment < 2; ++segment) {
+        const unsigned int segment_column_base = column_base + segment * 16u;
+        if (segment_column_base >= input_columns) break;
         BFragment weight_fragment;
         if (weight_meta.format == 1u) {
             static_assert(BFragment::num_elements == 8, "GFX11 FP8 B fragment lane layout 已改变");
             const unsigned int output_row = output_base + (lane & 15u);
-            const unsigned int lane_column = column_base + (lane >> 4u) * 8u;
+            const unsigned int lane_column = segment_column_base + (lane >> 4u) * 8u;
             unsigned long long codes = 0u;
             float scale = 0.0f;
             if (output_row < output_rows) {
@@ -2153,7 +2267,7 @@ extern "C" __global__ void ct_grouped_down_scatter_wmma_bf16(
             // W4G128 直读：同 gate/up 的 B-fragment lane 布局，寄存器 (code-8)*scale 解包。
             static_assert(BFragment::num_elements == 8, "GFX11 W4 B fragment lane layout 已改变");
             const unsigned int output_row = output_base + (lane & 15u);
-            const unsigned int lane_column = column_base + (lane >> 4u) * 8u;
+            const unsigned int lane_column = segment_column_base + (lane >> 4u) * 8u;
             unsigned int word = 0u;
             float scale = 0.0f;
             if (output_row < output_rows) {
@@ -2161,7 +2275,7 @@ extern "C" __global__ void ct_grouped_down_scatter_wmma_bf16(
                 word = packed[row_words + lane_column / 8u];
                 scale = zllm_scale(
                     scales,
-                    (unsigned long long)output_row * groups + column_base / weight_meta.group_size,
+                    (unsigned long long)output_row * groups + segment_column_base / weight_meta.group_size,
                     weight_meta.scale_dtype);
             }
             #pragma unroll
@@ -2171,18 +2285,18 @@ extern "C" __global__ void ct_grouped_down_scatter_wmma_bf16(
                     (float)((int)code - 8) * scale);
             }
         }
-        __syncthreads();
         #pragma unroll
         for (unsigned int tile = 0; tile < 8; ++tile) {
             if (input_base + tile * 16 < input_rows) {
                 AFragment input_fragment;
-                load_matrix_sync(input_fragment, (const bfloat16_t*)input_tiles[tile], 16);
+                load_matrix_sync(input_fragment, (const bfloat16_t*)input_tiles[segment * 8u + tile], 16);
                 mma_sync(
                     accumulator_fragments[tile],
                     input_fragment,
                     weight_fragment,
                     accumulator_fragments[tile]);
             }
+        }
         }
         __syncthreads();
     }
