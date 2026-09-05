@@ -1357,7 +1357,19 @@ impl Glm52Engine {
                             let d2h_micros = boundary_started.map(|started| started.elapsed().as_micros()).unwrap_or(0);
                             if critical && diagnostics.trace_stage_output {
                                 let hash = values.iter().fold(0xcbf29ce484222325_u64, |hash, &value| (hash ^ u64::from(value)).wrapping_mul(0x100000001b3));
-                                eprintln!("[glm52-stage-output] session={session} position={position} rows={rows} hash={hash:016x}");
+                                // verify 的行级数值摘要：容差内比较（位级 hash 会被
+                                // kernel 路径差异的 1-ulp 淹没），前 4 值 + L2 范数。
+                                let row_digest = (0..rows)
+                                    .map(|row| {
+                                        let start = row * hidden_size;
+                                        let row_values = &values[start..start + hidden_size];
+                                        let head4 = row_values.iter().take(4).map(|&bits| half::bf16::from_bits(bits).to_f32()).collect::<Vec<_>>();
+                                        let norm = row_values.iter().map(|&bits| f64::from(half::bf16::from_bits(bits).to_f32())).map(|value| value * value).sum::<f64>().sqrt();
+                                        format!("[{head4:?} |{norm:.3}]")
+                                    })
+                                    .collect::<Vec<_>>();
+                                let kind = if value.verify { "Verify" } else { "Decode" };
+                                eprintln!("[glm52-stage-output] kind={kind} session={session} position={position} rows={rows} hash={hash:016x} digest={row_digest:?}");
                             }
                             let selection = if critical || position.saturating_add(rows) > index_top_k { value.selection.map(|selection| selection.to_host_completed()).transpose()?.unwrap_or_default() } else { Vec::new() };
                             let selection_micros = boundary_started.map(|started| started.elapsed().as_micros()).unwrap_or(0);
@@ -2338,6 +2350,7 @@ impl Glm52Engine {
             mtp,
             cached_output_ready,
             pending_verify_rows: 0,
+            mtp_verify_rows: Vec::new(),
             dspark_aux_history,
             dspark_aux_history_start,
             prompt_dspark_aux_history,
@@ -2355,8 +2368,9 @@ impl Glm52Engine {
             dspark_verify_rounds: 0,
             dspark_verified_drafts: 0,
             dspark_accepted_drafts: 0,
-            dspark_verified_by_depth: vec![0; self.options.dspark_draft_tokens],
-            dspark_accepted_by_depth: vec![0; self.options.dspark_draft_tokens],
+            // 容量取 max(dspark, mtp)：统计字段由 DSpark 与 MTP(nextn) 共用。
+            dspark_verified_by_depth: vec![0; self.options.dspark_draft_tokens.max(self.options.mtp_draft_tokens)],
+            dspark_accepted_by_depth: vec![0; self.options.dspark_draft_tokens.max(self.options.mtp_draft_tokens)],
         })
     }
 
@@ -2527,6 +2541,35 @@ impl Glm52Engine {
         for mut item in ready {
             if item.session >= slots.len() {
                 return Err(format!("A0 ready session={} 越界 {}", item.session, slots.len()));
+            }
+            if item.verify && self.dspark_runtime.is_none() && slots[item.session].as_ref().is_some_and(|task| task.mtp.as_ref().is_some_and(|mtp| mtp.active)) {
+                // MTP(nextn) 与 DSpark split verify 同构：K+1 行各自穿 16-stage
+                // 回到 A0（每行一个单行 frame）。按到达顺序聚齐 concat 成整段
+                // （position 回退到 anchor 位）后再进入 accept 两遍式处理。
+                let task = slots[item.session].as_mut().ok_or_else(|| format!("MTP verify 落到空 session={}", item.session))?;
+                let expected = task.pending_verify_rows;
+                if expected == 0 {
+                    return Err(format!("MTP session={} 收到无 pending 的 verify", item.session));
+                }
+                if expected > item.hidden.rows || !task.mtp_verify_rows.is_empty() {
+                    let received = task.mtp_verify_rows.iter().map(|(_, hidden)| hidden.rows).sum::<usize>();
+                    let base = task.cached_tokens.len().checked_sub(expected).ok_or("MTP split verify cached_tokens 下溢")?;
+                    if item.position != base + received {
+                        return Err(format!("MTP split verify session={} position={}，期望 {}", item.session, item.position, base + received));
+                    }
+                    let total = received.saturating_add(item.hidden.rows);
+                    if total > expected {
+                        return Err(format!("MTP split verify session={} accumulated rows={total}，期望 {expected}", item.session));
+                    }
+                    task.mtp_verify_rows.push((item.position, item.hidden.clone()));
+                    if total < expected {
+                        continue;
+                    }
+                    item.position = base;
+                    let rows = std::mem::take(&mut task.mtp_verify_rows);
+                    let hidden_refs = rows.iter().map(|(_, hidden)| hidden).collect::<Vec<_>>();
+                    item.hidden = output_context.concat_token_rows(&hidden_refs).map_err(|error| format!("汇合 MTP verify hidden: {error:?}"))?;
+                }
             }
             if let Some(capture_count) = dspark_capture_count
                 && item.verify
@@ -2786,7 +2829,9 @@ impl Glm52Engine {
             let Some((offset, count)) = head_ranges[session] else { continue };
             let task = slots[session].as_mut().expect("ready session 已检查");
             let dspark_active = self.dspark_runtime.is_some() && task.mtp.as_ref().is_none_or(|mtp| !mtp.active);
-            if dspark_active {
+            // MTP(nextn) verify 与 DSpark 共用计数器，命中率统计两条路径都覆盖。
+            let mtp_active = task.mtp.as_ref().is_some_and(|mtp| mtp.active);
+            if dspark_active || mtp_active {
                 task.dspark_target_rounds += 1;
             }
             if item.verify {
@@ -2860,7 +2905,7 @@ impl Glm52Engine {
                     task.dspark_cpu_anchor_in_flight = false;
                 }
                 task.last_hidden = Some(last);
-                if dspark_active {
+                if dspark_active || mtp_active {
                     task.dspark_verify_rounds += 1;
                     task.dspark_verified_drafts += verified_drafts;
                     task.dspark_accepted_drafts += model_accepted_drafts;
@@ -3212,7 +3257,7 @@ impl Glm52Engine {
                 mtp.pending_hidden = task.last_hidden.clone();
             }
         }
-        if self.dspark_runtime.is_some() {
+        if self.dspark_runtime.is_some() || task.dspark_verify_rounds > 0 {
             let acceptance = task.dspark_accepted_drafts as f64 * 100.0 / task.dspark_verified_drafts.max(1) as f64;
             eprintln!(
                 "[glm52-dspark-summary] request_id={} completion={} target_rounds={} verify_rounds={} verified_drafts={} accepted_drafts={} acceptance={acceptance:.2}% verified_by_depth={:?} accepted_by_depth={:?}",

@@ -251,11 +251,14 @@ extern "C" __global__ void ct_quantized_dual_gemv_bf16_w8_g32(
         second ? second_output_rows : first_output_rows;
     const unsigned int scale_dtype =
         second ? second_scale_dtype : first_scale_dtype;
-    const unsigned int lane = threadIdx.x & 7u;
-    const unsigned int subgroup = threadIdx.x >> 3u;
-    const unsigned int outputs_per_block = blockDim.x >> 3u;
+    // wave32 变体（与单行 W8 G32 同构）：每 wave 一行、每 lane 一个 group
+    // （32 列 = 8 个 packed word，lane 内连续 32B），两个投影仍共享一次
+    // dispatch 与同一份 activation BF16。
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int wave = threadIdx.x >> 5u;
+    const unsigned int outputs_per_block = blockDim.x >> 5u;
     const unsigned int output_row =
-        blockIdx.x * outputs_per_block + subgroup;
+        blockIdx.x * outputs_per_block + wave;
     if (output_row >= output_rows) return;
 
     const unsigned int group_count = input_columns / 32u;
@@ -264,33 +267,168 @@ extern "C" __global__ void ct_quantized_dual_gemv_bf16_w8_g32(
     const unsigned long long scale_base =
         (unsigned long long)output_row * group_count;
     float sum = 0.0f;
-    for (unsigned int group = 0u; group < group_count; ++group) {
-        const unsigned int codes = packed[
-            packed_base + (unsigned long long)group * 8u + lane
-        ];
-        const unsigned int column = group * 32u + lane * 4u;
-        const zllm_ct_bf16x2 x01 = { input[column], input[column + 1u] };
-        const zllm_ct_bf16x2 x23 = { input[column + 2u], input[column + 3u] };
-        const zllm_ct_bf16x2 w01 = {
-            zllm_ct_i8_bf16[codes & 0xffu],
-            zllm_ct_i8_bf16[(codes >> 8) & 0xffu]
-        };
-        const zllm_ct_bf16x2 w23 = {
-            zllm_ct_i8_bf16[(codes >> 16) & 0xffu],
-            zllm_ct_i8_bf16[(codes >> 24) & 0xffu]
-        };
-        float word_sum = __builtin_amdgcn_fdot2_f32_bf16(
-            x01, w01, 0.0f, false
-        );
-        word_sum = __builtin_amdgcn_fdot2_f32_bf16(
-            x23, w23, word_sum, false
-        );
-        sum += word_sum * zllm_scale(
+    for (unsigned int group = lane; group < group_count; group += 32u) {
+        const unsigned int word_base = group * 8u;
+        float group_dot = 0.0f;
+        #pragma unroll
+        for (unsigned int word = 0u; word < 8u; ++word) {
+            const unsigned int codes = packed[packed_base + word_base + word];
+            const unsigned int column = group * 32u + word * 4u;
+            const zllm_ct_bf16x2 x01 = { input[column], input[column + 1u] };
+            const zllm_ct_bf16x2 x23 = { input[column + 2u], input[column + 3u] };
+            const zllm_ct_bf16x2 w01 = {
+                zllm_ct_i8_bf16[codes & 0xffu],
+                zllm_ct_i8_bf16[(codes >> 8) & 0xffu]
+            };
+            const zllm_ct_bf16x2 w23 = {
+                zllm_ct_i8_bf16[(codes >> 16) & 0xffu],
+                zllm_ct_i8_bf16[(codes >> 24) & 0xffu]
+            };
+            group_dot = __builtin_amdgcn_fdot2_f32_bf16(
+                x01, w01, group_dot, false
+            );
+            group_dot = __builtin_amdgcn_fdot2_f32_bf16(
+                x23, w23, group_dot, false
+            );
+        }
+        sum += group_dot * zllm_scale(
             scales, scale_base + group, scale_dtype
         );
     }
-    for (unsigned int offset = 4u; offset > 0u; offset >>= 1u) {
-        sum += __shfl_down(sum, offset, 8);
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+        sum += __shfl_down(sum, offset, 32);
+    }
+    if (lane == 0u) output[output_row] = sum;
+}
+
+// ===== W8G32 perm 直读臂（v_perm_b32 + v_dot2_f32_f16，消灭发散常量查表）=====
+// 原 w8_g32 每 group 32 次 zllm_ct_i8_bf16[] 发散 __constant__ 查表是 LSU
+// 吞吐瓶颈（dual q_a+kv_a 16MB 只跑 468GB/s，同族 q_b 614GB/s）。此臂：
+// - 激活整行经 LDS 预转 f16（bf16 值在 f16 正常值域精确表示）；
+// - 权重码由 preamble 的 zllm_w8_perm_f16 直接构造 f16(1024+u)，注意
+//   magic 只能用 0x6400（mantissa 恰好整字节放 u）；不能用 0x5C00(256)：
+//   256+u 需要 mantissa = 4u，跨字节，perm 放不了；
+// - +1024 偏置在 group 边界一次修正：dot 初值 = -(1024+128)·Σx_g，Σx_g
+//   由 staging 与 dot 同一批 f16 值累加，无第二轮舍入。
+// 乘积 f16×f16→f32 精确；修正误差 ~2^-24·1024·Σ|x|·scale 低于激活自身
+// bf16 舍入（2^-8）——bf16 容差族（Mac 端 numpy 仿真 max_rel≈1.6e-4）。
+__device__ __forceinline__ float zllm_ct_w8_g32_perm_group(
+    const zllm_f16x2* input_f16,
+    const unsigned int* packed,
+    unsigned long long packed_base,
+    const float* group_bias,
+    const unsigned char* scales,
+    unsigned long long scale_base,
+    unsigned int scale_dtype,
+    unsigned int group)
+{
+    // 32 列 = 8 个连续 u32 码字；uint4 双装载对齐 16B（group*8 恒为 4 的倍数）。
+    const uint4 codes_low = *reinterpret_cast<const uint4*>(
+        packed + packed_base + group * 8u);
+    const uint4 codes_high = *reinterpret_cast<const uint4*>(
+        packed + packed_base + group * 8u + 4u);
+    const unsigned int words[8] = {
+        codes_low.x, codes_low.y, codes_low.z, codes_low.w,
+        codes_high.x, codes_high.y, codes_high.z, codes_high.w,
+    };
+    const zllm_f16x2* source = input_f16 + group * 16u;
+    float group_dot = -group_bias[group];
+    #pragma unroll
+    for (unsigned int word = 0u; word < 8u; ++word) {
+        group_dot = zllm_f16x2_dot2(
+            source[word * 2u], zllm_w8_perm_f16(words[word], 0x0504u), group_dot);
+        group_dot = zllm_f16x2_dot2(
+            source[word * 2u + 1u], zllm_w8_perm_f16(words[word], 0x0706u), group_dot);
+    }
+    return group_dot * zllm_scale(scales, scale_base + group, scale_dtype);
+}
+
+extern "C" __global__ void ct_quantized_dual_gemv_bf16_w8_g32_perm(
+    const unsigned short* input,
+    const unsigned int* first_packed,
+    const unsigned char* first_scales,
+    float* first_output,
+    unsigned int first_output_rows,
+    unsigned int first_scale_dtype,
+    const unsigned int* second_packed,
+    const unsigned char* second_scales,
+    float* second_output,
+    unsigned int second_output_rows,
+    unsigned int second_scale_dtype,
+    unsigned int input_columns
+) {
+    const bool second = blockIdx.z != 0u;
+    const unsigned int* packed = second ? second_packed : first_packed;
+    const unsigned char* scales = second ? second_scales : first_scales;
+    float* output = second ? second_output : first_output;
+    const unsigned int output_rows =
+        second ? second_output_rows : first_output_rows;
+    const unsigned int scale_dtype =
+        second ? second_scale_dtype : first_scale_dtype;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int wave = threadIdx.x >> 5u;
+    const unsigned int outputs_per_block = blockDim.x >> 5u;
+    const unsigned int output_row =
+        blockIdx.x * outputs_per_block + wave;
+    if (output_row >= output_rows) return;
+
+    const unsigned int group_count = input_columns / 32u;
+    const unsigned long long packed_base =
+        (unsigned long long)output_row * (input_columns / 4u);
+    const unsigned long long scale_base =
+        (unsigned long long)output_row * group_count;
+
+    // LDS：f16 激活行 + 每 group 偏置修正。host 门控保证 input_columns 为
+    // 128 的倍数且总 LDS ≤32KB（6144 列 = 13KB，多 block/CU 驻留）。
+    extern __shared__ unsigned char w8_perm_cache[];
+    zllm_f16x2* input_f16 = reinterpret_cast<zllm_f16x2*>(w8_perm_cache);
+    float* group_bias = reinterpret_cast<float*>(w8_perm_cache + input_columns * 2u);
+    for (unsigned int column = threadIdx.x * 2u; column < input_columns;
+         column += blockDim.x * 2u) {
+        const unsigned int raw = *reinterpret_cast<const unsigned int*>(input + column);
+        union ZllmCtF16x2Word {
+            zllm_f16x2 pair;
+            unsigned int word;
+        } converted;
+        converted.word = (unsigned int)zllm_f32_to_f16(
+            zllm_bf16_to_f32((unsigned short)(raw & 0xffffu)))
+            | ((unsigned int)zllm_f32_to_f16(
+                zllm_bf16_to_f32((unsigned short)(raw >> 16u))) << 16u);
+        input_f16[column >> 1u] = converted.pair;
+    }
+    __syncthreads();
+    for (unsigned int group = threadIdx.x; group < group_count;
+         group += blockDim.x) {
+        const zllm_f16x2* source = input_f16 + group * 16u;
+        float sum = 0.0f;
+        #pragma unroll 8
+        for (unsigned int pair = 0u; pair < 16u; ++pair) {
+            sum += (float)source[pair].x + (float)source[pair].y;
+        }
+        group_bias[group] = 1152.0f * sum;
+    }
+    __syncthreads();
+
+    // even/odd 双 group 累加：码字装载在两个独立链上重叠，隐藏 HBM 延迟。
+    float even_sum = 0.0f;
+    float odd_sum = 0.0f;
+    unsigned int group = lane;
+    for (; group + 32u < group_count; group += 64u) {
+        even_sum += zllm_ct_w8_g32_perm_group(
+            input_f16, packed, packed_base, group_bias, scales,
+            scale_base, scale_dtype, group);
+        odd_sum += zllm_ct_w8_g32_perm_group(
+            input_f16, packed, packed_base, group_bias, scales,
+            scale_base, scale_dtype, group + 32u);
+    }
+    for (; group < group_count; group += 32u) {
+        even_sum += zllm_ct_w8_g32_perm_group(
+            input_f16, packed, packed_base, group_bias, scales,
+            scale_base, scale_dtype, group);
+    }
+    float sum = even_sum + odd_sum;
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+        sum += __shfl_down(sum, offset, 32);
     }
     if (lane == 0u) output[output_row] = sum;
 }

@@ -53,7 +53,7 @@ impl BackendResources for CudaContext {
 
     fn prepare_weight(&self, weight: LinearWeight<'_>, rows: usize, cols: usize) -> Result<CudaWeight, BackendError> {
         if let LinearWeight::Quantized(QuantizedMatrixRef::Gguf(matrix)) = weight
-            && matches!(matrix.tensor_type.0, 8 | 12..=14)
+            && matches!(matrix.tensor_type.0, 2 | 8 | 12..=14)
         {
             if matrix.rows != rows || matrix.columns != cols {
                 return Err(compute_error(format!("GGUF {} weight shape [{},{}]，期望 [{rows},{cols}]", matrix.name, matrix.rows, matrix.columns)));
@@ -310,6 +310,10 @@ impl Backend for CudaContext {
     }
 
     fn add(&self, left: &CudaTensor, right: &CudaTensor) -> Result<CudaTensor, BackendError> {
+        // f32 残差流:任一侧 f32 时结果保持 f32,防 f16 悬崖(Laguna L46)。
+        if left.slice_f32.is_some() || right.slice_f32.is_some() {
+            return ops::tensor::add_residual(self, left, right).map_err(compute_error);
+        }
         ops::tensor::add_f16(self, left, right).map_err(compute_error)
     }
 
@@ -319,6 +323,35 @@ impl Backend for CudaContext {
 
     fn sigmoid_gate(&self, input: &CudaTensor, gate: &CudaTensor) -> Result<CudaTensor, BackendError> {
         ops::attention::sigmoid_gate_f16(self, input, gate).map_err(compute_error)
+    }
+
+    fn cast_f16(&self, input: &CudaTensor) -> Result<CudaTensor, BackendError> {
+        if input.slice_f32.is_some() {
+            return ops::diffusion::cast_f32_to_f16(self, input).map_err(compute_error);
+        }
+        Ok(input.clone())
+    }
+
+    fn softplus_gate(&self, input: &CudaTensor, gate: &CudaTensor) -> Result<CudaTensor, BackendError> {
+        ops::attention::softplus_gate_per_head_f16(self, input, gate).map_err(compute_error)
+    }
+
+    fn debug_last_row_f32(&self, input: &CudaTensor) -> Result<Vec<f32>, BackendError> {
+        let row = self.select_row(input, input.rows.checked_sub(1).ok_or_else(|| compute_error("空张量无末行"))?)?;
+        self.tensor_to_f32(&row).map_err(compute_error)
+    }
+
+    fn debug_row_head_f32(&self, input: &CudaTensor, row: usize) -> Result<Vec<f32>, BackendError> {
+        let row = self.select_row(input, row)?;
+        let values = self.tensor_to_f32(&row).map_err(compute_error)?;
+        Ok(values.into_iter().take(8).collect())
+    }
+
+    fn debug_row_full_f32(&self, input: &CudaTensor, row: usize) -> Result<(Vec<f32>, usize), BackendError> {
+        let row = self.select_row(input, row)?;
+        let values = self.tensor_to_f32(&row).map_err(compute_error)?;
+        let nan = values.iter().filter(|value| value.is_nan()).count();
+        Ok((values, nan))
     }
 
     fn select_row(&self, input: &CudaTensor, row: usize) -> Result<CudaTensor, BackendError> {
@@ -336,6 +369,14 @@ impl Backend for CudaContext {
     }
 
     fn argmax(&self, input: &CudaTensor) -> Result<u32, BackendError> {
+        // f32 logits(f32 残差流的 LM head)先收缩 f16;argmax 对精度不敏感。
+        let converted;
+        let input = if input.slice_f32.is_some() {
+            converted = ops::diffusion::cast_f32_to_f16(self, input).map_err(compute_error)?;
+            &converted
+        } else {
+            input
+        };
         ops::tensor::argmax_f16(self, input).map_err(compute_error)
     }
 
@@ -399,14 +440,18 @@ impl Backend for CudaContext {
                 return ops::tensor::silu_mul_f16(self, &gate_output, &up_output).map_err(compute_error);
             }
         }
-        // GGUF Q4_K prefill/decode:packed gate/up 共同解码并融合 SiLU，
-        // 不生成反量化权重矩阵，也不保留两份投影输出。
+        // GGUF Q4_K / Q4_0 prefill/decode:packed gate/up 共同解码并融合 SiLU，
+        // 不生成反量化权重矩阵，也不保留两份投影输出。Q4_0 服务 Gemma4 QAT 官方权重。
         if matches!(activation, Activation::Silu) && gate.rows == up.rows && gate.cols == up.cols && input.cols == gate.cols {
             if let (Some(g), Some(u)) = (&gate.gguf_packed, &up.gguf_packed)
-                && g.tensor_type == 12
-                && u.tensor_type == 12
+                && g.tensor_type == u.tensor_type
+                && matches!(g.tensor_type, 2 | 12)
             {
-                return ops::linear::gated_linear_q4_k_silu_f16(self, input, &g.codes, &u.codes, gate.rows).map_err(compute_error);
+                let fused = match g.tensor_type {
+                    12 => ops::linear::gated_linear_q4_k_silu_f16(self, input, &g.codes, &u.codes, gate.rows),
+                    _ => ops::linear::gated_linear_q4_0_silu_f16(self, input, &g.codes, &u.codes, gate.rows),
+                };
+                return fused.map_err(compute_error);
             }
         }
         // 默认语义:dual_linear(两次 linear)+ gated_activation。
@@ -439,5 +484,37 @@ impl Backend for CudaContext {
         // 默认:f16 拆分 + 激活(LLM 与 f16 扩散路径)。
         let (gate, up) = self.split_columns(&input, left_columns)?;
         self.gated_activation(&gate, &up, activation)
+    }
+}
+
+impl crate::backend::SegmentedTensorBackend for CudaContext {
+    fn concat_token_rows(&self, tensors: &[&CudaTensor]) -> Result<CudaTensor, BackendError> {
+        if tensors.is_empty() {
+            return Err(compute_error("concat_token_rows 输入为空".to_owned()));
+        }
+        let columns = tensors[0].cols;
+        if tensors.iter().any(|tensor| tensor.cols != columns) {
+            return Err(compute_error(format!("concat_token_rows 列宽不一致: {:?}", tensors.iter().map(|tensor| tensor.cols).collect::<Vec<_>>())));
+        }
+        if tensors.iter().any(|tensor| tensor.slice_f32.is_some()) {
+            return Err(compute_error("concat_token_rows 暂不支持 f32 扩散 tensor"));
+        }
+        let total = tensors.iter().map(|tensor| tensor.rows).sum::<usize>();
+        let output = self.tensor_uninit(total, columns).map_err(compute_error)?;
+        let mut offset = 0usize;
+        for tensor in tensors {
+            // append_rows 复用为行段拷贝:槽位 = 绝对行 % 容量,容量=总行数时恒等。
+            ops::attention::append_rows_f16(self, tensor, &output.slice, offset, total).map_err(compute_error)?;
+            offset += tensor.rows;
+        }
+        Ok(output)
+    }
+
+    fn slice_token_rows(&self, tensor: &CudaTensor, row_start: usize, rows: usize) -> Result<CudaTensor, BackendError> {
+        if row_start + rows > tensor.rows {
+            return Err(compute_error(format!("slice_token_rows [{row_start},{}] 越界 {}", row_start + rows, tensor.rows)));
+        }
+        let indices = (row_start..row_start + rows).map(|row| row as u32).collect::<Vec<_>>();
+        self.select_rows(tensor, &indices)
     }
 }

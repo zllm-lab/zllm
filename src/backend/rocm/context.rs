@@ -600,7 +600,13 @@ impl RocmContext {
             return Err(compute_error(format!("ROCm GGUF packed shape/type 不匹配: rows={rows}, cols={cols}, bytes={}", bytes.len())));
         }
         let codes = Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, bytes).map_err(compute_error)?);
-        Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::GgufPacked { codes, tensor_type }), expert_gguf: None, cpu_mla_data: None })
+        let q8_gemv = if tensor_type == 8 {
+            let repacked = ops::hip::repack_q8_0_rows(bytes, rows, cols).map_err(compute_error)?;
+            Some(Arc::new(ops::hip::DeviceBuffer::upload(self.device_id, &repacked).map_err(compute_error)?))
+        } else {
+            None
+        };
+        Ok(RocmWeight { rows, cols, inner: RocmWeightInner::Quantized(RocmQuantizedWeight::GgufPacked { codes, tensor_type, q8_gemv }), expert_gguf: None, cpu_mla_data: None })
     }
 
     pub(crate) fn prepare_gguf_packed(&self, matrix: &crate::weight::container::gguf::GgufMatrix) -> Result<RocmWeight, BackendError> {

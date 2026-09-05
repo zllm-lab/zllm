@@ -209,6 +209,17 @@ pub fn load_direct_engine(
                 Err("Ornith CUDA console 需要 --features with-cuda".into())
             }
         }
+        (NodeModelConfig::Laguna(model), NodeBackendConfig::Cuda(cuda)) => {
+            #[cfg(feature = "with-cuda")]
+            {
+                crate::runtime::laguna::cuda_node::LagunaCudaEngine::load(model, &cuda, runtime, compute_steps).map(|engine| Box::new(engine) as Box<dyn crate::server::node::NodeEngine>)
+            }
+            #[cfg(not(feature = "with-cuda"))]
+            {
+                let _ = (model, cuda, runtime, compute_steps);
+                Err("Laguna CUDA console 需要 --features with-cuda".into())
+            }
+        }
         (NodeModelConfig::Mistral(model), NodeBackendConfig::Cuda(cuda)) => {
             #[cfg(feature = "with-cuda")]
             {
@@ -231,6 +242,20 @@ pub async fn run(config: NodeProcessConfig) -> Result<(), Box<dyn std::error::Er
 
 async fn run_parts(model: NodeModelConfig, backend: NodeBackendConfig, node_config: crate::server::node::NodeConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match model {
+        NodeModelConfig::Laguna(model) => match backend {
+            NodeBackendConfig::Cuda(cuda) => {
+                #[cfg(feature = "with-cuda")]
+                {
+                    crate::runtime::laguna::cuda_node::run(model, cuda, node_config).await
+                }
+                #[cfg(not(feature = "with-cuda"))]
+                {
+                    let _ = (model, cuda, node_config);
+                    Err("Laguna CUDA Node 需要 --features with-cuda".into())
+                }
+            }
+            _ => unreachable!("配置校验已保证 Laguna 只使用 CUDA"),
+        },
         NodeModelConfig::Ornith(model) => match backend {
             NodeBackendConfig::Metal(metal) => crate::runtime::ornith::node::run(model, metal, node_config).await,
             NodeBackendConfig::Cpu(_) => unreachable!("配置校验已保证 Ornith 不使用 CPU"),

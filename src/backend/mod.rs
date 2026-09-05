@@ -6,6 +6,8 @@ pub mod cuda;
 pub mod huawei;
 #[cfg(target_os = "macos")]
 pub mod metal;
+#[cfg(feature = "with-qnn")]
+pub mod qnn;
 #[cfg(feature = "with-rocm")]
 pub mod rocm;
 #[cfg(all(target_os = "android", feature = "with-vulkan"))]
@@ -587,6 +589,29 @@ pub trait Backend: BackendResources {
     }
     /// `input * sigmoid(gate)`；gate 可与 input 同 shape，也可每行只有一个标量。
     fn sigmoid_gate(&self, input: &Self::Tensor, gate: &Self::Tensor) -> Result<Self::Tensor, BackendError>;
+    /// `input * softplus(gate)`;gate 每行 n 列且 n 整除 input 列数,按块广播
+    /// (Laguna 逐头门控:gate=[rows, heads],input=[rows, heads*head_dim])。
+    fn softplus_gate(&self, _input: &Self::Tensor, _gate: &Self::Tensor) -> Result<Self::Tensor, BackendError> {
+        Err(BackendError::Compute { msg: "backend 未实现 softplus 逐头门控".to_owned() })
+    }
+    /// 调试插桩:回读张量末行 f32(NaN 审计等;非热路径)。
+    fn debug_last_row_f32(&self, _input: &Self::Tensor) -> Result<Vec<f32>, BackendError> {
+        Err(BackendError::Compute { msg: "backend 未实现 debug_last_row_f32".to_owned() })
+    }
+    /// 调试插桩:回读张量指定行前 8 个 f32。
+    fn debug_row_head_f32(&self, _input: &Self::Tensor, _row: usize) -> Result<Vec<f32>, BackendError> {
+        Err(BackendError::Compute { msg: "backend 未实现 debug_row_head_f32".to_owned() })
+    }
+    /// 调试插桩:回读张量整行,返回 (前8值, 全行 NaN 数)。
+    fn debug_row_full_f32(&self, _input: &Self::Tensor, _row: usize) -> Result<(Vec<f32>, usize), BackendError> {
+        Err(BackendError::Compute { msg: "backend 未实现 debug_row_full_f32".to_owned() })
+    }
+    /// f32 残差流收缩回 f16 进入投影/注意力(残差值域有界 < 65504,f16 安全);
+    /// 纯 f32 backend 恒等。防 f16 悬崖只作用于求和路径(Laguna L46)。
+    fn cast_f16(&self, input: &Self::Tensor) -> Result<Self::Tensor, BackendError> {
+        let _ = input;
+        Err(BackendError::Compute { msg: "backend 未实现 cast_f16".to_owned() })
+    }
     /// 在设备内取一行；prefill 只把最后一个 token 送入 LM head。
     fn select_row(&self, input: &Self::Tensor, row: usize) -> Result<Self::Tensor, BackendError>;
     /// 在设备内按给定顺序取多行；模型 runtime 用它构造移位后的 MTP 输入。
@@ -1562,8 +1587,9 @@ pub trait ExpertPrefillBackend: MoePrefillBackend {
         Ok(false)
     }
 
-    /// 两卡共同完成 q_b → MLA → o_proj，并把两份 full-hidden partial 与 residual
-    /// 在 owner 上融合。KV/DSA 的物理 ownership 与同步由 backend 负责。
+    /// 两卡共同完成 q_b → MLA → o_proj。backend 可以在 owner 汇合 sequence
+    /// shard 后直接生成完整输出，也可以归约两份 partial；KV/DSA 的物理
+    /// ownership 与同步由 backend 负责。
     #[allow(clippy::too_many_arguments)]
     fn cooperative_mla_prefill_add(
         &self,

@@ -17,6 +17,7 @@ impl ChatTemplate {
     /// 编译模板。注册 `raise_exception`（模板主动报"请求非法"用，转为渲染错误而非 panic），
     /// 以及 bos/eos 的默认 globals（接线时用 `set_special_tokens` 覆盖为模型真实 token 串）。
     pub fn new(template: &str) -> Result<Self, String> {
+        let template = strip_generation_markers(template);
         let mut env = Environment::new();
         // chat 模板按 Jinja2/Python 语义写（dict.get / str.split 等）,minijinja 原生没有
         // 这些方法;pycompat 回调按原语义补齐,避免改模板。
@@ -48,6 +49,12 @@ impl ChatTemplate {
     }
 }
 
+/// transformers 专用 `{% generation %}` 标注只用于训练/抽取生成区间,对渲染透明;
+/// minijinja 不识别该语句,编译前剔除(官方 Laguna 等模板在用)。
+fn strip_generation_markers(source: &str) -> String {
+    source.replace("{%- generation -%}", "").replace("{% generation %}", "").replace("{%- endgeneration -%}", "").replace("{% endgeneration %}", "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +76,13 @@ mod tests {
         assert_eq!(template.render(&with_tools).unwrap(), "[tools:get_weather]hi");
         let without_tools = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
         assert_eq!(template.render(&without_tools).unwrap(), "hi");
+    }
+
+    #[test]
+    fn generation_markers_are_stripped() {
+        let template = ChatTemplate::new("{%- generation -%}<assistant>{%- endgeneration -%}ok").unwrap();
+        let request = serde_json::json!({"messages": []});
+        assert_eq!(template.render(&request).unwrap(), "<assistant>ok");
     }
 
     #[test]

@@ -177,8 +177,8 @@ pub(crate) struct RocmMoeRoute {
 /// workspace；这里的三块 buffer 由 graph owner 独占并跨 token 保持地址稳定。
 pub(crate) struct MoeRouteGraphBuffers {
     logits: DeviceBuffer,
-    expert_ids: DeviceBuffer,
-    weights: DeviceBuffer,
+    expert_ids: std::sync::Arc<DeviceBuffer>,
+    weights: std::sync::Arc<DeviceBuffer>,
     len: usize,
 }
 
@@ -192,7 +192,12 @@ impl MoeRouteGraphBuffers {
         let logits_bytes = rows.checked_mul(experts).and_then(|n| n.checked_mul(4)).ok_or("ROCm graph logits 字节溢出")?;
         let len = rows.checked_mul(top_k).ok_or("ROCm graph route 数溢出")?;
         let route_bytes = len.checked_mul(4).ok_or("ROCm graph route 字节溢出")?;
-        Ok(Self { logits: DeviceBuffer::allocate(device_id, logits_bytes)?, expert_ids: DeviceBuffer::allocate(device_id, route_bytes)?, weights: DeviceBuffer::allocate(device_id, route_bytes)?, len })
+        Ok(Self {
+            logits: DeviceBuffer::allocate(device_id, logits_bytes)?,
+            expert_ids: std::sync::Arc::new(DeviceBuffer::allocate(device_id, route_bytes)?),
+            weights: std::sync::Arc::new(DeviceBuffer::allocate(device_id, route_bytes)?),
+            len,
+        })
     }
 
     pub(crate) fn expert_ids(&self) -> &DeviceBuffer {
@@ -201,6 +206,14 @@ impl MoeRouteGraphBuffers {
 
     pub(crate) fn weights(&self) -> &DeviceBuffer {
         &self.weights
+    }
+
+    pub(crate) fn expert_ids_arc(&self) -> std::sync::Arc<DeviceBuffer> {
+        self.expert_ids.clone()
+    }
+
+    pub(crate) fn weights_arc(&self) -> std::sync::Arc<DeviceBuffer> {
+        self.weights.clone()
     }
 
     #[allow(clippy::too_many_arguments)]

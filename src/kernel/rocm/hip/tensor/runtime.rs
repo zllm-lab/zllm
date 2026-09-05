@@ -76,6 +76,7 @@ pub(crate) struct TensorFunctions {
     pub(crate) concat_columns: usize,
     pub(crate) compact_qkv_head_range: usize,
     pub(crate) rope: usize,
+    pub(crate) rope_indirect: usize,
     #[cfg(test)]
     pub(crate) rope_segmented_pair: usize,
     pub(crate) select_rows: usize,
@@ -208,6 +209,7 @@ pub(crate) fn tensor_functions(device_id: i32) -> Result<TensorFunctions, String
                 concat_columns: function("concat_columns_f32")?,
                 compact_qkv_head_range: function("compact_qkv_head_range_f32")?,
                 rope: function("rope_f32")?,
+                rope_indirect: function("rope_indirect_f32")?,
                 #[cfg(test)]
                 rope_segmented_pair: function("rope_segmented_pair_f32")?,
                 select_rows: function("select_rows_to_f32")?,

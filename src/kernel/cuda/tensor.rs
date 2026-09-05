@@ -281,6 +281,21 @@ extern "C" __global__ void select_row_f16(
 }
 // argmax:屏蔽 excluded 中的 token(置 -inf)。excluded 为空指针 + 计数 0 时即普通 argmax。
 // excluded 设备数组 + 计数;decode 文本生成禁止输出 image/video 等特殊 token 时由 runtime 传入(通常 ≤ 数个)。
+extern "C" __global__ void add_f32_f16(const float *a, const __half *b, float *output, unsigned int count) {
+    unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= count) return;
+    output[id] = a[id] + __half2float(b[id]);
+}
+extern "C" __global__ void add_f32_f32(const float *a, const float *b, float *output, unsigned int count) {
+    unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= count) return;
+    output[id] = a[id] + b[id];
+}
+extern "C" __global__ void copy_f32(const float *input, float *output, unsigned int count) {
+    unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= count) return;
+    output[id] = input[id];
+}
 extern "C" __global__ void argmax_f16(
     const __half * __restrict__ input,
     unsigned int * __restrict__ output,
@@ -387,11 +402,59 @@ pub(super) fn grid_1d(n: usize) -> LaunchConfig {
 // ===== elementwise 算子 =====
 
 /// output = a + b。三者同形 [rows, cols]。
+/// f32 残差流加法:任一侧 f32 即输出 f32(Laguna 残差流防 f16 悬崖)。
+pub fn add_residual(ctx: &CudaContext, a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor, String> {
+    if a.rows != b.rows || a.cols != b.cols {
+        return Err(format!("CUDA add_residual shape [{},{}] vs [{},{}]", a.rows, a.cols, b.rows, b.cols));
+    }
+    let count = a.rows.checked_mul(a.cols).ok_or("CUDA add_residual 大小溢出")?;
+    match (&a.slice_f32, &b.slice_f32) {
+        (Some(left), Some(right)) => {
+            let mut out = ctx.buffer_uninit_f32(count)?;
+            let func = ctx.function("add_f32_f32")?;
+            unsafe {
+                ctx.stream().launch_builder(&func).arg(left).arg(right).arg(&mut out).arg(&(count as u32)).launch(grid_1d(count)).map_err(|e| format!("launch add_f32_f32: {e:?}"))?;
+            }
+            let placeholder = ctx.placeholder_f16()?;
+            Ok(CudaTensor::new_f32_residual(out, placeholder, a.rows, a.cols))
+        }
+        (Some(left), None) => {
+            let mut out = ctx.buffer_uninit_f32(count)?;
+            let func = ctx.function("add_f32_f16")?;
+            unsafe {
+                ctx.stream().launch_builder(&func).arg(left).arg(&b.slice).arg(&mut out).arg(&(count as u32)).launch(grid_1d(count)).map_err(|e| format!("launch add_f32_f16: {e:?}"))?;
+            }
+            let placeholder = ctx.placeholder_f16()?;
+            Ok(CudaTensor::new_f32_residual(out, placeholder, a.rows, a.cols))
+        }
+        (None, Some(right)) => {
+            let mut out = ctx.buffer_uninit_f32(count)?;
+            let func = ctx.function("add_f32_f16")?;
+            unsafe {
+                ctx.stream().launch_builder(&func).arg(right).arg(&a.slice).arg(&mut out).arg(&(count as u32)).launch(grid_1d(count)).map_err(|e| format!("launch add_f32_f16(swap): {e:?}"))?;
+            }
+            let placeholder = ctx.placeholder_f16()?;
+            Ok(CudaTensor::new_f32_residual(out, placeholder, a.rows, a.cols))
+        }
+        (None, None) => add_f16(ctx, a, b),
+    }
+}
+
+/// f32 设备切片拷贝(decode 累加器零拷贝不可行时的收尾)。
+pub fn copy_f32_slice(ctx: &CudaContext, input: &cudarc::driver::safe::CudaSlice<f32>, count: usize) -> Result<cudarc::driver::safe::CudaSlice<f32>, String> {
+    let mut out = ctx.buffer_uninit_f32(count)?;
+    let func = ctx.function("copy_f32")?;
+    unsafe {
+        ctx.stream().launch_builder(&func).arg(input).arg(&mut out).arg(&(count as u32)).launch(grid_1d(count)).map_err(|e| format!("launch copy_f32: {e:?}"))?;
+    }
+    Ok(out)
+}
+
 pub fn add_f16(ctx: &CudaContext, a: &CudaTensor, b: &CudaTensor) -> Result<CudaTensor, String> {
     if a.rows != b.rows || a.cols != b.cols {
         return Err(format!("add shape 不匹配: a=[{},{}] b=[{},{}]", a.rows, a.cols, b.rows, b.cols));
     }
-    let output = ctx.tensor_uninit(a.rows, a.cols)?;
+    let output = ctx.tensor_alloc(a.rows, a.cols)?;
     let func = ctx.function("add_f16")?;
     let count = (a.rows * a.cols) as u32;
     let cfg = grid_1d(a.rows * a.cols);
@@ -408,7 +471,7 @@ pub fn add_scaled_f16(ctx: &CudaContext, a: &CudaTensor, b: &CudaTensor, scale: 
     if !scale.is_finite() {
         return Err(format!("add_scaled scale={scale} 非法"));
     }
-    let output = ctx.tensor_uninit(a.rows, a.cols)?;
+    let output = ctx.tensor_alloc(a.rows, a.cols)?;
     let func = ctx.function("add_scaled_f16")?;
     let count = (a.rows * a.cols) as u32;
     let cfg = grid_1d(a.rows * a.cols);
@@ -423,7 +486,7 @@ pub fn silu_mul_f16(ctx: &CudaContext, gate: &CudaTensor, up: &CudaTensor) -> Re
     if gate.rows != up.rows || gate.cols != up.cols {
         return Err(format!("silu_mul shape 不匹配: gate=[{},{}] up=[{},{}]", gate.rows, gate.cols, up.rows, up.cols));
     }
-    let output = ctx.tensor_uninit(gate.rows, gate.cols)?;
+    let output = ctx.tensor_alloc(gate.rows, gate.cols)?;
     let func = ctx.function("silu_mul_f16")?;
     let count = (gate.rows * gate.cols) as u32;
     let cfg = grid_1d(gate.rows * gate.cols);
@@ -438,7 +501,7 @@ pub fn gelu_tanh_mul_f16(ctx: &CudaContext, gate: &CudaTensor, up: &CudaTensor) 
     if gate.rows != up.rows || gate.cols != up.cols {
         return Err(format!("gelu_tanh_mul shape 不匹配: gate=[{},{}] up=[{},{}]", gate.rows, gate.cols, up.rows, up.cols));
     }
-    let output = ctx.tensor_uninit(gate.rows, gate.cols)?;
+    let output = ctx.tensor_alloc(gate.rows, gate.cols)?;
     let func = ctx.function("gelu_tanh_mul_f16")?;
     let count = (gate.rows * gate.cols) as u32;
     unsafe {
@@ -453,8 +516,8 @@ pub fn split_columns_f16(ctx: &CudaContext, input: &CudaTensor, left_cols: usize
     if input.cols != total {
         return Err(format!("split_columns input cols={}，期望 left+right={total}", input.cols));
     }
-    let left = ctx.tensor_uninit(input.rows, left_cols)?;
-    let right = ctx.tensor_uninit(input.rows, right_cols)?;
+    let left = ctx.tensor_alloc(input.rows, left_cols)?;
+    let right = ctx.tensor_alloc(input.rows, right_cols)?;
     let func = ctx.function("split_columns_f16")?;
     let max_cols = left_cols.max(right_cols);
     let rows = input.rows as u32;
@@ -473,7 +536,7 @@ pub fn rmsnorm_f16(ctx: &CudaContext, input: &CudaTensor, weight: &CudaSliceF16,
     if input.cols == 0 {
         return Err("rmsnorm columns=0".to_string());
     }
-    let output = ctx.tensor_uninit(input.rows, input.cols)?;
+    let output = ctx.tensor_alloc(input.rows, input.cols)?;
     let func = ctx.function("rmsnorm_f16")?;
     let columns = input.cols as u32;
     // block 内归约需要共享内存:warp_sums[blockDim.x/32] 个 float。
@@ -499,7 +562,7 @@ pub fn segmented_rmsnorm_add_scaled_f16(ctx: &CudaContext, left: &CudaTensor, ri
     // 1. 预分配 N 个 [rows, segment_columns] 目标 tensor
     let mut out_tensors: Vec<CudaTensor> = Vec::with_capacity(segments);
     for _ in 0..segments {
-        out_tensors.push(ctx.tensor_uninit(left.rows, segment_columns)?);
+        out_tensors.push(ctx.tensor_alloc(left.rows, segment_columns)?);
     }
     // 2. 拼指针数组: cudarc DevicePtr trait 拿 raw device pointer (CUdeviceptr = u64)
     use cudarc::driver::safe::DevicePtr;
@@ -539,7 +602,7 @@ pub fn layer_norm_f16(ctx: &CudaContext, input: &CudaTensor, weight: &CudaSliceF
     if input.cols == 0 || weight.len() != input.cols || bias.len() != input.cols {
         return Err(format!("CUDA layer_norm input=[{},{}] weight={} bias={}", input.rows, input.cols, weight.len(), bias.len()));
     }
-    let output = ctx.tensor_uninit(input.rows, input.cols)?;
+    let output = ctx.tensor_alloc(input.rows, input.cols)?;
     let func = ctx.function("layer_norm_f16")?;
     let cfg = LaunchConfig { grid_dim: (input.rows as u32, 1, 1), block_dim: (THREADS, 1, 1), shared_mem_bytes: (2 * THREADS as usize * std::mem::size_of::<f32>()) as u32 };
     unsafe {
@@ -555,8 +618,8 @@ pub fn split_interleaved_columns_f16(ctx: &CudaContext, input: &CudaTensor, bloc
         return Err(format!("CUDA interleaved split cols={} block={block_columns} 非法", input.cols));
     }
     let output_columns = input.cols / 2;
-    let left = ctx.tensor_uninit(input.rows, output_columns)?;
-    let right = ctx.tensor_uninit(input.rows, output_columns)?;
+    let left = ctx.tensor_alloc(input.rows, output_columns)?;
+    let right = ctx.tensor_alloc(input.rows, output_columns)?;
     let func = ctx.function("split_interleaved_columns_f16")?;
     let rows = input.rows as u32;
     let columns = input.cols as u32;
@@ -582,7 +645,7 @@ pub fn concat_columns_f16(ctx: &CudaContext, left: &CudaTensor, right: &CudaTens
         return Err(format!("CUDA concat rows {} 与 {} 不一致", left.rows, right.rows));
     }
     let columns = left.cols.checked_add(right.cols).ok_or("CUDA concat columns 溢出")?;
-    let output = ctx.tensor_uninit(left.rows, columns)?;
+    let output = ctx.tensor_alloc(left.rows, columns)?;
     let func = ctx.function("concat_columns_f16")?;
     let rows = left.rows as u32;
     let left_columns = left.cols as u32;
@@ -624,7 +687,7 @@ fn apply_rope_f16(ctx: &CudaContext, input: &CudaTensor, head_count: usize, rota
     let table_end = position_offset.checked_add(input.rows).and_then(|rows| rows.checked_mul(half_dim)).ok_or_else(|| format!("CUDA {name} table end 溢出"))?;
     let cos = cos.get(table_begin..table_end).ok_or_else(|| format!("CUDA {name} cos={}，需要 {table_begin}..{table_end}", cos.len()))?;
     let sin = sin.get(table_begin..table_end).ok_or_else(|| format!("CUDA {name} sin={}，需要 {table_begin}..{table_end}", sin.len()))?;
-    let output = ctx.tensor_uninit(input.rows, input.cols)?;
+    let output = ctx.tensor_alloc(input.rows, input.cols)?;
     let pipeline = if prefix { "apply_rope_prefix_f16" } else { "apply_rope_partial_f16" };
     let func = ctx.function(pipeline)?;
     let rows = u32::try_from(input.rows).map_err(|_| format!("CUDA {name} rows 超过 u32"))?;
@@ -632,11 +695,9 @@ fn apply_rope_f16(ctx: &CudaContext, input: &CudaTensor, head_count: usize, rota
     let hc = u32::try_from(head_count).map_err(|_| format!("CUDA {name} head_count 超过 u32"))?;
     let rd = u32::try_from(rotary_dim).map_err(|_| format!("CUDA {name} rotary_dim 超过 u32"))?;
     let pos = 0u32;
-    // 只上传当前 token 窗口，decode 不再为每层复制整张 RoPE 表。
-    let cos_f16: Vec<half::f16> = cos.iter().map(|v| half::f16::from_f32(*v)).collect();
-    let sin_f16: Vec<half::f16> = sin.iter().map(|v| half::f16::from_f32(*v)).collect();
-    let cos_gpu = ctx.stream().clone_htod::<half::f16, _>(&cos_f16).map_err(|e| format!("{name} cos 上传失败: {e:?}"))?;
-    let sin_gpu = ctx.stream().clone_htod::<half::f16, _>(&sin_f16).map_err(|e| format!("{name} sin 上传失败: {e:?}"))?;
+    // 表窗口设备驻留缓存:同一窗口跨层复用,避免逐层 pageable 上传的重型负载 stall。
+    let cos_gpu = ctx.rope_window_f16(cos).map_err(|e| format!("{name} cos 窗口上传失败: {e}"))?;
+    let sin_gpu = ctx.rope_window_f16(sin).map_err(|e| format!("{name} sin 窗口上传失败: {e}"))?;
     unsafe {
         ctx.stream()
             .launch_builder(&func)
@@ -647,8 +708,8 @@ fn apply_rope_f16(ctx: &CudaContext, input: &CudaTensor, head_count: usize, rota
             .arg(&hc)
             .arg(&rd)
             .arg(&pos)
-            .arg(&cos_gpu)
-            .arg(&sin_gpu)
+            .arg(&*cos_gpu)
+            .arg(&*sin_gpu)
             .launch(grid_1d(input.rows * input.cols))
             .map_err(|e| format!("launch {pipeline} 失败: {e:?}"))?;
     }
@@ -660,7 +721,7 @@ pub fn select_row_f16(ctx: &CudaContext, input: &CudaTensor, row: usize) -> Resu
     if row >= input.rows {
         return Err(format!("select_row {row} 越界(共 {} 行)", input.rows));
     }
-    let output = ctx.tensor_uninit(1, input.cols)?;
+    let output = ctx.tensor_alloc(1, input.cols)?;
     let func = ctx.function("select_row_f16")?;
     let r = row as u32;
     let cols = input.cols as u32;

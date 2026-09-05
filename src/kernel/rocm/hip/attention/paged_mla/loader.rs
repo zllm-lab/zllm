@@ -54,6 +54,9 @@ fn load(device_id: i32) -> Result<(usize, PagedMlaFunctions), String> {
     };
     let dense_wmma = supports("zllm_paged_dense_wmma_marker");
     let decode_partial_wmma_q8 = if dense_wmma { function("mla_paged_decode_partial_q8_wmma_f32")? } else { 0 };
+    let decode_partial_wmma_q8_colpar = if dense_wmma { function("mla_paged_decode_partial_q8_wmma_f32_colpar")? } else { 0 };
+    let decode_partial_wmma_q8_colpar512 = if dense_wmma { function("mla_paged_decode_partial_q8_wmma_f32_colpar512")? } else { 0 };
+    let decode_partial_wmma_q8_colpar512_abl = if dense_wmma { function("mla_paged_decode_partial_q8_wmma_f32_colpar512_abl")? } else { 0 };
     Ok((
         module as usize,
         PagedMlaFunctions {
@@ -68,10 +71,12 @@ fn load(device_id: i32) -> Result<(usize, PagedMlaFunctions), String> {
             dsa_kpool_compress: function("dsa_kpool_compress_q8")?,
             cache_copy_q8_pair: function("q8_cache_copy_pair")?,
             cache_append_mla_q8_bf16: function("paged_cache_append_mla_f32_q8_bf16")?,
+            cache_append_mla_q8_bf16_indirect: function("paged_cache_append_mla_f32_q8_bf16_indirect")?,
             mla_hot_scatter_q8: function("mla_hot_scatter_q8")?,
             mla_hot_gather_q8: function("mla_hot_gather_q8")?,
             dsa_clear: function("dsa_clear_u32")?,
             dsa_gather_selection_scores: function("dsa_gather_selection_scores")?,
+            mla_gather_selected_q8: function("mla_gather_selected_q8")?,
             dsa_merge_sequence_shards: function("dsa_merge_sequence_shard_topk")?,
             dsa_score: function("dsa_score_tiles_q8")?,
             dsa_quantize_query_i8: function("dsa_quantize_query_hadamard_i8")?,
@@ -89,6 +94,7 @@ fn load(device_id: i32) -> Result<(usize, PagedMlaFunctions), String> {
             dsa_select: function("dsa_radix_select_topk")?,
             dsa_select_compact: function("dsa_compact_radix_select_topk")?,
             dsa_select_threshold: function("dsa_compact_radix_threshold")?,
+            dsa_select_radix_stage: function("dsa_compact_radix_stage")?,
             dsa_select_tile_counts: function("dsa_count_selected_tiles")?,
             dsa_select_tile_scan: function("dsa_scan_selected_tiles")?,
             dsa_select_tile_scatter: function("dsa_scatter_selected_tiles")?,
@@ -101,12 +107,17 @@ fn load(device_id: i32) -> Result<(usize, PagedMlaFunctions), String> {
             decode_attention: function("mla_paged_decode_latent_f32")?,
             decode_partial: function("mla_paged_decode_partial_f32")?,
             decode_partial_wmma_q8,
+            decode_partial_wmma_q8_colpar,
+            decode_partial_wmma_q8_colpar512,
+            decode_partial_wmma_q8_colpar512_abl,
             split_merge: function("mla_paged_split_merge_f32")?,
+            split_merge_pl: function("mla_paged_split_merge_f32_pl")?,
             selection_split: function("mla_split_selection_parity")?,
             shard_scale: function("mla_paged_shard_scale_bf16")?,
             shard_merge_heads: function("mla_paged_shard_merge_heads_bf16")?,
             project_value: function("mla_project_value_ct")?,
             project_value_wmma: function("mla_project_value_ct_wmma")?,
+            project_value_perm: function("mla_project_value_ct_perm")?,
             wavefront_size: wavefront_size as u32,
         },
     ))

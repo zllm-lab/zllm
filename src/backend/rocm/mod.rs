@@ -6,6 +6,7 @@ mod compressed_sparse;
 mod context;
 mod diffusion;
 mod dsa;
+mod dsa_union_probe;
 mod expert;
 mod gated_delta_net;
 mod hyper_connection;
@@ -132,9 +133,12 @@ pub enum RocmQuantizedWeight {
         scales: Arc<ops::hip::DeviceBuffer>,
     },
     /// GGUF K-quant 原始 block 常驻；dense/expert kernel 直接从 block 解码 scale/min。
+    /// `q8_gemv` 是 Q8_0 专属的 scales/quants 平面分离预重排（decode GEMV 向量化
+    /// 加载用；prefill 标量路径仍用 codes 原始块）。
     GgufPacked {
         codes: Arc<ops::hip::DeviceBuffer>,
         tensor_type: u32,
+        q8_gemv: Option<Arc<ops::hip::DeviceBuffer>>,
     },
 }
 
@@ -193,7 +197,7 @@ impl RocmWeight {
 
     pub(crate) fn expert_gguf(&self) -> Option<(&Arc<ops::hip::DeviceBuffer>, u32)> {
         self.expert_gguf.as_ref().map(|(codes, tensor_type)| (codes, *tensor_type)).or_else(|| match &self.inner {
-            RocmWeightInner::Quantized(RocmQuantizedWeight::GgufPacked { codes, tensor_type }) => Some((codes, *tensor_type)),
+            RocmWeightInner::Quantized(RocmQuantizedWeight::GgufPacked { codes, tensor_type, .. }) => Some((codes, *tensor_type)),
             _ => None,
         })
     }

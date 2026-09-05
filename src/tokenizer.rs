@@ -599,7 +599,16 @@ impl Tokenizer {
             let merged_id = *ids.get(merged.as_str()).ok_or_else(|| invalid_data(format!("merged token {merged:?} 不在 vocab")))?;
             merge_entries.push((left_id, right_id, merged_id));
         }
-        let vocab = tokens.iter().zip(special).enumerate().map(|(id, (token, special))| Ok((if *special { token.as_bytes().to_vec() } else { decode_byte_level(token)? }, id as u32))).collect::<io::Result<Vec<_>>>()?;
+        let mut vocab =
+            tokens.iter().zip(special).enumerate().map(|(id, (token, special))| Ok((if *special { token.as_bytes().to_vec() } else { decode_byte_level(token)? }, id as u32, *special))).collect::<io::Result<Vec<(Vec<u8>, u32, bool)>>>()?;
+        // GGUF 里同一字符串可能既是 merge vocab token 又是 added/special token(Laguna 等);
+        // string→id 匹配按 HF 语义让 special 条目胜出,同类取低 id。
+        // special 优先、同类低 id 优先的去重;不能只靠相邻 dedup(重复项在长度排序下
+        // 才相邻,这里顺序不同),用 seen 集合按保留序取首个。
+        vocab.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.1.cmp(&b.1)));
+        let mut seen = std::collections::HashSet::with_capacity(vocab.len());
+        vocab.retain(|(key, _, _)| seen.insert(key.clone()));
+        let vocab = vocab.into_iter().map(|(key, id, _)| (key, id)).collect::<Vec<_>>();
         let added = tokens
             .iter()
             .zip(special)
@@ -1476,6 +1485,22 @@ fn is_symbol(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn duplicate_vocab_key_prefers_special_token() {
+        // 完整字节字母表 + merge token(id 256,"aa")与 added/special token(id 257)同串:
+        // special 胜出,不再报 duplicate vocab key。
+        let mut tokens: Vec<String> = (0..=255u8).map(|byte| encode_byte(byte).to_string()).collect();
+        let mut special = vec![false; 256];
+        tokens.push("laguna".to_owned());
+        special.push(false);
+        tokens.push("laguna".to_owned());
+        special.push(true);
+        let merges: Vec<String> = Vec::new();
+        let tokenizer = Tokenizer::from_bpe_tokens(&tokens, &merges, &special).expect("重复 vocab key 应被去重");
+        assert_eq!(tokenizer.tokenize(b"laguna"), vec![257]);
+    }
+
     use super::*;
     use serde_json::json;
 

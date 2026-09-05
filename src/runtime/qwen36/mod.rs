@@ -719,6 +719,8 @@ where
                 self.maybe_capture(layer, &hidden);
                 // 下一层仍沿同一 queue 消费；每两层设置完成边界，及时释放
                 // PendingMetalProfile 保活的大型 attention/MLP activation。
+                // (按 chunk 行数放宽 in-flight 深度的实验无收益:gaps 的
+                // 真因是每 CB ~2.8ms 的提交固定成本,不是 CPU 编码等待。)
                 backend.submit_batch();
                 if (layer + 1).is_multiple_of(MAX_IN_FLIGHT_PREFILL_LAYERS) {
                     backend.synchronize()?;

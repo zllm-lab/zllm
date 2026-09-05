@@ -600,6 +600,8 @@ impl RocmContext {
             || latent.cols != mla.kv_lora_rank
             || k_rope.cols != mla.qk_rope_head_dim
             || residual.cols != weights.owner_o.rows
+            || weights.owner_o_full.rows != residual.cols
+            || weights.owner_o_full.cols != mla.q_projection_size
             || !mla.num_heads.is_multiple_of(2)
             || !o_columns_valid
         {
@@ -720,8 +722,13 @@ impl RocmContext {
             let half_columns = mla.q_projection_size / 2;
             let owner_source = owner_query.device.as_ref().ok_or_else(|| compute_error("pair owner query head shard 缺少 device buffer"))?.clone();
             let peer_source = peer_query.device.as_ref().ok_or_else(|| compute_error("pair peer query head shard 缺少 device buffer"))?.clone();
-            let owner_on_peer = owner_source.copy_stable_to_device_ordered_async_retained_by(peer.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} MLA owner query head->peer: {error}")))?;
-            let peer_on_owner = peer_source.copy_stable_to_device_ordered_async_retained_by(self.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} MLA peer query head->owner: {error}")))?;
+            // 先在两张卡各自的 producer stream 记录 ready，再同时排入
+            // 两个方向的 copy。连续两次单向 copy 会让 peer ready 落在
+            // owner->peer 入向 copy 之后，把本可并行的 query half 交换串行化。
+            let (mut owner_on_peer, mut peer_on_owner) =
+                ops::hip::DeviceBuffer::exchange_stable_groups_ordered_async_retained_by(&[owner_source], &[peer_source], self.device_id).map_err(|error| compute_error(format!("L{layer} MLA query head exchange: {error}")))?;
+            let owner_on_peer = owner_on_peer.pop().ok_or_else(|| compute_error(format!("L{layer} MLA owner query head->peer 缺失")))?;
+            let peer_on_owner = peer_on_owner.pop().ok_or_else(|| compute_error(format!("L{layer} MLA peer query head->owner 缺失")))?;
             let owner_on_peer = device_tensor_f32(owner_on_peer, 1, half_columns);
             let peer_on_owner = device_tensor_f32(peer_on_owner, 1, half_columns);
             peer.activate().map_err(compute_error)?;
@@ -737,8 +744,10 @@ impl RocmContext {
         if query_row_split {
             let owner_query_source = owner_query.device.as_ref().ok_or_else(|| compute_error("pair owner query 缺少 device buffer"))?.clone();
             let peer_query_source = peer_query.device.as_ref().ok_or_else(|| compute_error("pair peer query 缺少 device buffer"))?.clone();
-            let owner_query_on_peer = owner_query_source.copy_stable_to_device_ordered_async_retained_by(peer.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} MLA owner query->peer: {error}")))?;
-            let peer_query_on_owner = peer_query_source.copy_stable_to_device_ordered_async_retained_by(self.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} MLA peer query->owner: {error}")))?;
+            let (mut owner_query_on_peer, mut peer_query_on_owner) =
+                ops::hip::DeviceBuffer::exchange_stable_groups_ordered_async_retained_by(&[owner_query_source], &[peer_query_source], self.device_id).map_err(|error| compute_error(format!("L{layer} MLA query row exchange: {error}")))?;
+            let owner_query_on_peer = owner_query_on_peer.pop().ok_or_else(|| compute_error(format!("L{layer} MLA owner query->peer 缺失")))?;
+            let peer_query_on_owner = peer_query_on_owner.pop().ok_or_else(|| compute_error(format!("L{layer} MLA peer query->owner 缺失")))?;
             let owner_query_on_peer = device_tensor_with_dtype(owner_query_on_peer, half_query_rows, mla.q_projection_size, owner_query.dtype);
             let peer_query_on_owner = device_tensor_with_dtype(peer_query_on_owner, half_query_rows, mla.q_projection_size, peer_query.dtype);
             return self.cooperative_mla_query_row_shards_finish(
@@ -791,6 +800,32 @@ impl RocmContext {
             ops::hip::device_profile_scope_end(self.device_id).map_err(compute_error)?;
             ops::hip::device_profile_scope_begin(self.device_id, "glm_pair_attn_owner_post").map_err(compute_error)?;
         }
+
+        if normalized_q_lora.rows == 1 && weights.o_head_sharded() && ops::hip::options().cooperative_mla_decode_full_merge {
+            // decode 已经必须把 peer 的 weighted/stats 送到 owner 完成稳定 softmax。
+            // owner 直接物化全部 head 并执行完整 o_proj，删除 full-hidden partial
+            // 的第二次 P2P 与归约；peer 不再做 attention 尾部投影。
+            let mut peer_on_owner = copy_sequence_shards_to_device(&[&peer_shard], self.device_id, self.device_id)?;
+            let peer_on_owner = peer_on_owner.pop().expect("单 shard P2P 已校验");
+            if profile_pair {
+                peer.activate().map_err(compute_error)?;
+                ops::hip::device_profile_scope_end(peer.device_id).map_err(compute_error)?;
+                ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+            }
+            let projected = project_merged_sequence_heads(self, &owner_shard, &peer_on_owner, &weights.owner_kv_b, &weights.owner_o_full, 1, 0, mla.num_heads, mla)?;
+            trace_step("full-output-projection");
+            let residual = f32_tensor(self, residual)?;
+            let output = self.add(&projected, &residual)?;
+            trace_step("residual-add");
+            if profile_pair {
+                ops::hip::device_profile_scope_end(self.device_id).map_err(compute_error)?;
+            }
+            ops::hip::order_stream_after(self.device_id, 0, owner_stream).map_err(compute_error)?;
+            ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
+            trace_step("exit-handoff");
+            return Ok(output);
+        }
+
         let (local_partial, stable_peer_partial) = if weights.o_head_sharded() {
             // 两张卡先完成各自的 sequence shard，再各自通过 peer BAR 读取另一半
             // weighted latent，只物化自己的 head 半区并执行半列 o_proj。
@@ -1094,14 +1129,11 @@ impl DecodeBackend for RocmContext {
         } else {
             None
         };
-        let mut prepared = if let LinearWeight::Quantized(QuantizedMatrixRef::W8A16(matrix)) = weight {
-            let mut values = vec![0.0_f32; checked_elements(rows, cols, "ROCm MLA KV-B")?];
-            crate::weight::codec::groupwise::decode_w8a16_matrix(matrix.packed(), matrix.scales(), matrix.scale_dtype(), matrix.group_size(), rows, cols, &mut values).map_err(compute_error)?;
-            let values = values.into_iter().map(half::f16::from_f32).collect::<Vec<_>>();
-            self.prepare_weight(LinearWeight::F16(&values), rows, cols)?
-        } else {
-            self.prepare_weight(weight, rows, cols)?
-        };
+        // W8A16 直接驻留（absorb decode 有 W8G32 向量化臂、PV 有 W8G32 快路径，
+        // 均为同值逐位/近无损）；此前 decode 成 F32 dense 驻留让 absorb/PV 多读
+        // 4 倍字节（58.6MB/层 → 14.7MB/层）。prefill WMMA 走 paged_weight 通用
+        // W8 反量化，正确但逐元素解码（TTFT 观察项）。
+        let mut prepared = self.prepare_weight(weight, rows, cols)?;
         prepared.cpu_mla_data = cpu_mla_data;
         Ok(prepared)
     }

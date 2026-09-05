@@ -7,7 +7,7 @@
 //!
 //! 与 qwen3_vl 的差异（Mistral 默认无 QK-norm）：
 //! - 无 QK-norm（`GqaSpec.use_qk_norm = false`）
-//! - q/k/v 独立投影（非 fused QKV，用 `dual_linear(q, k)` + 独立 `linear(v)`）
+//! - q/k/v 独立权重，通过 `triple_linear` 让 backend 选择是否合并 dispatch
 //! - 无 vision tower（Mistral-3.2 文本分支；未来 VLM 接入预留 `vision.rs` 子模块）
 //!
 //! 模板：`src/runtime/qwen3_vl.rs::text_layer` (715-737)，删掉 `gemma_rmsnorm_heads`
@@ -16,7 +16,7 @@
 use crate::{
     attention::{
         gqa::{CausalWindow, GqaSpec},
-        rope::{RopeTable, RotaryLayout},
+        rope::{RopeSpec, RopeTable, RotaryLayout},
     },
     backend::{Backend, BackendError, GqaPrefillBackend, LinearWeight},
     moe::{
@@ -82,13 +82,17 @@ pub fn prepare_mistral_output_head_quantized<B: Backend>(backend: &B, config: &M
 
 /// RoPE 表，按整个 prefill 序列一次性算好。
 pub fn mistral_rope_table(config: &MistralConfig, seq_len: usize) -> RopeTable {
-    RopeTable::precompute(seq_len, config.head_dim, config.rope_theta)
+    let spec = match config.rope_scaling {
+        Some(scaling) => RopeSpec::Yarn { rotary_dim: config.head_dim, theta: config.rope_theta, factor: scaling.factor, original_context: scaling.original_context, beta_fast: scaling.beta_fast, beta_slow: scaling.beta_slow },
+        None => RopeSpec::Default { rotary_dim: config.head_dim, theta: config.rope_theta },
+    };
+    RopeTable::from_spec(seq_len, spec).unwrap_or_else(|error| panic!("Mistral RoPE 参数非法: {error}"))
 }
 
 /// 单 token 增量推理的 RoPE 前缀表；常驻 engine 应预计算最大长度并复用，
 /// 这个便捷入口只供一次性调用。
 pub fn mistral_decode_rope_table(config: &MistralConfig, position: usize) -> RopeTable {
-    RopeTable::precompute(position + 1, config.head_dim, config.rope_theta)
+    mistral_rope_table(config, position + 1)
 }
 
 /// Prefill 一整段 prompt 的 hidden states（最后一层输出），可选同时写入 KV cache。
@@ -219,8 +223,7 @@ fn mistral_layer<B: GqaPrefillBackend>(
     }
     // 1. pre-norm + QKV projections
     let normed = backend.rmsnorm(hidden, &weights.input_norm, config.rms_eps)?;
-    let (query, key) = backend.dual_linear(&normed, &weights.query, &weights.key)?;
-    let value = backend.linear(&normed, &weights.value)?;
+    let (query, key, value) = backend.triple_linear(&normed, &weights.query, &weights.key, &weights.value)?;
     // 2. RoPE on Q/K (SplitHalf layout, full head_dim as rotary dim)
     let query = backend.rope_prefix(&query, config.num_heads, config.head_dim, RotaryLayout::SplitHalf, position, &rope.cos, &rope.sin)?;
     let key = backend.rope_prefix(&key, config.num_kv_heads, config.head_dim, RotaryLayout::SplitHalf, position, &rope.cos, &rope.sin)?;
@@ -287,7 +290,20 @@ mod tests {
 
     #[test]
     fn sequence_length不超过模型声明上限() {
-        let config = MistralConfig { layer_count: 1, hidden_size: 8, intermediate_size: 16, num_heads: 1, num_kv_heads: 1, head_dim: 8, vocab_size: 32, max_position_embeddings: 128, rope_theta: 10_000.0, rms_eps: 1e-5 };
+        let config = MistralConfig {
+            architecture: crate::weight::model::mistral::DenseGqaArchitecture::Mistral,
+            layer_count: 1,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 8,
+            vocab_size: 32,
+            max_position_embeddings: 128,
+            rope_theta: 10_000.0,
+            rope_scaling: None,
+            rms_eps: 1e-5,
+        };
         assert!(crate::runtime::validate_max_sequence_length("Mistral", 128, config.max_position_embeddings).is_ok());
         assert!(crate::runtime::validate_max_sequence_length("Mistral", 0, config.max_position_embeddings).is_err());
         assert!(crate::runtime::validate_max_sequence_length("Mistral", 129, config.max_position_embeddings).is_err());

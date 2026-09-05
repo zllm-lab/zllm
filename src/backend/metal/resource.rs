@@ -4,15 +4,17 @@ use super::{MetalContext, MetalGpuProfile};
 
 const MIN_SYSTEM_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
-/// 模型加载完成后的 Metal resident 可用预算。库模式与节点模式都以同一快照
-/// 建立 KV admission，避免把权重和系统保留空间重复算作可用显存。
+/// 模型加载完成后的 Metal resident 容量口径:统一内存工作集减系统保留。
+/// 引擎常驻(权重等 current_allocated_size)由 FixedSessionResidency 在
+/// admission 侧统一扣除;这里再扣一次会把同一笔常驻算两遍,大权重
+/// (如 26GB 机器装 27B)直接把 session 预算压成 0,节点永不调度。
 pub fn available_residency_bytes(ctx: &MetalContext) -> u64 {
     let working_set = ctx.device.recommended_max_working_set_size();
     if working_set == 0 {
         return 0;
     }
     let reserve = (working_set / 8).max(MIN_SYSTEM_RESERVE_BYTES).min(working_set / 2);
-    working_set.saturating_sub(reserve).saturating_sub(ctx.device.current_allocated_size())
+    working_set.saturating_sub(reserve)
 }
 
 pub fn merge_gpu_profiles(totals: &mut Vec<MetalGpuProfile>, current: &[MetalGpuProfile]) {

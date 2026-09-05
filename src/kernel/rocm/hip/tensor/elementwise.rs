@@ -10,10 +10,18 @@ use super::*;
 
 pub fn try_add_resident_f32(device_id: i32, left: &DeviceBuffer, right: &DeviceBuffer, elements: usize, scale: f32) -> Result<DeviceBuffer, String> {
     let bytes = elements.checked_mul(4).ok_or("resident add 大小溢出")?;
+    let output = DeviceBuffer::allocate_reusable(device_id, bytes)?;
+    try_add_resident_f32_into(device_id, left, right, &output, elements, scale)?;
+    Ok(output)
+}
+
+/// graph 兼容的 into 变体：输出地址由调用方持有并固定。
+pub fn try_add_resident_f32_into(device_id: i32, left: &DeviceBuffer, right: &DeviceBuffer, output: &DeviceBuffer, elements: usize, scale: f32) -> Result<(), String> {
+    let bytes = elements.checked_mul(4).ok_or("resident add 大小溢出")?;
     validate_resident(left, device_id, bytes, "add left")?;
     validate_resident(right, device_id, bytes, "add right")?;
+    validate_resident(output, device_id, bytes, "add output")?;
     set_device(device_id)?;
-    let output = DeviceBuffer::allocate_reusable(device_id, bytes)?;
     let functions = tensor_functions(device_id)?;
     let mut d_left = left.pointer;
     let mut d_right = right.pointer;
@@ -22,7 +30,7 @@ pub fn try_add_resident_f32(device_id: i32, left: &DeviceBuffer, right: &DeviceB
     let mut scale = scale;
     let mut arguments = [(&mut d_left as *mut *mut c_void).cast(), (&mut d_right as *mut *mut c_void).cast(), (&mut d_output as *mut *mut c_void).cast(), (&mut elements as *mut u32).cast(), (&mut scale as *mut f32).cast()];
     launch_tensor_kernel(functions.add_scaled, elements.div_ceil(256), 256, &mut arguments, "HIP resident add")?;
-    Ok(output)
+    Ok(())
 }
 
 pub fn try_subtract_resident_f32(device_id: i32, left: &DeviceBuffer, right: &DeviceBuffer, elements: usize) -> Result<DeviceBuffer, String> {
@@ -830,8 +838,15 @@ pub fn try_sample_top_p_rows_excluding_resident_f32(device_id: i32, input: &Devi
         launch_tensor_kernel(functions.sample_top_p_rows_excluding, grid, 1024, &mut arguments, "HIP resident row top-p")?;
         let mut output = vec![u32::MAX; rows];
         workspace.buffer(3).copy_to_host(unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast(), output_bytes) })?;
-        if output.contains(&u32::MAX) {
-            return Err("HIP sample rows 存在没有可选 token 的行".to_owned());
+        if let Some(row) = output.iter().position(|&token| token == u32::MAX) {
+            // 区分两种失败：概率和为 0/NaN（上游 hidden 垃圾）vs 正常分布但
+            // top-p 候选全被 excluded（fence 状态污染）。
+            let mut all_probabilities = vec![0.0_f32; rows * columns as usize];
+            workspace.buffer(2).copy_to_host(unsafe { std::slice::from_raw_parts_mut(all_probabilities.as_mut_ptr().cast(), all_probabilities.len() * 4) })?;
+            let row_slice = &all_probabilities[row * columns as usize..(row + 1) * columns as usize];
+            let probe: Vec<f32> = row_slice.iter().copied().take(8).collect();
+            let sum: f32 = row_slice.iter().sum();
+            return Err(format!("HIP sample rows 行 {row}/{rows} 无可选 token：概率首 8={probe:?} 概率和={sum} columns={columns} excluded={}", excluded.len()));
         }
         Ok(output)
     })?;
@@ -937,13 +952,45 @@ pub fn try_rmsnorm_resident_weight_to_bf16(device_id: i32, input: &DeviceBuffer,
 }
 
 #[derive(Clone, Copy)]
-enum RmsnormOutput {
+pub(crate) enum RmsnormOutput {
     F32,
     Bf16,
     F32AndBf16,
 }
 
 fn try_rmsnorm_resident_weight(device_id: i32, input: &DeviceBuffer, weight: &DeviceBuffer, rows: usize, cols: usize, eps: f32, gemma: bool, output_kind: RmsnormOutput) -> Result<(DeviceBuffer, Option<DeviceBuffer>), String> {
+    let elements = rows.checked_mul(cols).ok_or("resident weight RMSNorm 大小溢出")?;
+    let f32_bytes = elements.checked_mul(4).ok_or("resident weight RMSNorm F32 字节溢出")?;
+    let bf16_bytes = elements.checked_mul(2).ok_or("resident weight RMSNorm BF16 字节溢出")?;
+    let output_is_bf16 = matches!(output_kind, RmsnormOutput::Bf16);
+    let output_bytes = if output_is_bf16 { bf16_bytes } else { f32_bytes };
+    if input.bytes() != f32_bytes && input.bytes() != bf16_bytes {
+        return Err(format!("resident weight RMSNorm input 字节={}，期望 BF16={bf16_bytes} 或 F32={f32_bytes}", input.bytes()));
+    }
+    validate_resident(input, device_id, input.bytes(), "resident weight RMSNorm input")?;
+    validate_resident(weight, device_id, cols.checked_mul(4).ok_or("resident weight RMSNorm 参数字节溢出")?, "resident weight RMSNorm weight")?;
+    set_device(device_id)?;
+    let output = DeviceBuffer::allocate_reusable(device_id, output_bytes)?;
+    // dual RMSNorm 的 BF16 分支会被 cooperative MoE 直接跨卡消费；从源头
+    // 放入显式池，避免 async allocation 再 deferred D2D 的跨 stream 可见性窗口。
+    let quantized = matches!(output_kind, RmsnormOutput::F32AndBf16).then(|| DeviceBuffer::allocate_peer(device_id, bf16_bytes)).transpose()?;
+    return try_rmsnorm_resident_weight_into(device_id, input, weight, &output, quantized.as_ref(), rows, cols, eps, gemma, output_kind).map(|()| (output, quantized));
+}
+
+/// graph 兼容的 into 变体：输出地址由调用方持有并固定。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_rmsnorm_resident_weight_into(
+    device_id: i32,
+    input: &DeviceBuffer,
+    weight: &DeviceBuffer,
+    output: &DeviceBuffer,
+    quantized: Option<&DeviceBuffer>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    gemma: bool,
+    output_kind: RmsnormOutput,
+) -> Result<(), String> {
     let elements = rows.checked_mul(cols).ok_or("resident weight RMSNorm 大小溢出")?;
     let f32_bytes = elements.checked_mul(4).ok_or("resident weight RMSNorm F32 字节溢出")?;
     let bf16_bytes = elements.checked_mul(2).ok_or("resident weight RMSNorm BF16 字节溢出")?;
@@ -956,11 +1003,12 @@ fn try_rmsnorm_resident_weight(device_id: i32, input: &DeviceBuffer, weight: &De
     };
     validate_resident(input, device_id, input.bytes(), "resident weight RMSNorm input")?;
     validate_resident(weight, device_id, cols.checked_mul(4).ok_or("resident weight RMSNorm 参数字节溢出")?, "resident weight RMSNorm weight")?;
+    validate_resident(output, device_id, output_bytes, "resident weight RMSNorm output")?;
+    if matches!(output_kind, RmsnormOutput::F32AndBf16) {
+        let Some(quantized) = quantized else { return Err("resident weight RMSNorm dual 缺少 BF16 输出".to_owned()) };
+        validate_resident(quantized, device_id, bf16_bytes, "resident weight RMSNorm quantized output")?;
+    }
     set_device(device_id)?;
-    let output = DeviceBuffer::allocate_reusable(device_id, output_bytes)?;
-    // dual RMSNorm 的 BF16 分支会被 cooperative MoE 直接跨卡消费；从源头
-    // 放入显式池，避免 async allocation 再 deferred D2D 的跨 stream 可见性窗口。
-    let quantized = matches!(output_kind, RmsnormOutput::F32AndBf16).then(|| DeviceBuffer::allocate_peer(device_id, bf16_bytes)).transpose()?;
     let functions = tensor_functions(device_id)?;
     let mut d_input = input.pointer;
     let mut d_weight = weight.pointer;
@@ -987,7 +1035,7 @@ fn try_rmsnorm_resident_weight(device_id: i32, input: &DeviceBuffer, weight: &De
     // 同一行不能因为邻接行数量改变归约树，否则连续批处理会改变解码结果。
     let threads = if cols >= 2048 { 512 } else { 256 };
     launch_tensor_kernel(functions.rmsnorm, rows, threads, &mut arguments, "HIP resident weight rmsnorm")?;
-    Ok((output, quantized))
+    Ok(())
 }
 
 pub fn try_rmsnorm_resident_weight_to_f32_bf16(device_id: i32, input: &DeviceBuffer, weight: &DeviceBuffer, rows: usize, cols: usize, eps: f32, gemma: bool) -> Result<(DeviceBuffer, DeviceBuffer), String> {

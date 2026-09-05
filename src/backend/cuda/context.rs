@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use cudarc::cublas::CudaBlas;
@@ -114,6 +114,41 @@ impl CudaTensor {
 /// 设计说明:cudarc 的 `CudaContext` 用 `Arc` 引用计数(多数方法签名是 `self: &Arc<Self>`),
 /// 所以本结构持有 `Arc<CudaCtx>`,并在构造时顺便取一份 `Arc<CudaStream>` 缓存,
 /// 避免每次算子调用都走 `default_stream`(那会原子地查/建默认流)。
+/// expert 流式上传的轮转槽:buffer 按需增长,event 为上一次 DMA 的完成标记。
+struct PinnedUploadSlot {
+    buffer: cudarc::driver::safe::PinnedHostSlice<u8>,
+    event: Option<cudarc::driver::safe::CudaEvent>,
+}
+
+const PINNED_UPLOAD_SLOTS: usize = 8;
+
+#[derive(Default)]
+struct PinnedUploadRing {
+    slots: Vec<Option<PinnedUploadSlot>>,
+    next: usize,
+}
+
+impl PinnedUploadRing {
+    /// 取出下一槽;返回槽在环内的原位置(release 时放回,保留已增长的容量)。
+    fn take_slot(&mut self) -> (usize, Option<PinnedUploadSlot>) {
+        if self.slots.len() < PINNED_UPLOAD_SLOTS {
+            self.slots.push(None);
+            let index = self.slots.len() - 1;
+            self.next = 0;
+            return (index, None);
+        }
+        let index = self.next;
+        self.next = (self.next + 1) % self.slots.len();
+        (index, self.slots[index].take())
+    }
+
+    fn release_slot(&mut self, index: usize, slot: Option<PinnedUploadSlot>) {
+        if index < self.slots.len() {
+            self.slots[index] = slot;
+        }
+    }
+}
+
 pub struct CudaContext {
     ctx: Arc<CudaCtx>,
     stream: Arc<CudaStream>,
@@ -121,8 +156,22 @@ pub struct CudaContext {
     module: Arc<CudaModule>,
     functions: Mutex<HashMap<String, CudaFunction>>,
     row_maps: Mutex<HashMap<Vec<u32>, Arc<CudaSlice<u32>>>>,
+    /// rope 表窗口缓存:键 = (源切片地址, 元素数)。rope 表由引擎长期持有,地址稳定;
+    /// 同一窗口(query/key × 各层)跨层命中,避免逐层 pageable 上传的重型负载 stall。
+    /// 容量封顶:decode 逐 token 前移窗口,超过上限后退化为直接 pinned 上传。
+    rope_windows: Mutex<HashMap<(usize, usize), Arc<CudaSlice<f16>>>>,
     pinned_u32: Mutex<Option<cudarc::driver::safe::PinnedHostSlice<u32>>>,
     pinned_f16: Mutex<Option<cudarc::driver::safe::PinnedHostSlice<f16>>>,
+    pinned_f32_src: Mutex<Option<cudarc::driver::safe::PinnedHostSlice<f32>>>,
+    /// expert 流式上传的 pinned 槽环:槽复用前只等自己的 DMA 事件,不排空计算流。
+    pinned_u8_ring: Mutex<PinnedUploadRing>,
+    /// expert 流式上传专用 copy 流:分配/DMA 不进计算流 backlog,消费侧
+    /// wait copy fence 事件拿跨流依赖。
+    copy_stream: Arc<cudarc::driver::safe::CudaStream>,
+    copy_fence: Mutex<Option<cudarc::driver::safe::CudaEvent>>,
+    /// 计算流上 expert buffer 分配完成的事件;copy 流 DMA 前等待,
+    /// 保证 mallocAsync 指针在跨流使用前已物化。
+    copy_fence_dirty: AtomicBool,
     gpu_nanoseconds: AtomicU64,
     command_buffers: AtomicU64,
 }
@@ -175,6 +224,32 @@ impl CudaContext {
         // 4. 取默认 stream 缓存。default_stream 需要 &Arc<Self>,返回 Arc<CudaStream>。
         let stream = ctx.default_stream();
         let blas = CudaBlas::new(stream.clone()).map_err(|e| format!("CUDA cuBLAS 初始化失败: {e:?}"))?;
+        // expert 上传专用 copy 流;同时把 mallocAsync 池的 release threshold 归零,
+        // freeAsync 即时归还设备内存——12GB 级显存上池峰值保留会挤掉 expert cache
+        // (实测 6GiB cache 因池保留峰值 OOM)。
+        let copy_stream = ctx.new_stream().map_err(|e| format!("CUDA copy stream 创建失败: {e:?}"))?;
+        unsafe {
+            let mut pool: cudarc::driver::sys::CUmemoryPool = std::ptr::null_mut();
+            if cudarc::driver::sys::cuDeviceGetDefaultMemPool(&mut pool, options.device as cudarc::driver::sys::CUdevice) == cudarc::driver::sys::cudaError_enum::CUDA_SUCCESS && !pool.is_null() {
+                // eager 归还:freeAsync 即时归还设备内存(expert cache 让出峰值余量)。
+                if std::env::var_os("ZLLM_CUDA_POOL_EAGER").is_some() {
+                    let threshold: usize = 0;
+                    cudarc::driver::sys::cuMemPoolSetAttribute(pool, cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, &threshold as *const usize as *mut std::ffi::c_void);
+                }
+                // 严格复用(诊断开关):关闭全部跨流/机会主义复用捷径,验证
+                // "池跨流复用竞态"假设——L46 损坏的领先根因候选。
+                if std::env::var_os("ZLLM_CUDA_POOL_STRICT").is_some() {
+                    for attr in [
+                        cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_REUSE_FOLLOW_EVENT_DEPENDENCIES,
+                        cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_REUSE_ALLOW_OPPORTUNISTIC,
+                        cudarc::driver::sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_REUSE_ALLOW_INTERNAL_DEPENDENCIES,
+                    ] {
+                        let disabled: i32 = 0;
+                        cudarc::driver::sys::cuMemPoolSetAttribute(pool, attr, &disabled as *const i32 as *mut std::ffi::c_void);
+                    }
+                }
+            }
+        }
 
         Ok(Self {
             ctx,
@@ -183,11 +258,57 @@ impl CudaContext {
             module,
             functions: Mutex::new(HashMap::new()),
             row_maps: Mutex::new(HashMap::new()),
+            rope_windows: Mutex::new(HashMap::new()),
             pinned_u32: Mutex::new(None),
             pinned_f16: Mutex::new(None),
+            pinned_f32_src: Mutex::new(None),
+            pinned_u8_ring: Mutex::new(PinnedUploadRing::default()),
+            copy_stream,
+            copy_fence: Mutex::new(None),
+            copy_fence_dirty: AtomicBool::new(false),
             gpu_nanoseconds: AtomicU64::new(0),
             command_buffers: AtomicU64::new(0),
         })
+    }
+
+    pub fn copy_stream(&self) -> &Arc<cudarc::driver::safe::CudaStream> {
+        &self.copy_stream
+    }
+
+    /// 在 copy 流上记录栅栏;消费侧通过 wait_copy_fence 建立跨流依赖。
+    fn record_copy_fence(&self) -> Result<(), String> {
+        let mut guard = self.copy_fence.lock().map_err(|_| "CUDA copy fence 锁已中毒".to_owned())?;
+        let event = guard.get_or_insert_with(|| self.ctx.new_event(None).unwrap_or_else(|_| unreachable!("copy fence 事件创建失败")));
+        event.record(&self.copy_stream).map_err(|e| format!("CUDA copy fence 记录失败: {e:?}"))?;
+        self.copy_fence_dirty.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// 计算流等待 copy 栅栏(有新上传时);幂等。
+    pub fn wait_copy_fence(&self) -> Result<(), String> {
+        if !self.copy_fence_dirty.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(());
+        }
+        let guard = self.copy_fence.lock().map_err(|_| "CUDA copy fence 锁已中毒".to_owned())?;
+        if let Some(event) = guard.as_ref() {
+            // 二分诊断:ZLLM_CUDA_FENCE_SYNC=1 时用 host 同步替代跨流 stream wait,
+            // 区分"event 跨流依赖未生效"与"内存被并发踩"。
+            if std::env::var_os("ZLLM_CUDA_FENCE_SYNC").is_some() {
+                event.synchronize().map_err(|e| format!("CUDA copy fence host 同步失败: {e:?}"))?;
+                return Ok(());
+            }
+            self.stream.wait(event).map_err(|e| format!("CUDA copy fence 等待失败: {e:?}"))?;
+        }
+        Ok(())
+    }
+
+    /// copy-on 下 expert 块宿主在 copy 流;驱逐 freeAsync 前让 copy 流等计算流,
+    /// 否则读块的 kernel(计算流)未完成块就被池复用,后续写入踩到在途读取。
+    pub fn fence_compute_before_copy(&self) -> Result<(), String> {
+        let event = self.ctx.new_event(None).map_err(|e| format!("CUDA 驱逐 fence 事件创建失败: {e:?}"))?;
+        event.record(&self.stream).map_err(|e| format!("CUDA 驱逐 fence 记录失败: {e:?}"))?;
+        self.copy_stream.wait(&event).map_err(|e| format!("CUDA 驱逐 fence 等待失败: {e:?}"))?;
+        Ok(())
     }
 
     /// 设备名(用于启动时打印确认)。
@@ -237,13 +358,53 @@ impl CudaContext {
     /// 分配零填充的 f16 GPU buffer。对称 `MetalContext::tensor_zeros`。
     pub fn tensor_zeros(&self, rows: usize, cols: usize) -> Result<CudaTensor, String> {
         let len = rows.checked_mul(cols).ok_or_else(|| format!("tensor_zeros 维度溢出: {rows}×{cols}"))?;
+        self.trace_large_alloc(len * std::mem::size_of::<f16>());
         let slice = self.stream.alloc_zeros::<f16>(len).map_err(|e| format!("CUDA alloc_zeros 失败: {e:?}"))?;
         Ok(CudaTensor::new(slice, rows, cols))
     }
 
     /// 分配由后续 kernel 完整覆写的 device buffer。
     pub fn buffer_uninit<T: cudarc::driver::DeviceRepr>(&self, len: usize) -> Result<CudaSlice<T>, String> {
+        self.trace_large_alloc(len.saturating_mul(std::mem::size_of::<T>()));
         unsafe { self.stream.alloc::<T>(len) }.map_err(|e| format!("CUDA alloc 失败: {e:?}"))
+    }
+
+    /// 大块分配诊断:定位显存峰值/泄漏时打印 >=32MiB 的请求与剩余显存。
+    /// 默认关闭(每次 cuMemGetInfo 是 driver 调用,线上会写成日志洪水);
+    /// ZLLM_CUDA_ALLOC_TRACE=1 显式开启。
+    fn trace_large_alloc(&self, bytes: usize) {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if bytes < 32 * 1024 * 1024 || !ENABLED.get_or_init(|| std::env::var_os("ZLLM_CUDA_ALLOC_TRACE").is_some()) {
+            return;
+        }
+        if let Ok((free, total)) = self.mem_info() {
+            eprintln!("[cuda-alloc] {bytes} bytes (free={free}/total={total})");
+        }
+    }
+
+    /// 当前设备 (free, total) 显存字节;分配失败诊断用。
+    pub fn mem_info(&self) -> Result<(usize, usize), String> {
+        cudarc::driver::result::mem_get_info().map_err(|e| format!("CUDA mem_info 失败: {e:?}"))
+    }
+
+    /// rope 表窗口的设备驻留副本(跨层/跨 chunk 复用)。键 = (源切片地址, 元素数),
+    /// 语义与 Metal cast cache 相同:源表长期存活且内容不可变。缓存满后退化为
+    /// 每次 pinned 上传,不阻塞调用方。
+    pub fn rope_window_f16(&self, values: &[f32]) -> Result<Arc<CudaSlice<f16>>, String> {
+        const MAX_WINDOWS: usize = 8192;
+        let key = (values.as_ptr() as usize, values.len());
+        if let Some(hit) = self.rope_windows.lock().map_err(|_| "CUDA rope 窗口缓存锁已中毒".to_owned())?.get(&key) {
+            return Ok(hit.clone());
+        }
+        let converted: Vec<f16> = values.iter().map(|value| f16::from_f32(*value)).collect();
+        let mut device = self.buffer_uninit::<f16>(converted.len())?;
+        self.upload_f16_pinned(&converted, &mut device)?;
+        let entry = Arc::new(device);
+        let mut cache = self.rope_windows.lock().map_err(|_| "CUDA rope 窗口缓存锁已中毒".to_owned())?;
+        if cache.len() < MAX_WINDOWS {
+            cache.insert(key, entry.clone());
+        }
+        Ok(entry)
     }
 
     /// 把 CPU u32 row_map 上传到 GPU；相同内容复用不可变设备 buffer。
@@ -324,11 +485,153 @@ impl CudaContext {
         Ok(())
     }
 
+    /// u32 主机数组 → 设备 buffer,pinned 中转(row_map 同款;同步保 staging 复用安全)。
+    pub fn upload_u32_pinned(&self, src: &[u32], dst: &mut CudaSlice<u32>) -> Result<(), String> {
+        if dst.len() < src.len() {
+            return Err(format!("CUDA upload_u32_pinned dst.len={} < src.len={}", dst.len(), src.len()));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.pinned_u32.lock().map_err(|_| "CUDA pinned u32 cache 锁已中毒".to_owned())?;
+        if guard.as_ref().is_none_or(|pinned| pinned.len() < src.len()) {
+            let pinned = unsafe { self.ctx.alloc_pinned::<u32>(src.len().checked_next_power_of_two().ok_or("CUDA pinned u32 容量溢出")?.max(4096)) }.map_err(|e| format!("CUDA pinned_u32 alloc 失败: {e:?}"))?;
+            *guard = Some(pinned);
+        }
+        let pinned = guard.as_mut().ok_or("CUDA pinned u32 cache 初始化失败")?;
+        let host_ptr = pinned.as_mut_ptr().map_err(|e| format!("pinned_u32 as_mut_ptr 失败: {e:?}"))?;
+        let staging = unsafe { std::slice::from_raw_parts_mut(host_ptr, pinned.len()) };
+        staging[..src.len()].copy_from_slice(src);
+        let src_ptr = pinned.as_ptr().map_err(|e| format!("pinned_u32 as_ptr 失败: {e:?}"))?;
+        use cudarc::driver::safe::DevicePtrMut;
+        let (dev_ptr, _sync) = dst.device_ptr_mut(&self.stream);
+        self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA context 失败: {e:?}"))?;
+        let nbytes = src.len() * std::mem::size_of::<u32>();
+        let status = unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dev_ptr, src_ptr as *const std::ffi::c_void, nbytes, self.stream.cu_stream()) };
+        // 共享 staging 覆写安全:等 DMA 完成再放锁。
+        self.ctx.synchronize().map_err(|e| format!("CUDA pinned_u32 同步失败: {e:?}"))?;
+        drop(_sync);
+        if let Err(e) = status.result() {
+            return Err(format!("CUDA pinned_u32 cuMemcpyHtoDAsync 失败: {e:?}"));
+        }
+        Ok(())
+    }
+
+    /// f32 主机数组 → 设备 buffer,pinned 中转(路由权重等小上传)。
+    pub fn upload_f32_pinned(&self, src: &[f32], dst: &mut CudaSlice<f32>) -> Result<(), String> {
+        if dst.len() < src.len() {
+            return Err(format!("CUDA upload_f32_pinned dst.len={} < src.len={}", dst.len(), src.len()));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.pinned_f32_src.lock().map_err(|_| "CUDA pinned f32 src 锁已中毒".to_owned())?;
+        if guard.as_ref().is_none_or(|pinned| pinned.len() < src.len()) {
+            let pinned = unsafe { self.ctx.alloc_pinned::<f32>(src.len().checked_next_power_of_two().ok_or("CUDA pinned f32 容量溢出")?.max(4096)) }.map_err(|e| format!("CUDA pinned_f32 alloc 失败: {e:?}"))?;
+            *guard = Some(pinned);
+        }
+        let pinned = guard.as_mut().ok_or("CUDA pinned f32 src 初始化失败")?;
+        let host_ptr = pinned.as_mut_ptr().map_err(|e| format!("pinned_f32 as_mut_ptr 失败: {e:?}"))?;
+        let staging = unsafe { std::slice::from_raw_parts_mut(host_ptr, pinned.len()) };
+        staging[..src.len()].copy_from_slice(src);
+        let src_ptr = pinned.as_ptr().map_err(|e| format!("pinned_f32 as_ptr 失败: {e:?}"))?;
+        use cudarc::driver::safe::DevicePtrMut;
+        let (dev_ptr, _sync) = dst.device_ptr_mut(&self.stream);
+        self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA context 失败: {e:?}"))?;
+        let nbytes = src.len() * std::mem::size_of::<f32>();
+        let status = unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dev_ptr, src_ptr as *const std::ffi::c_void, nbytes, self.stream.cu_stream()) };
+        self.ctx.synchronize().map_err(|e| format!("CUDA pinned_f32 同步失败: {e:?}"))?;
+        drop(_sync);
+        if let Err(e) = status.result() {
+            return Err(format!("CUDA pinned_f32 cuMemcpyHtoDAsync 失败: {e:?}"));
+        }
+        Ok(())
+    }
+
+    /// u8 主机数组 → 设备 buffer,经 pinned 槽环 + 事件异步中转。
+    /// 复用槽前只等待该槽上一次 DMA 的事件,计算流不被排空;pageable clone_htod
+    /// 在 PCIe3 上带宽仅 ~1/3 且有 SyncOnDrop stall,逐次 ctx.synchronize 又会
+    /// 消灭预取重叠,事件环是两者的折中。
+    pub fn upload_u8_pinned(&self, src: &[u8], dst: &mut CudaSlice<u8>) -> Result<(), String> {
+        if dst.len() < src.len() {
+            return Err(format!("CUDA upload_u8_pinned dst.len={} < src.len={}", dst.len(), src.len()));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        let mut ring = self.pinned_u8_ring.lock().map_err(|_| "CUDA pinned u8 ring 锁已中毒".to_owned())?;
+        let (slot_index, mut slot) = ring.take_slot();
+        let result = self.upload_u8_slot(&mut slot, src, dst);
+        ring.release_slot(slot_index, slot);
+        result
+    }
+
+    /// 槽内执行一次上传;`slot` 为 None 时按需创建新槽。
+    fn upload_u8_slot(&self, slot: &mut Option<PinnedUploadSlot>, src: &[u8], dst: &mut CudaSlice<u8>) -> Result<(), String> {
+        if slot.is_none() {
+            let capacity = src.len().checked_next_power_of_two().ok_or_else(|| "CUDA pinned u8 容量溢出".to_owned())?;
+            let buffer = unsafe { self.ctx.alloc_pinned::<u8>(capacity) }.map_err(|e| format!("CUDA pinned_u8 alloc 失败: {e:?}"))?;
+            *slot = Some(PinnedUploadSlot { buffer, event: None });
+        }
+        let slot = slot.as_mut().expect("槽已就位");
+        if slot.buffer.len() < src.len() {
+            let capacity = src.len().checked_next_power_of_two().ok_or_else(|| "CUDA pinned u8 容量溢出".to_owned())?;
+            slot.buffer = unsafe { self.ctx.alloc_pinned::<u8>(capacity) }.map_err(|e| format!("CUDA pinned_u8 扩容失败: {e:?}"))?;
+            slot.event = None;
+        }
+        if let Some(event) = slot.event.as_ref() {
+            event.synchronize().map_err(|e| format!("CUDA pinned_u8 槽事件等待失败: {e:?}"))?;
+        }
+        let host_ptr = slot.buffer.as_mut_ptr().map_err(|e| format!("pinned_u8 as_mut_ptr 失败: {e:?}"))?;
+        let pinned_slice = unsafe { std::slice::from_raw_parts_mut(host_ptr, slot.buffer.len()) };
+        pinned_slice[..src.len()].copy_from_slice(src);
+        let src_ptr = slot.buffer.as_ptr().map_err(|e| format!("pinned_u8 as_ptr 失败: {e:?}"))?;
+        use cudarc::driver::safe::DevicePtrMut;
+        // 正确性二分:默认走计算流(旧行为);ZLLM_CUDA_COPY_STREAM=1 时 DMA 进 copy 流
+        // 并记录消费栅栏。
+        let use_copy_stream = std::env::var_os("ZLLM_CUDA_COPY_STREAM").is_some();
+        let stream: &Arc<cudarc::driver::safe::CudaStream> = if use_copy_stream { &self.copy_stream } else { &self.stream };
+        let (dev_ptr, _sync) = dst.device_ptr_mut(stream);
+        self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA context 失败: {e:?}"))?;
+        let nbytes = src.len();
+        let status = unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dev_ptr, src_ptr as *const std::ffi::c_void, nbytes, stream.cu_stream()) };
+        let event = match slot.event.take() {
+            Some(event) => event,
+            None => self.ctx.new_event(None).map_err(|e| format!("CUDA pinned_u8 事件创建失败: {e:?}"))?,
+        };
+        event.record(stream).map_err(|e| format!("CUDA pinned_u8 事件记录失败: {e:?}"))?;
+        slot.event = Some(event);
+        drop(_sync);
+        if let Err(e) = status.result() {
+            return Err(format!("CUDA pinned_u8 cuMemcpyHtoDAsync 失败: {e:?}"));
+        }
+        if use_copy_stream {
+            // 二分诊断:ZLLM_CUDA_COPY_DRAIN=1 时逐次 DMA 后等完成(host 同步),
+            // 消灭 copy 流与计算流的一切并发——用于区分并发时序竞态与结构性别名。
+            if std::env::var_os("ZLLM_CUDA_COPY_DRAIN").is_some() {
+                slot.event.as_ref().expect("DMA 后槽事件必在").synchronize().map_err(|e| format!("CUDA copy drain 同步失败: {e:?}"))?;
+            }
+            self.record_copy_fence()?;
+        }
+        Ok(())
+    }
+
     /// 分配由后续 kernel 完整覆写的 f16 tensor，避免无意义的 memset。
     pub fn tensor_uninit(&self, rows: usize, cols: usize) -> Result<CudaTensor, String> {
         let len = rows.checked_mul(cols).ok_or_else(|| format!("tensor_uninit 维度溢出: {rows}×{cols}"))?;
         let slice = self.buffer_uninit(len)?;
         Ok(CudaTensor::new(slice, rows, cols))
+    }
+
+    /// 调试/防御:ZLLM_CUDA_ZERO_UNINIT 时 tensor_uninit 走清零分配,用于判定
+    /// "kernel 未写区域 + 池旧字节"类污染。
+    pub fn tensor_alloc(&self, rows: usize, cols: usize) -> Result<CudaTensor, String> {
+        if std::env::var_os("ZLLM_CUDA_ZERO_UNINIT").is_some() {
+            let len = rows.checked_mul(cols).ok_or_else(|| format!("tensor_alloc 维度溢出: {rows}×{cols}"))?;
+            let slice = self.stream().alloc_zeros::<half::f16>(len).map_err(|e| format!("tensor_alloc 清零失败: {e:?}"))?;
+            return Ok(CudaTensor::new(slice, rows, cols));
+        }
+        self.tensor_uninit(rows, cols)
     }
 
     /// 分配由后续 kernel 完整覆写的 f32 device buffer(DiT 残差流用)。

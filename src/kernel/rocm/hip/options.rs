@@ -44,6 +44,9 @@ pub struct RocmOptions {
     pub(crate) mla_decode_target_blocks: usize,
     /// cooperative decode 用序列拆分（两卡全头各扫半段序列 + LSE 合并）替代半头拆分。
     pub(crate) cooperative_mla_sequence_split: bool,
+    /// owner 汇合两侧 sequence shard 后直接生成完整 attention 输出，跳过
+    /// peer full-hidden partial 的第二次 P2P 与归约。
+    pub(crate) cooperative_mla_decode_full_merge: bool,
     pub(crate) sparse_prefill_heads4: bool,
     pub(crate) mla_prefill_target_blocks: usize,
     pub(crate) dense_profile: bool,
@@ -106,6 +109,7 @@ impl Default for RocmOptions {
             mla_decode_wmma: true,
             mla_decode_target_blocks: 608,
             cooperative_mla_sequence_split: false,
+            cooperative_mla_decode_full_merge: false,
             sparse_prefill_heads4: false,
             mla_prefill_target_blocks: 8192,
             dense_profile: false,
@@ -146,6 +150,7 @@ impl RocmOptions {
         mla_decode_split_threshold: usize,
         mla_decode_wmma: bool,
         cooperative_mla_sequence_split: bool,
+        cooperative_mla_decode_full_merge: bool,
         dsa_hadamard_i8: bool,
         dsa_hadamard_shadow_samples: usize,
         dsa_hisa_shadow_samples: usize,
@@ -154,6 +159,8 @@ impl RocmOptions {
         prefill_attention_cpu: bool,
         mla_hot_trace: bool,
         precise_router: bool,
+        w8_profile: bool,
+        mla_decode_tile_size: usize,
     ) -> Self {
         Self {
             kernel_sync,
@@ -167,7 +174,9 @@ impl RocmOptions {
             kv_f16,
             mla_decode_split_threshold,
             mla_decode_wmma,
+            mla_decode_tile_size,
             cooperative_mla_sequence_split,
+            cooperative_mla_decode_full_merge,
             dsa_hadamard_i8,
             // shadow 会同步下载整行 exact/coarse score，只允许显式 profile 使用。
             dsa_hadamard_shadow_samples: if kernel_profile { dsa_hadamard_shadow_samples } else { 0 },
@@ -177,6 +186,7 @@ impl RocmOptions {
             prefill_attention_cpu,
             mla_hot_trace,
             precise_router,
+            w8_profile,
             ..Self::default()
         }
     }

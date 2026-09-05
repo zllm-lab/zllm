@@ -95,7 +95,7 @@ impl DiffusionBackend for CudaContext {
         }
         let rows = query.rows;
         let spec = GqaSpec { num_heads: head_count, num_kv_heads: head_count, head_dim, rope_dim: 0, rope_theta: 0.0, use_qk_norm: false, window: CausalWindow::Full, score_scale, output_gate: false };
-        ops::attention::gqa_attention_f16(self, &query, &key.slice, &value.slice, rows, rows.saturating_sub(1), &spec).map_err(compute_error)
+        ops::attention::gqa_attention_f16(self, &query, &key.slice, &value.slice, rows, rows.saturating_sub(1), &spec, rows).map_err(compute_error)
     }
 
     #[allow(clippy::too_many_arguments)]

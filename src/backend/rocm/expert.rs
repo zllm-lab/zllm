@@ -543,6 +543,15 @@ impl RocmContext {
         let (Some(route_device), Some(_), Some(_)) = (inputs.route.device.as_deref(), inputs.expert.device.as_deref(), residual.device.as_deref()) else {
             return Err(compute_error("ROCm cooperative experts 缺少 device input"));
         };
+        // GGUF decode 单行：route+routed+shared+combine 整段在固定地址 graph 上 replay。
+        if matches!(&experts.archive, RocmExpertArchive::Gguf(_))
+            && ops::hip::options().decode_graph
+            && !ops::hip::options().kernel_sync
+            && !ops::hip::options().kernel_profile
+            && let Some(output) = self.cooperative_moe_graph_routed_add(spec, &weights, layer, experts, &inputs, residual)?
+        {
+            return Ok(output);
+        }
         // 双卡 consumer 会在同一闭包中切换 current device；单卡 deferred
         // route workspace 无法在闭包返回后可靠地给 owner stream 记录 event。
         // owned route buffer 保活到两卡提交完成，析构仍排在 owner join 之后。
@@ -575,7 +584,7 @@ impl RocmContext {
         &self,
         spec: &TopkMoeSpec,
         layer: usize,
-        experts: &RocmPrefillExperts,
+        experts: &mut RocmPrefillExperts,
         input: &RocmTensor,
         residual: &RocmTensor,
         route_ids: Arc<ops::hip::DeviceBuffer>,
@@ -717,6 +726,196 @@ impl RocmContext {
         ops::hip::order_stream_after(self.device_id, 0, owner_stream).map_err(compute_error)?;
         ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
         Ok(device_tensor_f32(output, input.rows, input.cols))
+    }
+
+    /// 单卡 integrated GGUF MoE 单行 decode 的 graph 快路：owner 段
+    /// [route → routed → shared → add] 在固定地址 graph 上 replay，route/输入
+    /// 写入固定槽位后整段一次 launch。residual add 保持 eager。
+    #[allow(clippy::too_many_arguments)]
+    fn integrated_gguf_moe_graph_add(
+        &self,
+        spec: &TopkMoeSpec,
+        weights: &RoutedMoeWeightsRef<'_, RocmWeight>,
+        shared_experts: &[crate::moe::topk_moe::SharedExpertRef<'_, RocmWeight>],
+        layer: usize,
+        experts: &mut RocmPrefillExperts,
+        inputs: RoutedMoeInputs<'_, RocmTensor>,
+        residual: &RocmTensor,
+    ) -> Result<Option<RocmTensor>, BackendError> {
+        if inputs.route.rows != 1 || weights.selected_experts.is_some() || shared_experts.len() != 1 {
+            return Ok(None);
+        }
+        let (Some(route_input_device), Some(expert_input_device), Some(residual_device)) = (inputs.route.device.as_deref(), inputs.expert.device.as_deref(), residual.device.as_deref()) else { return Ok(None) };
+        let key = (self.device_id, layer);
+        if !experts.cooperative_moe_graphs.contains_key(&key) {
+            let build = (|| {
+                ops::hip::set_device(self.device_id)?;
+                let routed = experts.gguf_routed_grouped(self.device_id, layer).map_err(|error| format!("L{layer} routed grouped: {error:?}"))?.clone();
+                let shared = experts.gguf_shared_grouped(self.device_id, layer, &shared_experts[0]).map_err(|error| format!("L{layer} shared grouped: {error:?}"))?.ok_or_else(|| format!("L{layer} GGUF shared grouped 缺失"))?;
+                let weight = weights.router.router_resident(self.device_id, ops::hip::options().precise_router).map_err(|error| format!("L{layer} router resident: {error:?}"))?;
+                let bias = resident_weight(weights.bias, "router bias").map_err(|error| format!("L{layer} router bias: {error:?}"))?;
+                let scoring = match spec.scoring_func {
+                    crate::moe::topk_moe::ScoringFunc::Softmax => 0,
+                    crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
+                    crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
+                };
+                RocmCooperativeMoeGraph::build(self.device_id, inputs.expert.cols, spec.intermediate_size, spec.top_k, &routed, &shared, true, false, None, spec.num_experts, scoring, spec.routed_scaling_factor)
+            })();
+            experts.cooperative_moe_graphs.insert(
+                key,
+                match build {
+                    Ok(graph) => RocmCooperativeMoeGraphState::Ready(graph),
+                    Err(error) => {
+                        eprintln!("[integrated-moe-graph] L{layer} device={} 录制失败回退 eager: {error}", self.device_id);
+                        RocmCooperativeMoeGraphState::Disabled
+                    }
+                },
+            );
+        }
+        let graph_stream = match experts.cooperative_moe_graphs.get(&key) {
+            Some(RocmCooperativeMoeGraphState::Ready(graph)) => graph.stream,
+            _ => return Ok(None),
+        };
+        // graph 只在绑定流上与输入 D2D 保序；当前流不一致时 replay 会乱序竞争
+        // 固定槽位（死循环嫌疑根因），回退 eager 而不是带病 replay。
+        let current_stream = ops::hip::active_compute_stream() as usize;
+        if graph_stream != current_stream {
+            eprintln!("[integrated-moe-graph] L{layer} device={} 流不匹配回退 eager: 绑定流={graph_stream:#x} 当前流={current_stream:#x}", self.device_id);
+            experts.cooperative_moe_graphs.insert(key, RocmCooperativeMoeGraphState::Disabled);
+            return Ok(None);
+        }
+        let Some(RocmCooperativeMoeGraphState::Ready(graph)) = experts.cooperative_moe_graphs.get(&key) else {
+            return Ok(None);
+        };
+        ops::hip::set_device(self.device_id).map_err(compute_error)?;
+        // route 在 graph 外 eager 完成；graph 录制/replay 与生产共用当前 active stream，
+        // 不切到 default——graph 节点与 eager kernel 在同一条流上保序。
+        let weight_device = weights.router.router_resident(self.device_id, ops::hip::options().precise_router)?;
+        let bias_device = resident_weight(weights.bias, "router bias")?;
+        let scoring = match spec.scoring_func {
+            crate::moe::topk_moe::ScoringFunc::Softmax => 0,
+            crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
+            crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
+        };
+        let route = ops::hip::try_moe_route_resident_device_f32(self.device_id, route_input_device, weight_device, bias_device, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor)
+            .map_err(|error| compute_error(format!("L{layer} MoE route eager: {error}")))?;
+        graph.launch_owner(expert_input_device, &route.expert_ids, &route.weights).map_err(|error| compute_error(format!("L{layer} integrated MoE graph replay: {error}")))?;
+        let output = ops::hip::try_add_resident_f32(self.device_id, residual_device, &graph.combined, inputs.expert.rows * inputs.expert.cols, 1.0).map_err(compute_error)?;
+        Ok(Some(device_tensor_f32(output, inputs.expert.rows, inputs.expert.cols)))
+    }
+
+    /// GGUF decode 单行的 graph 快路：owner 段 [route → routed → shared → add] 与
+    /// peer 段 [routed → shared → combine] 在两卡各自的固定地址 graph 上 replay。
+    /// norm 双输出写入 owner 固定槽位后 replay；route 结果在 graph 内产生，
+    /// 随 expert_input 一起 P2P 直写 peer 槽位。录制失败/形状不符回退 eager。
+    #[allow(clippy::too_many_arguments)]
+    fn cooperative_moe_graph_routed_add(
+        &self,
+        spec: &TopkMoeSpec,
+        weights: &RoutedMoeWeightsRef<'_, RocmWeight>,
+        layer: usize,
+        experts: &mut RocmPrefillExperts,
+        inputs: &RoutedMoeInputs<'_, RocmTensor>,
+        residual: &RocmTensor,
+    ) -> Result<Option<RocmTensor>, BackendError> {
+        if inputs.route.rows != 1 || weights.selected_experts.is_some() {
+            return Ok(None);
+        }
+        let (Some(route_input_device), Some(expert_input_device)) = (inputs.route.device.as_deref(), inputs.expert.device.as_deref()) else { return Ok(None) };
+        let peer = experts.cooperative_peer.ok_or_else(|| compute_error("ROCm cooperative expert peer 缺失"))?;
+        let (local_routed, local_shared) = {
+            let grouped = experts.cooperative_gguf_grouped(self.device_id, layer)?;
+            (grouped.routed.clone(), grouped.shared.clone())
+        };
+        let (remote_routed, remote_shared) = {
+            let grouped = experts.cooperative_gguf_grouped(peer.context.device_id, layer)?;
+            (grouped.routed.clone(), grouped.shared.clone())
+        };
+        // 单卡路径 shared expert 不属于 expert archive（shared=None）；graph 段只在
+        // cooperative preload 提供 shared TP shard 时可用，否则回退 eager。
+        let (Some(local_shared), Some(remote_shared)) = (local_shared, remote_shared) else { return Ok(None) };
+        ops::hip::set_device(self.device_id).map_err(compute_error)?;
+        let owner_stream = ops::hip::active_compute_stream() as usize;
+        ops::hip::order_stream_after(self.device_id, owner_stream, 0).map_err(compute_error)?;
+        ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+        // 桥接到 default 流之后才允许录制（graph 绑定 replay 流）；build 内不再切流。
+        for (device, routed, shared, owner_add) in [(self.device_id, &local_routed, &local_shared, true), (peer.context.device_id, &remote_routed, &remote_shared, false)] {
+            let key = (device, layer);
+            if experts.cooperative_moe_graphs.contains_key(&key) {
+                continue;
+            }
+            let build = (|| {
+                ops::hip::set_device(device)?;
+                ops::hip::activate_compute_stream(device, 0)?;
+                let router = if owner_add {
+                    let weight = weights.router.router_resident(device, ops::hip::options().precise_router).map_err(|error| format!("L{layer} router resident: {error:?}"))?;
+                    let bias = resident_weight(weights.bias, "router bias").map_err(|error| format!("L{layer} router bias: {error:?}"))?;
+                    Some((weight, bias))
+                } else {
+                    None
+                };
+                let scoring = match spec.scoring_func {
+                    crate::moe::topk_moe::ScoringFunc::Softmax => 0,
+                    crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
+                    crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
+                };
+                RocmCooperativeMoeGraph::build(device, inputs.expert.cols, spec.intermediate_size / 2, spec.top_k, routed, shared, owner_add, owner_add, router, spec.num_experts, scoring, spec.routed_scaling_factor)
+            })();
+            experts.cooperative_moe_graphs.insert(
+                key,
+                match build {
+                    Ok(graph) => RocmCooperativeMoeGraphState::Ready(graph),
+                    Err(error) => {
+                        eprintln!("[cooperative-moe-graph] L{layer} device={device} 录制失败回退 eager: {error}");
+                        RocmCooperativeMoeGraphState::Disabled
+                    }
+                },
+            );
+            // 录制完 peer 卡后回到 owner default 流。
+            ops::hip::set_device(self.device_id).map_err(compute_error)?;
+            ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+        }
+        // replay 前校验两卡 graph 绑定流与实际 replay 流一致：owner 此时在
+        // default 流（上方已桥接），peer 在 peer.context 的流。不一致时 replay
+        // 与输入写入零保序（死循环嫌疑根因），回退 eager 而不是带病 replay。
+        let (owner_bound, peer_bound) = match (experts.cooperative_moe_graphs.get(&(self.device_id, layer)), experts.cooperative_moe_graphs.get(&(peer.context.device_id, layer))) {
+            (Some(RocmCooperativeMoeGraphState::Ready(owner_graph)), Some(RocmCooperativeMoeGraphState::Ready(peer_graph))) => (owner_graph.stream, peer_graph.stream),
+            _ => return Ok(None),
+        };
+        let owner_current = ops::hip::active_compute_stream() as usize;
+        let peer_current = peer.context.compute_stream;
+        if owner_bound != owner_current || peer_bound != peer_current {
+            eprintln!("[cooperative-moe-graph] L{layer} 流不匹配回退 eager: owner 绑定={owner_bound:#x}/当前={owner_current:#x} peer(device={}) 绑定={peer_bound:#x}/当前={peer_current:#x}", peer.context.device_id);
+            experts.cooperative_moe_graphs.insert((self.device_id, layer), RocmCooperativeMoeGraphState::Disabled);
+            experts.cooperative_moe_graphs.insert((peer.context.device_id, layer), RocmCooperativeMoeGraphState::Disabled);
+            return Ok(None);
+        }
+        let (Some(RocmCooperativeMoeGraphState::Ready(owner_graph)), Some(RocmCooperativeMoeGraphState::Ready(peer_graph))) =
+            (experts.cooperative_moe_graphs.get(&(self.device_id, layer)), experts.cooperative_moe_graphs.get(&(peer.context.device_id, layer)))
+        else {
+            return Ok(None);
+        };
+
+        // norm 双输出落 owner 固定槽位后整段 replay（route 在 graph 内完成）；
+        // route 结果随 expert_input 一起 P2P 进 peer 槽位。
+        owner_graph.launch_owner_with_route(route_input_device, expert_input_device).map_err(|error| compute_error(format!("L{layer} owner MoE graph 输入: {error}")))?;
+        ops::hip::DeviceBuffer::copy_stable_group_into_device_ordered_async_retained_by(
+            &[owner_graph.route_ids.clone(), owner_graph.route_weights.clone(), owner_graph.expert_input.clone()],
+            &[(&peer_graph.route_ids, 0), (&peer_graph.route_weights, 0), (&peer_graph.expert_input, 0)],
+            peer.context.device_id,
+            self.device_id,
+        )
+        .map_err(|error| compute_error(format!("L{layer} cooperative graph route/input owner->peer: {error}")))?;
+        peer.context.activate().map_err(compute_error)?;
+        peer_graph.launch_peer().map_err(|error| compute_error(format!("L{layer} peer MoE graph replay: {error}")))?;
+        let peer_combined_on_owner = peer_graph.combined.copy_stable_to_device_ordered_async_retained_by(self.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} output peer->owner: {error}")))?;
+        ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+        let residual = f32_tensor(self, residual)?;
+        let residual_device = residual.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative residual 缺少 F32 device buffer"))?;
+        let output = ops::hip::try_ct_cooperative_partial_join_f32(self.device_id, &owner_graph.combined, &peer_combined_on_owner, residual_device, inputs.expert.rows, inputs.expert.cols).map_err(compute_error)?;
+        ops::hip::order_stream_after(self.device_id, 0, owner_stream).map_err(compute_error)?;
+        ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
+        Ok(Some(device_tensor_f32(output, inputs.expert.rows, inputs.expert.cols)))
     }
 }
 
@@ -881,6 +1080,13 @@ impl ExpertPrefillBackend for RocmContext {
         if matches!(experts.archive, RocmExpertArchive::Gguf(_)) {
             if weights.selected_experts.is_some() || residual.dtype != RocmTensorDType::F32 {
                 return Ok(None);
+            }
+            if ops::hip::options().decode_graph
+                && !ops::hip::options().kernel_sync
+                && !ops::hip::options().kernel_profile
+                && let Some(output) = self.integrated_gguf_moe_graph_add(spec, &weights, shared_experts, layer, experts, inputs, residual)?
+            {
+                return Ok(Some(output));
             }
             let Some(shared_grouped) = experts.gguf_shared_grouped(self.device_id, layer, shared)? else {
                 return Ok(None);
@@ -1501,6 +1707,140 @@ impl RocmCtMoeGraph {
     }
 }
 
+/// 单层单行 cooperative MoE（GGUF）的固定地址 decode graph。段固定为
+/// [routed → shared → 合并]；owner 合并是 F32 add（本地 join 输入），peer 合并是
+/// BF16 combine（跨卡回传输入）。route 在 graph 外完成后随 input 一起写入固定
+/// 槽位（owner D2D / peer 由 P2P 直写），replay 不含任何 host 依赖。
+/// `ZLLM_ROCM_GRAPH_SYNC=1` 时 replay 前先整卡同步、`=2` 时只同步当前 compute
+/// 流：验证"前一 replay 未完成、host 已 D2D 覆写固定槽位"的并发覆写嫌疑，并
+/// 二分竞态对手（流内保序失效 vs 跨流并发）。诊断开关，定位后移除。
+fn graph_sync_before_replay() -> u32 {
+    static FLAG: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("ZLLM_ROCM_GRAPH_SYNC").ok().and_then(|value| value.parse::<u32>().ok()).unwrap_or(0))
+}
+
+fn graph_sync_device_before_replay(device_id: i32) -> Result<(), String> {
+    match graph_sync_before_replay() {
+        1 => ops::hip::synchronize_device(device_id, "graph replay 前整卡同步(并发覆写诊断)"),
+        2 => ops::hip::synchronize_compute_stream(device_id, "graph replay 前流同步(并发覆写诊断)"),
+        _ => Ok(()),
+    }
+}
+
+struct RocmCooperativeMoeGraph {
+    graph: ops::hip::StaticHipGraph,
+    expert_input: Arc<ops::hip::DeviceBuffer>,
+    route_ids: Arc<ops::hip::DeviceBuffer>,
+    route_weights: Arc<ops::hip::DeviceBuffer>,
+    combined: Arc<ops::hip::DeviceBuffer>,
+    /// graph 中间结果与 shared route 的固定 buffer：仅持有所有权。kernel 节点
+    /// 固化了这些指针，若 drop 归还内存池被重用，replay 读写的就是别人的内存
+    /// （graph 死循环/NaN/illegal memory access 的根因）。
+    _routed_out: Arc<ops::hip::DeviceBuffer>,
+    _shared_out: Arc<ops::hip::DeviceBuffer>,
+    _shared_ids: Arc<ops::hip::DeviceBuffer>,
+    _shared_weights: Arc<ops::hip::DeviceBuffer>,
+    device_id: i32,
+    stream: usize,
+    /// owner 段含 route 时持有：route GEMV+top-k 的固定输入与 workspace。
+    route_input: Option<Arc<ops::hip::DeviceBuffer>>,
+    route: Option<ops::hip::MoeRouteGraphBuffers>,
+}
+
+impl RocmCooperativeMoeGraph {
+    /// `owner_join_add=true` 时合并用 F32 add（owner 本地 partial）；false 用 BF16
+    /// combine（peer 回传 partial）。`with_route=true` 时段首含 router GEMV+top-k
+    /// （输入 route_input 为 norm 的 F32 输出），route 结果留在 graph 内固定 buffer。
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        device_id: i32,
+        hidden: usize,
+        half_intermediate: usize,
+        top_k: usize,
+        routed: &ops::hip::GgufGroupedMetas,
+        shared: &ops::hip::GgufGroupedMetas,
+        owner_join_add: bool,
+        with_route: bool,
+        router: Option<(&ops::hip::DeviceBuffer, &ops::hip::DeviceBuffer)>,
+        expert_count: usize,
+        scoring: u32,
+        scaling: f32,
+    ) -> Result<Self, String> {
+        let expert_input = Arc::new(ops::hip::DeviceBuffer::allocate(device_id, hidden * 2)?);
+        let routed_out = Arc::new(ops::hip::DeviceBuffer::allocate(device_id, hidden * 4)?);
+        let shared_out = Arc::new(ops::hip::DeviceBuffer::allocate(device_id, hidden * 4)?);
+        // peer 的 combined 会被 owner 跨卡读；统一用显式稳定池。
+        let combined = Arc::new(ops::hip::DeviceBuffer::allocate_peer(device_id, if owner_join_add { hidden * 4 } else { hidden * 2 })?);
+        let (shared_ids, shared_weights) = ops::hip::cooperative_single_expert_route(device_id, 1)?;
+        let route = with_route.then(|| ops::hip::MoeRouteGraphBuffers::new(device_id, 1, expert_count, top_k)).transpose()?;
+        let route_input = with_route.then(|| ops::hip::DeviceBuffer::allocate(device_id, hidden * 4).map(Arc::new)).transpose()?;
+        let route_ids = match &route {
+            Some(route) => route.expert_ids_arc(),
+            None => Arc::new(ops::hip::DeviceBuffer::allocate(device_id, top_k * 4)?),
+        };
+        let route_weights = match &route {
+            Some(route) => route.weights_arc(),
+            None => Arc::new(ops::hip::DeviceBuffer::allocate(device_id, top_k * 4)?),
+        };
+        let stream = ops::hip::active_compute_stream();
+        // 录制前只完成 HIPRTC 编译与 module load（不真执行 kernel）：graph 段内只
+        // 允许 kernel node，编译必须在录制前完成。真执行的 warmup 会在生产的
+        // latency 流上留下未对齐的工作，曾导致 replay 死循环。
+        let _ = ops::hip::ct_quantized_functions(device_id)?;
+        let recorder = ops::hip::StaticGraphRecorder::begin(device_id, stream)?;
+        if let (Some(route), Some(route_input), Some((router_weight, router_bias))) = (&route, &route_input, router) {
+            route.launch(device_id, route_input, router_weight, router_bias, 1, hidden, expert_count, top_k, scoring, scaling)?;
+        }
+        ops::hip::try_gguf_fused_decode_experts_typed(device_id, &expert_input, 1, hidden, half_intermediate, top_k, &route_ids, &route_weights, top_k, &routed.buffer, &routed_out, routed.uniform_types)?;
+        ops::hip::try_gguf_fused_decode_experts_typed(device_id, &expert_input, 1, hidden, half_intermediate, 1, &shared_ids, &shared_weights, 1, &shared.buffer, &shared_out, shared.uniform_types)?;
+        if owner_join_add {
+            ops::hip::try_add_resident_f32_into(device_id, &routed_out, &shared_out, &combined, hidden, 1.0)?;
+        } else {
+            ops::hip::try_ct_cooperative_combine_partial_bf16_into(device_id, &routed_out, &shared_out, &combined, hidden)?;
+        }
+        let graph = recorder.finish()?.ok_or("ROCm cooperative MoE graph 录制段没有 kernel 节点")?;
+        if graph.node_count() < 3 {
+            return Err(format!("ROCm cooperative MoE graph 节点过少: {}", graph.node_count()));
+        }
+        eprintln!("[rocm-moe-graph] device={device_id} 录制完成 nodes={} 绑定流={stream:p}", graph.node_count());
+        Ok(Self { graph, expert_input, route_ids, route_weights, combined, _routed_out: routed_out, _shared_out: shared_out, _shared_ids: shared_ids, _shared_weights: shared_weights, device_id, stream: stream as usize, route_input, route })
+    }
+
+    /// owner 段 replay（不含 route 的 A/B 诊断路径）：route 已由外层 eager 完成，
+    /// ids/weights 与 norm 输入写入固定槽位后 replay [routed+shared+combine]。
+    /// 输入 D2D 与 replay 都必须在 graph 绑定流上保序：replay 传当前 active
+    /// stream（接入点已校验一致），让 `StaticHipGraph::launch` 的 owner 校验
+    /// 真正生效，不再用存储流自证。
+    fn launch_owner(&self, expert_input: &ops::hip::DeviceBuffer, route_ids: &ops::hip::DeviceBuffer, route_weights: &ops::hip::DeviceBuffer) -> Result<(), String> {
+        graph_sync_device_before_replay(self.device_id)?;
+        self.expert_input.copy_from_device(0, expert_input, 0, self.expert_input.bytes())?;
+        self.route_ids.copy_from_device(0, route_ids, 0, self.route_ids.bytes())?;
+        self.route_weights.copy_from_device(0, route_weights, 0, self.route_weights.bytes())?;
+        self.graph.launch(self.device_id, ops::hip::active_compute_stream())
+    }
+
+    /// owner 段 replay（含 route）：norm 双输出写入固定槽位后整段 replay。
+    /// route ids/weights 在 graph 内产生；返回后它们才可用于 P2P。
+    fn launch_owner_with_route(&self, route_input: &ops::hip::DeviceBuffer, expert_input: &ops::hip::DeviceBuffer) -> Result<(), String> {
+        graph_sync_device_before_replay(self.device_id)?;
+        let route_dst = self.route_input.as_ref().expect("owner graph 缺少 route_input");
+        route_dst.copy_from_device(0, route_input, 0, route_dst.bytes())?;
+        self.expert_input.copy_from_device(0, expert_input, 0, self.expert_input.bytes())?;
+        self.graph.launch(self.device_id, ops::hip::active_compute_stream())
+    }
+
+    /// peer 段 replay：输入已由 P2P 直写固定槽位。
+    fn launch_peer(&self) -> Result<(), String> {
+        graph_sync_device_before_replay(self.device_id)?;
+        self.graph.launch(self.device_id, ops::hip::active_compute_stream())
+    }
+}
+
+enum RocmCooperativeMoeGraphState {
+    Ready(RocmCooperativeMoeGraph),
+    Disabled,
+}
+
 enum RocmCtMoeGraphState {
     Ready(RocmCtMoeGraph),
     Disabled,
@@ -1707,6 +2047,8 @@ pub struct RocmPrefillExperts {
     mxfp4_grouped: HashMap<(i32, usize), Arc<Mxfp4GroupedLayer>>,
     /// 与 resident 权重同 generation 的单行固定地址 graph；Disabled 避免失败后逐轮重试。
     ct_moe_graphs: HashMap<(i32, usize), RocmCtMoeGraphState>,
+    /// cooperative GGUF 单行 decode graph；key = (device, layer)。
+    cooperative_moe_graphs: HashMap<(i32, usize), RocmCooperativeMoeGraphState>,
     /// 单路实验只在同机相邻卡间拆 routed experts；Attention/KV/DSA 仍由当前卡持有。
     cooperative_peer: Option<RocmCooperativeExpertPeer>,
     /// sequence-parallel attention 的 q_b/kv_b/o_proj 在两卡完整驻留。两边
@@ -1738,6 +2080,9 @@ pub(super) struct RocmCooperativeMlaWeights {
     pub(super) peer_decode_q_b: Option<RocmWeight>,
     pub(super) owner_kv_b: RocmWeight,
     pub(super) peer_kv_b: RocmWeight,
+    /// decode 在 owner 汇合两侧 sequence shard 后直接生成完整 hidden，
+    /// 避免再传输并归约两份 o_proj partial。
+    pub(super) owner_o_full: RocmWeight,
     pub(super) owner_o: RocmWeight,
     pub(super) peer_o: RocmWeight,
 }
@@ -1770,6 +2115,7 @@ impl RocmPrefillExperts {
             gguf_grouped: HashMap::new(),
             mxfp4_grouped: HashMap::new(),
             ct_moe_graphs: HashMap::new(),
+            cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
@@ -1786,6 +2132,7 @@ impl RocmPrefillExperts {
             gguf_grouped: HashMap::new(),
             mxfp4_grouped: HashMap::new(),
             ct_moe_graphs: HashMap::new(),
+            cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
@@ -1801,6 +2148,7 @@ impl RocmPrefillExperts {
             gguf_grouped: HashMap::new(),
             mxfp4_grouped: HashMap::new(),
             ct_moe_graphs: HashMap::new(),
+            cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
@@ -1816,6 +2164,7 @@ impl RocmPrefillExperts {
             gguf_grouped: HashMap::new(),
             mxfp4_grouped: HashMap::new(),
             ct_moe_graphs: HashMap::new(),
+            cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
@@ -1831,6 +2180,7 @@ impl RocmPrefillExperts {
             gguf_grouped: HashMap::new(),
             mxfp4_grouped: HashMap::new(),
             ct_moe_graphs: HashMap::new(),
+            cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
@@ -1846,6 +2196,7 @@ impl RocmPrefillExperts {
             gguf_grouped: HashMap::new(),
             mxfp4_grouped: HashMap::new(),
             ct_moe_graphs: HashMap::new(),
+            cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
@@ -1864,19 +2215,38 @@ impl RocmPrefillExperts {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn set_cooperative_mla_layer(&mut self, layer: usize, owner_q_b: RocmWeight, peer_q_b: RocmWeight, owner_kv_b: RocmWeight, peer_kv_b: RocmWeight, owner_o: RocmWeight, peer_o: RocmWeight) -> Result<(), BackendError> {
+    pub fn set_cooperative_mla_layer(
+        &mut self,
+        layer: usize,
+        owner_q_b: RocmWeight,
+        peer_q_b: RocmWeight,
+        owner_kv_b: RocmWeight,
+        peer_kv_b: RocmWeight,
+        owner_o_full: RocmWeight,
+        owner_o: RocmWeight,
+        peer_o: RocmWeight,
+    ) -> Result<(), BackendError> {
         if self.cooperative_peer.is_none() {
             return Err(compute_error(format!("L{layer} cooperative MLA 缺少 peer")));
         }
         let full_o = owner_o.cols == owner_q_b.rows && peer_o.cols == owner_q_b.rows;
         let sharded_o = owner_o.cols == peer_o.cols && owner_o.cols.checked_add(peer_o.cols) == Some(owner_q_b.rows);
-        if owner_q_b.rows != peer_q_b.rows || owner_q_b.cols != peer_q_b.cols || owner_kv_b.rows != peer_kv_b.rows || owner_kv_b.cols != peer_kv_b.cols || owner_o.rows != peer_o.rows || !(full_o || sharded_o) {
+        if owner_q_b.rows != peer_q_b.rows
+            || owner_q_b.cols != peer_q_b.cols
+            || owner_kv_b.rows != peer_kv_b.rows
+            || owner_kv_b.cols != peer_kv_b.cols
+            || owner_o_full.rows != owner_o.rows
+            || owner_o_full.cols != owner_q_b.rows
+            || owner_o.rows != peer_o.rows
+            || !(full_o || sharded_o)
+        {
             return Err(compute_error(format!(
-                "L{layer} cooperative MLA shard shape 非法: q={:?}/{:?} kv={:?}/{:?} o={:?}/{:?}",
+                "L{layer} cooperative MLA shard shape 非法: q={:?}/{:?} kv={:?}/{:?} o_full={:?} o={:?}/{:?}",
                 (owner_q_b.rows, owner_q_b.cols),
                 (peer_q_b.rows, peer_q_b.cols),
                 (owner_kv_b.rows, owner_kv_b.cols),
                 (peer_kv_b.rows, peer_kv_b.cols),
+                (owner_o_full.rows, owner_o_full.cols),
                 (owner_o.rows, owner_o.cols),
                 (peer_o.rows, peer_o.cols),
             )));
@@ -1890,7 +2260,7 @@ impl RocmPrefillExperts {
         } else {
             (None, None)
         };
-        self.cooperative_mla.insert(layer, RocmCooperativeMlaWeights { owner_q_b, peer_q_b, owner_decode_q_b, peer_decode_q_b, owner_kv_b, peer_kv_b, owner_o, peer_o });
+        self.cooperative_mla.insert(layer, RocmCooperativeMlaWeights { owner_q_b, peer_q_b, owner_decode_q_b, peer_decode_q_b, owner_kv_b, peer_kv_b, owner_o_full, owner_o, peer_o });
         Ok(())
     }
 

@@ -329,8 +329,8 @@ mod p2p_tests {
         for (owner, peer) in [(0, 1), (2, 3), (4, 5), (6, 7)] {
             enable_peer_access(peer, owner).expect("peer access owner->peer");
             enable_peer_access(owner, peer).expect("peer access peer->owner");
-            let src = DeviceBuffer::allocate(owner, 1024 * 1024).expect("src");
-            let dst = DeviceBuffer::allocate(peer, 1024 * 1024).expect("dst");
+            let src = DeviceBuffer::allocate_peer(owner, 1024 * 1024).expect("src");
+            let dst = DeviceBuffer::allocate_peer(peer, 1024 * 1024).expect("dst");
             let mut begin = ptr::null_mut();
             let mut end = ptr::null_mut();
             let mut owner_ready = ptr::null_mut();
@@ -343,13 +343,14 @@ mod p2p_tests {
                 set_device(peer).expect("peer device");
                 assert_eq!(create(&mut peer_done, HIP_EVENT_DISABLE_TIMING), HIP_SUCCESS);
                 for &(bytes, label) in &[(4 * 1024usize, "4KB"), (132 * 1024, "132KB"), (1024 * 1024, "1MB")] {
-                    // 两个 device 各自 record 本地 event；跨卡只 wait，不能跨 device
-                    // 重新 record 同一个 event。
                     let started = Instant::now();
                     const ROUNDS: usize = 200;
-                    set_device(owner).expect("owner device");
-                    assert_eq!(record(begin, legacy), HIP_SUCCESS);
+                    let mut device_ms = 0.0f32;
                     for _ in 0..ROUNDS {
+                        // event 的下一次 record 会覆盖既有 generation；每轮先同步
+                        // owner 末事件，再安全复用两张卡各自持有的 event。
+                        set_device(owner).expect("owner device");
+                        assert_eq!(record(begin, legacy), HIP_SUCCESS);
                         assert_eq!(record(owner_ready, legacy), HIP_SUCCESS);
                         set_device(peer).expect("peer device");
                         assert_eq!(wait(legacy, owner_ready, 0), HIP_SUCCESS);
@@ -357,12 +358,13 @@ mod p2p_tests {
                         assert_eq!(record(peer_done, legacy), HIP_SUCCESS);
                         set_device(owner).expect("owner device");
                         assert_eq!(wait(legacy, peer_done, 0), HIP_SUCCESS);
+                        assert_eq!(record(end, legacy), HIP_SUCCESS);
+                        assert_eq!(sync(end), HIP_SUCCESS);
+                        let mut round_ms = 0.0f32;
+                        assert_eq!(elapsed(&mut round_ms, begin, end), HIP_SUCCESS);
+                        device_ms += round_ms;
                     }
-                    assert_eq!(record(end, legacy), HIP_SUCCESS);
-                    assert_eq!(sync(end), HIP_SUCCESS);
-                    let mut ms = 0.0f32;
-                    assert_eq!(elapsed(&mut ms, begin, end), HIP_SUCCESS);
-                    eprintln!("[p2p-probe] pair={owner}/{peer} {label} roundtrip avg_us={:.1} wall_us={:.1}", ms * 1000.0 / ROUNDS as f32, started.elapsed().as_secs_f64() * 1e6 / ROUNDS as f64);
+                    eprintln!("[p2p-probe] pair={owner}/{peer} {label} roundtrip avg_us={:.1} wall_us={:.1}", device_ms * 1000.0 / ROUNDS as f32, started.elapsed().as_secs_f64() * 1e6 / ROUNDS as f64);
                 }
             }
         }

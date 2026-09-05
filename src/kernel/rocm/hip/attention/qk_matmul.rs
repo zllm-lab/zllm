@@ -66,7 +66,7 @@ pub fn try_qk_matmul_f32(device_id: i32, tensor_type: u32, input: &[f32], weight
 
         // 复用按设备的 resident kernel 缓存;原进程级 OnceLock 会在多卡下
         // 把 device 0 加载的句柄错误地用于其他设备。
-        let (function, _, _) = qk_matmul_resident_functions(device_id, runtime)?;
+        let (function, _, _, _) = qk_matmul_resident_functions(device_id, runtime)?;
 
         let mut input_rows = u32::try_from(input_rows).map_err(|_| "Q4_K input_rows 超过 u32")?;
         let mut columns = u32::try_from(columns).map_err(|_| "Q4_K columns 超过 u32")?;
@@ -171,7 +171,7 @@ pub fn try_qk_matmul_resident_f32(device_id: i32, tensor_type: u32, input: &[f32
         return Err(runtime.hip_error(init_status, "hipInit QK resident"));
     }
     let d_output = DeviceBuffer::allocate_reusable(device_id, output_bytes)?;
-    let (qk_function, q6_function, _fdot2_function) = qk_matmul_resident_functions(device_id, &runtime)?;
+    let (qk_function, q6_function, _fdot2_function, _q8_repacked_function) = qk_matmul_resident_functions(device_id, &runtime)?;
     let function = if tensor_type == 14 { q6_function } else { qk_function };
     let mut rows = u32::try_from(input_rows).map_err(|_| "QK resident input_rows 超过 u32")?;
     let mut cols = u32::try_from(columns).map_err(|_| "QK resident columns 超过 u32")?;
@@ -224,6 +224,7 @@ pub fn try_qk_matmul_resident_f32(device_id: i32, tensor_type: u32, input: &[f32
 pub fn try_qk_matmul_fdot2_resident_f32(device_id: i32, tensor_type: u32, input: &[f32], input_device: Option<&DeviceBuffer>, weight: &DeviceBuffer, input_rows: usize, columns: usize, output_rows: usize) -> Result<DeviceBuffer, String> {
     const QK_K: usize = 256;
     let block_bytes = match tensor_type {
+        8 => 272,
         11 | 12 | 13 | 14 | 21 | 23 => match tensor_type {
             11 | 21 => 110,
             12 => 144,
@@ -277,7 +278,7 @@ pub fn try_qk_matmul_fdot2_resident_f32(device_id: i32, tensor_type: u32, input:
         return Err(runtime.hip_error(init_status, "hipInit QK fdot2"));
     }
     let d_output = DeviceBuffer::allocate_reusable(device_id, output_bytes)?;
-    let (_qk_function, _q6_function, fdot2_function) = qk_matmul_resident_functions(device_id, &runtime)?;
+    let (_qk_function, _q6_function, fdot2_function, _q8_repacked_function) = qk_matmul_resident_functions(device_id, &runtime)?;
     let mut rows = u32::try_from(input_rows).map_err(|_| "QK fdot2 input_rows 超过 u32")?;
     let mut cols = u32::try_from(columns).map_err(|_| "QK fdot2 columns 超过 u32")?;
     let mut out_rows = u32::try_from(output_rows).map_err(|_| "QK fdot2 output_rows 超过 u32")?;
@@ -305,12 +306,106 @@ pub fn try_qk_matmul_fdot2_resident_f32(device_id: i32, tensor_type: u32, input:
     Ok(d_output)
 }
 
-fn qk_matmul_resident_functions(device_id: i32, runtime: &RocmRuntime) -> Result<(*mut c_void, *mut c_void, *mut c_void), String> {
-    static FUNCTIONS: OnceLock<Mutex<HashMap<i32, (usize, usize, usize)>>> = OnceLock::new();
+/// Q8_0 GGUF 行布局（[f16 scale][32×i8] 交替 34B 块）重排为 scales/quants
+/// 平面分离布局：每行 [cols/32 个 f16 scale][cols 个 i8]。decode GEMV 的
+/// 向量化加载依赖此布局；prefill 标量路径仍用原始 GGUF 块。
+pub(crate) fn repack_q8_0_rows(bytes: &[u8], rows: usize, cols: usize) -> Result<Vec<u8>, String> {
+    if cols % 256 != 0 || rows == 0 {
+        return Err(format!("Q8_0 预重排 shape 非法: rows={rows} cols={cols}"));
+    }
+    let groups = cols / 32;
+    let source_row_bytes = groups * 34;
+    if bytes.len() != rows * source_row_bytes {
+        return Err(format!("Q8_0 预重排字节 {}，期望 {}", bytes.len(), rows * source_row_bytes));
+    }
+    let scale_bytes = groups * 2;
+    let row_stride = scale_bytes + cols;
+    let mut out = vec![0_u8; rows * row_stride];
+    for row in 0..rows {
+        let source = &bytes[row * source_row_bytes..(row + 1) * source_row_bytes];
+        let target = &mut out[row * row_stride..(row + 1) * row_stride];
+        for group in 0..groups {
+            target[group * 2..group * 2 + 2].copy_from_slice(&source[group * 34..group * 34 + 2]);
+            target[scale_bytes + group * 32..scale_bytes + (group + 1) * 32].copy_from_slice(&source[group * 34 + 2..(group + 1) * 34]);
+        }
+    }
+    Ok(out)
+}
+
+/// Q8_0 预重排布局的 decode 少行 GEMV。数值形态与 fdot2 路径相同（bf16 舍入
+/// + fdot2），但 quant 8B 向量加载、scale 每 32 列一次广播。
+pub fn try_q8_gemv_repacked_resident_f32(device_id: i32, input: &[f32], input_device: Option<&DeviceBuffer>, weight: &DeviceBuffer, input_rows: usize, columns: usize, output_rows: usize) -> Result<DeviceBuffer, String> {
+    if input_rows == 0 || input_rows > 8 || columns == 0 || output_rows == 0 || !columns.is_multiple_of(256) {
+        return Err(format!("Q8 repacked GEMV shape 非法: [{input_rows},{columns}] x [{output_rows},{columns}]"));
+    }
+    if weight.device_id != device_id {
+        return Err("Q8 repacked GEMV weight 与执行 device 不一致".to_owned());
+    }
+    let weight_bytes = output_rows.checked_mul(columns / 16 + columns).ok_or("Q8 repacked weight 大小溢出")?;
+    if weight.bytes() != weight_bytes {
+        return Err(format!("Q8 repacked weight 字节 {}，期望 {weight_bytes}", weight.bytes()));
+    }
+    let input_elements = input_rows.checked_mul(columns).ok_or("Q8 repacked input 大小溢出")?;
+    let output_bytes = input_rows.checked_mul(output_rows).and_then(|elements| elements.checked_mul(4)).ok_or("Q8 repacked output 大小溢出")?;
+    let input_bytes_f32 = input_elements.checked_mul(4).ok_or("Q8 repacked input 字节溢出")?;
+    let input_bytes_bf16 = input_elements.checked_mul(2).ok_or("Q8 repacked input 字节溢出")?;
+    let uploaded_input;
+    let input_pointer: *mut c_void;
+    let input_is_bf16: u32;
+    match input_device {
+        Some(buffer) if buffer.device_id == device_id && buffer.bytes == input_bytes_bf16 => {
+            input_pointer = buffer.pointer;
+            input_is_bf16 = 1;
+        }
+        Some(buffer) if buffer.device_id == device_id && buffer.bytes == input_bytes_f32 => {
+            input_pointer = buffer.pointer;
+            input_is_bf16 = 0;
+        }
+        _ => {
+            if input.len() != input_elements {
+                return Err(format!("Q8 repacked host input={}/{}，且无匹配设备 buffer", input.len(), input_elements));
+            }
+            uploaded_input = DeviceBuffer::allocate_reusable(device_id, input_bytes_f32)?;
+            uploaded_input.copy_from_host(unsafe { std::slice::from_raw_parts(input.as_ptr().cast(), input_bytes_f32) })?;
+            input_pointer = uploaded_input.pointer;
+            input_is_bf16 = 0;
+        }
+    }
+    let runtime = RocmRuntime::open()?;
+    let module_launch = crate::kernel::rocm::hip::kernel_launch_trampoline;
+    let d_output = DeviceBuffer::allocate_reusable(device_id, output_bytes)?;
+    let (_qk_function, _q6_function, _fdot2_function, q8_repacked_function) = qk_matmul_resident_functions(device_id, &runtime)?;
+    let mut rows = u32::try_from(input_rows).map_err(|_| "Q8 repacked input_rows 超过 u32")?;
+    let mut cols = u32::try_from(columns).map_err(|_| "Q8 repacked columns 超过 u32")?;
+    let mut out_rows = u32::try_from(output_rows).map_err(|_| "Q8 repacked output_rows 超过 u32")?;
+    let mut is_bf16 = input_is_bf16;
+    let mut input_pointer = input_pointer;
+    let mut arguments = [
+        (&mut input_pointer as *mut *mut c_void).cast(),
+        (&weight.pointer as *const _ as *mut c_void).cast(),
+        (&d_output.pointer as *const _ as *mut c_void).cast(),
+        (&mut rows as *mut u32).cast(),
+        (&mut cols as *mut u32).cast(),
+        (&mut out_rows as *mut u32).cast(),
+        (&mut is_bf16 as *mut u32).cast(),
+    ];
+    let launch_status =
+        unsafe { module_launch(q8_repacked_function, u32::try_from(output_rows).map_err(|_| "Q8 repacked grid 超过 u32")?, 1, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
+    if launch_status != HIP_SUCCESS {
+        return Err(runtime.hip_error(launch_status, "hipModuleLaunchKernel Q8 repacked GEMV"));
+    }
+    if crate::kernel::rocm::hip::options().kernel_sync {
+        crate::kernel::rocm::hip::synchronize_device(device_id, "Q8 repacked kernel_sync")?;
+    }
+    Ok(d_output)
+}
+
+fn qk_matmul_resident_functions(device_id: i32, runtime: &RocmRuntime) -> Result<(*mut c_void, *mut c_void, *mut c_void, *mut c_void), String> {
+    static FUNCTIONS: OnceLock<Mutex<HashMap<i32, (usize, usize, usize, usize)>>> = OnceLock::new();
     let functions = FUNCTIONS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut functions = functions.lock().map_err(|_| "QK resident kernel cache 已损坏".to_owned())?;
-    if let Some(&(qk, q6, fdot2)) = functions.get(&device_id) {
-        return Ok((qk as *mut c_void, q6 as *mut c_void, fdot2 as *mut c_void));
+    if let Some(&(qk, q6, fdot2, q8_repacked)) = functions.get(&device_id) {
+        return Ok((qk as *mut c_void, q6 as *mut c_void, fdot2 as *mut c_void, q8_repacked as *mut c_void));
     }
     set_device(device_id)?;
     let module_load: Symbol<HipModuleLoadData> = runtime.symbol(&runtime.hip, b"hipModuleLoadData\0")?;
@@ -321,8 +416,8 @@ fn qk_matmul_resident_functions(device_id: i32, runtime: &RocmRuntime) -> Result
     if load_status != HIP_SUCCESS {
         return Err(runtime.hip_error(load_status, "hipModuleLoadData QK resident"));
     }
-    let mut loaded = [ptr::null_mut(); 3];
-    for (slot, name) in ["qk_matmul_f32", "q6_matmul_f32", "qk_matmul_fdot2"].into_iter().enumerate() {
+    let mut loaded = [ptr::null_mut(); 4];
+    for (slot, name) in ["qk_matmul_f32", "q6_matmul_f32", "qk_matmul_fdot2", "q8_gemv_repacked"].into_iter().enumerate() {
         let name = CString::new(name).unwrap();
         let status = unsafe { module_get_function(&mut loaded[slot], module, name.as_ptr()) };
         if status != HIP_SUCCESS {
@@ -332,8 +427,8 @@ fn qk_matmul_resident_functions(device_id: i32, runtime: &RocmRuntime) -> Result
         }
     }
     // module 常驻不卸载；仅保存 function 句柄。
-    functions.insert(device_id, (loaded[0] as usize, loaded[1] as usize, loaded[2] as usize));
-    Ok((loaded[0], loaded[1], loaded[2]))
+    functions.insert(device_id, (loaded[0] as usize, loaded[1] as usize, loaded[2] as usize, loaded[3] as usize));
+    Ok((loaded[0], loaded[1], loaded[2], loaded[3]))
 }
 
 #[cfg(test)]
@@ -347,11 +442,17 @@ mod tests {
         let (device, columns, output_rows, input_rows) = (0_i32, 1536_usize, 96_usize, 1_usize);
         super::super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
         let input: Vec<f32> = (0..input_rows * columns).map(|index| (((index as i32 * 37) % 41 - 20) as f32) / 32.0).collect();
-        for tensor_type in [11_u32, 12, 13, 14, 21, 23] {
-            let (_, block_bytes) = crate::weight::codec::ggml::block_layout(tensor_type).unwrap();
-            let mut weight = vec![0_u8; output_rows * (columns / 256) * block_bytes];
+        for tensor_type in [8_u32, 11, 12, 13, 14, 21, 23] {
+            let (block_size, block_bytes) = crate::weight::codec::ggml::block_layout(tensor_type).unwrap();
+            let mut weight = vec![0_u8; output_rows * (columns / block_size) * block_bytes];
             for (byte, value) in weight.iter_mut().enumerate() {
                 *value = ((byte % 256 * 29 + byte / 7) % 256) as u8;
+            }
+            if tensor_type == 8 {
+                // Q8_0 每 34B 一个 f16 scale；随机 bit 可能是 NaN/Inf，写合法值。
+                for block in weight.chunks_exact_mut(34) {
+                    block[..2].copy_from_slice(&half::f16::from_f32(0.015625).to_le_bytes());
+                }
             }
             let weight_device = super::DeviceBuffer::upload(device, &weight).unwrap();
             let fast = try_qk_matmul_fdot2_resident_f32(device, tensor_type, &input, None, &weight_device, input_rows, columns, output_rows).unwrap();
@@ -366,6 +467,41 @@ mod tests {
             }
             println!("[qk-fdot2-oracle] type={tensor_type} max_abs={max_abs:.6e}");
             assert!(max_abs <= 1.0e-2, "type={tensor_type} max_abs={max_abs}");
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn q8_repacked_matches_scalar_within_bf16_tolerance() {
+        let device = 0_i32;
+        super::super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+        for (columns, output_rows, input_rows) in [(1536_usize, 96_usize, 1_usize), (2048, 512, 2), (6144, 64, 1), (16384, 32, 1)] {
+            let input: Vec<f32> = (0..input_rows * columns).map(|index| (((index as i32 * 37) % 41 - 20) as f32) / 32.0).collect();
+            let (block_size, block_bytes) = crate::weight::codec::ggml::block_layout(8).unwrap();
+            let mut weight = vec![0_u8; output_rows * (columns / block_size) * block_bytes];
+            for (byte, value) in weight.iter_mut().enumerate() {
+                *value = ((byte % 256 * 29 + byte / 7) % 256) as u8;
+            }
+            // Q8_0 每 34B 一个 f16 scale；随机 bit 可能是 NaN/Inf，写合法值。
+            for block in weight.chunks_exact_mut(34) {
+                block[..2].copy_from_slice(&half::f16::from_f32(0.015625).to_le_bytes());
+            }
+            let repacked = super::repack_q8_0_rows(&weight, output_rows, columns).unwrap();
+            let repacked_device = super::DeviceBuffer::upload(device, &repacked).unwrap();
+            let fast = super::try_q8_gemv_repacked_resident_f32(device, &input, None, &repacked_device, input_rows, columns, output_rows).unwrap();
+            let decoded = crate::weight::codec::ggml::dequantize(8, &weight, output_rows * columns).unwrap();
+            let mut fast_host = vec![0.0_f32; input_rows * output_rows];
+            fast.copy_to_host(unsafe { std::slice::from_raw_parts_mut(fast_host.as_mut_ptr().cast(), fast_host.len() * 4) }).unwrap();
+            for row in 0..input_rows {
+                for out_row in 0..output_rows {
+                    let expected: f32 = decoded[out_row * columns..(out_row + 1) * columns].iter().zip(&input[row * columns..(row + 1) * columns]).map(|(weight, input)| weight * input).sum();
+                    let actual = fast_host[row * output_rows + out_row];
+                    assert!(actual.is_finite(), "cols={columns} row={row} out={out_row} 非有限");
+                    let tolerance = 1.0e-2 * expected.abs().max(1.0);
+                    assert!((actual - expected).abs() <= tolerance, "cols={columns} row={row} out={out_row} actual={actual} expected={expected}");
+                }
+            }
+            println!("[q8-repacked-oracle] cols={columns} rows={output_rows} in={input_rows} 通过");
         }
     }
 
@@ -394,5 +530,118 @@ mod tests {
                 assert!((actual - expected).abs() <= tolerance, "type={tensor_type} actual={actual} expected={expected}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod q8_bench {
+    /// Q8_0 GEMV 真实形状微基准：generic 标量路径 vs fdot2 快路径。
+    /// `cargo test --release --features with-rocm q8_0_gemv_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn q8_0_gemv_bench() {
+        use super::*;
+        let device = 0_i32;
+        super::super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+        for (columns, output_rows, label) in [(2048_usize, 16384_usize, "q_b"), (16384, 6144, "o_proj")] {
+            let input: Vec<f32> = (0..columns).map(|index| (((index as i32 * 37) % 41 - 20) as f32) / 32.0).collect();
+            let (block_size, block_bytes) = crate::weight::codec::ggml::block_layout(8).unwrap();
+            let mut weight = vec![0_u8; output_rows * (columns / block_size) * block_bytes];
+            for (byte, value) in weight.iter_mut().enumerate() {
+                *value = ((byte % 256 * 29 + byte / 7) % 256) as u8;
+            }
+            for block in weight.chunks_exact_mut(34) {
+                block[..2].copy_from_slice(&half::f16::from_f32(0.015625).to_le_bytes());
+            }
+            let weight_device = DeviceBuffer::upload(device, &weight).unwrap();
+            let weight_gib = weight.len() as f64 / (1u64 << 30) as f64;
+            let bench = |name: &str, call: &mut dyn FnMut()| {
+                for _ in 0..3 {
+                    call();
+                }
+                let started = std::time::Instant::now();
+                let rounds = 50;
+                for _ in 0..rounds {
+                    call();
+                }
+                super::super::super::synchronize_device(device, name).unwrap();
+                let micros = started.elapsed().as_micros() as f64 / rounds as f64;
+                eprintln!("[q8-gemv-bench] {label} {name} avg_us={micros:.1} bw_GBps={:.0}", weight_gib * 1024.0 / (micros / 1e6));
+            };
+            // 标量 resident 路径不支持 Q8_0；生产 decode 基线是 fdot2。
+            bench("fdot2", &mut || {
+                let _ = try_qk_matmul_fdot2_resident_f32(device, 8, &input, None, &weight_device, 1, columns, output_rows).unwrap();
+            });
+            let repacked = repack_q8_0_rows(&weight, output_rows, columns).unwrap();
+            let repacked_device = DeviceBuffer::upload(device, &repacked).unwrap();
+            bench("repacked", &mut || {
+                let _ = try_q8_gemv_repacked_resident_f32(device, &input, None, &repacked_device, 1, columns, output_rows).unwrap();
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod q6_lm_head_bench {
+    /// lm_head 真实形状（6144×154880）GEMV 微基准：
+    /// Q6_K GGUF fdot2（源格式）vs Q8G128 W8A16（当前生产）。
+    /// `cargo test --release --features with-rocm q6_lm_head_gemv_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn q6_lm_head_gemv_bench() {
+        use super::*;
+        const DEVICE: i32 = 0;
+        const COLUMNS: usize = 6144;
+        const OUTPUT_ROWS: usize = 154880;
+        super::super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+        let input: Vec<f32> = (0..COLUMNS).map(|index| (((index as i32 * 37) % 41 - 20) as f32) / 32.0).collect();
+        let d_input = DeviceBuffer::upload(DEVICE, unsafe { std::slice::from_raw_parts(input.as_ptr().cast::<u8>(), COLUMNS * 4) }).unwrap();
+
+        // Q6_K（type 14，block 256 元素 / 210B）
+        let (q6_block_size, q6_block_bytes) = crate::weight::codec::ggml::block_layout(14).unwrap();
+        let mut q6_weight = vec![0_u8; OUTPUT_ROWS * (COLUMNS / q6_block_size) * q6_block_bytes];
+        for (byte, value) in q6_weight.iter_mut().enumerate() {
+            *value = ((byte % 256 * 29 + byte / 7) % 256) as u8;
+        }
+        // Q6_K 每 block 头部 2B 是 f16 scale；随机 bit 可能是 NaN/Inf，写合法值。
+        for block in q6_weight.chunks_exact_mut(q6_block_bytes) {
+            block[..2].copy_from_slice(&half::f16::from_f32(0.015625).to_le_bytes());
+        }
+        let q6_weight_device = DeviceBuffer::upload(DEVICE, &q6_weight).unwrap();
+        let q6_gib = q6_weight.len() as f64 / (1u64 << 30) as f64;
+
+        // Q8G128（W8A16 packed + scale）
+        let q8_groups = COLUMNS / 128;
+        let mut q8_packed = vec![0_u8; OUTPUT_ROWS * COLUMNS];
+        for (byte, value) in q8_packed.iter_mut().enumerate() {
+            *value = ((byte % 256 * 29 + byte / 7) % 256) as u8;
+        }
+        let mut q8_scales = Vec::with_capacity(OUTPUT_ROWS * q8_groups);
+        for index in 0..OUTPUT_ROWS * q8_groups {
+            q8_scales.push(half::bf16::from_f32(0.015625 + (index % 7) as f32 * 0.001));
+        }
+        let q8_packed_device = DeviceBuffer::upload(DEVICE, &q8_packed).unwrap();
+        let q8_scales_device = DeviceBuffer::upload(DEVICE, unsafe { std::slice::from_raw_parts(q8_scales.as_ptr().cast::<u8>(), q8_scales.len() * 2) }).unwrap();
+        let q8_gib = (q8_packed.len() + q8_scales.len() * 2) as f64 / (1u64 << 30) as f64;
+
+        let bench = |label: &str, gib: f64, call: &mut dyn FnMut()| {
+            for _ in 0..2 {
+                call();
+            }
+            let started = std::time::Instant::now();
+            const ROUNDS: usize = 20;
+            for _ in 0..ROUNDS {
+                call();
+            }
+            super::super::super::synchronize_device(DEVICE, label).unwrap();
+            let micros = started.elapsed().as_micros() as f64 / ROUNDS as f64;
+            eprintln!("[lm-head-bench] {label} avg_us={micros:.1} bw_GBps={:.0}", gib * 1024.0 / (micros / 1e6));
+        };
+        bench("q6_k-fdot2", q6_gib, &mut || {
+            let _ = try_qk_matmul_fdot2_resident_f32(DEVICE, 14, &input, Some(&d_input), &q6_weight_device, 1, COLUMNS, OUTPUT_ROWS).unwrap();
+        });
+        bench("q8g128-w8a16", q8_gib, &mut || {
+            let _ = try_ct_quantized_matmul_bf16(DEVICE, 8, &input, Some(&d_input), &q8_packed_device, &q8_scales_device, 0, 128, 1, COLUMNS, OUTPUT_ROWS).unwrap();
+        });
     }
 }

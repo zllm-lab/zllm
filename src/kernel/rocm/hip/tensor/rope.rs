@@ -108,6 +108,64 @@ pub fn try_rope_resident_f32(
     Ok(output)
 }
 
+/// graph 兼容变体：position 从 device buffer 读取，replay 期参数地址不变。
+/// `position_buffer` 由调用方持有并每 token 更新（graph 外 H2D）。
+#[allow(clippy::too_many_arguments)]
+pub fn try_rope_indirect_resident_f32(
+    device_id: i32,
+    input: &DeviceBuffer,
+    rows: usize,
+    cols: usize,
+    head_count: usize,
+    rotary_dim: usize,
+    layout: RotaryLayout,
+    position_buffer: &DeviceBuffer,
+    cos: &[f32],
+    sin: &[f32],
+    prefix: bool,
+) -> Result<DeviceBuffer, String> {
+    let input_bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(4)).ok_or("resident RoPE 大小溢出")?;
+    validate_resident(input, device_id, input_bytes, "RoPE input")?;
+    validate_resident(position_buffer, device_id, 4, "RoPE indirect position")?;
+    let half = rotary_dim / 2;
+    if cos.len() < half || sin.len() < half {
+        return Err("resident RoPE table 太短".to_owned());
+    }
+    set_device(device_id)?;
+    let output = DeviceBuffer::allocate(device_id, input_bytes)?;
+    let functions = tensor_functions(device_id)?;
+    // graph 模式下 table 必须整表常驻：录制后无法再按 position 切片。
+    let table_rows = cos.len() / half;
+    let (cosine, sine) = resident_rope_tables(device_id, cos, sin, half, 0..table_rows)?;
+    let mut d_input = input.pointer;
+    let mut d_cosine = cosine.pointer;
+    let mut d_sine = sine.pointer;
+    let mut d_output = output.pointer;
+    let mut d_position = position_buffer.pointer;
+    let mut rows = u32::try_from(rows).map_err(|_| "resident RoPE rows 超过 u32".to_owned())?;
+    let mut cols = u32::try_from(cols).map_err(|_| "resident RoPE cols 超过 u32".to_owned())?;
+    let mut head_count = u32::try_from(head_count).map_err(|_| "resident RoPE heads 超过 u32".to_owned())?;
+    let mut rotary_dim = u32::try_from(rotary_dim).map_err(|_| "resident RoPE dim 超过 u32".to_owned())?;
+    let mut split_half = u32::from(layout == RotaryLayout::SplitHalf);
+    let mut prefix = u32::from(prefix);
+    let mut arguments = [
+        (&mut d_input as *mut *mut c_void).cast(),
+        (&mut d_cosine as *mut *mut c_void).cast(),
+        (&mut d_sine as *mut *mut c_void).cast(),
+        (&mut d_output as *mut *mut c_void).cast(),
+        (&mut rows as *mut u32).cast(),
+        (&mut cols as *mut u32).cast(),
+        (&mut head_count as *mut u32).cast(),
+        (&mut rotary_dim as *mut u32).cast(),
+        (&mut d_position as *mut *mut c_void).cast(),
+        (&mut split_half as *mut u32).cast(),
+        (&mut prefix as *mut u32).cast(),
+    ];
+    let elements = rows.checked_mul(cols).ok_or("resident RoPE elements 溢出")?;
+    launch_tensor_kernel(functions.rope_indirect, elements.div_ceil(256), 256, &mut arguments, "HIP resident indirect rope")?;
+    Ok(output)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 pub(crate) fn try_rope_segmented_pair_resident_f32(

@@ -376,6 +376,11 @@ impl Backend for CpuContext {
         Ok(CpuTensor { data: left.data.iter().zip(&right.data).map(|(left, right)| (left + right) * scale).collect(), rows: left.rows, cols: left.cols })
     }
 
+    fn cast_f16(&self, input: &CpuTensor) -> Result<CpuTensor, BackendError> {
+        // CPU 张量本就 f32,恒等返回。
+        Ok(input.clone())
+    }
+
     fn sigmoid_gate(&self, input: &CpuTensor, gate: &CpuTensor) -> Result<CpuTensor, BackendError> {
         if input.rows != gate.rows || (gate.cols != 1 && gate.cols != input.cols) {
             return Err(compute(format!("CPU sigmoid gate shape input=[{},{}], gate=[{},{}]", input.rows, input.cols, gate.rows, gate.cols)));
@@ -386,6 +391,22 @@ impl Backend for CpuContext {
                 let gate_column = if gate.cols == 1 { 0 } else { column };
                 let value = gate.data[row * gate.cols + gate_column];
                 output.data[row * input.cols + column] *= 1.0 / (1.0 + (-value).exp());
+            }
+        }
+        Ok(output)
+    }
+
+    fn softplus_gate(&self, input: &CpuTensor, gate: &CpuTensor) -> Result<CpuTensor, BackendError> {
+        if input.rows != gate.rows || gate.cols == 0 || input.cols % gate.cols != 0 {
+            return Err(compute(format!("CPU softplus gate shape input=[{},{}], gate=[{},{}] 不满足逐头广播", input.rows, input.cols, gate.rows, gate.cols)));
+        }
+        let span = input.cols / gate.cols;
+        let softplus = |value: f32| if value > 20.0 { value } else { value.exp().ln_1p() };
+        let mut output = input.clone();
+        for row in 0..input.rows {
+            for column in 0..input.cols {
+                let value = gate.data[row * gate.cols + column / span];
+                output.data[row * input.cols + column] *= softplus(value);
             }
         }
         Ok(output)

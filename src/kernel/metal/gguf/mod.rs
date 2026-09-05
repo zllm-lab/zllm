@@ -3154,6 +3154,243 @@ kernel void gguf_gemm_iq4nl_fused_f16(
         }
     }
 }
+
+// Fused IQ4_XS / IQ3_S GEMM(32×32 tile,对齐 MLX qmm 标杆结构):M5 的
+// threadgroup memory 是按 TG 分区的稀缺资源,64×64 tile 的 24-32KB 布局会把
+// 每 SIMD 的并发 TG 压到个位数;32×32 tile 全布局 8KB(2+2+4),并发翻倍,
+// M=58 的两个 m_tile 由同列段 TG 相邻调度经 L2 摊销权重重复读。每 simdgroup
+// 负责 16×16 输出(WM=WN=2)。BK=32 恰为 GGML 的一个 ib32 子块:
+// - IQ4_XS:块头 d 与 6 位 ls 每列解一次,每线程装 4 字节 quants 的低/高
+//   nibble 双段(前 8 字节低 nibble=元素 0-7、后 8 字节低=8-15,高=16-31)。
+// - IQ3_S:每线程装一个 t 段(2 次 grid 查表产 8 值)。
+// 覆盖 32 行以上 prefill,替代"整块物化 dequant + MPS"两步路径(实测占
+// 58-token prefill GPU 的 93%);gate/up 大矩阵经两次本 kernel + 激活 epilogue
+// 的分解路径接入。
+kernel void gguf_gemm_iq4xs_fused_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *weight [[buffer(1)]],
+    device const ulong *iq2s_grid [[buffer(2)]],
+    device half *output [[buffer(3)]],
+    constant uint &M [[buffer(4)]],
+    constant uint &N [[buffer(5)]],
+    constant uint &K [[buffer(6)]],
+    constant uint &row_bytes [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    threadgroup half stage_a[32 * 32];
+    threadgroup half stage_b[32 * 32];
+    threadgroup float result[32 * 32];
+    const uint row_base = group.y * 32;
+    const uint col_base = group.x * 32;
+    const uint gi = simd_index & 1;
+    const uint gj = simd_index >> 1;
+    simdgroup_float8x8 acc[2][2];
+    for (uint mi = 0; mi < 2; ++mi) {
+        for (uint nj = 0; nj < 2; ++nj) {
+            acc[mi][nj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    for (uint k_base = 0; k_base < K; k_base += 32) {
+        #pragma unroll
+        for (uint round = 0; round < 2; ++round) {
+            const uint index = thread_index + round * 128;
+            const uint local_row = index >> 3;
+            const uint local_k = (index & 7) << 2;
+            half4 value = 0.0h;
+            if (row_base + local_row < M) {
+                value = *(device const half4 *)(input + ulong(row_base + local_row) * K + k_base + local_k);
+            }
+            *(threadgroup half4 *)(stage_a + local_row * 32 + local_k) = value;
+        }
+        // 128 线程 = 32 权重列 × 4 个 quants 字节段;每线程产 8 值。
+        {
+            const uint local_n = thread_index >> 2;
+            const uint quarter = thread_index & 3;
+            const uint out_col = col_base + local_n;
+            half staged[8];
+            if (out_col < N) {
+                device const uchar *block = weight + ulong(out_col) * row_bytes + ulong(k_base >> 8) * 136;
+                const uint sub = (k_base >> 5) & 7;
+                const float d = float(load_f16(block));
+                const ushort scales_h = ushort(block[2]) | (ushort(block[3]) << 8);
+                const uchar scales_l = block[4 + (sub >> 1)];
+                const uint low = (sub & 1) != 0 ? scales_l >> 4 : scales_l & 0x0f;
+                const uint ls = low | (((scales_h >> (2 * sub)) & 0x03) << 4);
+                const float dl = d * (float(ls) - 32.0f);
+                device const uchar *quants = block + 8 + sub * 16 + quarter * 4;
+                // quarter 0..3 的 4 字节段连续覆盖 16B:低 nibble 是元素
+                // 4q..4q+3(0-15),高 nibble 是 16+4q..(16-31)。
+                const uint k_first = quarter * 4;
+                #pragma unroll
+                for (uint i = 0; i < 4; ++i) {
+                    const uchar packed = quants[i];
+                    staged[i] = half(dl * float(kvalues_iq4nl[packed & 15]));
+                    staged[4 + i] = half(dl * float(kvalues_iq4nl[packed >> 4]));
+                    stage_b[(k_first + i) * 32 + local_n] = staged[i];
+                    stage_b[(k_first + 16 + i) * 32 + local_n] = staged[4 + i];
+                }
+            } else {
+                const uint k_first = quarter * 4;
+                #pragma unroll
+                for (uint i = 0; i < 4; ++i) {
+                    stage_b[(k_first + i) * 32 + local_n] = 0.0h;
+                    stage_b[(k_first + 16 + i) * 32 + local_n] = 0.0h;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 32; k += 8) {
+            simdgroup_half8x8 a[2];
+            simdgroup_half8x8 b[2];
+            #pragma unroll
+            for (uint mi = 0; mi < 2; ++mi) {
+                simdgroup_load(a[mi], stage_a + (gi * 16 + mi * 8) * 32 + k, 32);
+            }
+            #pragma unroll
+            for (uint nj = 0; nj < 2; ++nj) {
+                simdgroup_load(b[nj], stage_b + k * 32 + gj * 16 + nj * 8, 32);
+            }
+            #pragma unroll
+            for (uint mi = 0; mi < 2; ++mi) {
+                for (uint nj = 0; nj < 2; ++nj) {
+                    simdgroup_multiply_accumulate(acc[mi][nj], a[mi], b[nj], acc[mi][nj]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma unroll
+    for (uint mi = 0; mi < 2; ++mi) {
+        for (uint nj = 0; nj < 2; ++nj) {
+            simdgroup_store(acc[mi][nj], result + (gi * 16 + mi * 8) * 32 + gj * 16 + nj * 8, 32);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint index = thread_index; index < 32 * 32; index += 128) {
+        const uint local_row = index >> 5;
+        const uint local_col = index & 31;
+        if (row_base + local_row < M && col_base + local_col < N) {
+            output[ulong(row_base + local_row) * N + col_base + local_col] = finite_f16(result[index]);
+        }
+    }
+}
+
+kernel void gguf_gemm_iq3s_fused_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *weight [[buffer(1)]],
+    device const ulong *iq2s_grid [[buffer(2)]],
+    device half *output [[buffer(3)]],
+    constant uint &M [[buffer(4)]],
+    constant uint &N [[buffer(5)]],
+    constant uint &K [[buffer(6)]],
+    constant uint &row_bytes [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    threadgroup half stage_a[32 * 32];
+    threadgroup half stage_b[32 * 32];
+    threadgroup float result[32 * 32];
+    const uint row_base = group.y * 32;
+    const uint col_base = group.x * 32;
+    const uint gi = simd_index & 1;
+    const uint gj = simd_index >> 1;
+    simdgroup_float8x8 acc[2][2];
+    for (uint mi = 0; mi < 2; ++mi) {
+        for (uint nj = 0; nj < 2; ++nj) {
+            acc[mi][nj] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    for (uint k_base = 0; k_base < K; k_base += 32) {
+        #pragma unroll
+        for (uint round = 0; round < 2; ++round) {
+            const uint index = thread_index + round * 128;
+            const uint local_row = index >> 3;
+            const uint local_k = (index & 7) << 2;
+            half4 value = 0.0h;
+            if (row_base + local_row < M) {
+                value = *(device const half4 *)(input + ulong(row_base + local_row) * K + k_base + local_k);
+            }
+            *(threadgroup half4 *)(stage_a + local_row * 32 + local_k) = value;
+        }
+        // 128 线程 = 32 权重列 × 4 个 t 段;每线程 2 次 grid 查表产 8 值。
+        {
+            const uint local_n = thread_index >> 2;
+            const uint t = thread_index & 3;
+            const uint out_col = col_base + local_n;
+            half staged[8];
+            if (out_col < N) {
+                device const uchar *block = weight + ulong(out_col) * row_bytes + ulong(k_base >> 8) * 110;
+                const uint g = (k_base >> 5) & 7;
+                const float d = float(load_f16(block));
+                const uchar scale = block[106 + (g >> 1)];
+                const float db = d * (1.0f + 2.0f * float(g & 1 ? scale >> 4 : scale & 0x0f));
+                const uint qh = block[66 + g];
+                device const uchar *qs = block + 2 + g * 8;
+                device const uchar *signs = block + 74 + g * 4;
+                const uint i0 = uint(qs[t * 2]) | ((qh << (8 - 2 * t)) & 256u);
+                const uint i1 = uint(qs[t * 2 + 1]) | ((qh << (7 - 2 * t)) & 256u);
+                const uint w0 = iq3s_grid[i0];
+                const uint w1 = iq3s_grid[i1];
+                const uchar sg = signs[t];
+                #pragma unroll
+                for (uint j = 0; j < 4; ++j) {
+                    staged[j] = half(db * float((w0 >> (8 * j)) & 0xff) * ((sg & (1u << j)) == 0 ? 1.0 : -1.0));
+                    staged[4 + j] = half(db * float((w1 >> (8 * j)) & 0xff) * ((sg & (16u << j)) == 0 ? 1.0 : -1.0));
+                }
+                #pragma unroll
+                for (uint j = 0; j < 8; ++j) {
+                    stage_b[(t * 8 + j) * 32 + local_n] = staged[j];
+                }
+            } else {
+                #pragma unroll
+                for (uint j = 0; j < 8; ++j) {
+                    stage_b[(t * 8 + j) * 32 + local_n] = 0.0h;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < 32; k += 8) {
+            simdgroup_half8x8 a[2];
+            simdgroup_half8x8 b[2];
+            #pragma unroll
+            for (uint mi = 0; mi < 2; ++mi) {
+                simdgroup_load(a[mi], stage_a + (gi * 16 + mi * 8) * 32 + k, 32);
+            }
+            #pragma unroll
+            for (uint nj = 0; nj < 2; ++nj) {
+                simdgroup_load(b[nj], stage_b + k * 32 + gj * 16 + nj * 8, 32);
+            }
+            #pragma unroll
+            for (uint mi = 0; mi < 2; ++mi) {
+                for (uint nj = 0; nj < 2; ++nj) {
+                    simdgroup_multiply_accumulate(acc[mi][nj], a[mi], b[nj], acc[mi][nj]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma unroll
+    for (uint mi = 0; mi < 2; ++mi) {
+        for (uint nj = 0; nj < 2; ++nj) {
+            simdgroup_store(acc[mi][nj], result + (gi * 16 + mi * 8) * 32 + gj * 16 + nj * 8, 32);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint index = thread_index; index < 32 * 32; index += 128) {
+        const uint local_row = index >> 5;
+        const uint local_col = index & 31;
+        if (row_base + local_row < M && col_base + local_col < N) {
+            output[ulong(row_base + local_row) * N + col_base + local_col] = finite_f16(result[index]);
+        }
+    }
+}
 "#;
 
 use crate::backend::metal::api as metal;

@@ -668,7 +668,7 @@ extern "C" __global__ void q8_cache_copy_pair(
     }
 }
 
-extern "C" __global__ void paged_cache_append_mla_f32_q8_bf16(
+__device__ __forceinline__ void paged_cache_append_mla_body(
     const float* latent_input,
     signed char* latent_cache,
     unsigned short* latent_scales,
@@ -740,6 +740,51 @@ extern "C" __global__ void paged_cache_append_mla_f32_q8_bf16(
     const float quantized = nearbyintf(value / quant_scale);
     latent_cache[physical * latent_columns + column]
         = (signed char)fmaxf(-127.0f, fminf(127.0f, quantized));
+}
+
+// 既有 kernel：position 来自 host 参数。
+extern "C" __global__ void paged_cache_append_mla_f32_q8_bf16(
+    const float* latent_input,
+    signed char* latent_cache,
+    unsigned short* latent_scales,
+    const float* rope_input,
+    const float* cosine,
+    const float* sine,
+    unsigned short* rope_cache,
+    const unsigned int* block_table,
+    unsigned int position,
+    unsigned int rope_position,
+    unsigned int rows,
+    unsigned int latent_columns,
+    unsigned int rope_columns,
+    unsigned int rotary_dim,
+    unsigned int split_half,
+    unsigned int group_size,
+    unsigned int block_size)
+{
+    paged_cache_append_mla_body(latent_input, latent_cache, latent_scales, rope_input, cosine, sine, rope_cache, block_table, position, rope_position, rows, latent_columns, rope_columns, rotary_dim, split_half, group_size, block_size);
+}
+
+// 间接变体：position/rope_position 从 device buffer 读（graph replay 固定参数）。
+extern "C" __global__ void paged_cache_append_mla_f32_q8_bf16_indirect(
+    const float* latent_input,
+    signed char* latent_cache,
+    unsigned short* latent_scales,
+    const float* rope_input,
+    const float* cosine,
+    const float* sine,
+    unsigned short* rope_cache,
+    const unsigned int* block_table,
+    const unsigned int* positions,
+    unsigned int rows,
+    unsigned int latent_columns,
+    unsigned int rope_columns,
+    unsigned int rotary_dim,
+    unsigned int split_half,
+    unsigned int group_size,
+    unsigned int block_size)
+{
+    paged_cache_append_mla_body(latent_input, latent_cache, latent_scales, rope_input, cosine, sine, rope_cache, block_table, positions[0], positions[1], rows, latent_columns, rope_columns, rotary_dim, split_half, group_size, block_size);
 }
 
 // CPU 全历史只上传本轮缺失行；slot 是 GPU hot cache 中的精确落点。
@@ -2669,13 +2714,14 @@ extern "C" __global__ void dsa_compact_radix_select_topk(
 
 // 单行长上下文的精确选择先保留现有 radix 阈值算法，再把最终稳定压紧拆给
 // 多个 CTA。阈值只依赖计数，shared candidate 的收集顺序不会影响结果。
+// threshold 只负责 byte1（coarse histogram）与 byte2（tile 并行 histogram），
+// byte3/byte4 由 dsa_compact_radix_stage 逐级接力（kernel 边界=全局 barrier）。
 extern "C" __global__ void dsa_compact_radix_threshold(
     const unsigned int* score_keys,
     const unsigned int* coarse_histograms,
-    unsigned int* thresholds,
-    unsigned int* equal_needed_values,
     unsigned int* tile_histograms,
     unsigned int* completed_tiles,
+    unsigned int* radix_state,
     unsigned int query_rows,
     unsigned int score_stride,
     unsigned int query_start,
@@ -2683,7 +2729,6 @@ extern "C" __global__ void dsa_compact_radix_threshold(
     unsigned int tile_count,
     unsigned int tile_rows)
 {
-    constexpr unsigned int candidate_capacity = 4096u;
     const unsigned int tile = blockIdx.x;
     const unsigned int row = blockIdx.y;
     if (row >= query_rows || tile >= tile_count) return;
@@ -2692,13 +2737,9 @@ extern "C" __global__ void dsa_compact_radix_threshold(
     const unsigned long long row_base = (unsigned long long)row * score_stride;
 
     __shared__ unsigned int histogram[256];
-    __shared__ unsigned int candidates[candidate_capacity];
     __shared__ unsigned int prefix;
     __shared__ unsigned int prefix_mask;
     __shared__ unsigned int rank;
-    __shared__ unsigned int prefix_count;
-    __shared__ unsigned int candidate_span;
-    __shared__ unsigned int compacted;
     __shared__ unsigned int last_tile;
 
     histogram[threadIdx.x]
@@ -2708,14 +2749,11 @@ extern "C" __global__ void dsa_compact_radix_threshold(
         prefix = 0u;
         prefix_mask = 0u;
         rank = target_count - 1u;
-        candidate_span = 0u;
-        compacted = 0u;
         for (int bucket = 255; bucket >= 0; --bucket) {
             const unsigned int count = histogram[bucket];
             if (rank < count) {
                 prefix = (unsigned int)bucket << 24;
                 prefix_mask = 255u << 24;
-                prefix_count = count;
                 break;
             }
             rank -= count;
@@ -2766,7 +2804,6 @@ extern "C" __global__ void dsa_compact_radix_threshold(
             if (rank < count) {
                 prefix |= (unsigned int)bucket << 16;
                 prefix_mask |= 255u << 16;
-                prefix_count = count;
                 break;
             }
             rank -= count;
@@ -2774,57 +2811,99 @@ extern "C" __global__ void dsa_compact_radix_threshold(
     }
     __syncthreads();
 
-    for (int shift = 8; shift >= 0; shift -= 8) {
-        histogram[threadIdx.x] = 0u;
-        const unsigned int gather = !compacted
-            && prefix_count <= candidate_capacity && shift != 0;
-        if (threadIdx.x == 0u && gather) candidate_span = 0u;
-        __syncthreads();
-
-        if (compacted) {
-            const unsigned int span = candidate_span;
-            for (unsigned int index = threadIdx.x; index < span;
-                 index += blockDim.x) {
-                const unsigned int token = candidates[index];
-                const unsigned int key = score_keys[row_base + token];
-                if ((key & prefix_mask) == prefix) {
-                    atomicAdd(&histogram[(key >> shift) & 255u], 1u);
-                }
-            }
-        } else {
-            for (unsigned int token = threadIdx.x; token < visible;
-                 token += blockDim.x) {
-                const unsigned int key = score_keys[row_base + token];
-                if ((key & prefix_mask) == prefix) {
-                    if (gather) {
-                        const unsigned int position = atomicAdd(&candidate_span, 1u);
-                        if (position < candidate_capacity) candidates[position] = token;
-                    }
-                    atomicAdd(&histogram[(key >> shift) & 255u], 1u);
-                }
-            }
-        }
-        __syncthreads();
-
-        if (threadIdx.x == 0u) {
-            for (int bucket = 255; bucket >= 0; --bucket) {
-                const unsigned int count = histogram[bucket];
-                if (rank < count) {
-                    prefix |= (unsigned int)bucket << shift;
-                    prefix_mask |= 255u << shift;
-                    prefix_count = count;
-                    break;
-                }
-                rank -= count;
-            }
-            if (gather) compacted = 1u;
-        }
-        __syncthreads();
-    }
-
+    // byte1/byte2 已定；byte3/byte4 拆给 dsa_compact_radix_stage kernel
+    // （kernel 边界即全局 barrier，每级全 tile 并行重扫，替代本 CTA 内
+    // O(visible) 的 shift 循环串行尾巴）。last CTA 写出状态并复位
+    // completed_tiles，下一级无需额外 clear。
     if (threadIdx.x == 0u) {
-        thresholds[row] = prefix;
-        equal_needed_values[row] = rank + 1u;
+        radix_state[(unsigned long long)row * 3u + 0u] = prefix;
+        radix_state[(unsigned long long)row * 3u + 1u] = prefix_mask;
+        radix_state[(unsigned long long)row * 3u + 2u] = rank;
+        completed_tiles[row] = 0u;
+    }
+}
+
+// radix select 的 byte3/byte4 级：threshold kernel 写出 [prefix, mask, rank]
+// 状态后，每级一次本 kernel。全部 tile CTA 并行扫各自 history 段做本字节
+// histogram，最后完成的 CTA 归约并决策（只做 256-bin 扫描，无全量过滤），
+// 再写出状态、复位 completed_tiles。末级（shift==0）同时落最终
+// thresholds/equal_needed。每级决策序列与原单 CTA shift 循环完全相同。
+extern "C" __global__ void dsa_compact_radix_stage(
+    const unsigned int* score_keys,
+    unsigned int* tile_histograms,
+    unsigned int* radix_state,
+    unsigned int* completed_tiles,
+    unsigned int* thresholds,
+    unsigned int* equal_needed_values,
+    unsigned int query_rows,
+    unsigned int score_stride,
+    unsigned int query_start,
+    unsigned int tile_count,
+    unsigned int tile_rows,
+    unsigned int shift)
+{
+    const unsigned int tile = blockIdx.x;
+    const unsigned int row = blockIdx.y;
+    if (row >= query_rows || tile >= tile_count) return;
+    const unsigned int visible = query_start + row + 1u;
+    const unsigned long long row_base = (unsigned long long)row * score_stride;
+    const unsigned int prefix = radix_state[(unsigned long long)row * 3u + 0u];
+    const unsigned int prefix_mask = radix_state[(unsigned long long)row * 3u + 1u];
+    unsigned int rank = radix_state[(unsigned long long)row * 3u + 2u];
+
+    __shared__ unsigned int histogram[256];
+    __shared__ unsigned int last_tile;
+    histogram[threadIdx.x] = 0u;
+    __syncthreads();
+    const unsigned int tile_begin = tile * tile_rows;
+    const unsigned int tile_end = tile_begin + tile_rows < visible
+        ? tile_begin + tile_rows : visible;
+    for (unsigned int token = tile_begin + threadIdx.x; token < tile_end;
+         token += blockDim.x) {
+        const unsigned int key = score_keys[row_base + token];
+        if ((key & prefix_mask) == prefix) {
+            atomicAdd(&histogram[(key >> shift) & 255u], 1u);
+        }
+    }
+    __syncthreads();
+    tile_histograms[((unsigned long long)row * tile_count + tile) * 256u
+        + threadIdx.x] = histogram[threadIdx.x];
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        __threadfence();
+        last_tile = atomicAdd(&completed_tiles[row], 1u) + 1u == tile_count;
+    }
+    __syncthreads();
+    if (!last_tile) return;
+
+    unsigned int bucket_count = 0u;
+    for (unsigned int current = 0u; current < tile_count; ++current) {
+        bucket_count += tile_histograms[
+            ((unsigned long long)row * tile_count + current) * 256u
+                + threadIdx.x];
+    }
+    histogram[threadIdx.x] = bucket_count;
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+        unsigned int next_prefix = prefix;
+        unsigned int next_mask = prefix_mask;
+        for (int bucket = 255; bucket >= 0; --bucket) {
+            const unsigned int count = histogram[bucket];
+            if (rank < count) {
+                next_prefix |= (unsigned int)bucket << shift;
+                next_mask |= 255u << shift;
+                break;
+            }
+            rank -= count;
+        }
+        radix_state[(unsigned long long)row * 3u + 0u] = next_prefix;
+        radix_state[(unsigned long long)row * 3u + 1u] = next_mask;
+        radix_state[(unsigned long long)row * 3u + 2u] = rank;
+        completed_tiles[row] = 0u;
+        if (shift == 0u) {
+            thresholds[row] = next_prefix;
+            equal_needed_values[row] = rank + 1u;
+        }
     }
 }
 
@@ -3099,6 +3178,98 @@ extern "C" __global__ void mla_absorb_query_ct(
     // Decode 只有一行，16-lane/output 避免执行 15 行无效 tile FMA。
     if (query_rows == 1u) {
         const unsigned int nope_dim = q_head_dim - rope_dim;
+        // W8G32 向量化臂：每 16-lane 组产 4 连续 latent 输出列，同 block 16 组
+        // 在同一迭代读同一权重行的 16 个连续 word（两条完整 cache line），
+        // 字节量 4×↓ 且 L2 完全合并。逐输出归约顺序与 F32 路径相同（逐位一致）。
+        if (bits == 8u && group_size == 32u && (latent_dim & 63u) == 0u
+            && (nope_dim & 15u) == 0u && nope_dim <= 1024u) {
+            // grid.x 必须由调用方按 heads × latent/64 发射。
+            const unsigned int latent_quads = latent_dim / 64u;
+            const unsigned int head = blockIdx.x / latent_quads;
+            const unsigned int quad = blockIdx.x % latent_quads;
+            if (head >= head_count) return;
+            const unsigned int group_lane = threadIdx.x >> 4u;
+            const unsigned int lane = threadIdx.x & 15u;
+            const unsigned int col0 = quad * 64u + group_lane * 4u;
+            const unsigned int groups_per_row = latent_dim >> 5u;
+            const unsigned int row_words = latent_dim >> 2u;
+            __shared__ float query_tile[1024];
+            for (unsigned int index = threadIdx.x; index < nope_dim; index += blockDim.x) {
+                query_tile[index] = query[(unsigned long long)head * q_head_dim + index];
+            }
+            __syncthreads();
+            float acc0 = 0.0f;
+            float acc1 = 0.0f;
+            float acc2 = 0.0f;
+            float acc3 = 0.0f;
+            // 行主循环 4 路展开：原形态每迭代 1 次权重装载进 1 条依赖 FMA 链，
+            // nope=192 时每 lane 仅 12 次装载，延迟逐次暴露（bench 14.3µs 只有
+            // 440GB/s）。4 行装载批量发射后再按行序 FMA——累加顺序不变，逐位一致。
+            unsigned int row = lane;
+            for (; row + 48u < nope_dim; row += 64u) {
+                const unsigned long long weight_row0 =
+                    (unsigned long long)head * kv_head_dim + row;
+                const unsigned int word0 = packed[weight_row0 * row_words + (col0 >> 2u)];
+                const unsigned int word1 = packed[(weight_row0 + 16u) * row_words + (col0 >> 2u)];
+                const unsigned int word2 = packed[(weight_row0 + 32u) * row_words + (col0 >> 2u)];
+                const unsigned int word3 = packed[(weight_row0 + 48u) * row_words + (col0 >> 2u)];
+                const float scale0 = zllm_scale(
+                    scales, weight_row0 * groups_per_row + (col0 >> 5u), scale_dtype);
+                const float scale1 = zllm_scale(
+                    scales, (weight_row0 + 16u) * groups_per_row + (col0 >> 5u), scale_dtype);
+                const float scale2 = zllm_scale(
+                    scales, (weight_row0 + 32u) * groups_per_row + (col0 >> 5u), scale_dtype);
+                const float scale3 = zllm_scale(
+                    scales, (weight_row0 + 48u) * groups_per_row + (col0 >> 5u), scale_dtype);
+                const float q0 = query_tile[row];
+                const float q1 = query_tile[row + 16u];
+                const float q2 = query_tile[row + 32u];
+                const float q3 = query_tile[row + 48u];
+                acc0 += q0 * ((float)((int)(word0 & 255u) - 128) * scale0);
+                acc1 += q0 * ((float)((int)((word0 >> 8u) & 255u) - 128) * scale0);
+                acc2 += q0 * ((float)((int)((word0 >> 16u) & 255u) - 128) * scale0);
+                acc3 += q0 * ((float)((int)(word0 >> 24u) - 128) * scale0);
+                acc0 += q1 * ((float)((int)(word1 & 255u) - 128) * scale1);
+                acc1 += q1 * ((float)((int)((word1 >> 8u) & 255u) - 128) * scale1);
+                acc2 += q1 * ((float)((int)((word1 >> 16u) & 255u) - 128) * scale1);
+                acc3 += q1 * ((float)((int)(word1 >> 24u) - 128) * scale1);
+                acc0 += q2 * ((float)((int)(word2 & 255u) - 128) * scale2);
+                acc1 += q2 * ((float)((int)((word2 >> 8u) & 255u) - 128) * scale2);
+                acc2 += q2 * ((float)((int)((word2 >> 16u) & 255u) - 128) * scale2);
+                acc3 += q2 * ((float)((int)(word2 >> 24u) - 128) * scale2);
+                acc0 += q3 * ((float)((int)(word3 & 255u) - 128) * scale3);
+                acc1 += q3 * ((float)((int)((word3 >> 8u) & 255u) - 128) * scale3);
+                acc2 += q3 * ((float)((int)((word3 >> 16u) & 255u) - 128) * scale3);
+                acc3 += q3 * ((float)((int)(word3 >> 24u) - 128) * scale3);
+            }
+            for (; row < nope_dim; row += 16u) {
+                const unsigned long long weight_row =
+                    (unsigned long long)head * kv_head_dim + row;
+                const unsigned int word = packed[weight_row * row_words + (col0 >> 2u)];
+                const float scale = zllm_scale(
+                    scales, weight_row * groups_per_row + (col0 >> 5u), scale_dtype);
+                const float q = query_tile[row];
+                acc0 += q * ((float)((int)(word & 255u) - 128) * scale);
+                acc1 += q * ((float)((int)((word >> 8u) & 255u) - 128) * scale);
+                acc2 += q * ((float)((int)((word >> 16u) & 255u) - 128) * scale);
+                acc3 += q * ((float)((int)(word >> 24u) - 128) * scale);
+            }
+            for (unsigned int offset = 8u; offset > 0u; offset >>= 1u) {
+                acc0 += __shfl_down(acc0, offset, 16);
+                acc1 += __shfl_down(acc1, offset, 16);
+                acc2 += __shfl_down(acc2, offset, 16);
+                acc3 += __shfl_down(acc3, offset, 16);
+            }
+            if (lane == 0u) {
+                const unsigned long long out_base =
+                    (unsigned long long)head * latent_dim + col0;
+                absorbed[out_base] = zllm_f32_to_bf16(acc0);
+                absorbed[out_base + 1u] = zllm_f32_to_bf16(acc1);
+                absorbed[out_base + 2u] = zllm_f32_to_bf16(acc2);
+                absorbed[out_base + 3u] = zllm_f32_to_bf16(acc3);
+            }
+            return;
+        }
         const unsigned int latent_tiles = (latent_dim + 15u) / 16u;
         const unsigned int head = blockIdx.x / latent_tiles;
         const unsigned int latent_column = (blockIdx.x % latent_tiles) * 16u + (threadIdx.x >> 4u);
@@ -5146,9 +5317,553 @@ extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8
         }
     }
 }
+
+// 列并行 QK 变体：与 mla_paged_decode_partial_q8_wmma_f32 同形同参，但 QK 段
+// 把 36 个 16 列切片分给 8 个 wave 并行累加（latent 32 片 = 4 个超级迭代，
+// rope 4 片 = 1 个超级迭代），再经 LDS 按固定顺序跨 wave 求和。
+// 原 kernel 只有 wave0 做 QK WMMA（36 次串行迭代、72 次 __syncthreads）；
+// 这里 5 次超级迭代、10 次 sync。数值上改变了 score 的求和顺序（容差族，
+// 非逐位一致），softmax/PV/epilogue 与原 kernel 完全一致。
+// score_reduce 与 value_tile 分时复用同一段 LDS（归约结束后才写 value_tile）。
+// 模板参数固定维度时（FIXED_* 非零）所有内层循环上界编译期已知，
+// gather/dequant 循环可展开、全局加载批量发射；FIXED_*=0 退化为运行时维度。
+template <unsigned int FIXED_LATENT, unsigned int FIXED_ROPE, unsigned int FIXED_QHEAD, unsigned int FIXED_GROUP>
+__device__ __forceinline__ void mla_decode_partial_q8_wmma_colpar_impl(
+    const float* query,
+    const unsigned short* absorbed,
+    const unsigned short* latent_cache,
+    const unsigned short* latent_scales,
+    const unsigned short* rope_cache,
+    const unsigned int* block_table,
+    const unsigned int* selection,
+    const unsigned int* selection_counts,
+    float* partial,
+    float* stats,
+    unsigned short* weighted_latent,
+    unsigned int context_rows,
+    unsigned int query_start,
+    unsigned int head_count,
+    unsigned int q_head_dim_,
+    unsigned int latent_dim_,
+    unsigned int latent_group_size_,
+    unsigned int rope_dim_,
+    unsigned int top_k,
+    unsigned int block_size,
+    unsigned int selected,
+    unsigned int tile_size,
+    unsigned int shard_parity,
+    unsigned int phase_mask)
+{
+    const unsigned int q_head_dim = FIXED_QHEAD ? FIXED_QHEAD : q_head_dim_;
+    const unsigned int latent_dim = FIXED_LATENT ? FIXED_LATENT : latent_dim_;
+    const unsigned int latent_group_size = FIXED_GROUP ? FIXED_GROUP : latent_group_size_;
+    const unsigned int rope_dim = FIXED_ROPE ? FIXED_ROPE : rope_dim_;
+    const unsigned int lane = threadIdx.x;
+    const unsigned int wave = lane >> 5;
+    const unsigned int wave_lane = lane & 31;
+    const unsigned int row_column = wave_lane & 15;
+    const unsigned int half = wave_lane >> 4;
+    const unsigned int heads_per_block = 16;
+    const unsigned int head_start = blockIdx.x * heads_per_block;
+    if (blockDim.x != 256 || head_start >= head_count || latent_group_size == 0) return;
+    const unsigned int block_head_count = head_count - head_start < heads_per_block
+        ? head_count - head_start : heads_per_block;
+    const unsigned int token_tile = 32;
+    const unsigned int output_stride = 128;
+    const unsigned int output_passes = latent_dim / output_stride;
+    const unsigned int latent_slices = latent_dim / 16;
+    const unsigned int rope_slices = rope_dim / 16;
+    // 列并行形状约束：latent 切片能被 8 整除、rope 切片不超过 8。
+    if (block_head_count != heads_per_block || output_passes != 4
+        || latent_dim % output_stride != 0 || latent_slices % 8 != 0
+        || rope_dim == 0 || rope_dim % 16 != 0 || rope_slices > 8) return;
+
+    const bool direct_output = weighted_latent != nullptr;
+    const unsigned int query_row = direct_output ? blockIdx.y : 0u;
+    const unsigned int dense_visible = query_start + query_row + 1 < context_rows
+        ? query_start + query_row + 1 : context_rows;
+    const bool use_selection = selected && top_k < dense_visible;
+    const unsigned int visible = use_selection
+        ? (selection_counts == nullptr ? top_k : selection_counts[query_row])
+        : dense_visible;
+    const unsigned int tile = direct_output ? 0u : blockIdx.y;
+    const unsigned int tile_start = tile * tile_size;
+    if (tile_start >= visible) {
+        const unsigned long long output_head_base
+            = (unsigned long long)(direct_output ? query_row : tile) * head_count
+                + head_start;
+        if (stats != nullptr) {
+            for (unsigned int head = lane; head < block_head_count; head += blockDim.x) {
+                stats[(output_head_base + head) * 2] = -3.402823466e+38F;
+                stats[(output_head_base + head) * 2 + 1] = 0.0f;
+            }
+        }
+        for (unsigned int index = lane;
+             index < block_head_count * latent_dim;
+             index += blockDim.x) {
+            if (direct_output) {
+                weighted_latent[output_head_base * latent_dim + index] = 0u;
+            } else {
+                partial[output_head_base * latent_dim + index] = 0.0f;
+            }
+        }
+        return;
+    }
+    const unsigned int count = visible - tile_start < tile_size
+        ? visible - tile_start : tile_size;
+    const unsigned int groups = latent_dim / latent_group_size;
+    const unsigned int nope_dim = q_head_dim - rope_dim;
+    const float attention_scale = rsqrtf((float)q_head_dim);
+
+    extern __shared__ unsigned char decode_wmma_cache[];
+    unsigned short* key_tile = reinterpret_cast<unsigned short*>(decode_wmma_cache);
+    unsigned short* probability_tile = key_tile + 8 * token_tile * 16;
+    unsigned short* value_tile = probability_tile + heads_per_block * 16;
+    float* score_reduce = reinterpret_cast<float*>(value_tile);
+    float* alpha = reinterpret_cast<float*>(value_tile + 16 * latent_dim);
+    unsigned int* physicals = reinterpret_cast<unsigned int*>(alpha + heads_per_block);
+    unsigned int* latent_code_tile = physicals + token_tile;
+    unsigned short* latent_scale_tile = reinterpret_cast<unsigned short*>(
+        latent_code_tile + token_tile * latent_dim / 4);
+
+    zllm_wmma_float8 output_accumulator[4] = {};
+    float running_max[8];
+    float running_denominator[8];
+    #pragma unroll
+    for (unsigned int index = 0; index < 8; ++index) {
+        running_max[index] = -3.402823466e+38F;
+        running_denominator[index] = 0.0f;
+    }
+
+    const unsigned int latent_supers = latent_slices / 8;
+    const unsigned int total_supers = latent_supers + 1;
+
+    for (unsigned int tile_base = 0; tile_base < count; tile_base += token_tile) {
+        // phase_mask bit0：gather（physicals + eager materialization）。
+        if (phase_mask & 1u) {
+        if (lane < token_tile) {
+            const unsigned int candidate = tile_base + lane;
+            if (candidate < count) {
+                const unsigned int logical = tile_start + candidate;
+                const unsigned int token = use_selection
+                    ? selection[(unsigned long long)query_row * top_k + logical]
+                    : logical;
+                physicals[lane] = (unsigned int)(shard_parity < 2
+                    ? paged_shard_row(block_table, token, block_size, shard_parity)
+                    : paged_row(block_table, token, block_size));
+            } else {
+                physicals[lane] = 0;
+            }
+        }
+        __syncthreads();
+
+        // 与原 kernel 相同的 eager tile materialization。
+        {
+            const unsigned int words_per_token = latent_dim / 4;
+            #pragma unroll 4
+            for (unsigned int word = lane; word < token_tile * words_per_token; word += blockDim.x) {
+                const unsigned int token_column = word / words_per_token;
+                const unsigned int candidate = tile_base + token_column;
+                latent_code_tile[word] = candidate < count
+                    ? reinterpret_cast<const unsigned int*>(latent_cache)[
+                          (unsigned long long)physicals[token_column] * words_per_token
+                          + (word - token_column * words_per_token)]
+                    : 0u;
+            }
+            for (unsigned int index = lane; index < token_tile * groups; index += blockDim.x) {
+                const unsigned int token_column = index / groups;
+                const unsigned int group = index - token_column * groups;
+                const unsigned int candidate = tile_base + token_column;
+                latent_scale_tile[index] = candidate < count
+                    ? latent_scales[(unsigned long long)physicals[token_column] * groups + group]
+                    : 0x3f80u;
+            }
+            __syncthreads();
+        }
+        }
+
+        zllm_wmma_float8 score_accumulator[2] = {};
+        // 列段并行 QK：每个超级迭代装载 8 个 16 列切片进 key_tile，
+        // wave w 处理切片 super*8+w 并累加自己的部分和。phase_mask bit1。
+        if (phase_mask & 2u) {
+        #pragma unroll
+        for (unsigned int super = 0; super < total_supers; ++super) {
+            const bool rope_super = super == latent_supers;
+            const unsigned int slices_this = rope_super ? rope_slices : 8u;
+            const unsigned int slice = super * 8u + wave;
+            const unsigned int words_per_slice = token_tile * 16 / 4;
+            #pragma unroll 2
+            for (unsigned int word = lane; word < slices_this * words_per_slice; word += blockDim.x) {
+                const unsigned int s = word / words_per_slice;
+                const unsigned int local = word - s * words_per_slice;
+                const unsigned int token_column = local / 4;
+                const unsigned int column = (local & 3u) * 4u;
+                const unsigned int candidate = tile_base + token_column;
+                unsigned long long packed_bf16 = 0;
+                if (candidate < count) {
+                    if (!rope_super) {
+                        const unsigned int column_base = (super * 8u + s) * 16u;
+                        const unsigned int group = column_base / latent_group_size;
+                        const unsigned short encoded_scale =
+                            latent_scale_tile[token_column * groups + group];
+                        const float scale = zllm_bf16_to_f32(encoded_scale);
+                        const unsigned int code_word = latent_code_tile[
+                            (token_column * latent_dim + column_base + column) / 4];
+                        #pragma unroll
+                        for (unsigned int element = 0; element < 4; ++element) {
+                            const signed char code = (signed char)(
+                                (code_word >> (element * 8)) & 0xffu);
+                            packed_bf16 |= (unsigned long long)zllm_f32_to_bf16(
+                                (float)code * scale) << (element * 16);
+                        }
+                    } else {
+                        const unsigned int column_base = s * 16u;
+                        packed_bf16 = *reinterpret_cast<const unsigned long long*>(
+                            rope_cache + (unsigned long long)physicals[token_column] * rope_dim
+                            + column_base + column);
+                    }
+                }
+                reinterpret_cast<unsigned long long*>(key_tile)[
+                    s * words_per_slice + local] = packed_bf16;
+            }
+            __syncthreads();
+            if (wave < slices_this) {
+                zllm_wmma_short16 query_fragment;
+                #pragma unroll
+                for (unsigned int index = 0; index < 8; ++index) {
+                    const unsigned int local_head = row_column;
+                    const unsigned int head = head_start + local_head;
+                    if (rope_super) {
+                        const unsigned int column_base = wave * 16u;
+                        query_fragment[index] = local_head < block_head_count
+                            ? (short)zllm_f32_to_bf16(query[((unsigned long long)query_row * head_count + head) * q_head_dim
+                                + nope_dim + column_base + half * 8 + index])
+                            : 0;
+                    } else {
+                        const unsigned int column_base = slice * 16u;
+                        query_fragment[index] = local_head < block_head_count
+                            ? (short)absorbed[((unsigned long long)query_row * head_count + head) * latent_dim
+                                + column_base + half * 8 + index]
+                            : 0;
+                    }
+                }
+                query_fragment = paged_wmma_expand_bf16(query_fragment);
+                #pragma unroll
+                for (unsigned int token_block = 0; token_block < token_tile / 16; ++token_block) {
+                    zllm_wmma_short16 key_fragment;
+                    #pragma unroll
+                    for (unsigned int index = 0; index < 8; ++index) {
+                        key_fragment[index] = (short)key_tile[
+                            wave * (token_tile * 16)
+                            + (token_block * 16 + row_column) * 16 + half * 8 + index];
+                    }
+                    key_fragment = paged_wmma_expand_bf16(key_fragment);
+                    score_accumulator[token_block]
+                        = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+                            query_fragment, key_fragment, score_accumulator[token_block]);
+                }
+            }
+            __syncthreads();
+        }
+
+        // 跨 wave 归约：8 份列段部分和按 wave 顺序求和（确定性）。
+        #pragma unroll
+        for (unsigned int token_block = 0; token_block < token_tile / 16; ++token_block) {
+            #pragma unroll
+            for (unsigned int index = 0; index < 8; ++index) {
+                score_reduce[((wave * 2 + token_block) * 8 + index) * 32 + wave_lane]
+                    = score_accumulator[token_block][index];
+            }
+        }
+        __syncthreads();
+        if (wave == 0) {
+            #pragma unroll
+            for (unsigned int token_block = 0; token_block < token_tile / 16; ++token_block) {
+                #pragma unroll
+                for (unsigned int index = 0; index < 8; ++index) {
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (unsigned int w = 0; w < 8; ++w) {
+                        sum += score_reduce[((w * 2 + token_block) * 8 + index) * 32 + wave_lane];
+                    }
+                    score_accumulator[token_block][index] = sum;
+                }
+            }
+        }
+        __syncthreads();
+        }
+
+        // 以下 softmax/PV/epilogue 与原 kernel 逐行一致。phase_mask bit2=softmax，bit3=PV。
+        #pragma unroll
+        for (unsigned int token_block = 0; token_block < token_tile / 16; ++token_block) {
+            const unsigned int token_base = tile_base + token_block * 16;
+            if (token_base >= count) break;
+            if ((phase_mask & 4u) && wave < 1) {
+                #pragma unroll
+                for (unsigned int index = 0; index < 8; ++index) {
+                    const unsigned int head = wave * 16 + half + 2 * index;
+                    const unsigned int candidate = token_base + row_column;
+                    // 非分片路径（shard_parity>=2）owned 与 token 无关：
+                    // selection 散读只在分片掩码需要时发生，避免 1-wave softmax
+                    // 串行暴露 16 次全局延迟。
+                    const unsigned int logical = tile_start + candidate;
+                    const unsigned int token = (shard_parity < 2 && candidate < count)
+                        ? (use_selection
+                            ? selection[(unsigned long long)query_row * top_k + logical]
+                            : logical)
+                        : 0u;
+                    const bool owned = candidate < count
+                        && (shard_parity >= 2
+                            || paged_shard_owns(token, block_size, shard_parity));
+                    const float score = owned
+                        ? score_accumulator[token_block][index] * attention_scale
+                        : -3.402823466e+38F;
+                    float tile_max = score;
+                    #pragma unroll
+                    for (unsigned int offset = 8; offset > 0; offset >>= 1) {
+                        tile_max = fmaxf(tile_max, __shfl_xor(tile_max, offset, 16));
+                    }
+                    const float next_max = fmaxf(running_max[index], tile_max);
+                    const float old_scale = running_max[index] == -3.402823466e+38F
+                        ? 0.0f : __builtin_amdgcn_exp2f((running_max[index] - next_max) * 1.4426950408889634f);
+                    const float probability = owned
+                        ? __builtin_amdgcn_exp2f((score - next_max) * 1.4426950408889634f) : 0.0f;
+                    float tile_sum = probability;
+                    #pragma unroll
+                    for (unsigned int offset = 8; offset > 0; offset >>= 1) {
+                        tile_sum += __shfl_xor(tile_sum, offset, 16);
+                    }
+                    running_denominator[index]
+                        = old_scale * running_denominator[index] + tile_sum;
+                    running_max[index] = next_max;
+                    probability_tile[head * 16 + row_column]
+                        = zllm_f32_to_bf16(probability);
+                    if (row_column == 0) alpha[head] = old_scale;
+                }
+            }
+            __syncthreads();
+
+            if (phase_mask & 8u) {
+            const unsigned int value_words = 16 * latent_dim / 4;
+            #pragma unroll 4
+            for (unsigned int word = lane; word < value_words; word += blockDim.x) {
+                const unsigned int index = word * 4;
+                const unsigned int token_column = index / latent_dim;
+                const unsigned int dimension = index - token_column * latent_dim;
+                const unsigned int candidate = token_base + token_column;
+                if (candidate < count) {
+                    const float scale = zllm_bf16_to_f32(
+                        latent_scale_tile[(token_block * 16 + token_column) * groups
+                            + dimension / latent_group_size]);
+                    const unsigned int code_word = latent_code_tile[
+                        ((token_block * 16 + token_column) * latent_dim + dimension) / 4];
+                    unsigned long long packed_bf16 = 0;
+                    #pragma unroll
+                    for (unsigned int element = 0; element < 4; ++element) {
+                        const signed char code = (signed char)(
+                            (code_word >> (element * 8)) & 0xffu);
+                        packed_bf16 |= (unsigned long long)zllm_f32_to_bf16(
+                            (float)code * scale) << (element * 16);
+                    }
+                    reinterpret_cast<unsigned long long*>(value_tile)[word] = packed_bf16;
+                } else {
+                    reinterpret_cast<unsigned long long*>(value_tile)[word] = 0ull;
+                }
+            }
+            __syncthreads();
+
+            const unsigned int dimension_group = wave;
+            zllm_wmma_short16 probability_fragment;
+            #pragma unroll
+            for (unsigned int index = 0; index < 8; ++index) {
+                const unsigned int head = half + 2 * index;
+                const float old_scale = head < block_head_count ? alpha[head] : 0.0f;
+                #pragma unroll
+                for (unsigned int pass = 0; pass < 4; ++pass) {
+                    output_accumulator[pass][index] *= old_scale;
+                }
+                probability_fragment[index] = row_column < block_head_count
+                    ? (short)probability_tile[row_column * 16 + half * 8 + index]
+                    : 0;
+            }
+            probability_fragment = paged_wmma_expand_bf16(probability_fragment);
+            #pragma unroll
+            for (unsigned int pass = 0; pass < 4; ++pass) {
+                const unsigned int dimension_base = pass * output_stride + dimension_group * 16;
+                zllm_wmma_short16 value_fragment;
+                #pragma unroll
+                for (unsigned int index = 0; index < 8; ++index) {
+                    value_fragment[index] = (short)value_tile[
+                        (half * 8 + index) * latent_dim + dimension_base + row_column];
+                }
+                value_fragment = paged_wmma_expand_bf16(value_fragment);
+                output_accumulator[pass]
+                    = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+                        probability_fragment, value_fragment, output_accumulator[pass]);
+            }
+            }
+            __syncthreads();
+        }
+    }
+
+    if (direct_output) {
+        if (wave < 1 && row_column == 0) {
+            #pragma unroll
+            for (unsigned int index = 0; index < 8; ++index) {
+                const unsigned int head = wave * 16 + half + 2 * index;
+                if (head < block_head_count) alpha[head] = running_denominator[index];
+            }
+        }
+        __syncthreads();
+    }
+    const unsigned long long tile_head_base
+        = (unsigned long long)(direct_output ? query_row : tile) * head_count;
+    if (stats != nullptr && wave < 1 && row_column == 0) {
+        #pragma unroll
+        for (unsigned int index = 0; index < 8; ++index) {
+            const unsigned int local_head = wave * 16 + half + 2 * index;
+            const unsigned int head = head_start + local_head;
+            if (local_head < block_head_count) {
+                stats[(tile_head_base + head) * 2] = running_max[index];
+                stats[(tile_head_base + head) * 2 + 1] = running_denominator[index];
+            }
+        }
+    }
+    #pragma unroll
+    for (unsigned int pass = 0; pass < 4; ++pass) {
+        const unsigned int dimension_group = wave;
+        const unsigned int dimension_base = pass * output_stride + dimension_group * 16;
+        #pragma unroll
+        for (unsigned int index = 0; index < 8; ++index) {
+            const unsigned int local_head = half + 2 * index;
+            const unsigned int head = head_start + local_head;
+            if (local_head < block_head_count) {
+                if (direct_output) {
+                    const float denominator = alpha[local_head];
+                    weighted_latent[((unsigned long long)query_row * head_count + head)
+                            * latent_dim + dimension_base + row_column]
+                        = zllm_f32_to_bf16(denominator == 0.0f
+                            ? 0.0f
+                            : output_accumulator[pass][index] / denominator);
+                } else {
+                    partial[(tile_head_base + head) * latent_dim
+                        + dimension_base + row_column] = output_accumulator[pass][index];
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8_wmma_f32_colpar(
+    const float* query,
+    const unsigned short* absorbed,
+    const unsigned short* latent_cache,
+    const unsigned short* latent_scales,
+    const unsigned short* rope_cache,
+    const unsigned int* block_table,
+    const unsigned int* selection,
+    const unsigned int* selection_counts,
+    float* partial,
+    float* stats,
+    unsigned short* weighted_latent,
+    unsigned int context_rows,
+    unsigned int query_start,
+    unsigned int head_count,
+    unsigned int q_head_dim,
+    unsigned int latent_dim,
+    unsigned int latent_group_size,
+    unsigned int rope_dim,
+    unsigned int top_k,
+    unsigned int block_size,
+    unsigned int selected,
+    unsigned int tile_size,
+    unsigned int shard_parity)
+{
+    mla_decode_partial_q8_wmma_colpar_impl<0, 0, 0, 0>(
+        query, absorbed, latent_cache, latent_scales, rope_cache, block_table,
+        selection, selection_counts, partial, stats, weighted_latent,
+        context_rows, query_start, head_count, q_head_dim, latent_dim,
+        latent_group_size, rope_dim, top_k, block_size, selected, tile_size, shard_parity, 15u);
+}
+
+// GLM-5.3 生产形状特化（latent 512 / rope 64 / Q8G64）：
+// 全部内层循环编译期展开，gather 全局加载批量发射。
+// q_head_dim 保持运行时（只出现在 rope query 寻址，不进循环上界）——
+// 生产实际 q_head=256（nope 192 + rope 64），不要按 576 门控。
+extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8_wmma_f32_colpar512(
+    const float* query,
+    const unsigned short* absorbed,
+    const unsigned short* latent_cache,
+    const unsigned short* latent_scales,
+    const unsigned short* rope_cache,
+    const unsigned int* block_table,
+    const unsigned int* selection,
+    const unsigned int* selection_counts,
+    float* partial,
+    float* stats,
+    unsigned short* weighted_latent,
+    unsigned int context_rows,
+    unsigned int query_start,
+    unsigned int head_count,
+    unsigned int q_head_dim,
+    unsigned int latent_dim,
+    unsigned int latent_group_size,
+    unsigned int rope_dim,
+    unsigned int top_k,
+    unsigned int block_size,
+    unsigned int selected,
+    unsigned int tile_size,
+    unsigned int shard_parity)
+{
+    if (latent_dim != 512 || latent_group_size != 64 || rope_dim != 64) return;
+    mla_decode_partial_q8_wmma_colpar_impl<512, 64, 0, 64>(
+        query, absorbed, latent_cache, latent_scales, rope_cache, block_table,
+        selection, selection_counts, partial, stats, weighted_latent,
+        context_rows, query_start, head_count, q_head_dim, latent_dim,
+        latent_group_size, rope_dim, top_k, block_size, selected, tile_size, shard_parity, 15u);
+}
+
+// 消融专用：phase_mask 逐位开关 gather(1)/QK(2)/softmax(4)/PV(8)，仅用于计时分解，
+// 数值无意义。生产路径不得使用。
+extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8_wmma_f32_colpar512_abl(
+    const float* query,
+    const unsigned short* absorbed,
+    const unsigned short* latent_cache,
+    const unsigned short* latent_scales,
+    const unsigned short* rope_cache,
+    const unsigned int* block_table,
+    const unsigned int* selection,
+    const unsigned int* selection_counts,
+    float* partial,
+    float* stats,
+    unsigned short* weighted_latent,
+    unsigned int context_rows,
+    unsigned int query_start,
+    unsigned int head_count,
+    unsigned int q_head_dim,
+    unsigned int latent_dim,
+    unsigned int latent_group_size,
+    unsigned int rope_dim,
+    unsigned int top_k,
+    unsigned int block_size,
+    unsigned int selected,
+    unsigned int tile_size,
+    unsigned int shard_parity,
+    unsigned int phase_mask)
+{
+    if (q_head_dim == 0 || latent_dim != 512 || latent_group_size != 64 || rope_dim != 64) return;
+    mla_decode_partial_q8_wmma_colpar_impl<512, 64, 0, 64>(
+        query, absorbed, latent_cache, latent_scales, rope_cache, block_table,
+        selection, selection_counts, partial, stats, weighted_latent,
+        context_rows, query_start, head_count, q_head_dim, latent_dim,
+        latent_group_size, rope_dim, top_k, block_size, selected, tile_size, shard_parity, phase_mask);
+}
 #endif
 
 #undef ZLLM_PAGED_BF16_DOT2
+// merge 按 latent 维切片的粒度：128 维一片，64 头 × 4 片 = 256 block。
+#define MERGE_SLICE_DIM 128u
+
 extern "C" __global__ void mla_paged_split_merge_f32(
     const float* partial,
     const float* stats,
@@ -5158,12 +5873,19 @@ extern "C" __global__ void mla_paged_split_merge_f32(
     unsigned int tile_count,
     float* merged_stats)
 {
-    const unsigned int head = blockIdx.x;
+    const unsigned int slice_count = (latent_dim + MERGE_SLICE_DIM - 1u) / MERGE_SLICE_DIM;
+    const unsigned int head = blockIdx.x % head_count;
+    const unsigned int slice = blockIdx.x / head_count;
     const unsigned int row = blockIdx.y;
     const unsigned int lane = threadIdx.x;
     // tile 上限由 shared scale 数组容量决定；decode split-k 在 cooperative 半头
     // 拆分下每卡 grid.x=1，需要 ~target_blocks 个 tile 才能打满 CU。
-    if (head >= head_count || tile_count == 0 || tile_count > 512) return;
+    // latent 维按 MERGE_SLICE_DIM 切片进 grid.x：64 头 × 4 片 = 256 block，
+    // 替代原来每头一个 block 的 64-block 低占用形态。
+    if (head >= head_count || slice >= slice_count || tile_count == 0 || tile_count > 512) return;
+    const unsigned int dimension_begin = slice * MERGE_SLICE_DIM;
+    const unsigned int dimension_end = dimension_begin + MERGE_SLICE_DIM < latent_dim
+        ? dimension_begin + MERGE_SLICE_DIM : latent_dim;
     __shared__ float old_scales[512];
     __shared__ float tile_scales[512];
     __shared__ float denominator;
@@ -5185,20 +5907,120 @@ extern "C" __global__ void mla_paged_split_merge_f32(
             if (tile_denominator != 0.0f) running_max = next_max;
         }
         denominator = running_denominator;
-        if (merged_stats != nullptr) {
+        if (merged_stats != nullptr && slice == 0u) {
             const unsigned long long merged = ((unsigned long long)row * head_count + head) * 2;
             merged_stats[merged] = running_max;
             merged_stats[merged + 1] = running_denominator;
         }
     }
     __syncthreads();
-    for (unsigned int dimension = lane; dimension < latent_dim; dimension += blockDim.x) {
+    for (unsigned int dimension = dimension_begin + lane; dimension < dimension_end; dimension += blockDim.x) {
         float value = 0.0f;
         for (unsigned int tile = 0; tile < tile_count; ++tile) {
             value = value * old_scales[tile]
                 + partial[(((unsigned long long)row * tile_count + tile) * head_count + head)
                     * latent_dim + dimension]
                     * tile_scales[tile];
+        }
+        weighted_latent[((unsigned long long)row * head_count + head) * latent_dim + dimension]
+            = zllm_f32_to_bf16(denominator == 0.0f ? 0.0f : value / denominator);
+    }
+}
+
+// 软件流水变体：partial 读取 4 深预取，打破 "全局加载 → 依赖 FMA" 的逐次延迟暴露。
+// FMA 归约链仍按 tile 顺序逐个进行，数值与原 merge 逐位一致。
+extern "C" __global__ void mla_paged_split_merge_f32_pl(
+    const float* partial,
+    const float* stats,
+    unsigned short* weighted_latent,
+    unsigned int head_count,
+    unsigned int latent_dim,
+    unsigned int tile_count,
+    float* merged_stats)
+{
+    const unsigned int slice_count = (latent_dim + MERGE_SLICE_DIM - 1u) / MERGE_SLICE_DIM;
+    const unsigned int head = blockIdx.x % head_count;
+    const unsigned int slice = blockIdx.x / head_count;
+    const unsigned int row = blockIdx.y;
+    const unsigned int lane = threadIdx.x;
+    if (head >= head_count || slice >= slice_count || tile_count == 0 || tile_count > 512) return;
+    const unsigned int dimension_begin = slice * MERGE_SLICE_DIM;
+    const unsigned int dimension_end = dimension_begin + MERGE_SLICE_DIM < latent_dim
+        ? dimension_begin + MERGE_SLICE_DIM : latent_dim;
+    __shared__ float old_scales[512];
+    __shared__ float tile_scales[512];
+    __shared__ float denominator;
+    if (lane == 0) {
+        // stats 同样是逐 tile 串行全局读（stride head_count*2），静态 4 路展开批量发射。
+        const float* stat_source = stats
+            + ((unsigned long long)row * tile_count * head_count + head) * 2;
+        const unsigned long long stat_stride = (unsigned long long)head_count * 2;
+        float running_max = -3.402823466e+38F;
+        float running_denominator = 0.0f;
+        unsigned int tile = 0;
+        for (; tile + 4 <= tile_count; tile += 4) {
+            const float m0 = stat_source[(unsigned long long)tile * stat_stride];
+            const float d0 = stat_source[(unsigned long long)tile * stat_stride + 1];
+            const float m1 = stat_source[(unsigned long long)(tile + 1) * stat_stride];
+            const float d1 = stat_source[(unsigned long long)(tile + 1) * stat_stride + 1];
+            const float m2 = stat_source[(unsigned long long)(tile + 2) * stat_stride];
+            const float d2 = stat_source[(unsigned long long)(tile + 2) * stat_stride + 1];
+            const float m3 = stat_source[(unsigned long long)(tile + 3) * stat_stride];
+            const float d3 = stat_source[(unsigned long long)(tile + 3) * stat_stride + 1];
+            #pragma unroll
+            for (unsigned int k = 0; k < 4; ++k) {
+                const float tile_max = k == 0 ? m0 : k == 1 ? m1 : k == 2 ? m2 : m3;
+                const float tile_denominator = k == 0 ? d0 : k == 1 ? d1 : k == 2 ? d2 : d3;
+                const float next_max = running_denominator == 0.0f ? tile_max : fmaxf(running_max, tile_max);
+                const float old_scale = running_denominator == 0.0f ? 0.0f : expf(running_max - next_max);
+                const float tile_scale = tile_denominator == 0.0f ? 0.0f : expf(tile_max - next_max);
+                old_scales[tile + k] = old_scale;
+                tile_scales[tile + k] = tile_scale;
+                running_denominator = running_denominator * old_scale
+                    + tile_denominator * tile_scale;
+                if (tile_denominator != 0.0f) running_max = next_max;
+            }
+        }
+        for (; tile < tile_count; ++tile) {
+            const float tile_max = stat_source[(unsigned long long)tile * stat_stride];
+            const float tile_denominator = stat_source[(unsigned long long)tile * stat_stride + 1];
+            const float next_max = running_denominator == 0.0f ? tile_max : fmaxf(running_max, tile_max);
+            const float old_scale = running_denominator == 0.0f ? 0.0f : expf(running_max - next_max);
+            const float tile_scale = tile_denominator == 0.0f ? 0.0f : expf(tile_max - next_max);
+            old_scales[tile] = old_scale;
+            tile_scales[tile] = tile_scale;
+            running_denominator = running_denominator * old_scale
+                + tile_denominator * tile_scale;
+            if (tile_denominator != 0.0f) running_max = next_max;
+        }
+        denominator = running_denominator;
+        if (merged_stats != nullptr && slice == 0u) {
+            const unsigned long long merged = ((unsigned long long)row * head_count + head) * 2;
+            merged_stats[merged] = running_max;
+            merged_stats[merged + 1] = running_denominator;
+        }
+    }
+    __syncthreads();
+    for (unsigned int dimension = dimension_begin + lane; dimension < dimension_end; dimension += blockDim.x) {
+        const float* source = partial
+            + ((unsigned long long)row * tile_count * head_count + head) * latent_dim + dimension;
+        const unsigned long long stride = (unsigned long long)head_count * latent_dim;
+        // 静态 4 路展开：4 个独立全局加载批量发射后按序进入 FMA 链（顺序不变，逐位一致）。
+        float value = 0.0f;
+        unsigned int tile = 0;
+        for (; tile + 4 <= tile_count; tile += 4) {
+            const float p0 = source[(unsigned long long)tile * stride];
+            const float p1 = source[(unsigned long long)(tile + 1) * stride];
+            const float p2 = source[(unsigned long long)(tile + 2) * stride];
+            const float p3 = source[(unsigned long long)(tile + 3) * stride];
+            value = value * old_scales[tile] + p0 * tile_scales[tile];
+            value = value * old_scales[tile + 1] + p1 * tile_scales[tile + 1];
+            value = value * old_scales[tile + 2] + p2 * tile_scales[tile + 2];
+            value = value * old_scales[tile + 3] + p3 * tile_scales[tile + 3];
+        }
+        for (; tile < tile_count; ++tile) {
+            value = value * old_scales[tile]
+                + source[(unsigned long long)tile * stride] * tile_scales[tile];
         }
         weighted_latent[((unsigned long long)row * head_count + head) * latent_dim + dimension]
             = zllm_f32_to_bf16(denominator == 0.0f ? 0.0f : value / denominator);
@@ -5854,7 +6676,61 @@ extern "C" __global__ void mla_project_value_ct(
         if (value < value_dim) {
             float sum = 0.0f;
             const unsigned int weight_row = (weight_head_start + head) * kv_head_dim + nope_dim + value;
-            if (bits == 4u && group_size == 128u && (latent_dim & 127u) == 0u) {
+            if (bits == 32u && (latent_dim & 127u) == 0u) {
+                // F32 dense decode 向量化：每 lane 8 连续列两次 float4 加载，
+                // 替代逐元素 4B 标量加载。数值不变，仅 lane 内归约从跨步 16
+                // 改为 8 连续列。
+                const float *weight_row_f32 = reinterpret_cast<const float *>(packed)
+                    + (unsigned long long)weight_row * latent_dim;
+                const unsigned short *input_row = weighted_latent + (unsigned long long)head * latent_dim;
+                for (unsigned int col0 = lane * 8u; col0 < latent_dim; col0 += 128u) {
+                    const float4 wa = *reinterpret_cast<const float4 *>(weight_row_f32 + col0);
+                    const float4 wb = *reinterpret_cast<const float4 *>(weight_row_f32 + col0 + 4u);
+                    const uint4 in8 = *reinterpret_cast<const uint4 *>(input_row + col0);
+                    const unsigned int *in_words = reinterpret_cast<const unsigned int *>(&in8);
+                    #pragma unroll
+                    for (unsigned int element = 0; element < 4; ++element) {
+                        const unsigned int in_pair = in_words[element / 2];
+                        const unsigned short in_bits = (unsigned short)(in_pair >> ((element & 1u) * 16u));
+                        const float input_value = zllm_bf16_to_f32(in_bits);
+                        const float weight_value = element == 0u ? wa.x : element == 1u ? wa.y : element == 2u ? wa.z : wa.w;
+                        sum += input_value * weight_value;
+                    }
+                    #pragma unroll
+                    for (unsigned int element = 0; element < 4; ++element) {
+                        const unsigned int in_pair = in_words[element / 2 + 2];
+                        const unsigned short in_bits = (unsigned short)(in_pair >> ((element & 1u) * 16u));
+                        const float input_value = zllm_bf16_to_f32(in_bits);
+                        const float weight_value = element == 0u ? wb.x : element == 1u ? wb.y : element == 2u ? wb.z : wb.w;
+                        sum += input_value * weight_value;
+                    }
+                }
+            } else if (bits == 8u && group_size == 32u && (latent_dim & 127u) == 0u) {
+                // W8（i8+128 偏置码）decode 向量化：每 lane 8 连续列，一次 8B
+                // packed 加载 + 每 32 列一次 scale，替代逐元素 4B 字加载与逐元素
+                // scale 读取。每元素数值不变，lane 归约从跨步改为 8 连续列。
+                const unsigned int groups = latent_dim >> 5u;
+                const unsigned char *weight_bytes = reinterpret_cast<const unsigned char *>(packed)
+                    + (unsigned long long)weight_row * latent_dim;
+                const unsigned short *input_row = weighted_latent + (unsigned long long)head * latent_dim;
+                for (unsigned int col0 = lane * 8u; col0 < latent_dim; col0 += 128u) {
+                    const int2 pack8 = *reinterpret_cast<const int2 *>(weight_bytes + col0);
+                    const float scale = zllm_scale(scales, (unsigned long long)weight_row * groups + (col0 >> 5u), scale_dtype);
+                    const uint4 in8 = *reinterpret_cast<const uint4 *>(input_row + col0);
+                    const unsigned int *in_words = reinterpret_cast<const unsigned int *>(&in8);
+                    const unsigned int pack_words[2] = {(unsigned int)pack8.x, (unsigned int)pack8.y};
+                    #pragma unroll
+                    for (unsigned int half = 0; half < 2; ++half) {
+                        #pragma unroll
+                        for (unsigned int element = 0; element < 4; ++element) {
+                            const int code = (int)((pack_words[half] >> (element * 8u)) & 255u) - 128;
+                            const unsigned int in_pair = in_words[half * 2 + element / 2];
+                            const unsigned short in_bits = (unsigned short)(in_pair >> ((element & 1u) * 16u));
+                            sum += zllm_bf16_to_f32(in_bits) * ((float)code * scale);
+                        }
+                    }
+                }
+            } else if (bits == 4u && group_size == 128u && (latent_dim & 127u) == 0u) {
                 const unsigned int packed_columns = latent_dim >> 3u;
                 const unsigned int groups = latent_dim >> 7u;
                 #pragma unroll
@@ -5938,5 +6814,145 @@ extern "C" __global__ void mla_project_value_ct(
                 output[((unsigned long long)tail_row * head_count + head) * q_head_dim + tail_column] = 0.0f;
             }
         }
+    }
+}
+
+// PV decode 的 perm 直读臂：与 mla_project_value_ct 的 W8G32 分支同形
+// （decode 单行、16-lane/value、每 lane 8 连续列、grid=heads×value_tiles），
+// 差别：本 head 的 weighted latent 行经 LDS 预转 f16 并按 32 列 group 预累加
+// Σx_g；权重码由 zllm_w8_perm_f16 直接构造 f16(1024+u) 配 zllm_f16x2_dot2
+// 累加，+1024 偏置由 dot 初值 -1152·Σx_g 一次修正。替代逐元素
+// extract/cvt/mul/mul/add 标量链（当前 23µs 仅 365GB/s，每 lane 仅 4 次迭代的
+// 延迟暴露），数值 bf16 容差族。形状门控在 host 侧（bits==8、G32、
+// latent%128==0）；kernel 只需 256 线程 decode 形态。
+extern "C" __global__ void mla_project_value_ct_perm(
+    const unsigned short* weighted_latent,
+    const unsigned int* packed,
+    const unsigned char* scales,
+    float* output,
+    unsigned int query_rows,
+    unsigned int head_count,
+    unsigned int weight_head_start,
+    unsigned int q_head_dim,
+    unsigned int kv_head_dim,
+    unsigned int latent_dim,
+    unsigned int rope_dim,
+    unsigned int group_size,
+    unsigned int scale_dtype,
+    unsigned int bits)
+{
+    if (query_rows != 1u || bits != 8u || group_size != 32u
+        || (latent_dim & 127u) != 0u || blockDim.x != 256u) {
+        return;
+    }
+    const unsigned int nope_dim = q_head_dim - rope_dim;
+    const unsigned int value_dim = kv_head_dim - nope_dim;
+    const unsigned int value_tiles = (value_dim + 15u) / 16u;
+    const unsigned int head = blockIdx.x / value_tiles;
+    if (head >= head_count) return;
+    const unsigned int value = (blockIdx.x % value_tiles) * 16u + (threadIdx.x >> 4u);
+    const unsigned int lane = threadIdx.x & 15u;
+    const unsigned int groups = latent_dim >> 5u;
+
+    extern __shared__ unsigned char pv_perm_cache[];
+    zllm_f16x2* input_f16 = reinterpret_cast<zllm_f16x2*>(pv_perm_cache);
+    float* group_bias = reinterpret_cast<float*>(pv_perm_cache + latent_dim * 2u);
+    for (unsigned int column = threadIdx.x * 2u; column < latent_dim;
+         column += blockDim.x * 2u) {
+        const unsigned int raw = *reinterpret_cast<const unsigned int*>(
+            weighted_latent + (unsigned long long)head * latent_dim + column);
+        union ZllmPvF16x2Word {
+            zllm_f16x2 pair;
+            unsigned int word;
+        } converted;
+        converted.word = (unsigned int)zllm_f32_to_f16(
+            zllm_bf16_to_f32((unsigned short)(raw & 0xffffu)))
+            | ((unsigned int)zllm_f32_to_f16(
+                zllm_bf16_to_f32((unsigned short)(raw >> 16u))) << 16u);
+        input_f16[column >> 1u] = converted.pair;
+    }
+    __syncthreads();
+    for (unsigned int group = threadIdx.x; group < groups; group += blockDim.x) {
+        const zllm_f16x2* source = input_f16 + group * 16u;
+        float sum = 0.0f;
+        #pragma unroll 8
+        for (unsigned int pair = 0u; pair < 16u; ++pair) {
+            sum += (float)source[pair].x + (float)source[pair].y;
+        }
+        group_bias[group] = 1152.0f * sum;
+    }
+    __syncthreads();
+
+    if (value < value_dim) {
+        const unsigned int weight_row =
+            (weight_head_start + head) * kv_head_dim + nope_dim + value;
+        const unsigned char* weight_bytes = reinterpret_cast<const unsigned char*>(packed)
+            + (unsigned long long)weight_row * latent_dim;
+        float sum = 0.0f;
+        for (unsigned int col0 = lane * 8u; col0 < latent_dim; col0 += 128u) {
+            // 8 列 = uint2 码字（8B 对齐：col0 为 8 的倍数、行基址 256B 对齐）。
+            const uint2 codes = *reinterpret_cast<const uint2*>(weight_bytes + col0);
+            const float scale = zllm_scale(
+                scales, (unsigned long long)weight_row * groups + (col0 >> 5u), scale_dtype);
+            const zllm_f16x2* source = input_f16 + (col0 >> 1u);
+            float group_dot = -group_bias[col0 >> 5u];
+            group_dot = zllm_f16x2_dot2(
+                source[0], zllm_w8_perm_f16(codes.x, 0x0504u), group_dot);
+            group_dot = zllm_f16x2_dot2(
+                source[1], zllm_w8_perm_f16(codes.x, 0x0706u), group_dot);
+            group_dot = zllm_f16x2_dot2(
+                source[2], zllm_w8_perm_f16(codes.y, 0x0504u), group_dot);
+            group_dot = zllm_f16x2_dot2(
+                source[3], zllm_w8_perm_f16(codes.y, 0x0706u), group_dot);
+            sum += group_dot * scale;
+        }
+        for (unsigned int offset = 8u; offset > 0u; offset >>= 1u)
+            sum += __shfl_down(sum, offset, 16);
+        if (lane == 0u)
+            output[(unsigned long long)head * q_head_dim + value] = sum;
+    }
+    const unsigned int tail_dim = q_head_dim - value_dim;
+    if (blockIdx.x % value_tiles == 0u) {
+        for (unsigned int index = threadIdx.x; index < tail_dim; index += blockDim.x)
+            output[(unsigned long long)head * q_head_dim + value_dim + index] = 0.0f;
+    }
+}
+
+// selected decode 的 latent 预重排：把 top-k 选中行的 Q8 code/scale/rope 按
+// selection 顺序收集到连续 workspace，scan 的 4 个 head-group 全部由随机散读
+// 变为一次散读 + 连续读。物理行号经 block_table 映射（identity 时即 token）。
+extern "C" __global__ void mla_gather_selected_q8(
+    const signed char* latent,
+    const unsigned short* latent_scales,
+    const unsigned short* rope,
+    const unsigned int* block_table,
+    const unsigned int* selection,
+    signed char* gathered_latent,
+    unsigned short* gathered_scales,
+    unsigned short* gathered_rope,
+    unsigned int count,
+    unsigned int latent_dim,
+    unsigned int latent_group_size,
+    unsigned int rope_dim,
+    unsigned int block_size)
+{
+    const unsigned int index = blockIdx.x;
+    if (index >= count || latent_group_size == 0) return;
+    const unsigned int token = selection[index];
+    const unsigned long long physical = paged_row(block_table, token, block_size);
+    const unsigned int groups = latent_dim / latent_group_size;
+    const unsigned int lane = threadIdx.x;
+    // 行内 576B code + 16B scale + 128B rope，整行连续装载。
+    for (unsigned int column = lane; column < latent_dim; column += blockDim.x) {
+        gathered_latent[(unsigned long long)index * latent_dim + column]
+            = latent[physical * latent_dim + column];
+    }
+    for (unsigned int group = lane; group < groups; group += blockDim.x) {
+        gathered_scales[index * groups + group]
+            = latent_scales[physical * groups + group];
+    }
+    for (unsigned int column = lane; column < rope_dim; column += blockDim.x) {
+        gathered_rope[(unsigned long long)index * rope_dim + column]
+            = rope[physical * rope_dim + column];
     }
 }

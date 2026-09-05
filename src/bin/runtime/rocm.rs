@@ -84,7 +84,7 @@ fn rocm_kv_f16(config: &zllm::config::RuntimeProcessConfig) -> bool {
             NodeModelConfig::MinimaxH3(_) => false,
             NodeModelConfig::DeepseekV4(_) => false,
             // 尚无 ROCm node engine,保持默认 KV 格式;真正拒绝运行由入口层负责。
-            NodeModelConfig::Gemma4(_) | NodeModelConfig::Qwen36(_) | NodeModelConfig::Glm53Flash(_) | NodeModelConfig::Mistral(_) | NodeModelConfig::MiniCpm5(_) => false,
+            NodeModelConfig::Gemma4(_) | NodeModelConfig::Qwen36(_) | NodeModelConfig::Glm53Flash(_) | NodeModelConfig::Mistral(_) | NodeModelConfig::MiniCpm5(_) | NodeModelConfig::Laguna(_) => false,
         },
         RuntimeProcessConfig::Stage(config) => match &config.model {
             zllm::config::StageModelConfig::Glm52(model) => model.execution.kv_cache_format == KvCacheFormat::F16,
@@ -95,7 +95,7 @@ fn rocm_kv_f16(config: &zllm::config::RuntimeProcessConfig) -> bool {
             NodeModelConfig::Ornith(model) => model.execution.kv_cache_format == KvCacheFormat::F16,
             NodeModelConfig::MinimaxH3(_) => false,
             NodeModelConfig::DeepseekV4(_) => false,
-            NodeModelConfig::Gemma4(_) | NodeModelConfig::Qwen36(_) | NodeModelConfig::Glm53Flash(_) | NodeModelConfig::Mistral(_) | NodeModelConfig::MiniCpm5(_) => false,
+            NodeModelConfig::Gemma4(_) | NodeModelConfig::Qwen36(_) | NodeModelConfig::Glm53Flash(_) | NodeModelConfig::Mistral(_) | NodeModelConfig::MiniCpm5(_) | NodeModelConfig::Laguna(_) => false,
         },
     }
 }
@@ -139,6 +139,7 @@ fn configure_backend(backend: &zllm::config::RocmBackendConfig, kv_f16: bool) ->
         backend.mla_decode_split_threshold,
         backend.mla_decode_wmma,
         backend.cooperative_mla_sequence_split,
+        backend.cooperative_mla_decode_full_merge,
         backend.dsa_hadamard_i8,
         backend.dsa_hadamard_shadow_samples,
         backend.dsa_hisa_shadow_samples,
@@ -147,6 +148,8 @@ fn configure_backend(backend: &zllm::config::RocmBackendConfig, kv_f16: bool) ->
         backend.prefill_attention_cpu,
         backend.mla_hot_trace,
         backend.precise_router,
+        backend.w8_profile,
+        backend.mla_decode_tile_size,
     );
     zllm::kernel::rocm::hip::configure(options)?;
     Ok(())

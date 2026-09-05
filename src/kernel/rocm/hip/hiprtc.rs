@@ -114,6 +114,63 @@ __device__ __forceinline__ float zllm_scale(
     }
     return ((const float*)scales)[index];
 }
+
+// f16 向量与换算：W8A16 权重 perm 直读（v_perm_b32 构造 f16(1024+u) +
+// v_dot2_f32_f16 累加）的公共件，ct_dense 与 paged_mla 共用。
+typedef _Float16 __attribute__((ext_vector_type(2))) zllm_f16x2;
+
+__device__ __forceinline__ unsigned short zllm_f32_to_f16(float value)
+{
+    union ZllmF16Bits {
+        _Float16 value;
+        unsigned short bits;
+    } converted;
+    converted.value = (_Float16)value;
+    return converted.bits;
+}
+
+// f16 点积：gfx10+ 有 v_dot2_f32_f16；工具链缺该 builtin 时退化 f32 标量，
+// 数值与 dot2 语义一致（乘积精确、f32 累加、(lo+hi)+acc 次序）。
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_amdgcn_fdot2_f32_f16)
+#define ZLLM_HAS_FDOT2_F16 1
+#endif
+#endif
+
+__device__ __forceinline__ float zllm_f16x2_dot2(
+    zllm_f16x2 left, zllm_f16x2 right, float accumulator)
+{
+#if defined(ZLLM_HAS_FDOT2_F16)
+    return __builtin_amdgcn_fdot2_f32_f16(left, right, accumulator, false);
+#else
+    union ZllmF16x2Word {
+        zllm_f16x2 pair;
+        unsigned int word;
+    } low, high;
+    low.pair = left;
+    high.pair = right;
+    const float first = zllm_f16_to_f32((unsigned short)(low.word & 0xffffu))
+        * zllm_f16_to_f32((unsigned short)(high.word & 0xffffu));
+    const float second = zllm_f16_to_f32((unsigned short)(low.word >> 16u))
+        * zllm_f16_to_f32((unsigned short)(high.word >> 16u));
+    return accumulator + (first + second);
+#endif
+}
+
+// V_PERM_B32 字节池 = {src1 字节 0-3, src0 字节 0-3}（与 gguf_iq4nl_perm 同
+// 口径）。f16 1024 = 0x6400，10 位 mantissa 恰好放下整个 u 字节（u≤255<1024），
+// perm 整字节放置可行，(1024+u) 在 f16 精确；0x0504 取 (u1,u0)、0x0706 取
+// (u3,u2)。配套偏置修正：dot 初值 = -(1024+128)·Σx_g = -1152·Σx_g。
+__device__ __forceinline__ zllm_f16x2 zllm_w8_perm_f16(
+    unsigned int codes, unsigned int selector)
+{
+    union ZllmF16x2Word {
+        zllm_f16x2 pair;
+        unsigned int word;
+    } converted;
+    converted.word = __builtin_amdgcn_perm(codes, 0x64646464u, selector);
+    return converted.pair;
+}
 "#;
 
 pub(super) fn compile_hip_source(source: &str, name: &str) -> Result<Vec<u8>, String> {

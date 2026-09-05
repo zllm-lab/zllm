@@ -13,6 +13,14 @@ pub enum RocmKvOwnership {
     InterleavedPair,
 }
 
+/// `ZLLM_ROCM_MLA_CPU_MIRROR=1`：无条件维护 MLA 全量 CPU 镜像（Q8 原格式），
+/// 不要求 prefill_attention_cpu / hot rows。镜像只增不消费，供 CPU KV 方案取证；
+/// 每层每 token 增加约 3 个 D2D pack + 1 个异步 D2H，生产速度轮应保持关闭。
+fn mla_cpu_mirror_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLLM_ROCM_MLA_CPU_MIRROR").is_ok_and(|value| value == "1"))
+}
+
 impl RocmKvOwnership {
     pub(super) fn parity(self) -> Option<usize> {
         match self {
@@ -995,7 +1003,7 @@ impl RocmKvCache {
         }
         let appended_rows = latent.rows;
         cached.rows += appended_rows;
-        if hot_rows != 0 || ops::hip::options().prefill_attention_cpu {
+        if hot_rows != 0 || ops::hip::options().prefill_attention_cpu || mla_cpu_mirror_enabled() {
             if cached.latent_group_size == 0 {
                 return Err(compute_error(format!("L{layer} ROCm MLA CPU mirror 只支持 Q8 cache")));
             }

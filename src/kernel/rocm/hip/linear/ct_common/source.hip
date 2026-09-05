@@ -802,58 +802,62 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_scalar(
         }
         return;
     }
-    // GGUF Q8_0 每 32 列只有八个 packed word。旧 16-lane subgroup 的后八个
-    // lane 在每个 group 都空转；按八 lane 映射后一个 wave 同时覆盖四个输出行，
-    // 保持每行原有的 group 累加顺序和 8-lane 归约顺序。
+    // GGUF Q8_0 group32 的 wave32 变体：每 wave 一行、每 lane 一个 group
+    // （32 列 = 8 个 packed word，lane 内连续 32B 读取），每 lane 迭代数降 32 倍、
+    // 同 blockDim 下 block 数较 8-lane subgroup 翻四倍，小输出矩阵不再欠占用。
+    // 归约为组内顺序累加 + 32-lane shfl 树，与 group128 wave32 路径同一数值形态。
     if (group_size == 32u) {
-        const unsigned int lane8 = threadIdx.x & 7u;
-        const unsigned int subgroup8 = threadIdx.x >> 3u;
-        const unsigned int outputs_per_block8 = blockDim.x >> 3u;
-        const unsigned int output_row8 =
-            blockIdx.x * outputs_per_block8 + subgroup8;
-        if (output_row8 >= output_rows) return;
-        const unsigned long long packed_base8 =
-            (unsigned long long)output_row8 * (input_columns / 4u);
-        const unsigned long long scale_base8 =
-            (unsigned long long)output_row8 * group_count;
-        float sum8 = 0.0f;
-        for (unsigned int group = 0u; group < group_count; ++group) {
-            const unsigned int word = group * 8u + lane8;
-            const unsigned int codes = packed[packed_base8 + word];
-            const unsigned int column = group * 32u + lane8 * 4u;
-            const zllm_ct_bf16x2 x01 = {
-                input[input_base + column], input[input_base + column + 1u]
-            };
-            const zllm_ct_bf16x2 x23 = {
-                input[input_base + column + 2u], input[input_base + column + 3u]
-            };
-            const zllm_ct_bf16x2 w01 = {
-                zllm_ct_i8_to_bf16(codes),
-                zllm_ct_i8_to_bf16(codes >> 8u)
-            };
-            const zllm_ct_bf16x2 w23 = {
-                zllm_ct_i8_to_bf16(codes >> 16u),
-                zllm_ct_i8_to_bf16(codes >> 24u)
-            };
-            float word_sum = __builtin_amdgcn_fdot2_f32_bf16(
-                x01, w01, 0.0f, false
-            );
-            word_sum = __builtin_amdgcn_fdot2_f32_bf16(
-                x23, w23, word_sum, false
-            );
-            sum8 += word_sum * zllm_scale(
-                scales, scale_base8 + group, scale_dtype
+        const unsigned int lane = threadIdx.x & 31u;
+        const unsigned int wave = threadIdx.x >> 5u;
+        const unsigned int outputs_per_block = blockDim.x >> 5u;
+        const unsigned int output_row = blockIdx.x * outputs_per_block + wave;
+        if (output_row >= output_rows) return;
+        const unsigned long long packed_base =
+            (unsigned long long)output_row * (input_columns / 4u);
+        const unsigned long long scale_base =
+            (unsigned long long)output_row * group_count;
+        float sum = 0.0f;
+        for (unsigned int group = lane; group < group_count; group += 32u) {
+            const unsigned int word_base = group * 8u;
+            float group_dot = 0.0f;
+            #pragma unroll
+            for (unsigned int word = 0u; word < 8u; ++word) {
+                const unsigned int codes = packed[packed_base + word_base + word];
+                const unsigned int column = group * 32u + word * 4u;
+                const zllm_ct_bf16x2 x01 = {
+                    input[input_base + column], input[input_base + column + 1u]
+                };
+                const zllm_ct_bf16x2 x23 = {
+                    input[input_base + column + 2u], input[input_base + column + 3u]
+                };
+                const zllm_ct_bf16x2 w01 = {
+                    zllm_ct_i8_to_bf16(codes),
+                    zllm_ct_i8_to_bf16(codes >> 8u)
+                };
+                const zllm_ct_bf16x2 w23 = {
+                    zllm_ct_i8_to_bf16(codes >> 16u),
+                    zllm_ct_i8_to_bf16(codes >> 24u)
+                };
+                group_dot = __builtin_amdgcn_fdot2_f32_bf16(
+                    x01, w01, group_dot, false
+                );
+                group_dot = __builtin_amdgcn_fdot2_f32_bf16(
+                    x23, w23, group_dot, false
+                );
+            }
+            sum += group_dot * zllm_scale(
+                scales, scale_base + group, scale_dtype
             );
         }
-        for (unsigned int offset = 4u; offset > 0u; offset >>= 1u) {
-            sum8 += __shfl_down(sum8, offset, 8);
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+            sum += __shfl_down(sum, offset, 32);
         }
-        if (lane8 == 0u) {
+        if (lane == 0u) {
             const unsigned long long output_index =
-                (unsigned long long)input_row * output_rows + output_row8;
+                (unsigned long long)input_row * output_rows + output_row;
             output[output_index] = residual
-                ? residual[output_index] + sum8
-                : sum8;
+                ? residual[output_index] + sum
+                : sum;
         }
         return;
     }

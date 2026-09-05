@@ -27,6 +27,7 @@ pub mod mistral;
 pub mod mistral_small32 {
     pub use crate::runtime::mistral::*;
 }
+pub mod laguna;
 pub mod minicpm5;
 pub mod multiplex;
 pub mod node;

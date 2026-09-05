@@ -471,7 +471,7 @@ fn try_ct_quantized_matmul_bf16_epilogue(
             256
         };
         let scalar_subgroup = if use_w8 && group_size == 32 && functions.wavefront_size == 32 {
-            8
+            32
         } else if use_w8 && group_size == 128 && (input_columns == 2048 || input_columns / group_size >= 32) {
             32
         } else {
@@ -745,7 +745,7 @@ pub fn try_ct_dual_gemv_bf16(
                     let subgroup = if bits == 4 {
                         16
                     } else if fused_w8_g32 {
-                        8
+                        32
                     } else {
                         32
                     };
@@ -936,5 +936,338 @@ mod tests {
             }
         }
         eprintln!("[rocm-w8-g32-dual-oracle] max_abs={max_abs:.6e} max_rel={max_rel:.6e}");
+    }
+
+    /// W8 G32 GEMV 全形状微基准：attention 投影各真实形状的带宽利用率。
+    /// `cargo test --release --features with-rocm w8_g32_gemv_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn w8_g32_gemv_bench() {
+        const DEVICE: i32 = 0;
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+        // (in, out, label)
+        for (columns, output_rows, label) in [(6144_usize, 2048_usize, "q_a"), (2048, 16384, "q_b"), (6144, 576, "kv_a"), (16384, 6144, "o_proj"), (2048, 4096, "wq_b"), (6144, 154880, "lm_head")] {
+            let input: Vec<bf16> = (0..columns).map(|index| bf16::from_f32(((index as i32 * 37) % 41 - 20) as f32 / 32.0)).collect();
+            let d_input = DeviceBuffer::upload(DEVICE, bytes(&input)).unwrap();
+            let mut packed = vec![0_u8; output_rows * columns];
+            for (byte, value) in packed.iter_mut().enumerate() {
+                *value = ((byte % 256 * 29 + byte / 7) % 256) as u8;
+            }
+            let mut scales = Vec::with_capacity(output_rows * (columns / 32));
+            for index in 0..output_rows * (columns / 32) {
+                scales.push(bf16::from_f32(0.015625 + (index % 7) as f32 * 0.001));
+            }
+            let d_packed = DeviceBuffer::upload(DEVICE, &packed).unwrap();
+            let d_scales = DeviceBuffer::upload(DEVICE, bytes(&scales)).unwrap();
+            let weight_gib = (packed.len() + scales.len() * 2) as f64 / (1u64 << 30) as f64;
+            let bench = |tag: &str, call: &mut dyn FnMut()| {
+                for _ in 0..3 {
+                    call();
+                }
+                let started = std::time::Instant::now();
+                const ROUNDS: usize = 50;
+                for _ in 0..ROUNDS {
+                    call();
+                }
+                super::super::synchronize_device(DEVICE, "w8 g32 bench").unwrap();
+                let micros = started.elapsed().as_micros() as f64 / ROUNDS as f64;
+                eprintln!("[w8-g32-bench] {label} {tag} in={columns} out={output_rows} avg_us={micros:.1} bw_GBps={:.0}", weight_gib * 1024.0 / (micros / 1e6));
+            };
+            let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+            bench("bf16", &mut || {
+                let _ = try_ct_quantized_matmul_bf16(DEVICE, 8, &[], Some(&d_input), &d_packed, &d_scales, 0, 32, 1, columns, output_rows).unwrap();
+            });
+            bench("f32+cast", &mut || {
+                let _ = try_ct_quantized_matmul_bf16(DEVICE, 8, &input_f32, None, &d_packed, &d_scales, 0, 32, 1, columns, output_rows).unwrap();
+            });
+        }
+    }
+
+    /// dual W8G32 kernel 的 block 线程数扫描：kernel 本身按 blockDim 泛化
+    /// （outputs_per_block = blockDim/32），小 block = 更多 block 摊到 CU。
+    /// 生产形状 q_a(6144→2048)+kv_a(6144→576)。64/128/256 三档逐位对照。
+    /// `cargo test --release --features with-rocm w8_g32_dual_threads_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn w8_g32_dual_threads_bench() {
+        const DEVICE: i32 = 0;
+        const COLUMNS: usize = 6_144;
+        const FIRST_ROWS: usize = 2_048;
+        const SECOND_ROWS: usize = 576;
+        const GROUP_SIZE: usize = 32;
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+
+        let input = (0..COLUMNS).map(|index| bf16::from_f32(((index * 17 % 61) as f32 - 30.0) / 64.0).to_bits()).collect::<Vec<_>>();
+        let d_input = DeviceBuffer::upload(DEVICE, bytes(&input)).unwrap();
+        let groups = COLUMNS / GROUP_SIZE;
+        let prepare = |seed: usize, rows: usize| {
+            let packed = (0..rows * COLUMNS).map(|index| (121 + (index * 29 + index / 7 + seed) % 15) as u8).collect::<Vec<_>>();
+            let scales = (0..rows * groups).map(|index| f16::from_f32((1 + (index + seed) % 7) as f32 / 256.0).to_bits()).collect::<Vec<_>>();
+            (DeviceBuffer::upload(DEVICE, &packed).unwrap(), DeviceBuffer::upload(DEVICE, bytes(&scales)).unwrap())
+        };
+        let first_out = DeviceBuffer::allocate(DEVICE, FIRST_ROWS * 4).unwrap();
+        let second_out = DeviceBuffer::allocate(DEVICE, SECOND_ROWS * 4).unwrap();
+        let functions = super::ct_quantized_functions(DEVICE).unwrap();
+        let launch = crate::kernel::rocm::hip::kernel_launch_trampoline;
+        let weight_mb = (FIRST_ROWS + SECOND_ROWS) * (COLUMNS + groups * 2);
+        // 8 组权重轮换（137MB > 96MB Infinity Cache），强制 HBM 流式读取——
+        // 单组 17MB 全驻 L2 会测成 1.1TB/s 的假带宽。
+        const COPIES: usize = 8;
+        let first_ring: Vec<_> = (0..COPIES).map(|copy| prepare(100 + copy, FIRST_ROWS)).collect();
+        let second_ring: Vec<_> = (0..COPIES).map(|copy| prepare(200 + copy, SECOND_ROWS)).collect();
+
+        let run = |threads: u32, rounds: usize, stream_hbm: bool| -> f64 {
+            let mut d_input_p = d_input.pointer;
+            let mut d_fo = first_out.pointer;
+            let mut first_rows = FIRST_ROWS as u32;
+            let mut first_sd = 1_u32;
+            let mut d_so = second_out.pointer;
+            let mut second_rows = SECOND_ROWS as u32;
+            let mut second_sd = 1_u32;
+            let mut cols = COLUMNS as u32;
+            let slots = if stream_hbm { COPIES } else { 1 };
+            let mut d_fp = first_ring[0].0.pointer;
+            let mut d_fs = first_ring[0].1.pointer;
+            let mut d_sp = second_ring[0].0.pointer;
+            let mut d_ss = second_ring[0].1.pointer;
+            let mut arguments = [
+                (&mut d_input_p as *mut *mut std::ffi::c_void).cast(),
+                (&mut d_fp as *mut *mut std::ffi::c_void).cast(),
+                (&mut d_fs as *mut *mut std::ffi::c_void).cast(),
+                (&mut d_fo as *mut *mut std::ffi::c_void).cast(),
+                (&mut first_rows as *mut u32).cast(),
+                (&mut first_sd as *mut u32).cast(),
+                (&mut d_sp as *mut *mut std::ffi::c_void).cast(),
+                (&mut d_ss as *mut *mut std::ffi::c_void).cast(),
+                (&mut d_so as *mut *mut std::ffi::c_void).cast(),
+                (&mut second_rows as *mut u32).cast(),
+                (&mut second_sd as *mut u32).cast(),
+                (&mut cols as *mut u32).cast(),
+            ];
+            let max_rows = FIRST_ROWS.max(SECOND_ROWS) as u32;
+            let grid_x = max_rows.div_ceil(threads / 32);
+            let mut slot = 0_usize;
+            let mut launch_once = |arguments: &mut [*mut std::ffi::c_void; 12], d_fp: &mut *mut std::ffi::c_void, d_fs: &mut *mut std::ffi::c_void, d_sp: &mut *mut std::ffi::c_void, d_ss: &mut *mut std::ffi::c_void| {
+                *d_fp = first_ring[slot].0.pointer;
+                *d_fs = first_ring[slot].1.pointer;
+                *d_sp = second_ring[slot].0.pointer;
+                *d_ss = second_ring[slot].1.pointer;
+                slot = (slot + 1) % slots;
+                unsafe { launch(functions.w8_dual_g32 as *mut std::ffi::c_void, grid_x, 1, 2, threads, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), std::ptr::null_mut()) };
+            };
+            for _ in 0..3 {
+                launch_once(&mut arguments, &mut d_fp, &mut d_fs, &mut d_sp, &mut d_ss);
+            }
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                for _ in 0..rounds {
+                    launch_once(&mut arguments, &mut d_fp, &mut d_fs, &mut d_sp, &mut d_ss);
+                }
+                super::super::synchronize_device(DEVICE, "dual threads bench").unwrap();
+                best = best.min(started.elapsed().as_micros() as f64 / rounds as f64);
+            }
+            best
+        };
+
+        let reference = run(256, 50, false);
+        let ref_first = first_out.download_f32(FIRST_ROWS).unwrap();
+        let ref_second = second_out.download_f32(SECOND_ROWS).unwrap();
+        eprintln!("[w8-g32-dual-threads] threads=256 L2-resident min_us={reference:.1} bw_GBps={:.0}", weight_mb as f64 / 1e3 / reference);
+        for threads in [256_u32, 128, 64] {
+            let us = run(threads, 50, true);
+            let first = first_out.download_f32(FIRST_ROWS).unwrap();
+            let second = second_out.download_f32(SECOND_ROWS).unwrap();
+            let diff = ref_first.iter().zip(&first).filter(|(a, b)| a.to_bits() != b.to_bits()).count() + ref_second.iter().zip(&second).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            eprintln!("[w8-g32-dual-threads] threads={threads} HBM min_us={us:.1} bw_GBps={:.0} bit-diff={diff}", weight_mb as f64 / 1e3 / us);
+            assert!(diff == 0, "threads={threads} 与 256 不逐位一致");
+        }
+    }
+
+    /// W8G32 perm 直读臂 oracle：v_perm_b32 构造 f16(1024+u) + v_dot2_f32_f16，
+    /// 与生产 w8_g32 常量查表路径对照。bf16 容差族——magic 偏置修正的舍入
+    /// 在激活自身 bf16 舍入之下（Mac 端 numpy 仿真 max_rel≈1.6e-4），
+    /// 门槛沿用 dual oracle 的 2e-4。生产选择器暂不切换，直接 trampoline 启动。
+    /// `cargo test --release --features with-rocm w8_g32_perm_dual_matches -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn rocm_w8_g32_perm_dual_matches_single() {
+        const DEVICE: i32 = 0;
+        const COLUMNS: usize = 6_144;
+        const FIRST_ROWS: usize = 2_048;
+        const SECOND_ROWS: usize = 576;
+        const GROUP_SIZE: usize = 32;
+        const THREADS: u32 = 256;
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+
+        let input = (0..COLUMNS).map(|index| bf16::from_f32(((index * 17 % 61) as f32 - 30.0) / 64.0).to_bits()).collect::<Vec<_>>();
+        let d_input = DeviceBuffer::upload(DEVICE, bytes(&input)).unwrap();
+        let groups = COLUMNS / GROUP_SIZE;
+        let prepare = |seed: usize, rows: usize| {
+            let packed = (0..rows * COLUMNS).map(|index| (121 + (index * 29 + index / 7 + seed) % 15) as u8).collect::<Vec<_>>();
+            let scales = (0..rows * groups).map(|index| f16::from_f32((1 + (index + seed) % 7) as f32 / 256.0).to_bits()).collect::<Vec<_>>();
+            (DeviceBuffer::upload(DEVICE, &packed).unwrap(), DeviceBuffer::upload(DEVICE, bytes(&scales)).unwrap())
+        };
+        let (first_packed, first_scales) = prepare(3, FIRST_ROWS);
+        let (second_packed, second_scales) = prepare(11, SECOND_ROWS);
+        let single = |packed: &DeviceBuffer, scales: &DeviceBuffer, rows: usize| try_ct_quantized_matmul_bf16(DEVICE, 8, &[], Some(&d_input), packed, scales, 1, GROUP_SIZE, 1, COLUMNS, rows).unwrap().download_f32(rows).unwrap();
+        let first_expected = single(&first_packed, &first_scales, FIRST_ROWS);
+        let second_expected = single(&second_packed, &second_scales, SECOND_ROWS);
+
+        let functions = super::ct_quantized_functions(DEVICE).unwrap();
+        let launch = crate::kernel::rocm::hip::kernel_launch_trampoline;
+        let first_out = DeviceBuffer::allocate(DEVICE, FIRST_ROWS * 4).unwrap();
+        let second_out = DeviceBuffer::allocate(DEVICE, SECOND_ROWS * 4).unwrap();
+        let mut d_input_p = d_input.pointer;
+        let mut d_fp = first_packed.pointer;
+        let mut d_fs = first_scales.pointer;
+        let mut d_fo = first_out.pointer;
+        let mut first_rows = FIRST_ROWS as u32;
+        let mut first_sd = 1_u32;
+        let mut d_sp = second_packed.pointer;
+        let mut d_ss = second_scales.pointer;
+        let mut d_so = second_out.pointer;
+        let mut second_rows = SECOND_ROWS as u32;
+        let mut second_sd = 1_u32;
+        let mut cols = COLUMNS as u32;
+        let mut arguments = [
+            (&mut d_input_p as *mut *mut std::ffi::c_void).cast(),
+            (&mut d_fp as *mut *mut std::ffi::c_void).cast(),
+            (&mut d_fs as *mut *mut std::ffi::c_void).cast(),
+            (&mut d_fo as *mut *mut std::ffi::c_void).cast(),
+            (&mut first_rows as *mut u32).cast(),
+            (&mut first_sd as *mut u32).cast(),
+            (&mut d_sp as *mut *mut std::ffi::c_void).cast(),
+            (&mut d_ss as *mut *mut std::ffi::c_void).cast(),
+            (&mut d_so as *mut *mut std::ffi::c_void).cast(),
+            (&mut second_rows as *mut u32).cast(),
+            (&mut second_sd as *mut u32).cast(),
+            (&mut cols as *mut u32).cast(),
+        ];
+        // LDS = f16 激活行 + 每 group 偏置修正（6144×2 + 192×4 = 13056B）。
+        let shared = (COLUMNS * 2 + groups * 4) as u32;
+        unsafe {
+            launch(
+                functions.w8_dual_g32_perm as *mut std::ffi::c_void,
+                FIRST_ROWS.max(SECOND_ROWS) as u32 / (THREADS / 32),
+                1,
+                2,
+                THREADS,
+                1,
+                1,
+                shared,
+                crate::kernel::rocm::hip::active_compute_stream(),
+                arguments.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+        }
+        super::super::synchronize_device(DEVICE, "perm dual oracle").unwrap();
+        let actual = [first_out.download_f32(FIRST_ROWS).unwrap(), second_out.download_f32(SECOND_ROWS).unwrap()];
+        let expected = [first_expected, second_expected];
+        let mut max_abs = 0.0_f32;
+        let mut max_rel = 0.0_f32;
+        for projection in 0..2 {
+            for row in 0..actual[projection].len() {
+                let difference = (actual[projection][row] - expected[projection][row]).abs();
+                max_abs = max_abs.max(difference);
+                max_rel = max_rel.max(difference / expected[projection][row].abs().max(1.0e-6));
+                assert!(difference <= expected[projection][row].abs() * 5.0e-4 + 5.0e-4, "projection={projection} row={row} actual={} expected={} difference={difference}", actual[projection][row], expected[projection][row]);
+            }
+        }
+        eprintln!("[rocm-w8-g32-perm-dual-oracle] max_abs={max_abs:.6e} max_rel={max_rel:.6e}");
+    }
+
+    /// W8G32 dual perm 臂微基准：生产形状 q_a(6144→2048)+kv_a(6144→576)，
+    /// L2 驻留与 8 组权重轮换 HBM 流式两档（单组 17MB 全驻 96MB Infinity
+    /// Cache 会测成假带宽，必须轮换）。对照 w8_g32_dual_threads_bench 的
+    /// 基线数字判断收益。
+    /// `cargo test --release --features with-rocm w8_g32_dual_perm_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn w8_g32_dual_perm_bench() {
+        const DEVICE: i32 = 0;
+        const COLUMNS: usize = 6_144;
+        const FIRST_ROWS: usize = 2_048;
+        const SECOND_ROWS: usize = 576;
+        const GROUP_SIZE: usize = 32;
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+
+        let input = (0..COLUMNS).map(|index| bf16::from_f32(((index * 17 % 61) as f32 - 30.0) / 64.0).to_bits()).collect::<Vec<_>>();
+        let d_input = DeviceBuffer::upload(DEVICE, bytes(&input)).unwrap();
+        let groups = COLUMNS / GROUP_SIZE;
+        let prepare = |seed: usize, rows: usize| {
+            let packed = (0..rows * COLUMNS).map(|index| (121 + (index * 29 + index / 7 + seed) % 15) as u8).collect::<Vec<_>>();
+            let scales = (0..rows * groups).map(|index| f16::from_f32((1 + (index + seed) % 7) as f32 / 256.0).to_bits()).collect::<Vec<_>>();
+            (DeviceBuffer::upload(DEVICE, &packed).unwrap(), DeviceBuffer::upload(DEVICE, bytes(&scales)).unwrap())
+        };
+        let first_out = DeviceBuffer::allocate(DEVICE, FIRST_ROWS * 4).unwrap();
+        let second_out = DeviceBuffer::allocate(DEVICE, SECOND_ROWS * 4).unwrap();
+        let functions = super::ct_quantized_functions(DEVICE).unwrap();
+        let launch = crate::kernel::rocm::hip::kernel_launch_trampoline;
+        let weight_mb = ((FIRST_ROWS + SECOND_ROWS) * (COLUMNS + groups * 2)) as f64 / 1e6;
+        const COPIES: usize = 8;
+        let first_ring: Vec<_> = (0..COPIES).map(|copy| prepare(100 + copy, FIRST_ROWS)).collect();
+        let second_ring: Vec<_> = (0..COPIES).map(|copy| prepare(200 + copy, SECOND_ROWS)).collect();
+        let shared = (COLUMNS * 2 + groups * 4) as u32;
+
+        let run = |threads: u32, rounds: usize, stream_hbm: bool| -> f64 {
+            let mut d_input_p = d_input.pointer;
+            let mut d_fo = first_out.pointer;
+            let mut first_rows = FIRST_ROWS as u32;
+            let mut first_sd = 1_u32;
+            let mut d_so = second_out.pointer;
+            let mut second_rows = SECOND_ROWS as u32;
+            let mut second_sd = 1_u32;
+            let mut cols = COLUMNS as u32;
+            let slots = if stream_hbm { COPIES } else { 1 };
+            let mut d_fp = first_ring[0].0.pointer;
+            let mut d_fs = first_ring[0].1.pointer;
+            let mut d_sp = second_ring[0].0.pointer;
+            let mut d_ss = second_ring[0].1.pointer;
+            let mut arguments = [
+                (&mut d_input_p as *mut *mut std::ffi::c_void).cast(),
+                (&mut d_fp as *mut *mut std::ffi::c_void).cast(),
+                (&mut d_fs as *mut *mut std::ffi::c_void).cast(),
+                (&mut d_fo as *mut *mut std::ffi::c_void).cast(),
+                (&mut first_rows as *mut u32).cast(),
+                (&mut first_sd as *mut u32).cast(),
+                (&mut d_sp as *mut *mut std::ffi::c_void).cast(),
+                (&mut d_ss as *mut *mut std::ffi::c_void).cast(),
+                (&mut d_so as *mut *mut std::ffi::c_void).cast(),
+                (&mut second_rows as *mut u32).cast(),
+                (&mut second_sd as *mut u32).cast(),
+                (&mut cols as *mut u32).cast(),
+            ];
+            let grid_x = FIRST_ROWS.max(SECOND_ROWS) as u32 / (threads / 32);
+            let mut slot = 0_usize;
+            let mut launch_once = |arguments: &mut [*mut std::ffi::c_void; 12], d_fp: &mut *mut std::ffi::c_void, d_fs: &mut *mut std::ffi::c_void, d_sp: &mut *mut std::ffi::c_void, d_ss: &mut *mut std::ffi::c_void| {
+                *d_fp = first_ring[slot].0.pointer;
+                *d_fs = first_ring[slot].1.pointer;
+                *d_sp = second_ring[slot].0.pointer;
+                *d_ss = second_ring[slot].1.pointer;
+                slot = (slot + 1) % slots;
+                unsafe { launch(functions.w8_dual_g32_perm as *mut std::ffi::c_void, grid_x, 1, 2, threads, 1, 1, shared, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), std::ptr::null_mut()) };
+            };
+            for _ in 0..3 {
+                launch_once(&mut arguments, &mut d_fp, &mut d_fs, &mut d_sp, &mut d_ss);
+            }
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let started = std::time::Instant::now();
+                for _ in 0..rounds {
+                    launch_once(&mut arguments, &mut d_fp, &mut d_fs, &mut d_sp, &mut d_ss);
+                }
+                super::super::synchronize_device(DEVICE, "dual perm bench").unwrap();
+                best = best.min(started.elapsed().as_micros() as f64 / rounds as f64);
+            }
+            best
+        };
+
+        let l2 = run(256, 50, false);
+        eprintln!("[w8-g32-dual-perm] threads=256 L2-resident min_us={l2:.1} bw_GBps={:.0}", weight_mb / 1e3 / l2);
+        for threads in [256_u32, 128] {
+            let us = run(threads, 50, true);
+            eprintln!("[w8-g32-dual-perm] threads={threads} HBM min_us={us:.1} bw_GBps={:.0}", weight_mb / 1e3 / us);
+        }
     }
 }

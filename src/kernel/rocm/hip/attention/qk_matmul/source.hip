@@ -208,6 +208,13 @@ __device__ __forceinline__ float gguf_kq_dequant(const unsigned char *row_base, 
 {
     const unsigned char *block = row_base + (unsigned long long)(column >> 8) * qk_block_bytes(tensor_type);
     const unsigned int local = column & 255;
+    // Q8_0：[f16 scale][32×i8] 交替 block，每 32 元素 34B。
+    if (tensor_type == 8u) {
+        const unsigned int block_idx = local >> 5;
+        const unsigned int offset = local & 31u;
+        const unsigned char *q8_block = block + (unsigned long long)block_idx * 34u;
+        return gguf_f16(q8_block) * (float)(signed char)q8_block[2 + offset];
+    }
     if (tensor_type == 11u || tensor_type == 21u || tensor_type == 23u)
         return zllm_gguf_extra_value(row_base, tensor_type, column);
     if (tensor_type == 14) {
@@ -306,6 +313,88 @@ extern "C" __global__ void qk_matmul_fdot2(
         for (unsigned int row = 0; row < 8; ++row) {
             if (row < input_rows) {
                 output[(unsigned long long)row * output_rows + output_row] = fdot2_partial[row][0];
+            }
+        }
+    }
+}
+
+
+// ===== Q8_0 预重排 decode GEMV：scales/quants 平面分离 =====
+// 布局：每行 [cols/32 个 f16 scale（小端）][cols 个 i8 quant]，row_stride =
+// cols/16 + cols（cols 为 256 倍数 → quants 平面 8B 对齐）。数值形态与
+// qk_matmul_fdot2 相同：f16 scale × i8 → f32 → bf16 舍入 → fdot2 累加，
+// 仅 lane 内列分配从跨步成对改为 8 连续列（归约顺序差异沿用 bf16 容差族）。
+// 每 lane 一次 8B quant 加载 + 每 32 列一次 scale 广播，替代逐字节标量加载。
+__device__ __forceinline__ qk_bf16x2 q8_pair(const float scale, const unsigned int word, const unsigned int byte)
+{
+    const int low = (int)(word << (24u - byte * 8u)) >> 24;
+    const int high = (int)(word << (16u - byte * 8u)) >> 24;
+    const unsigned int pair = qk_bf16_pair(scale * (float)low, scale * (float)high);
+    return *reinterpret_cast<const qk_bf16x2 *>(&pair);
+}
+
+__device__ __forceinline__ qk_bf16x2 q8_input_pair(const void *__restrict__ input, const unsigned long long offset, const unsigned int is_bf16)
+{
+    const unsigned int pair = qk_bf16_pair(qk_input(input, offset, is_bf16), qk_input(input, offset + 1u, is_bf16));
+    return *reinterpret_cast<const qk_bf16x2 *>(&pair);
+}
+
+extern "C" __global__ void q8_gemv_repacked(
+    const void *__restrict__ input,
+    const unsigned char *__restrict__ weight,
+    float *__restrict__ output,
+    const unsigned int input_rows,
+    const unsigned int columns,
+    const unsigned int output_rows,
+    const unsigned int input_is_bf16)
+{
+    const unsigned int output_row = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    if (output_row >= output_rows || input_rows == 0u || input_rows > 8u) return;
+
+    const unsigned int scale_bytes = columns >> 4;
+    const unsigned char *row_base = weight + (unsigned long long)output_row * ((unsigned long long)scale_bytes + columns);
+    const unsigned char *row_scales = row_base;
+    const signed char *row_quants = (const signed char *)(row_base + scale_bytes);
+    float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (unsigned int col0 = lane * 8u; col0 < columns; col0 += 2048u) {
+        const int2 packed = *(const int2 *)(row_quants + col0);
+        const float scale = gguf_f16(row_scales + ((col0 >> 5) << 1));
+        const qk_bf16x2 wa = q8_pair(scale, packed.x, 0u);
+        const qk_bf16x2 wb = q8_pair(scale, packed.x, 2u);
+        const qk_bf16x2 wc = q8_pair(scale, packed.y, 0u);
+        const qk_bf16x2 wd = q8_pair(scale, packed.y, 2u);
+        #pragma unroll
+        for (unsigned int row = 0; row < 8; ++row) {
+            if (row < input_rows) {
+                const unsigned long long base = (unsigned long long)row * columns + col0;
+                float acc = sums[row];
+                acc = __builtin_amdgcn_fdot2_f32_bf16(q8_input_pair(input, base + 0u, input_is_bf16), wa, acc, false);
+                acc = __builtin_amdgcn_fdot2_f32_bf16(q8_input_pair(input, base + 2u, input_is_bf16), wb, acc, false);
+                acc = __builtin_amdgcn_fdot2_f32_bf16(q8_input_pair(input, base + 4u, input_is_bf16), wc, acc, false);
+                acc = __builtin_amdgcn_fdot2_f32_bf16(q8_input_pair(input, base + 6u, input_is_bf16), wd, acc, false);
+                sums[row] = acc;
+            }
+        }
+    }
+
+    __shared__ float q8_partial[8][256];
+    #pragma unroll
+    for (unsigned int row = 0; row < 8; ++row) q8_partial[row][lane] = sums[row];
+    __syncthreads();
+    for (unsigned int stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) {
+            #pragma unroll
+            for (unsigned int row = 0; row < 8; ++row) q8_partial[row][lane] += q8_partial[row][lane + stride];
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        #pragma unroll
+        for (unsigned int row = 0; row < 8; ++row) {
+            if (row < input_rows) {
+                output[(unsigned long long)row * output_rows + output_row] = q8_partial[row][0];
             }
         }
     }

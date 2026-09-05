@@ -8,6 +8,7 @@ pub mod glm52;
 pub mod glm53_flash;
 pub mod h3;
 pub mod kimi_k3;
+pub mod laguna;
 pub mod minimax_m3;
 pub mod ornith;
 pub mod qwen36;

@@ -168,7 +168,7 @@ impl<S> ExpertDecodePipeline<S> {
                 on_route_ready()?;
             }
             if observe_single_token && !active_experts.is_empty() {
-                predictor.observe_route(layer, active_experts).map_err(BackendError::ExpertLoad)?;
+                predictor.observe_route(layer, active_experts).map_err(|msg| BackendError::ExpertLoad(format!("decode L{layer} route 塌缩: active={active_experts:?}: {msg}")))?;
             }
             match next {
                 Some((next_layer, next_source)) if observe_single_token => predict_prefetch_request(predictor, stats, spec, next_layer, next_source),

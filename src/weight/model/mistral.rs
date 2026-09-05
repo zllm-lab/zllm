@@ -1,4 +1,4 @@
-//! Mistral 风格 dense LLM GGUF loader。
+//! Llama 风格 dense GQA GGUF loader。
 //!
 //! 当前已验证：Mistral-Small-3.2-24B-Instruct-2506。
 //! 兼容任何 llama.cpp 风格 GGUF dense decoder（hidden_size / num_heads / num_kv_heads /
@@ -42,6 +42,7 @@ use crate::weight::container::gguf::{GgufMatrix, GgufReader, GgufValue};
 /// 同架构 Llama 风格 decoder 可直接复用本 config 字段，仅数值变化。
 #[derive(Debug, Clone, Copy)]
 pub struct MistralConfig {
+    pub architecture: DenseGqaArchitecture,
     pub layer_count: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -51,7 +52,34 @@ pub struct MistralConfig {
     pub vocab_size: usize,
     pub max_position_embeddings: usize,
     pub rope_theta: f32,
+    pub rope_scaling: Option<YarnRopeScaling>,
     pub rms_eps: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct YarnRopeScaling {
+    pub factor: f32,
+    pub original_context: usize,
+    pub beta_fast: f32,
+    pub beta_slow: f32,
+}
+
+/// 共享同一条 dense GQA + SwiGLU runtime 的 GGUF 架构。
+///
+/// 这里只记录权重元数据命名差异；模型计算仍由 `runtime::mistral` 的通用路径承担。
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum DenseGqaArchitecture {
+    Mistral,
+    K2Horizon,
+}
+
+impl DenseGqaArchitecture {
+    fn metadata_prefix(self) -> &'static str {
+        match self {
+            Self::Mistral => "llama",
+            Self::K2Horizon => "k2-horizon",
+        }
+    }
 }
 
 impl MistralConfig {
@@ -61,24 +89,52 @@ impl MistralConfig {
     /// GGUF converter 而异。真正的硬约束是 tensor shape，由 `validate_tensors()`
     /// 在 `open()` 末尾用 `expect_tensor` 执行。
     pub fn from_gguf_metadata(reader: &GgufReader) -> Result<Self, String> {
-        reader.expect_metadata_str("general.architecture", "llama")?;
-        let layer_count = reader.metadata_u64("llama.block_count")? as usize;
-        let hidden_size = reader.metadata_u64("llama.embedding_length")? as usize;
+        let architecture = match reader.metadata("general.architecture").and_then(GgufValue::as_str) {
+            Some("llama") => DenseGqaArchitecture::Mistral,
+            Some("k2-horizon") => DenseGqaArchitecture::K2Horizon,
+            Some(value) => return Err(format!("dense GQA loader 不支持 GGUF architecture={value}")),
+            None => return Err("GGUF metadata general.architecture 缺失或类型错误".to_owned()),
+        };
+        let prefix = architecture.metadata_prefix();
+        let key = |suffix: &str| format!("{prefix}.{suffix}");
+        let layer_count = reader.metadata_u64(&key("block_count"))? as usize;
+        let hidden_size = reader.metadata_u64(&key("embedding_length"))? as usize;
         // llama.cpp `feed_forward_length` = 单矩阵宽度 = HF intermediate_size / 2 (SwiGLU)
-        let intermediate_size = reader.metadata_u64("llama.feed_forward_length")? as usize;
-        let num_heads = reader.metadata_u64("llama.attention.head_count")? as usize;
-        let num_kv_heads = reader.metadata_u64("llama.attention.head_count_kv")? as usize;
-        let head_dim = reader.metadata_u64("llama.attention.key_length")? as usize;
-        let value_dim = reader.metadata_u64("llama.attention.value_length")? as usize;
+        let intermediate_size = reader.metadata_u64(&key("feed_forward_length"))? as usize;
+        let num_heads = reader.metadata_u64(&key("attention.head_count"))? as usize;
+        let num_kv_heads = reader.metadata_u64(&key("attention.head_count_kv"))? as usize;
+        let head_dim = reader.metadata_u64(&key("attention.key_length"))? as usize;
+        let value_dim = reader.metadata_u64(&key("attention.value_length"))? as usize;
         if value_dim != head_dim {
             return Err(format!("Mistral 假设 head_dim==value_dim，实际 head_dim={head_dim}, value_dim={value_dim}"));
         }
-        let vocab_size = reader.metadata_u64("llama.vocab_size")? as usize;
-        let max_position_embeddings = reader.metadata_u64("llama.context_length")? as usize;
+        // 新版 GGUF 不保证写入 architecture.vocab_size；embedding 的行数才是权威来源。
+        let vocab_size = match reader.metadata(&key("vocab_size")).and_then(GgufValue::as_u64) {
+            Some(value) => value as usize,
+            None => reader.tensor("token_embd.weight").and_then(|tensor| tensor.dims.get(1)).copied().ok_or_else(|| "GGUF 无法从 token_embd.weight 推导 vocab_size".to_owned())?,
+        };
+        let max_position_embeddings = reader.metadata_u64(&key("context_length"))? as usize;
         // llama.cpp 把 rope.freq_base 存为 f32（与 u32/u64 同样合法），读时按 f64 拿、归一为 f32。
-        let rope_theta = reader.metadata("llama.rope.freq_base").and_then(GgufValue::as_f64).ok_or_else(|| "GGUF metadata llama.rope.freq_base 缺失或类型错误".to_owned())? as f32;
-        let rms_eps = reader.metadata("llama.attention.layer_norm_rms_epsilon").and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(1e-5);
-        Ok(Self { layer_count, hidden_size, intermediate_size, num_heads, num_kv_heads, head_dim, vocab_size, max_position_embeddings, rope_theta, rms_eps })
+        let rope_theta = reader.metadata(&key("rope.freq_base")).and_then(GgufValue::as_f64).ok_or_else(|| format!("GGUF metadata {} 缺失或类型错误", key("rope.freq_base")))? as f32;
+        let rope_scaling = match reader.metadata(&key("rope.scaling.type")).and_then(GgufValue::as_str) {
+            None | Some("none") => None,
+            Some("yarn") => Some(YarnRopeScaling {
+                factor: reader.metadata(&key("rope.scaling.factor")).and_then(GgufValue::as_f64).ok_or_else(|| format!("GGUF metadata {} 缺失或类型错误", key("rope.scaling.factor")))? as f32,
+                original_context: reader.metadata_u64(&key("rope.scaling.original_context_length"))? as usize,
+                beta_fast: reader.metadata(&key("rope.scaling.yarn_beta_fast")).and_then(GgufValue::as_f64).unwrap_or(32.0) as f32,
+                beta_slow: reader.metadata(&key("rope.scaling.yarn_beta_slow")).and_then(GgufValue::as_f64).unwrap_or(1.0) as f32,
+            }),
+            Some(kind) => return Err(format!("dense GQA loader 不支持 rope.scaling.type={kind}")),
+        };
+        let rms_eps = reader.metadata(&key("attention.layer_norm_rms_epsilon")).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(1e-5);
+        if architecture == DenseGqaArchitecture::K2Horizon {
+            let experts = reader.metadata(&key("expert_count")).and_then(GgufValue::as_u64).unwrap_or(0);
+            let norm_groups = reader.metadata(&key("attention.group_norm_groups")).and_then(GgufValue::as_u64).unwrap_or(1);
+            if experts != 0 || norm_groups != 1 {
+                return Err(format!("K2 Horizon dense runtime 仅支持 expert_count=0、group_norm_groups=1，实际 {experts}、{norm_groups}"));
+            }
+        }
+        Ok(Self { architecture, layer_count, hidden_size, intermediate_size, num_heads, num_kv_heads, head_dim, vocab_size, max_position_embeddings, rope_theta, rope_scaling, rms_eps })
     }
 
     /// query 投影列数（attention output dim）。
@@ -97,9 +153,6 @@ impl MistralConfig {
         }
         if self.num_heads == 0 || self.num_kv_heads == 0 || self.head_dim == 0 {
             return Err("Mistral attention 维度必须非零".to_owned());
-        }
-        if !self.hidden_size.is_multiple_of(self.num_heads) {
-            return Err(format!("Mistral hidden_size={} 不是 num_heads={} 的整数倍", self.hidden_size, self.num_heads));
         }
         if !self.num_heads.is_multiple_of(self.num_kv_heads) {
             return Err(format!("Mistral num_heads={} 不是 num_kv_heads={} 的整数倍", self.num_heads, self.num_kv_heads));

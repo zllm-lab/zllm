@@ -12,6 +12,16 @@ extern "C" __global__ void sigmoid_gate_f16(const __half *input, const __half *g
     float g = __half2float(gate[row * gate_columns + (gate_columns == 1 ? 0 : column)]);
     output[id] = __float2half(__half2float(input[id]) / (1.0f + expf(-g)));
 }
+extern "C" __global__ void softplus_gate_per_head_f16(const __half *input, const __half *gate, __half *output, unsigned int columns, unsigned int gate_columns, unsigned int count) {
+    unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
+    if (id >= count) return;
+    unsigned int row = id / columns;
+    unsigned int column = id - row * columns;
+    float g = __half2float(gate[row * gate_columns + column / (columns / gate_columns)]);
+    // 数值稳定 softplus(与 torch 默认 threshold=20 对齐)
+    float softplus = g > 20.0f ? g : logf(1.0f + expf(g));
+    output[id] = __float2half(__half2float(input[id]) * softplus);
+}
 extern "C" __global__ void gemma_rmsnorm_heads_f16(const __half *input, const __half *weight, __half *output, unsigned int head_count, unsigned int head_dim, float eps) {
     extern __shared__ float sums[];
     unsigned int lane = threadIdx.x;
@@ -69,11 +79,14 @@ extern "C" __global__ void gemma_rmsnorm_residual_heads_f16(
         output[begin + column] = __float2half(v * scale * (1.0f + __half2float(weight[column])));
     }
 }
-extern "C" __global__ void append_rows_f16(const __half *input, __half *output, unsigned int position, unsigned int columns, unsigned int count) {
+extern "C" __global__ void append_rows_f16(const __half *input, __half *output, unsigned int position, unsigned int columns, unsigned int count, unsigned int capacity) {
     unsigned int id = blockIdx.x * blockDim.x + threadIdx.x;
-    if (id < count) output[(unsigned long long)position * columns + id] = input[id];
+    if (id >= count) return;
+    // ring KV:绝对行号对 capacity 取模落槽;dense 层 capacity >= 行数,取模为恒等。
+    unsigned int row = position + id / columns;
+    output[(unsigned long long)(row % capacity) * columns + id % columns] = input[id];
 }
-extern "C" __global__ void gqa_attention_f16(const __half *query, const __half *key, const __half *value, __half *output, unsigned int query_rows, unsigned int kv_rows, unsigned int position, unsigned int heads, unsigned int kv_heads, unsigned int head_dim, float attention_scale) {
+extern "C" __global__ void gqa_attention_f16(const __half *query, const __half *key, const __half *value, __half *output, unsigned int query_rows, unsigned int kv_rows, unsigned int position, unsigned int heads, unsigned int kv_heads, unsigned int head_dim, unsigned int kv_capacity, float attention_scale) {
     extern __shared__ float shared[];
     unsigned int block = blockIdx.x;
     unsigned int row = block / heads;
@@ -92,13 +105,15 @@ extern "C" __global__ void gqa_attention_f16(const __half *query, const __half *
     }
     __syncthreads();
 
+    // ring KV:可见键 = 已存储的最近 kv_capacity 个;dense 层 capacity >= kv_rows 时起点为 0。
+    unsigned int ring_start = kv_rows > kv_capacity ? kv_rows - kv_capacity : 0u;
     // 每个 warp 独立扫描一段 KV，最后合并在线 softmax，避免按 token 做 block 同步。
     float maximum = -3.402823466e+38F;
     float denominator = 0.0f;
     unsigned int last = position + row;
     if (last >= kv_rows) last = kv_rows - 1;
-    for (unsigned int token = warp; token <= last; token += warp_count) {
-        unsigned long long kv_base = ((unsigned long long)token * kv_heads + kv_head) * head_dim;
+    for (unsigned int token = ring_start + warp; token <= last; token += warp_count) {
+        unsigned long long kv_base = ((unsigned long long)(token % kv_capacity) * kv_heads + kv_head) * head_dim;
         float partial = 0.0f;
         for (unsigned int dimension = warp_lane; dimension < head_dim; dimension += 32) {
             partial += __half2float(query[q_base + dimension]) * __half2float(key[kv_base + dimension]);
@@ -177,6 +192,7 @@ extern "C" __global__ void gqa_attention_f16_flash(
     unsigned int heads,
     unsigned int kv_heads,
     unsigned int head_dim,
+    unsigned int kv_capacity,
     float attention_scale)
 {
     extern __shared__ unsigned char smem_raw[];
@@ -188,6 +204,11 @@ extern "C" __global__ void gqa_attention_f16_flash(
     const bool row_valid = row < query_rows;
     unsigned int last = position + row;
     if (last >= kv_rows) last = kv_rows - 1;
+
+    // ring KV:只扫最近 kv_capacity 个键;首 tile 对齐 FLASH_TILE,槽位 = token % capacity。
+    // 对齐带入的 ring_start 之前 token 由 load/active 双重掩码排除(槽里是回绕后的新数据)。
+    unsigned int ring_start = kv_rows > kv_capacity ? kv_rows - kv_capacity : 0u;
+    unsigned int first_tile = ring_start / FLASH_TILE * FLASH_TILE;
 
     // smem:K_tile + V_tile(各 FLASH_TILE × stride 个 half)+ 每 warp 32 个 softmax 权重。
     const unsigned int stride = head_dim + 2u;
@@ -209,7 +230,7 @@ extern "C" __global__ void gqa_attention_f16_flash(
     float maximum = -3.402823466e+38F;
     float denominator = 0.0f;
 
-    for (unsigned int tile = 0; tile <= block_last; tile += FLASH_TILE) {
+    for (unsigned int tile = first_tile; tile <= block_last; tile += FLASH_TILE) {
         // 合作加载 K/V tile:连续 idx → 行内连续 half,全局合并访问;越界 token 填 0。
         for (unsigned int index = threadIdx.x; index < FLASH_TILE * head_dim; index += blockDim.x) {
             unsigned int t = index / head_dim;
@@ -217,8 +238,8 @@ extern "C" __global__ void gqa_attention_f16_flash(
             unsigned int token = tile + t;
             __half k = __float2half(0.0f);
             __half v = __float2half(0.0f);
-            if (token <= block_last) {
-                unsigned long long kv = (unsigned long long)token * kv_heads * head_dim + kv_base + d;
+            if (token <= block_last && token >= ring_start) {
+                unsigned long long kv = (unsigned long long)(token % kv_capacity) * kv_heads * head_dim + kv_base + d;
                 k = key[kv];
                 v = value[kv];
             }
@@ -229,7 +250,7 @@ extern "C" __global__ void gqa_attention_f16_flash(
 
         // QK dot:lane=token,q 全 lane 同址广播(K/L1),k 从 smem(奇 word stride 无冲突)。
         unsigned int token = tile + lane;
-        bool active = row_valid && token <= last;
+        bool active = row_valid && token <= last && token >= ring_start;
         float score = -3.402823466e+38F;
         if (active) {
             const __half *k = K_tile + lane * stride;
@@ -851,7 +872,7 @@ pub fn sigmoid_gate_f16(ctx: &CudaContext, input: &CudaTensor, gate: &CudaTensor
     if input.rows != gate.rows || (gate.cols != 1 && gate.cols != input.cols) {
         return Err(format!("CUDA sigmoid gate shape input=[{},{}], gate=[{},{}]", input.rows, input.cols, gate.rows, gate.cols));
     }
-    let output = ctx.tensor_uninit(input.rows, input.cols)?;
+    let output = ctx.tensor_alloc(input.rows, input.cols)?;
     let func = ctx.function("sigmoid_gate_f16")?;
     unsafe {
         ctx.stream()
@@ -868,11 +889,34 @@ pub fn sigmoid_gate_f16(ctx: &CudaContext, input: &CudaTensor, gate: &CudaTensor
     Ok(output)
 }
 
+/// `input * softplus(gate)`;gate 每行 n 列且 n 整除 input 列数,按块广播
+/// (Laguna 逐头门控:gate=[rows, heads],input=[rows, heads*head_dim])。
+pub fn softplus_gate_per_head_f16(ctx: &CudaContext, input: &CudaTensor, gate: &CudaTensor) -> Result<CudaTensor, String> {
+    if input.rows != gate.rows || gate.cols == 0 || input.cols % gate.cols != 0 {
+        return Err(format!("CUDA softplus gate shape input=[{},{}], gate=[{},{}] 不满足逐头广播", input.rows, input.cols, gate.rows, gate.cols));
+    }
+    let output = ctx.tensor_alloc(input.rows, input.cols)?;
+    let func = ctx.function("softplus_gate_per_head_f16")?;
+    unsafe {
+        ctx.stream()
+            .launch_builder(&func)
+            .arg(&input.slice)
+            .arg(&gate.slice)
+            .arg(&output.slice)
+            .arg(&(input.cols as u32))
+            .arg(&(gate.cols as u32))
+            .arg(&(input.len() as u32))
+            .launch(grid_1d(input.len()))
+            .map_err(|error| format!("launch softplus_gate_per_head_f16: {error:?}"))?;
+    }
+    Ok(output)
+}
+
 pub fn gemma_rmsnorm_heads_f16(ctx: &CudaContext, input: &CudaTensor, weight: &CudaSliceF16, head_count: usize, head_dim: usize, eps: f32) -> Result<CudaTensor, String> {
     if input.cols != head_count * head_dim || weight.len() != head_dim {
         return Err(format!("CUDA Gemma head norm shape input=[{},{}], heads={head_count}, dim={head_dim}, weight={}", input.rows, input.cols, weight.len()));
     }
-    let output = ctx.tensor_uninit(input.rows, input.cols)?;
+    let output = ctx.tensor_alloc(input.rows, input.cols)?;
     let func = ctx.function("gemma_rmsnorm_heads_f16")?;
     let cfg = LaunchConfig { grid_dim: ((input.rows * head_count) as u32, 1, 1), block_dim: (THREADS, 1, 1), shared_mem_bytes: THREADS * std::mem::size_of::<f32>() as u32 };
     unsafe {
@@ -891,7 +935,7 @@ pub fn gemma_rmsnorm_residual_heads_f16(ctx: &CudaContext, input: &CudaTensor, r
     if input.cols != head_count * head_dim || weight.len() != head_dim {
         return Err(format!("CUDA Gemma residual norm heads/dim input=[{},{}], heads={head_count}, dim={head_dim}, weight={}", input.rows, input.cols, weight.len()));
     }
-    let output = ctx.tensor_uninit(input.rows, input.cols)?;
+    let output = ctx.tensor_alloc(input.rows, input.cols)?;
     let func = ctx.function("gemma_rmsnorm_residual_heads_f16")?;
     let cfg = LaunchConfig { grid_dim: ((input.rows * head_count) as u32, 1, 1), block_dim: (THREADS, 1, 1), shared_mem_bytes: THREADS * std::mem::size_of::<f32>() as u32 };
     unsafe {
@@ -910,11 +954,15 @@ pub fn gemma_rmsnorm_residual_heads_f16(ctx: &CudaContext, input: &CudaTensor, r
     Ok(output)
 }
 
-pub fn append_rows_f16(ctx: &CudaContext, input: &CudaTensor, destination: &CudaSliceF16, position: usize) -> Result<(), String> {
-    // kernel 按 position*columns + id 写入,先校验整个写入窗口不越出 destination。
-    let end = position.checked_mul(input.cols).and_then(|base| base.checked_add(input.len())).ok_or("CUDA append_rows 偏移溢出")?;
-    if end > destination.len() {
-        return Err(format!("CUDA append_rows 写入越界: position={position} columns={} count={} 需要 {end} > destination={}", input.cols, input.len(), destination.len()));
+/// 把 `[rows, columns]` 的 f16 行写入 KV 存储。`capacity` 是该层存储容量(行数):
+/// sliding-window 层容量 < max_seq_len,按 `绝对行 % capacity` 的 ring 槽位写入。
+pub fn append_rows_f16(ctx: &CudaContext, input: &CudaTensor, destination: &CudaSliceF16, position: usize, capacity: usize) -> Result<(), String> {
+    // 校验 chunk 自身不超过容量:ring 内自回绕会覆盖本 chunk 早期 query 仍需要的键。
+    if input.rows > capacity {
+        return Err(format!("CUDA append_rows chunk={} 超过 KV 容量 {capacity}:ring 内自回绕会破坏窗口语义", input.rows));
+    }
+    if destination.len() % input.cols != 0 {
+        return Err(format!("CUDA append_rows destination 长度 {} 不按 columns={} 对齐", destination.len(), input.cols));
     }
     let func = ctx.function("append_rows_f16")?;
     unsafe {
@@ -925,28 +973,35 @@ pub fn append_rows_f16(ctx: &CudaContext, input: &CudaTensor, destination: &Cuda
             .arg(&(position as u32))
             .arg(&(input.cols as u32))
             .arg(&(input.len() as u32))
+            .arg(&(capacity as u32))
             .launch(grid_1d(input.len()))
             .map_err(|error| format!("launch append_rows_f16: {error:?}"))?;
     }
     Ok(())
 }
 
-pub fn gqa_attention_f16(ctx: &CudaContext, query: &CudaTensor, key: &CudaSliceF16, value: &CudaSliceF16, kv_rows: usize, position: usize, spec: &crate::attention::gqa::GqaSpec) -> Result<CudaTensor, String> {
+/// `kv_capacity` 是 K/V 存储的容量(行数):sliding-window 层按 ring 寻址读取,
+/// dense 层传分配行数(取模恒等)。可见键 = 最近 capacity 个已存键。
+pub fn gqa_attention_f16(ctx: &CudaContext, query: &CudaTensor, key: &CudaSliceF16, value: &CudaSliceF16, kv_rows: usize, position: usize, spec: &crate::attention::gqa::GqaSpec, kv_capacity: usize) -> Result<CudaTensor, String> {
     let query_cols = spec.num_heads * spec.head_dim;
     let kv_cols = spec.num_kv_heads * spec.head_dim;
-    if query.cols != query_cols || key.len() < kv_rows * kv_cols || value.len() < kv_rows * kv_cols {
-        return Err(format!("CUDA GQA shape query=[{},{}], kv_rows={kv_rows}, kv_cols={kv_cols}", query.rows, query.cols));
+    if query.cols != query_cols || key.len() / kv_cols != kv_capacity || value.len() / kv_cols != kv_capacity {
+        return Err(format!("CUDA GQA shape query=[{},{}], kv_rows={kv_rows}, kv_cols={kv_cols}, kv_capacity={kv_capacity}", query.rows, query.cols));
     }
-    let output = ctx.tensor_uninit(query.rows, query.cols)?;
+    let output = ctx.tensor_alloc(query.rows, query.cols)?;
     let func = ctx.function("gqa_attention_f16")?;
     // decode 的 head 数有限，长 KV 用更多 warp 填满 SM；prefill 保持较小 block。
+    // warp 数受 smem 上限约束:warp_count × (head_dim+2) × f32 ≤ 48KB,否则 launch
+    // 返回 INVALID_VALUE(如 head_dim=512 + 1024 线程需要 64KB smem)。
+    let smem_warp_budget = 12_288usize / (spec.head_dim + 2);
     let threads = if query.rows == 1 && kv_rows >= 4096 {
         1024
     } else if query.rows == 1 && kv_rows >= 1024 {
         512
     } else {
         256
-    };
+    }
+    .min(smem_warp_budget.max(2) * 32);
     let warp_count = threads / 32;
     let shared_floats = warp_count * (spec.head_dim + 2);
     let cfg = LaunchConfig { grid_dim: ((query.rows * spec.num_heads) as u32, 1, 1), block_dim: (threads as u32, 1, 1), shared_mem_bytes: (shared_floats * std::mem::size_of::<f32>()) as u32 };
@@ -963,6 +1018,7 @@ pub fn gqa_attention_f16(ctx: &CudaContext, query: &CudaTensor, key: &CudaSliceF
             .arg(&(spec.num_heads as u32))
             .arg(&(spec.num_kv_heads as u32))
             .arg(&(spec.head_dim as u32))
+            .arg(&(kv_capacity as u32))
             .arg(&spec.score_scale)
             .launch(cfg)
             .map_err(|error| format!("launch gqa_attention_f16: {error:?}"))?;
@@ -978,15 +1034,15 @@ pub fn gqa_attention_f16(ctx: &CudaContext, query: &CudaTensor, key: &CudaSliceF
 /// 消除旧版「5 head × 全部行重复读 KV 打满 DRAM」与每 token 7 次 shuffle 的结构问题;
 /// 要求 `head_dim ∈ [32, 256]` 且按 32 对齐、`kv_heads` 整除 `heads`。decode(单行)继续
 /// 走 `gqa_attention_f16`。
-pub fn gqa_attention_f16_flash(ctx: &CudaContext, query: &CudaTensor, key: &CudaSliceF16, value: &CudaSliceF16, kv_rows: usize, position: usize, spec: &crate::attention::gqa::GqaSpec) -> Result<CudaTensor, String> {
+pub fn gqa_attention_f16_flash(ctx: &CudaContext, query: &CudaTensor, key: &CudaSliceF16, value: &CudaSliceF16, kv_rows: usize, position: usize, spec: &crate::attention::gqa::GqaSpec, kv_capacity: usize) -> Result<CudaTensor, String> {
     const THREADS: usize = 256;
     let query_cols = spec.num_heads * spec.head_dim;
     let kv_cols = spec.num_kv_heads * spec.head_dim;
     if query.rows <= 1 {
         return Err(format!("CUDA GQA flash 路径面向 prefill 多行,实际 rows={}", query.rows));
     }
-    if query.cols != query_cols || key.len() < kv_rows * kv_cols || value.len() < kv_rows * kv_cols {
-        return Err(format!("CUDA GQA flash shape query=[{},{}], kv_rows={kv_rows}, kv_cols={kv_cols}", query.rows, query.cols));
+    if query.cols != query_cols || key.len() / kv_cols != kv_capacity || value.len() / kv_cols != kv_capacity {
+        return Err(format!("CUDA GQA flash shape query=[{},{}], kv_rows={kv_rows}, kv_cols={kv_cols}, kv_capacity={kv_capacity}", query.rows, query.cols));
     }
     if spec.head_dim % 32 != 0 || spec.head_dim > 256 {
         return Err(format!("CUDA GQA flash 要求 head_dim ∈ {{32..256}} 且 head_dim % 32 == 0(实际 {})", spec.head_dim));
@@ -994,7 +1050,7 @@ pub fn gqa_attention_f16_flash(ctx: &CudaContext, query: &CudaTensor, key: &Cuda
     if spec.num_heads % spec.num_kv_heads != 0 {
         return Err(format!("CUDA GQA flash 要求 heads({}) 整除于 kv_heads({})", spec.num_heads, spec.num_kv_heads));
     }
-    let output = ctx.tensor_uninit(query.rows, query_cols)?;
+    let output = ctx.tensor_alloc(query.rows, query_cols)?;
     let func = ctx.function("gqa_attention_f16_flash")?;
     let stride = spec.head_dim + 2;
     // smem:K/V tile(各 32×stride 个 f16)+ 8 warp × 32 个 softmax 权重(f32)。
@@ -1014,6 +1070,7 @@ pub fn gqa_attention_f16_flash(ctx: &CudaContext, query: &CudaTensor, key: &Cuda
             .arg(&(spec.num_heads as u32))
             .arg(&(spec.num_kv_heads as u32))
             .arg(&(spec.head_dim as u32))
+            .arg(&(kv_capacity as u32))
             .arg(&spec.score_scale)
             .launch(cfg)
             .map_err(|error| format!("launch gqa_attention_f16_flash: {error:?}"))?;
@@ -1069,7 +1126,7 @@ pub fn gqa_attention_q8g64(
     if query.cols != query_cols || kv_cols % 64 != 0 || key_codes.len() < kv_rows * kv_cols || key_scales.len() < kv_rows * kv_cols / 64 || value_codes.len() < kv_rows * kv_cols || value_scales.len() < kv_rows * kv_cols / 64 {
         return Err(format!("CUDA GQA Q8G64 shape query=[{},{}], kv_rows={kv_rows}, kv_cols={kv_cols}", query.rows, query.cols));
     }
-    let output = ctx.tensor_uninit(query.rows, query_cols)?;
+    let output = ctx.tensor_alloc(query.rows, query_cols)?;
     let func = ctx.function("gqa_attention_q8g64")?;
     let threads = if query.rows == 1 && kv_rows >= 4096 {
         1024
@@ -1127,7 +1184,7 @@ pub fn gqa_attention_q8g64_flash(
     if spec.head_dim % 32 != 0 || spec.head_dim > 256 || spec.num_heads % spec.num_kv_heads != 0 {
         return Err(format!("CUDA GQA Q8G64 flash 要求 head_dim ∈ {{32..256}} 且 %32==0、heads 整除于 kv_heads(实际 head_dim={}, heads={}, kv_heads={})", spec.head_dim, spec.num_heads, spec.num_kv_heads));
     }
-    let output = ctx.tensor_uninit(query.rows, query_cols)?;
+    let output = ctx.tensor_alloc(query.rows, query_cols)?;
     let func = ctx.function("gqa_attention_q8g64_flash")?;
     let stride = spec.head_dim + 2;
     let shared_bytes = 2 * 32 * stride * std::mem::size_of::<half::f16>() + 8 * 32 * std::mem::size_of::<f32>();
@@ -1164,7 +1221,7 @@ pub fn gqa_attention_f16_tiled(ctx: &CudaContext, query: &CudaTensor, key: &Cuda
     if spec.head_dim % 32 != 0 || spec.head_dim / 32 > 16 {
         return Err(format!("CUDA GQA tiled 要求 head_dim ∈ {{32..512}} 且 head_dim % 32 == 0(实际 {head_dim})", head_dim = spec.head_dim));
     }
-    let output = ctx.tensor_uninit(query.rows, query.cols)?;
+    let output = ctx.tensor_alloc(query.rows, query.cols)?;
     let func = ctx.function("gqa_attention_f16_tiled")?;
     // tiled 路径主要给 prefill 长 KV 用;统一 256 线程 = 8 warps,适合 block_kv=32。
     let threads = 256;
@@ -1204,7 +1261,7 @@ pub fn full_attention_batched_f16(ctx: &CudaContext, query: &CudaTensor, key: &C
     if batch == 0 || query.rows != total_rows || query.cols != cols || key.len() < total_rows * cols || value.len() < total_rows * cols {
         return Err(format!("CUDA batched full attention shape query=[{},{}] batch={batch} rows={rows} heads={heads} head_dim={head_dim}", query.rows, query.cols));
     }
-    let output = ctx.tensor_uninit(query.rows, query.cols)?;
+    let output = ctx.tensor_alloc(query.rows, query.cols)?;
     let func = ctx.function("full_attention_batched_f16")?;
     // block 规模与 gqa 一致:rows 较小时 256 线程足够;rows≥1024 用更多 warp 填满 SM。
     let threads = if rows >= 1024 { 512 } else { 256 };
@@ -1249,9 +1306,9 @@ pub fn gated_delta_net_f16(
     if conv_weight.data.len() != spec.conv_state_elements() || a_log_f32.len() != spec.value_heads || dt_bias_f32.len() != spec.value_heads || norm_weight_f32.len() != spec.value_head_dim {
         return Err("CUDA Gated DeltaNet F32 control weight shape 与 spec 不一致".to_owned());
     }
-    let mixed = ctx.tensor_uninit(qkv.rows, spec.conv_dim())?;
-    let core = ctx.tensor_uninit(qkv.rows, spec.value_dim())?;
-    let output = ctx.tensor_uninit(qkv.rows, spec.value_dim())?;
+    let mixed = ctx.tensor_alloc(qkv.rows, spec.conv_dim())?;
+    let core = ctx.tensor_alloc(qkv.rows, spec.value_dim())?;
+    let output = ctx.tensor_alloc(qkv.rows, spec.value_dim())?;
     if let Some(conv_weight_f32) = &conv_weight.data_f32 {
         let conv = ctx.function("gated_delta_conv_f16")?;
         unsafe {
@@ -1495,7 +1552,7 @@ mod tests {
         let gpu_k = htod(&ctx, &k);
         let gpu_v = htod(&ctx, &v);
         let spec = make_gqa_spec(heads, kv_heads, head_dim);
-        let out = gqa_attention_f16_flash(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec).unwrap();
+        let out = gqa_attention_f16_flash(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec, kv_rows).unwrap();
         check_close("gqa_flash_gqa_tail", &ctx.tensor_to_f32(&out).unwrap(), &expect);
     }
 
@@ -1511,8 +1568,8 @@ mod tests {
         let gpu_k = htod(&ctx, &k);
         let gpu_v = htod(&ctx, &v);
         let spec = make_gqa_spec(heads, kv_heads, head_dim);
-        let expect_kernel = gqa_attention_f16(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec).unwrap();
-        let out = gqa_attention_f16_flash(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec).unwrap();
+        let expect_kernel = gqa_attention_f16(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec, kv_rows).unwrap();
+        let out = gqa_attention_f16_flash(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec, kv_rows).unwrap();
         check_close("gqa_flash_vs_plain", &ctx.tensor_to_f32(&out).unwrap(), &ctx.tensor_to_f32(&expect_kernel).unwrap());
     }
 
@@ -1573,7 +1630,7 @@ mod tests {
         let gpu_q = ctx.tensor_from_f32(&q, q_rows, heads * head_dim).unwrap();
         let gpu_k = ctx.tensor_from_f32(&k, kv_rows, kv_heads * head_dim).unwrap();
         let gpu_v = ctx.tensor_from_f32(&v, kv_rows, kv_heads * head_dim).unwrap();
-        let expect = gqa_attention_f16(&ctx, &gpu_q, &gpu_k.slice, &gpu_v.slice, kv_rows, pos, &spec).unwrap();
+        let expect = gqa_attention_f16(&ctx, &gpu_q, &gpu_k.slice, &gpu_v.slice, kv_rows, pos, &spec, kv_rows).unwrap();
 
         let mut key_codes = ctx.buffer_uninit::<i8>(kv_rows * kv_heads * head_dim).unwrap();
         let mut key_scales = ctx.buffer_uninit::<f32>(kv_rows * kv_heads * head_dim / 64).unwrap();
@@ -1635,7 +1692,7 @@ mod tests {
         let gpu_v = htod(&ctx, &v);
         let spec = make_gqa_spec(heads, kv_heads, head_dim);
         let out_tiled = gqa_attention_f16_tiled(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec, 32).unwrap();
-        let out_untiled = gqa_attention_f16(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec).unwrap();
+        let out_untiled = gqa_attention_f16(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec, kv_rows).unwrap();
         check_close("gqa_tiled_vs_untiled", &ctx.tensor_to_f32(&out_tiled).unwrap(), &ctx.tensor_to_f32(&out_untiled).unwrap());
     }
 
@@ -1679,5 +1736,73 @@ mod tests {
             }
         }
         check_close("gemma_rmsnorm_residual", &fused_out, &expect);
+    }
+
+    /// ring KV 滑窗语义:容量 1024 存储 3072 行,槽位 = token % capacity。
+    /// 用真实 append_rows_f16 分 chunk 写入,oracle 按绝对 K/V 的
+    /// "可见键 = 最近 capacity 个 ∩ 因果"窗口计算,flash/plain/decode 三路对拍。
+    #[test]
+    fn gqa_attention_ring_window_matches_oracle() {
+        let ctx = ctx();
+        let (q_rows, kv_rows, capacity, heads, kv_heads, head_dim) = (70usize, 3072, 1024, 4, 2, 64);
+        let kv_cols = kv_heads * head_dim;
+        let query_cols = heads * head_dim;
+        let pos = kv_rows - q_rows;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q: Vec<f32> = (0..q_rows * query_cols).map(|i| ((i * 31) % 97) as f32 * 0.012 - 0.5).collect();
+        let k: Vec<f32> = (0..kv_rows * kv_cols).map(|i| ((i * 17) % 89) as f32 * 0.010 + 0.3).collect();
+        let v: Vec<f32> = (0..kv_rows * kv_cols).map(|i| ((i * 11) % 73) as f32 * 0.014 - 0.25).collect();
+
+        // 窗口 oracle:query 行 p 可见 [max(0, kv_rows - capacity), p]。
+        let ring_start = kv_rows.saturating_sub(capacity);
+        let mut expect = vec![0.0f32; q_rows * query_cols];
+        for row in 0..q_rows {
+            let p = pos + row;
+            for head in 0..heads {
+                let kv_head = head / (heads / kv_heads);
+                let ho = head * head_dim;
+                let ko = kv_head * head_dim;
+                let mut scores = Vec::with_capacity(capacity);
+                let mut maxv = f32::NEG_INFINITY;
+                for token in ring_start..=p {
+                    let mut s = 0.0;
+                    for d in 0..head_dim {
+                        s += q[row * query_cols + ho + d] * k[token * kv_cols + ko + d];
+                    }
+                    s *= scale;
+                    scores.push(s);
+                    maxv = maxv.max(s);
+                }
+                let denom: f32 = scores.iter().map(|s| (s - maxv).exp()).sum();
+                for d in 0..head_dim {
+                    let acc: f32 = scores.iter().enumerate().map(|(j, s)| (s - maxv).exp() * v[(ring_start + j) * kv_cols + ko + d]).sum();
+                    expect[row * query_cols + ho + d] = acc / denom;
+                }
+            }
+        }
+
+        // ring 存储经真实 append kernel 分 chunk 写入。
+        let mut gpu_k = ctx.buffer_uninit::<half::f16>(capacity * kv_cols).unwrap();
+        let mut gpu_v = ctx.buffer_uninit::<half::f16>(capacity * kv_cols).unwrap();
+        for chunk_start in (0..kv_rows).step_by(512) {
+            let chunk = 512.min(kv_rows - chunk_start);
+            let k_chunk = ctx.tensor_from_f32(&k[chunk_start * kv_cols..(chunk_start + chunk) * kv_cols], chunk, kv_cols).unwrap();
+            let v_chunk = ctx.tensor_from_f32(&v[chunk_start * kv_cols..(chunk_start + chunk) * kv_cols], chunk, kv_cols).unwrap();
+            append_rows_f16(&ctx, &k_chunk, &gpu_k, chunk_start, capacity).unwrap();
+            append_rows_f16(&ctx, &v_chunk, &gpu_v, chunk_start, capacity).unwrap();
+        }
+        let gpu_q = ctx.tensor_from_f32(&q, q_rows, query_cols).unwrap();
+        let spec = make_gqa_spec(heads, kv_heads, head_dim);
+
+        let flash = gqa_attention_f16_flash(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec, capacity).unwrap();
+        check_close("gqa_ring_flash", &ctx.tensor_to_f32(&flash).unwrap(), &expect);
+
+        let plain = gqa_attention_f16(&ctx, &gpu_q, &gpu_k, &gpu_v, kv_rows, pos, &spec, capacity).unwrap();
+        check_close("gqa_ring_plain", &ctx.tensor_to_f32(&plain).unwrap(), &expect);
+
+        // decode 单行:last = kv_rows - 1,同窗口。
+        let one = ctx.tensor_from_f32(&q[(q_rows - 1) * query_cols..], 1, query_cols).unwrap();
+        let decode = gqa_attention_f16(&ctx, &one, &gpu_k, &gpu_v, kv_rows, kv_rows - 1, &spec, capacity).unwrap();
+        check_close("gqa_ring_decode", &ctx.tensor_to_f32(&decode).unwrap(), &expect[(q_rows - 1) * query_cols..]);
     }
 }

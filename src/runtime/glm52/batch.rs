@@ -35,6 +35,8 @@ pub(super) struct Glm52BatchTask {
     pub(super) mtp: Option<RocmMtpSession>,
     pub(super) cached_output_ready: bool,
     pub(super) pending_verify_rows: usize,
+    /// 逐行 verify 聚合缓冲：K+1 行各自穿 16-stage，A0 收齐 concat 成整段再 accept。
+    pub(super) mtp_verify_rows: Vec<(usize, RocmTensor)>,
     pub(super) dspark_aux_history: Option<RocmTensor>,
     pub(super) dspark_aux_history_start: usize,
     pub(super) prompt_dspark_aux_history: Option<RocmTensor>,

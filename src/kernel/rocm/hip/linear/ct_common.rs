@@ -16,7 +16,7 @@ pub(super) fn ct_quantized_code() -> Result<&'static [u8], String> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct CtFunctions {
+pub(crate) struct CtFunctions {
     pub(super) wavefront_size: u32,
     pub(super) cast: usize,
     pub(super) expand: usize,
@@ -39,6 +39,7 @@ pub(super) struct CtFunctions {
     pub(super) w4_dual_rows8: usize,
     pub(super) w8_dual: usize,
     pub(super) w8_dual_g32: usize,
+    pub(super) w8_dual_g32_perm: usize,
     pub(super) wmma: usize,
     pub(super) wmma_w8_g128: usize,
     pub(super) wmma_w4_g128: usize,
@@ -72,15 +73,22 @@ pub(super) struct CtFunctions {
     pub(super) gguf_fused_gate_up_iq3s: usize,
     pub(super) gguf_fused_gate_up_iq4xs: usize,
     pub(super) gguf_fused_down_iq4xs: usize,
+    pub(super) gguf_fused_down_iq4xs_perm: usize,
     pub(super) gguf_fused_gate_up_q8_0: usize,
     pub(super) gguf_fused_down_q8_0: usize,
+    pub(super) gguf_fused_gate_up_iq3s_wave32: usize,
+    pub(super) gguf_fused_gate_up_iq3s_r112: usize,
+    pub(super) gguf_fused_gate_up_iq3s_nogrid: usize,
+    pub(super) gguf_fused_gate_up_iq3s_wide: usize,
+    pub(super) gguf_fused_gate_up_iq3s_split: usize,
+    pub(super) gguf_fused_gate_up_split_combine: usize,
     pub(super) cooperative_merge_activation: usize,
     pub(super) cooperative_sharded_down: usize,
     pub(super) cooperative_combine_partial: usize,
     pub(super) cooperative_partial_join: usize,
 }
 
-pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, String> {
+pub(crate) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, String> {
     static FUNCTIONS: OnceLock<Mutex<HashMap<i32, Result<(usize, CtFunctions), String>>>> = OnceLock::new();
     let functions = FUNCTIONS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut functions = functions.lock().map_err(|_| "ROCm kernel cache mutex 已损坏".to_owned())?;
@@ -160,8 +168,16 @@ pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, Stri
             "gguf_fused_gate_up_q8_0_f32",
             "gguf_fused_down_q8_0_f32",
             "gather_bf16_rows_f32",
+            "gguf_fused_gate_up_iq3s_wave32_f32",
+            "gguf_fused_gate_up_iq3s_r112_f32",
+            "gguf_fused_gate_up_iq3s_nogrid_f32",
+            "gguf_fused_gate_up_iq3s_wide_f32",
+            "gguf_fused_gate_up_iq3s_split_f32",
+            "gguf_fused_gate_up_split_combine_f32",
+            "gguf_fused_down_iq4xs_perm_f32",
+            "ct_quantized_dual_gemv_bf16_w8_g32_perm",
         ];
-        let mut handles = [ptr::null_mut(); 60];
+        let mut handles = [ptr::null_mut(); 68];
         for (handle, name) in handles.iter_mut().zip(names) {
             let name = CString::new(name).unwrap();
             let status = unsafe { module_get_function(handle, module, name.as_ptr()) };
@@ -202,6 +218,7 @@ pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, Stri
                 _w4_rows2: handles[43] as usize,
                 w8_dual: handles[14] as usize,
                 w8_dual_g32: handles[53] as usize,
+                w8_dual_g32_perm: handles[67] as usize,
                 gather_bf16_rows: handles[59] as usize,
                 wmma: handles[4] as usize,
                 wmma_w8_g128: handles[28] as usize,
@@ -238,6 +255,13 @@ pub(super) fn ct_quantized_functions(device_id: i32) -> Result<CtFunctions, Stri
                 gguf_fused_down_iq4xs: handles[55] as usize,
                 gguf_fused_gate_up_q8_0: handles[57] as usize,
                 gguf_fused_down_q8_0: handles[58] as usize,
+                gguf_fused_gate_up_iq3s_wave32: handles[60] as usize,
+                gguf_fused_gate_up_iq3s_r112: handles[61] as usize,
+                gguf_fused_gate_up_iq3s_nogrid: handles[62] as usize,
+                gguf_fused_gate_up_iq3s_wide: handles[63] as usize,
+                gguf_fused_gate_up_iq3s_split: handles[64] as usize,
+                gguf_fused_gate_up_split_combine: handles[65] as usize,
+                gguf_fused_down_iq4xs_perm: handles[66] as usize,
                 cooperative_merge_activation: handles[45] as usize,
                 cooperative_sharded_down: handles[46] as usize,
                 cooperative_combine_partial: handles[47] as usize,

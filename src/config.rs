@@ -198,12 +198,14 @@ pub struct EmbeddedSessionConfig {
 #[serde(tag = "architecture", rename_all = "snake_case")]
 pub enum NodeModelConfig {
     Ornith(OrnithNodeModelConfig),
+    Laguna(LagunaNodeModelConfig),
     Gemma4(Gemma4NodeModelConfig),
     Qwen36(Qwen36NodeModelConfig),
     DeepseekV4(DeepSeekV4NodeModelConfig),
     Glm52(Glm52NodeModelConfig),
     Glm53Flash(Glm53FlashNodeModelConfig),
     MinimaxH3(H3NodeModelConfig),
+    #[serde(alias = "k2_horizon")]
     Mistral(MistralNodeModelConfig),
     MiniCpm5(MiniCpm5NodeModelConfig),
 }
@@ -299,6 +301,46 @@ fn default_deepseek_v4_decode_batch_limit() -> usize {
 }
 const fn default_deepseek_v4_dspark_min_sessions() -> usize {
     1
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LagunaNodeModelConfig {
+    pub weights_directory: PathBuf,
+    #[serde(default)]
+    pub lm_head_quantization: LmHeadQuantization,
+    #[serde(default = "default_max_sequence_length")]
+    pub max_sequence_length: usize,
+    #[serde(default)]
+    pub execution: LagunaNodeExecutionConfig,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LagunaNodeExecutionConfig {
+    #[serde(default)]
+    pub expert_batch_size: Option<usize>,
+    #[serde(default = "default_expert_cache_gib")]
+    pub expert_cache_gib: usize,
+    #[serde(default)]
+    pub expert_prefetch_count: Option<usize>,
+}
+
+impl Default for LagunaNodeExecutionConfig {
+    fn default() -> Self {
+        Self { expert_batch_size: None, expert_cache_gib: default_expert_cache_gib(), expert_prefetch_count: None }
+    }
+}
+
+/// Laguna 直接生成边界参数(runtime/laguna/cuda.rs::generate)。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LagunaStandaloneModelConfig {
+    pub weights: PathBuf,
+    #[serde(default)]
+    pub lm_head_quantization: LmHeadQuantization,
+    pub generation: TextGenerationConfig,
+    #[serde(default)]
+    pub execution: LagunaNodeExecutionConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1024,6 +1066,9 @@ pub struct StandaloneHttpConfig {
     pub listen: SocketAddr,
     #[serde(default)]
     pub public_base_url: Option<String>,
+    /// Bearer/x-api-key 鉴权列表;空 = 匿名开放(语义与 scheduler http 相同)。
+    #[serde(default)]
+    pub api_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1304,6 +1349,9 @@ pub struct RocmBackendConfig {
     pub kernel_sync: bool,
     #[serde(default)]
     pub kernel_profile: bool,
+    /// 逐 W8 GEMV kernel 打印形状与耗时（含 device synchronize，仅诊断）。
+    #[serde(default)]
+    pub w8_profile: bool,
     /// 单行 integrated MoE 使用固定地址 HIP Graph；诊断模式下自动回退 eager。
     #[serde(default)]
     pub decode_graph: bool,
@@ -1316,9 +1364,17 @@ pub struct RocmBackendConfig {
     /// MLA decode split 走 Q8 WMMA kernel；false 走 fdot2 标量 staged 路径。
     #[serde(default = "default_true")]
     pub mla_decode_wmma: bool,
+    /// MLA decode split 的 tile 行数（32 对齐）。tile 越大 split-partial 工作区
+    /// 流量越小，但 block 数越少占用率越低；仅在真实 50K 门禁下扫描。
+    #[serde(default = "default_rocm_mla_decode_tile_size")]
+    pub mla_decode_tile_size: usize,
     /// cooperative decode 用序列拆分（两卡全头各扫半段 + LSE 合并）替代半头拆分。
     #[serde(default)]
     pub cooperative_mla_sequence_split: bool,
+    /// cooperative decode 在 owner 合并两侧 sequence shard 并执行完整 o_proj，
+    /// 跳过 attention 尾部的 hidden partial P2P 与归约；用于同二进制 A/B。
+    #[serde(default)]
+    pub cooperative_mla_decode_full_merge: bool,
     /// DSA Q/K 同时做 Hadamard+Q8，并以 i8 WMMA 评分；真机 oracle 前默认关闭。
     #[serde(default)]
     pub dsa_hadamard_i8: bool,
@@ -1449,6 +1505,7 @@ impl NodeProcessConfig {
 fn resolve_node_model_backend(base: &Path, model: &mut NodeModelConfig, backend: &mut NodeBackendConfig) {
     match model {
         NodeModelConfig::Ornith(model) => resolve_path(base, &mut model.weights_directory),
+        NodeModelConfig::Laguna(model) => resolve_path(base, &mut model.weights_directory),
         NodeModelConfig::Gemma4(model) => {
             resolve_path(base, &mut model.weights_directory);
             resolve_optional_path(base, &mut model.execution.mtp_weights);
@@ -1497,6 +1554,8 @@ fn validate_node_model_backend(model: &NodeModelConfig, backend: &NodeBackendCon
     match (model, backend) {
         (NodeModelConfig::Ornith(model), NodeBackendConfig::Metal(_)) => validate_ornith(model),
         (NodeModelConfig::Ornith(model), NodeBackendConfig::Cuda(_)) => validate_ornith(model),
+        (NodeModelConfig::Laguna(model), NodeBackendConfig::Cuda(_)) => validate_laguna(model),
+        (NodeModelConfig::Laguna(_), _) => Err(ConfigError::Invalid("Laguna Node 当前支持 CUDA backend".to_owned())),
         // Ornith 只使用 full-attention cached GQA，ROCm 已有设备 prefill/decode 实现。
         (NodeModelConfig::Ornith(model), NodeBackendConfig::Rocm(backend)) => validate_ornith_rocm(model, backend),
         (NodeModelConfig::Ornith(_), _) => Err(ConfigError::Invalid("Ornith Node 当前支持 Metal/CUDA/ROCm backend".to_owned())),
@@ -1644,9 +1703,21 @@ impl StandaloneProcessConfig {
     pub fn server(&self) -> Result<(SocketAddr, ServerConfig), ConfigError> {
         let public_base_url = self.http.public_base_url.clone().unwrap_or_else(|| format!("http://{}", self.http.listen));
         let scheduler = SchedulerConfig { artifact_dir: self.artifacts.directory.clone(), public_base_url, dispatch_wait: std::time::Duration::from_secs(30), iroh: IrohConfig::default() };
+        // 与 scheduler http 相同的清洗;配置了 key 后匿名命名空间关闭(按 key 哈希隔离)。
+        let mut api_keys = self.http.api_keys.iter().map(|value| value.trim()).filter(|value| !value.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+        api_keys.sort_unstable();
+        api_keys.dedup();
         Ok((
             self.http.listen,
-            ServerConfig { api_keys: Vec::new(), anonymous_cache_namespace: Some("standalone".to_owned()), node_api_key: None, models: Vec::new(), anthropic_family_tiers: Default::default(), model_aliases: Default::default(), scheduler },
+            ServerConfig {
+                anonymous_cache_namespace: api_keys.is_empty().then(|| "standalone".to_owned()),
+                api_keys,
+                node_api_key: None,
+                models: Vec::new(),
+                anthropic_family_tiers: Default::default(),
+                model_aliases: Default::default(),
+                scheduler,
+            },
         ))
     }
 }
@@ -1697,7 +1768,7 @@ fn validate_standalone_backend(model: &StandaloneModelConfig, backend: &BackendC
     match (model, backend) {
         (StandaloneModelConfig::Gemma4(model), BackendConfig::Metal(backend)) if model.execution.replay_ablation && !backend.replay => Err(ConfigError::Invalid("Gemma 4 replay_ablation 必须与 backend.replay 一起启用".to_owned())),
         (StandaloneModelConfig::Gemma4(_), BackendConfig::Metal(_)) => Ok(()),
-        (StandaloneModelConfig::Gemma4(model), BackendConfig::Cuda(_)) if model.execution.mtp_weights.is_some() || model.execution.replay_ablation => Err(ConfigError::Invalid("Gemma 4 CUDA 当前不支持 Metal MTP/replay 选项".to_owned())),
+        (StandaloneModelConfig::Gemma4(model), BackendConfig::Cuda(_)) if model.execution.replay_ablation => Err(ConfigError::Invalid("Gemma 4 replay_ablation 是 Metal 重放专用选项".to_owned())),
         (StandaloneModelConfig::Gemma4(_), BackendConfig::Cuda(_)) => Ok(()),
         (StandaloneModelConfig::Gemma4(_), _) => Err(ConfigError::Invalid("Gemma 4 standalone 当前支持 Metal/CUDA backend".to_owned())),
         (StandaloneModelConfig::Glm52(model), BackendConfig::Cpu(_) | BackendConfig::Metal(_)) if model.prefill_layer_ends.is_none() => Ok(()),
@@ -1720,6 +1791,13 @@ fn validate_standalone_backend(model: &StandaloneModelConfig, backend: &BackendC
         (StandaloneModelConfig::Qwen36(_), BackendConfig::Cpu(_) | BackendConfig::Cuda(_) | BackendConfig::Rocm(_)) => Err(ConfigError::Invalid("Qwen3.6 图像/视频输入当前只支持 Metal backend".to_owned())),
         (StandaloneModelConfig::Qwen36(_), BackendConfig::Huawei(_)) => Err(ConfigError::Invalid("Qwen3.6 standalone 尚未接入 Huawei backend".to_owned())),
     }
+}
+
+fn validate_laguna(model: &LagunaNodeModelConfig) -> Result<(), ConfigError> {
+    if model.max_sequence_length == 0 {
+        return Err(ConfigError::Invalid("model.max_sequence_length 必须大于 0".to_owned()));
+    }
+    Ok(())
 }
 
 fn validate_ornith(model: &OrnithNodeModelConfig) -> Result<(), ConfigError> {
@@ -1781,8 +1859,8 @@ fn validate_gemma4_metal(model: &Gemma4NodeModelConfig, backend: &NodeMetalBacke
 
 fn validate_gemma4_cuda(model: &Gemma4NodeModelConfig) -> Result<(), ConfigError> {
     validate_gemma4(model)?;
-    if model.execution.mtp_weights.is_some() || model.execution.replay_ablation {
-        return Err(ConfigError::Invalid("Gemma 4 CUDA 当前不支持 Metal MTP/replay 选项".to_owned()));
+    if model.execution.replay_ablation {
+        return Err(ConfigError::Invalid("Gemma 4 replay_ablation 是 Metal 重放专用选项".to_owned()));
     }
     Ok(())
 }
@@ -2107,6 +2185,9 @@ fn default_hiprtc_cache_directory() -> PathBuf {
 }
 const fn default_rocm_mla_decode_split_threshold() -> usize {
     1024
+}
+const fn default_rocm_mla_decode_tile_size() -> usize {
+    32
 }
 const fn default_true() -> bool {
     true
@@ -2457,6 +2538,7 @@ mod tests {
             hiprtc_cache_directory: PathBuf::from("./hiprtc"),
             kernel_sync: false,
             kernel_profile: false,
+            w8_profile: false,
             decode_graph: false,
             precise_router: true,
             allow_cpu_reference_fallback: false,
@@ -2466,8 +2548,10 @@ mod tests {
             accelerator_memory_bytes: None,
             recommended_working_set_bytes: None,
             mla_decode_split_threshold: 1,
+            mla_decode_tile_size: 32,
             mla_decode_wmma: true,
             cooperative_mla_sequence_split: false,
+            cooperative_mla_decode_full_merge: false,
             dsa_hadamard_i8: false,
             dsa_hadamard_shadow_samples: 0,
             dsa_hisa_shadow_samples: 0,

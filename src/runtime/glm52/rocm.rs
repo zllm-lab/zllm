@@ -135,7 +135,7 @@ fn prepare_cooperative_mla_weights_ct(
     let peer_q_b = super::prepare_ct_linear(peer, &q_b_proj, mla.q_projection_size, mla.q_lora_rank).map_err(|error| format!("L{layer} q_b full device={}: {error:?}", peer.device_id()))?;
     let peer_kv_b = super::prepare_ct_linear(peer, &kv_b_proj, mla.kv_projection_size, mla.kv_lora_rank).map_err(|error| format!("L{layer} kv_b full device={}: {error:?}", peer.device_id()))?;
     let peer_o_head = super::prepare_ct_linear(peer, &peer_o_head_source, cfg.hidden_size, o_head_columns).map_err(|error| format!("L{layer} o_proj peer head device={}: {error:?}", peer.device_id()))?;
-    experts.set_cooperative_mla_layer(layer, owner_weights.0.clone(), peer_q_b, owner_weights.1.clone(), peer_kv_b, owner_o_head, peer_o_head).map_err(|error| format!("L{layer} 注册 cooperative MLA: {error:?}"))?;
+    experts.set_cooperative_mla_layer(layer, owner_weights.0.clone(), peer_q_b, owner_weights.1.clone(), peer_kv_b, owner_o.clone(), owner_o_head, peer_o_head).map_err(|error| format!("L{layer} 注册 cooperative MLA: {error:?}"))?;
     Ok(owner_o)
 }
 
@@ -208,7 +208,7 @@ fn prepare_cooperative_mla_weights_gguf(
     } else {
         peer.prepare_weight(LinearWeight::gguf(&o_proj), cfg.hidden_size, mla.q_projection_size).map_err(|error| format!("L{layer} GGUF o_proj full device={}: {error:?}", peer.device_id()))?
     };
-    experts.set_cooperative_mla_layer(layer, owner_weights.0.clone(), peer_q_b, owner_weights.1.clone(), peer_kv_b, owner_o_head, peer_o).map_err(|error| format!("L{layer} 注册 GGUF cooperative MLA: {error:?}"))?;
+    experts.set_cooperative_mla_layer(layer, owner_weights.0.clone(), peer_q_b, owner_weights.1.clone(), peer_kv_b, owner_o.clone(), owner_o_head, peer_o).map_err(|error| format!("L{layer} 注册 GGUF cooperative MLA: {error:?}"))?;
     Ok(owner_o)
 }
 

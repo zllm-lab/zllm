@@ -1320,7 +1320,7 @@ impl DeviceBuffer {
     }
 
     #[track_caller]
-    pub(super) fn allocate_peer(device_id: i32, bytes: usize) -> Result<Self, String> {
+    pub(crate) fn allocate_peer(device_id: i32, bytes: usize) -> Result<Self, String> {
         Self::allocate_inner(device_id, bytes, true, true, usize::MAX, std::panic::Location::caller())
     }
 

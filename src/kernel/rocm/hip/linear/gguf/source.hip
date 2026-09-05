@@ -428,6 +428,59 @@ __device__ __forceinline__ float gguf_iq4xs_word8_dot(
         sum, false);
 }
 
+// IQ4_XS 码本 perm 变体（llama.cpp vecdotq.cuh 在 gfx1100 的做法）：
+// 16 项 i8 码本装进 4 个 u32 寄存器，__builtin_amdgcn_perm 一次取 8 项、
+// bit3 选高低半表——纯寄存器指令替代 __constant__ 发散查表（每 lane 索引
+// 不同会序列化重放）。与 zllm_iq4nl[] 逐位同值。
+__device__ __forceinline__ int gguf_iq4nl_perm(unsigned int code)
+{
+    // V_PERM_B32 字节池是 {第二操作数, 第一操作数}：先传高半表。
+    const unsigned int lo = __builtin_amdgcn_perm(0xF6EADDCFu, 0xBFAD9881u, code & 7u);
+    const unsigned int hi = __builtin_amdgcn_perm(0x71594535u, 0x26190D01u, code & 7u);
+    return (int)(signed char)(((code & 8u) != 0u ? hi : lo) & 255u);
+}
+
+__device__ __forceinline__ zllm_ct_bf16x2 gguf_iq4xs_pair_bf16_perm(
+    const unsigned int word,
+    const unsigned int nibble_shift,
+    const unsigned int pair_shift,
+    const float scale)
+{
+    const unsigned int codes = word >> nibble_shift;
+    return {
+        zllm_f32_to_bf16(
+            scale * (float)gguf_iq4nl_perm((codes >> pair_shift) & 15u)),
+        zllm_f32_to_bf16(
+            scale * (float)gguf_iq4nl_perm((codes >> (pair_shift + 8u)) & 15u))
+    };
+}
+
+__device__ __forceinline__ float gguf_iq4xs_word8_dot_perm(
+    const unsigned short* input,
+    const uint2 words,
+    const unsigned int nibble_shift,
+    const float scale,
+    float sum)
+{
+    zllm_ct_bf16x2 x01;
+    zllm_ct_bf16x2 x23;
+    zllm_ct_bf16x2 x45;
+    zllm_ct_bf16x2 x67;
+    zllm_ct_load_bf16x8(input, x01, x23, x45, x67);
+    sum = __builtin_amdgcn_fdot2_f32_bf16(
+        x01, gguf_iq4xs_pair_bf16_perm(words.x, nibble_shift, 0u, scale),
+        sum, false);
+    sum = __builtin_amdgcn_fdot2_f32_bf16(
+        x23, gguf_iq4xs_pair_bf16_perm(words.x, nibble_shift, 16u, scale),
+        sum, false);
+    sum = __builtin_amdgcn_fdot2_f32_bf16(
+        x45, gguf_iq4xs_pair_bf16_perm(words.y, nibble_shift, 0u, scale),
+        sum, false);
+    return __builtin_amdgcn_fdot2_f32_bf16(
+        x67, gguf_iq4xs_pair_bf16_perm(words.y, nibble_shift, 16u, scale),
+        sum, false);
+}
+
 // IQ3_S 每个 grid 编码连续 4 个 magnitude；一次展开两个 grid 即覆盖一个
 // 8-weight tuple。packed gate/up 让 scale、qh、sign 和 grid lookup 都按 tuple
 // 复用，避免通用 pair 路径为相邻权重重复解析同一份元数据。
@@ -464,6 +517,7 @@ __device__ __forceinline__ void gguf_iq3s_gate_up_tuple8(
     const unsigned short* input,
     const unsigned char* gate_block,
     const unsigned char* up_block,
+    const unsigned int* grid_lds,
     const unsigned int group,
     const unsigned int tuple,
     const float gate_scale,
@@ -474,16 +528,16 @@ __device__ __forceinline__ void gguf_iq3s_gate_up_tuple8(
     const unsigned int gate_qh = gate_block[66u + group];
     const unsigned int up_qh = up_block[66u + group];
     const unsigned int q_offset = 2u + group * 8u + tuple * 2u;
-    const unsigned int gate_grid0 = zllm_iq3s_grid[
+    const unsigned int gate_grid0 = grid_lds[
         (unsigned int)gate_block[q_offset]
             | (((gate_qh >> (tuple * 2u)) & 1u) << 8u)];
-    const unsigned int gate_grid1 = zllm_iq3s_grid[
+    const unsigned int gate_grid1 = grid_lds[
         (unsigned int)gate_block[q_offset + 1u]
             | (((gate_qh >> (tuple * 2u + 1u)) & 1u) << 8u)];
-    const unsigned int up_grid0 = zllm_iq3s_grid[
+    const unsigned int up_grid0 = grid_lds[
         (unsigned int)up_block[q_offset]
             | (((up_qh >> (tuple * 2u)) & 1u) << 8u)];
-    const unsigned int up_grid1 = zllm_iq3s_grid[
+    const unsigned int up_grid1 = grid_lds[
         (unsigned int)up_block[q_offset + 1u]
             | (((up_qh >> (tuple * 2u + 1u)) & 1u) << 8u)];
     const unsigned int gate_signs = gate_block[74u + group * 4u + tuple];
@@ -747,6 +801,13 @@ extern "C" __global__ void gguf_fused_gate_up_iq3s_f32(
     const unsigned int group = lane;
     const unsigned int column_in_block = group * 32u;
     const unsigned long long input_base = (unsigned long long)token * hidden;
+    // IQ3_S 码本搬到 LDS：__constant__ 发散查表会串行化，LDS 的 bank 访问
+    // 对发散 grid index 友好得多（每 block 一次 2KB 协作加载）。
+    __shared__ unsigned int iq3s_grid_lds[512];
+    for (unsigned int index = threadIdx.x; index < 512u; index += blockDim.x) {
+        iq3s_grid_lds[index] = zllm_iq3s_grid[index];
+    }
+    __syncthreads();
     float gate_sum = 0.0f;
     float up_sum = 0.0f;
     for (unsigned int block_index = 0u;
@@ -761,16 +822,16 @@ extern "C" __global__ void gguf_fused_gate_up_iq3s_f32(
         const float gate_scale = gguf_iq3s_group_scale(gate_block, group);
         const float up_scale = gguf_iq3s_group_scale(up_block, group);
         gguf_iq3s_gate_up_tuple8(
-            block_input, gate_block, up_block, group, 0u,
+            block_input, gate_block, up_block, iq3s_grid_lds, group, 0u,
             gate_scale, up_scale, gate_sum, up_sum);
         gguf_iq3s_gate_up_tuple8(
-            block_input + 8u, gate_block, up_block, group, 1u,
+            block_input + 8u, gate_block, up_block, iq3s_grid_lds, group, 1u,
             gate_scale, up_scale, gate_sum, up_sum);
         gguf_iq3s_gate_up_tuple8(
-            block_input + 16u, gate_block, up_block, group, 2u,
+            block_input + 16u, gate_block, up_block, iq3s_grid_lds, group, 2u,
             gate_scale, up_scale, gate_sum, up_sum);
         gguf_iq3s_gate_up_tuple8(
-            block_input + 24u, gate_block, up_block, group, 3u,
+            block_input + 24u, gate_block, up_block, iq3s_grid_lds, group, 3u,
             gate_scale, up_scale, gate_sum, up_sum);
     }
     for (unsigned int offset = 4u; offset; offset >>= 1u) {
@@ -813,6 +874,13 @@ extern "C" __global__ void gguf_fused_gate_up_iq4xs_f32(
     const unsigned int group = lane;
     const unsigned int column_in_block = group * 32u;
     const unsigned long long input_base = (unsigned long long)token * hidden;
+    // IQ3_S 码本搬到 LDS：__constant__ 发散查表会串行化，LDS 的 bank 访问
+    // 对发散 grid index 友好得多（每 block 一次 2KB 协作加载）。
+    __shared__ unsigned int iq3s_grid_lds[512];
+    for (unsigned int index = threadIdx.x; index < 512u; index += blockDim.x) {
+        iq3s_grid_lds[index] = zllm_iq3s_grid[index];
+    }
+    __syncthreads();
     float gate_sum = 0.0f;
     float up_sum = 0.0f;
     for (unsigned int block_index = 0u;
@@ -912,6 +980,71 @@ extern "C" __global__ void gguf_fused_down_iq4xs_f32(
                 *reinterpret_cast<const uint2*>(codes),
                 4u, scale, route_sum);
             route_sum = gguf_iq4xs_word8_dot(
+                block_input + 24u,
+                *reinterpret_cast<const uint2*>(codes + 8u),
+                4u, scale, route_sum);
+        }
+        sum += route_sum * route_weights[assignment];
+    }
+    for (unsigned int offset = 4u; offset; offset >>= 1u)
+        sum += __shfl_down(sum, offset, 8);
+    if (lane == 0u)
+        output[(unsigned long long)token * hidden + output_row] = sum;
+}
+
+// perm 码本变体：与 gguf_fused_down_iq4xs_f32 逐位同值，仅码本查表换
+// __builtin_amdgcn_perm 寄存器指令。
+extern "C" __global__ void gguf_fused_down_iq4xs_perm_f32(
+    const unsigned short* activated,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    const float* route_weights,
+    float* output,
+    const unsigned int tokens,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate)
+{
+    const unsigned int token = blockIdx.y;
+    if (token >= tokens) return;
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int output_row = blockIdx.x * 32u + subgroup;
+    if (output_row >= hidden) return;
+    const unsigned int group = lane;
+    const unsigned int column_in_block = group * 32u;
+    float sum = 0.0f;
+    for (unsigned int k = 0u; k < top_k; ++k) {
+        const unsigned int assignment = token * top_k + k;
+        const GgufKqMeta meta = metas[route_slots[assignment]];
+        const unsigned char* down_row = gguf_kq_row(
+            meta.down, 23u, output_row, intermediate);
+        const unsigned short* input = activated
+            + (unsigned long long)assignment * intermediate;
+        float route_sum = 0.0f;
+        for (unsigned int block_index = 0u;
+             block_index < intermediate / 256u;
+             ++block_index) {
+            const unsigned char* block
+                = down_row + (unsigned long long)block_index * 136u;
+            const unsigned char* codes = block + 8u + group * 16u;
+            const unsigned short* block_input
+                = input + block_index * 256u + column_in_block;
+            const float scale = gguf_iq4xs_group_scale(block, group);
+            route_sum = gguf_iq4xs_word8_dot_perm(
+                block_input,
+                *reinterpret_cast<const uint2*>(codes),
+                0u, scale, route_sum);
+            route_sum = gguf_iq4xs_word8_dot_perm(
+                block_input + 8u,
+                *reinterpret_cast<const uint2*>(codes + 8u),
+                0u, scale, route_sum);
+            route_sum = gguf_iq4xs_word8_dot_perm(
+                block_input + 16u,
+                *reinterpret_cast<const uint2*>(codes),
+                4u, scale, route_sum);
+            route_sum = gguf_iq4xs_word8_dot_perm(
                 block_input + 24u,
                 *reinterpret_cast<const uint2*>(codes + 8u),
                 4u, scale, route_sum);
@@ -1609,4 +1742,438 @@ extern "C" __global__ void gguf_grouped_down_iq4xs_f32(
     gguf_grouped_down_impl<true>(activated, token_ids, grouped_weights,
         experts, route_offsets, output, input_columns, output_rows,
         expert_base, expert_count);
+}
+
+// ===== IQ3_S gate_up wave32 探针 =====
+// 结构对照实验：现有 8-lane 子组按 group 拆读 110B 超级块（逐字节标量读），
+// 探针改为每 wave 一个输出行、32 lane 协作把本行超级块按 2B 对齐连续装进 LDS，
+// dequant 全部走 LDS，数值与 tuple8 路径逐元素一致（归约树 8-lane→32-lane，
+// 沿用 fdot2 容差族）。grid x = intermediate/8。
+extern "C" __global__ void gguf_fused_gate_up_iq3s_wave32_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    const unsigned int assignment = blockIdx.y;
+    if (assignment >= assignments || input_is_bf16 == 0u) return;
+    const unsigned int token = assignment / top_k;
+    const GgufKqMeta meta = metas[route_slots[assignment]];
+    const unsigned int wave = threadIdx.x >> 5u;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int output_row = blockIdx.x * 8u + wave;
+    if (output_row >= intermediate) return;
+    const unsigned char* gate_row = gguf_kq_row(meta.gate, 21u, output_row, hidden);
+    const unsigned char* up_row = gguf_kq_row(meta.up, 21u, output_row, hidden);
+
+    __shared__ unsigned int iq3s_grid_lds[512];
+    // 110B 超级块按 55 个 u16 装进 56 槽（2B 对齐恒成立）。
+    __shared__ unsigned short gate_stage[8][56];
+    __shared__ unsigned short up_stage[8][56];
+    for (unsigned int index = threadIdx.x; index < 512u; index += blockDim.x) {
+        iq3s_grid_lds[index] = zllm_iq3s_grid[index];
+    }
+    __syncthreads();
+
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    const unsigned int superblocks = hidden >> 8u;
+    const unsigned short* block_input_base
+        = (const unsigned short*)input + (unsigned long long)token * hidden;
+    for (unsigned int block_index = 0u; block_index < superblocks; ++block_index) {
+        const unsigned char* gate_block = gate_row + (unsigned long long)block_index * 110u;
+        const unsigned char* up_block = up_row + (unsigned long long)block_index * 110u;
+        {
+            const unsigned short* gate_words = (const unsigned short*)gate_block;
+            const unsigned short* up_words = (const unsigned short*)up_block;
+            gate_stage[wave][lane] = gate_words[lane];
+            up_stage[wave][lane] = up_words[lane];
+            if (lane < 23u) {
+                gate_stage[wave][lane + 32u] = gate_words[lane + 32u];
+                up_stage[wave][lane + 32u] = up_words[lane + 32u];
+            }
+        }
+        __syncthreads();
+        const unsigned char* gate_shared = (const unsigned char*)gate_stage[wave];
+        const unsigned char* up_shared = (const unsigned char*)up_stage[wave];
+        const unsigned int group = lane >> 2u;
+        const float gate_scale = gguf_iq3s_group_scale(gate_shared, group);
+        const float up_scale = gguf_iq3s_group_scale(up_shared, group);
+        const unsigned short* block_input = block_input_base + block_index * 256u + lane * 8u;
+        // 每 lane 恰好一个 tuple（8 列）：tuple = lane & 3，group = lane >> 2。
+        gguf_iq3s_gate_up_tuple8(
+            block_input, gate_shared, up_shared, iq3s_grid_lds, group,
+            lane & 3u, gate_scale, up_scale, gate_sum, up_sum);
+        __syncthreads();
+    }
+    for (unsigned int offset = 16u; offset; offset >>= 1u) {
+        gate_sum += __shfl_down(gate_sum, offset, 32);
+        up_sum += __shfl_down(up_sum, offset, 32);
+    }
+    if (lane == 0u) {
+        const float gate = gate_sum / (1.0f + expf(-gate_sum));
+        activated[(unsigned long long)assignment * intermediate + output_row]
+            = zllm_f32_to_bf16(gate * up_sum);
+    }
+}
+
+// ===== IQ3_S gate_up r112（块内重排 112B）=====
+// 布局：[d f16][pad 2B][scales u32][qs 64B（8B/组，8 对齐）][qh 8B][signs 32B
+//（4B/组，4 对齐）]。结构与 8-lane 原版完全相同（lane=group、4 tuple、同样的
+// fdot2 序列与归约），只把逐字节标量读换成对齐宽加载，数值逐位不变。
+__device__ __forceinline__ void gguf_iq3s_r112_side(
+    const unsigned short* input,
+    const unsigned char* block,
+    const unsigned int* grid_lds,
+    const unsigned int group,
+    float& sum)
+{
+    const float d = gguf_kq_f16(block);
+    const unsigned int scales_word = *(const unsigned int*)(block + 4u);
+    const float scale = d * (1.0f + 2.0f * (float)((scales_word >> (group * 4u)) & 15u));
+    const unsigned long long qs = *(const unsigned long long*)(block + 8u + group * 8u);
+    const unsigned int qh = block[72u + group];
+    const unsigned int signs = *(const unsigned int*)(block + 80u + group * 4u);
+    #pragma unroll
+    for (unsigned int tuple = 0u; tuple < 4u; ++tuple) {
+        const unsigned int grid0 = grid_lds[
+            (unsigned int)((qs >> (tuple * 16u)) & 255u)
+                | (((qh >> (tuple * 2u)) & 1u) << 8u)];
+        const unsigned int grid1 = grid_lds[
+            (unsigned int)((qs >> (tuple * 16u + 8u)) & 255u)
+                | (((qh >> (tuple * 2u + 1u)) & 1u) << 8u)];
+        const unsigned int signs_byte = (signs >> (tuple * 8u)) & 255u;
+        zllm_ct_bf16x2 x01;
+        zllm_ct_bf16x2 x23;
+        zllm_ct_bf16x2 x45;
+        zllm_ct_bf16x2 x67;
+        zllm_ct_load_bf16x8(input + group * 32u + tuple * 8u, x01, x23, x45, x67);
+        sum = __builtin_amdgcn_fdot2_f32_bf16(
+            x01, gguf_iq3s_pair_bf16(grid0, 0u, signs_byte, 0u, scale), sum, false);
+        sum = __builtin_amdgcn_fdot2_f32_bf16(
+            x23, gguf_iq3s_pair_bf16(grid0, 16u, signs_byte, 2u, scale), sum, false);
+        sum = __builtin_amdgcn_fdot2_f32_bf16(
+            x45, gguf_iq3s_pair_bf16(grid1, 0u, signs_byte, 4u, scale), sum, false);
+        sum = __builtin_amdgcn_fdot2_f32_bf16(
+            x67, gguf_iq3s_pair_bf16(grid1, 16u, signs_byte, 6u, scale), sum, false);
+    }
+}
+
+extern "C" __global__ void gguf_fused_gate_up_iq3s_r112_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    const unsigned int assignment = blockIdx.y;
+    if (assignment >= assignments || input_is_bf16 == 0u) return;
+    const unsigned int token = assignment / top_k;
+    const GgufKqMeta meta = metas[route_slots[assignment]];
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int output_row = blockIdx.x * 32u + subgroup;
+    if (output_row >= intermediate) return;
+    const unsigned long long row_bytes = (unsigned long long)(hidden >> 8u) * 112u;
+    const unsigned char* gate_row = (const unsigned char*)meta.gate + (unsigned long long)output_row * row_bytes;
+    const unsigned char* up_row = (const unsigned char*)meta.up + (unsigned long long)output_row * row_bytes;
+    const unsigned int group = lane;
+    __shared__ unsigned int iq3s_grid_lds[512];
+    for (unsigned int index = threadIdx.x; index < 512u; index += blockDim.x) {
+        iq3s_grid_lds[index] = zllm_iq3s_grid[index];
+    }
+    __syncthreads();
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (unsigned int block_index = 0u; block_index < (hidden >> 8u); ++block_index) {
+        const unsigned short* block_input = (const unsigned short*)input
+            + (unsigned long long)token * hidden + block_index * 256u;
+        gguf_iq3s_r112_side(
+            block_input, gate_row + (unsigned long long)block_index * 112u,
+            iq3s_grid_lds, group, gate_sum);
+        gguf_iq3s_r112_side(
+            block_input, up_row + (unsigned long long)block_index * 112u,
+            iq3s_grid_lds, group, up_sum);
+    }
+    for (unsigned int offset = 4u; offset; offset >>= 1u) {
+        gate_sum += __shfl_down(gate_sum, offset, 8);
+        up_sum += __shfl_down(up_sum, offset, 8);
+    }
+    if (lane == 0u) {
+        const float gate = gate_sum / (1.0f + expf(-gate_sum));
+        activated[(unsigned long long)assignment * intermediate + output_row]
+            = zllm_f32_to_bf16(gate * up_sum);
+    }
+}
+
+// ===== IQ3_S gate_up split-K 探针 =====
+// 现状 kernel 总线程 ≈ 1 波（512 block × 256），每 lane 的 24 超级块 fdot2 链
+// 是串行延迟暴露。split-K 把 hidden 维切成 split_count 段：partial kernel 各段
+// 写出 F32 部分和，combine kernel 归约后做 silu×mul。归约顺序变为分段树，
+// 沿用 fdot2 容差族。
+extern "C" __global__ void gguf_fused_gate_up_iq3s_split_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    float* gate_partial,
+    float* up_partial,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    const unsigned int assignment = blockIdx.y;
+    if (assignment >= assignments || input_is_bf16 == 0u) return;
+    const unsigned int token = assignment / top_k;
+    const GgufKqMeta meta = metas[route_slots[assignment]];
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int output_row = blockIdx.x * 32u + subgroup;
+    if (output_row >= intermediate) return;
+    const unsigned char* gate_row = gguf_kq_row(meta.gate, 21u, output_row, hidden);
+    const unsigned char* up_row = gguf_kq_row(meta.up, 21u, output_row, hidden);
+    const unsigned int group = lane;
+    const unsigned int superblocks = hidden >> 8u;
+    const unsigned int split_count = gridDim.z;
+    const unsigned int split = blockIdx.z;
+    const unsigned int split_blocks = superblocks / split_count;
+    __shared__ unsigned int iq3s_grid_lds[512];
+    for (unsigned int index = threadIdx.x; index < 512u; index += blockDim.x) {
+        iq3s_grid_lds[index] = zllm_iq3s_grid[index];
+    }
+    __syncthreads();
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    const unsigned int block_end = split * split_blocks + split_blocks;
+    for (unsigned int block_index = split * split_blocks; block_index < block_end; ++block_index) {
+        const unsigned char* gate_block = gate_row + (unsigned long long)block_index * 110u;
+        const unsigned char* up_block = up_row + (unsigned long long)block_index * 110u;
+        const unsigned short* block_input = (const unsigned short*)input
+            + (unsigned long long)token * hidden + block_index * 256u + group * 32u;
+        const float gate_scale = gguf_iq3s_group_scale(gate_block, group);
+        const float up_scale = gguf_iq3s_group_scale(up_block, group);
+        gguf_iq3s_gate_up_tuple8(block_input, gate_block, up_block, iq3s_grid_lds, group, 0u, gate_scale, up_scale, gate_sum, up_sum);
+        gguf_iq3s_gate_up_tuple8(block_input + 8u, gate_block, up_block, iq3s_grid_lds, group, 1u, gate_scale, up_scale, gate_sum, up_sum);
+        gguf_iq3s_gate_up_tuple8(block_input + 16u, gate_block, up_block, iq3s_grid_lds, group, 2u, gate_scale, up_scale, gate_sum, up_sum);
+        gguf_iq3s_gate_up_tuple8(block_input + 24u, gate_block, up_block, iq3s_grid_lds, group, 3u, gate_scale, up_scale, gate_sum, up_sum);
+    }
+    for (unsigned int offset = 4u; offset; offset >>= 1u) {
+        gate_sum += __shfl_down(gate_sum, offset, 8);
+        up_sum += __shfl_down(up_sum, offset, 8);
+    }
+    if (lane == 0u) {
+        const unsigned long long index
+            = ((unsigned long long)split * assignments + assignment) * intermediate + output_row;
+        gate_partial[index] = gate_sum;
+        up_partial[index] = up_sum;
+    }
+}
+
+extern "C" __global__ void gguf_fused_gate_up_split_combine_f32(
+    const float* gate_partial,
+    const float* up_partial,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int intermediate,
+    const unsigned int split_count)
+{
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int total = assignments * intermediate;
+    if (index >= total) return;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (unsigned int split = 0u; split < split_count; ++split) {
+        const unsigned long long offset = (unsigned long long)split * total + index;
+        gate_sum += gate_partial[offset];
+        up_sum += up_partial[offset];
+    }
+    const float gate = gate_sum / (1.0f + expf(-gate_sum));
+    activated[index] = zllm_f32_to_bf16(gate * up_sum);
+}
+
+// M1 探针：结构与 IQ3_S fused 完全一致，唯一区别是跳过码本 LDS 查表
+//（grid := qs 字节本身）。数值无意义，仅用于隔离 LDS 发散查表的代价。
+extern "C" __global__ void gguf_fused_gate_up_iq3s_nogrid_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    const unsigned int assignment = blockIdx.y;
+    if (assignment >= assignments || input_is_bf16 == 0u) return;
+    const unsigned int token = assignment / top_k;
+    const GgufKqMeta meta = metas[route_slots[assignment]];
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int output_row = blockIdx.x * 32u + subgroup;
+    if (output_row >= intermediate) return;
+    const unsigned char* gate_row = gguf_kq_row(meta.gate, 21u, output_row, hidden);
+    const unsigned char* up_row = gguf_kq_row(meta.up, 21u, output_row, hidden);
+    const unsigned int group = lane;
+    const unsigned long long input_base = (unsigned long long)token * hidden;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (unsigned int block_index = 0u; block_index < hidden / 256u; ++block_index) {
+        const unsigned char* gate_block = gate_row + (unsigned long long)block_index * 110u;
+        const unsigned char* up_block = up_row + (unsigned long long)block_index * 110u;
+        const unsigned short* block_input = (const unsigned short*)input
+            + input_base + block_index * 256u + group * 32u;
+        const float gate_scale = gguf_iq3s_group_scale(gate_block, group);
+        const float up_scale = gguf_iq3s_group_scale(up_block, group);
+        #pragma unroll
+        for (unsigned int side = 0u; side < 2u; ++side) {
+            const unsigned char* block = side == 0u ? gate_block : up_block;
+            const float scale = side == 0u ? gate_scale : up_scale;
+            float& sum = side == 0u ? gate_sum : up_sum;
+            const unsigned int qh = block[66u + group];
+            #pragma unroll
+            for (unsigned int tuple = 0u; tuple < 4u; ++tuple) {
+                const unsigned int q_offset = 2u + group * 8u + tuple * 2u;
+                // 跳过码本：直接拿 qs 两字节当 grid 寄存器，保留同样的
+                // pair_bf16/fdot2 指令序列与 qh/符号/scale 读取。
+                const unsigned int grid0 = (unsigned int)block[q_offset] * 257u;
+                const unsigned int grid1 = (unsigned int)block[q_offset + 1u] * 257u;
+                const unsigned int signs = block[74u + group * 4u + tuple];
+                zllm_ct_bf16x2 x01;
+                zllm_ct_bf16x2 x23;
+                zllm_ct_bf16x2 x45;
+                zllm_ct_bf16x2 x67;
+                zllm_ct_load_bf16x8(block_input + tuple * 8u, x01, x23, x45, x67);
+                sum = __builtin_amdgcn_fdot2_f32_bf16(x01, gguf_iq3s_pair_bf16(grid0, 0u, signs, 0u, scale), sum, false);
+                sum = __builtin_amdgcn_fdot2_f32_bf16(x23, gguf_iq3s_pair_bf16(grid0, 16u, signs, 2u, scale), sum, false);
+                sum = __builtin_amdgcn_fdot2_f32_bf16(x45, gguf_iq3s_pair_bf16(grid1, 0u, signs, 4u, scale), sum, false);
+                sum = __builtin_amdgcn_fdot2_f32_bf16(x67, gguf_iq3s_pair_bf16(grid1, 16u, signs, 6u, scale), sum, false);
+            }
+        }
+    }
+    for (unsigned int offset = 4u; offset; offset >>= 1u) {
+        gate_sum += __shfl_down(gate_sum, offset, 8);
+        up_sum += __shfl_down(up_sum, offset, 8);
+    }
+    if (lane == 0u) {
+        const float gate = gate_sum / (1.0f + expf(-gate_sum));
+        activated[(unsigned long long)assignment * intermediate + output_row] = zllm_f32_to_bf16(gate * up_sum);
+    }
+}
+
+// ===== IQ3_S gate_up wide-lite：不改布局，把逐字节读升级为 u16/u32 宽读 =====
+// 110B 块 2B 对齐恒成立：qs 8B/组 走 4×u16，signs 4B/组 走 2×u16，
+// 数值与 tuple8 路径逐位一致（同样的提取位序与归约）。
+__device__ __forceinline__ void gguf_iq3s_gate_up_tuple8_wide(
+    const unsigned short* input,
+    const unsigned long long qs,
+    const unsigned int qh,
+    const unsigned int signs,
+    const unsigned int* grid_lds,
+    const unsigned int tuple,
+    const float gate_scale,
+    float& sum)
+{
+    const unsigned int grid0 = grid_lds[
+        (unsigned int)((qs >> (tuple * 16u)) & 255u)
+            | (((qh >> (tuple * 2u)) & 1u) << 8u)];
+    const unsigned int grid1 = grid_lds[
+        (unsigned int)((qs >> (tuple * 16u + 8u)) & 255u)
+            | (((qh >> (tuple * 2u + 1u)) & 1u) << 8u)];
+    const unsigned int signs_byte = (signs >> (tuple * 8u)) & 255u;
+    zllm_ct_bf16x2 x01;
+    zllm_ct_bf16x2 x23;
+    zllm_ct_bf16x2 x45;
+    zllm_ct_bf16x2 x67;
+    zllm_ct_load_bf16x8(input + tuple * 8u, x01, x23, x45, x67);
+    sum = __builtin_amdgcn_fdot2_f32_bf16(x01, gguf_iq3s_pair_bf16(grid0, 0u, signs_byte, 0u, gate_scale), sum, false);
+    sum = __builtin_amdgcn_fdot2_f32_bf16(x23, gguf_iq3s_pair_bf16(grid0, 16u, signs_byte, 2u, gate_scale), sum, false);
+    sum = __builtin_amdgcn_fdot2_f32_bf16(x45, gguf_iq3s_pair_bf16(grid1, 0u, signs_byte, 4u, gate_scale), sum, false);
+    sum = __builtin_amdgcn_fdot2_f32_bf16(x67, gguf_iq3s_pair_bf16(grid1, 16u, signs_byte, 6u, gate_scale), sum, false);
+}
+
+extern "C" __global__ void gguf_fused_gate_up_iq3s_wide_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    const unsigned int assignment = blockIdx.y;
+    if (assignment >= assignments || input_is_bf16 == 0u) return;
+    const unsigned int token = assignment / top_k;
+    const GgufKqMeta meta = metas[route_slots[assignment]];
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int output_row = blockIdx.x * 32u + subgroup;
+    if (output_row >= intermediate) return;
+    const unsigned char* gate_row = gguf_kq_row(meta.gate, 21u, output_row, hidden);
+    const unsigned char* up_row = gguf_kq_row(meta.up, 21u, output_row, hidden);
+    const unsigned int group = lane;
+    const unsigned long long input_base = (unsigned long long)token * hidden;
+    __shared__ unsigned int iq3s_grid_lds[512];
+    for (unsigned int index = threadIdx.x; index < 512u; index += blockDim.x) {
+        iq3s_grid_lds[index] = zllm_iq3s_grid[index];
+    }
+    __syncthreads();
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    for (unsigned int block_index = 0u; block_index < hidden / 256u; ++block_index) {
+        const unsigned char* gate_block = gate_row + (unsigned long long)block_index * 110u;
+        const unsigned char* up_block = up_row + (unsigned long long)block_index * 110u;
+        const unsigned short* block_input = (const unsigned short*)input
+            + input_base + block_index * 256u + group * 32u;
+        // 每侧每超级块：qs 4×u16 + qh 1B + signs 2×u16 + scale 1B + d 2B。
+        const unsigned short* gate_qs16 = (const unsigned short*)(gate_block + 2u + group * 8u);
+        const unsigned short* up_qs16 = (const unsigned short*)(up_block + 2u + group * 8u);
+        const unsigned long long gate_qs = (unsigned long long)gate_qs16[0]
+            | ((unsigned long long)gate_qs16[1] << 16u)
+            | ((unsigned long long)gate_qs16[2] << 32u)
+            | ((unsigned long long)gate_qs16[3] << 48u);
+        const unsigned long long up_qs = (unsigned long long)up_qs16[0]
+            | ((unsigned long long)up_qs16[1] << 16u)
+            | ((unsigned long long)up_qs16[2] << 32u)
+            | ((unsigned long long)up_qs16[3] << 48u);
+        const unsigned int gate_qh = gate_block[66u + group];
+        const unsigned int up_qh = up_block[66u + group];
+        const unsigned short* gate_signs16 = (const unsigned short*)(gate_block + 74u + group * 4u);
+        const unsigned short* up_signs16 = (const unsigned short*)(up_block + 74u + group * 4u);
+        const unsigned int gate_signs = (unsigned int)gate_signs16[0] | ((unsigned int)gate_signs16[1] << 16u);
+        const unsigned int up_signs = (unsigned int)up_signs16[0] | ((unsigned int)up_signs16[1] << 16u);
+        const float gate_scale = gguf_iq3s_group_scale(gate_block, group);
+        const float up_scale = gguf_iq3s_group_scale(up_block, group);
+        #pragma unroll
+        for (unsigned int tuple = 0u; tuple < 4u; ++tuple) {
+            gguf_iq3s_gate_up_tuple8_wide(block_input, gate_qs, gate_qh, gate_signs, iq3s_grid_lds, tuple, gate_scale, gate_sum);
+            gguf_iq3s_gate_up_tuple8_wide(block_input, up_qs, up_qh, up_signs, iq3s_grid_lds, tuple, up_scale, up_sum);
+        }
+    }
+    for (unsigned int offset = 4u; offset; offset >>= 1u) {
+        gate_sum += __shfl_down(gate_sum, offset, 8);
+        up_sum += __shfl_down(up_sum, offset, 8);
+    }
+    if (lane == 0u) {
+        const float gate = gate_sum / (1.0f + expf(-gate_sum));
+        activated[(unsigned long long)assignment * intermediate + output_row]
+            = zllm_f32_to_bf16(gate * up_sum);
+    }
 }

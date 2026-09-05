@@ -1,6 +1,8 @@
 //! Gemma 4 dense text runtime。模型层顺序只在这里出现，backend 只提供既有算子能力。
 
 #[cfg(feature = "with-cuda")]
+pub mod cuda_mtp;
+#[cfg(feature = "with-cuda")]
 pub mod cuda_node;
 pub mod engine;
 #[cfg(target_os = "macos")]

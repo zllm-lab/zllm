@@ -132,14 +132,21 @@ impl Backend for RocmContext {
             }
             // GgufPacked 只保存原始 GGUF block，dense linear 复用 QK matmul
             // kernel 并在寄存器中解码 scale/min。
-            let gguf_codes = match quantized {
-                RocmQuantizedWeight::GgufPacked { codes, tensor_type, .. } => Some((codes, *tensor_type)),
+            let gguf_packed = match quantized {
+                RocmQuantizedWeight::GgufPacked { codes, tensor_type, q8_gemv } => Some((codes, *tensor_type, q8_gemv)),
                 _ => None,
             };
-            if let Some((packed, tensor_type)) = gguf_codes {
+            if let Some((packed, tensor_type, q8_gemv)) = gguf_packed {
                 // decode 少行(≤8)走 fdot2 快路径(bf16 舍入+fdot2，与 CT W8 家族同
-                // 数值形态)；prefill(rows>8)沿用标量 qk_matmul。
-                let output = if input.rows <= 8 && matches!(tensor_type, 11 | 12 | 13 | 14 | 21 | 23) {
+                // 数值形态)；Q8_0 进一步走预重排向量化 GEMV；prefill(rows>8)
+                // 沿用标量 qk_matmul。
+                let output = if input.rows <= 8
+                    && tensor_type == 8
+                    && let Some(repacked) = q8_gemv
+                {
+                    ops::hip::try_q8_gemv_repacked_resident_f32(self.device_id, &input.data, input.device.as_deref(), repacked, input.rows, input.cols, weight.rows)
+                        .map_err(|error| compute_error(format!("ROCm Q8 repacked linear launch 失败: input=[{},{}] output_rows={}: {error}", input.rows, input.cols, weight.rows)))?
+                } else if input.rows <= 8 && matches!(tensor_type, 8 | 11 | 12 | 13 | 14 | 21 | 23) {
                     ops::hip::try_qk_matmul_fdot2_resident_f32(self.device_id, tensor_type, &input.data, input.device.as_deref(), packed, input.rows, input.cols, weight.rows)
                         .map_err(|error| compute_error(format!("ROCm GGUF fdot2 linear launch 失败: input=[{},{}] output_rows={} type={tensor_type}: {error}", input.rows, input.cols, weight.rows)))?
                 } else {

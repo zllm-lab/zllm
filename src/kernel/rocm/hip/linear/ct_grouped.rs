@@ -569,7 +569,7 @@ pub(crate) fn try_ct_cooperative_routed_bf16(
     })
 }
 
-pub(super) fn cooperative_single_expert_route(device_id: i32, input_rows: usize) -> Result<(std::sync::Arc<DeviceBuffer>, std::sync::Arc<DeviceBuffer>), String> {
+pub(crate) fn cooperative_single_expert_route(device_id: i32, input_rows: usize) -> Result<(std::sync::Arc<DeviceBuffer>, std::sync::Arc<DeviceBuffer>), String> {
     // 单 token decode 的 shared route 永远是 {expert=0, weight=1}。按线程和
     // device 常驻，既不引入全局 mutex，也避免每层重复发两个单元素 fill kernel。
     if input_rows == 1 {
@@ -601,15 +601,22 @@ pub(crate) fn try_ct_cooperative_shared_bf16(device_id: i32, input: &DeviceBuffe
 }
 
 pub(crate) fn try_ct_cooperative_combine_partial_bf16(device_id: i32, routed: &DeviceBuffer, shared: &DeviceBuffer, elements: usize) -> Result<DeviceBuffer, String> {
-    let input_bytes = elements.checked_mul(4).ok_or("cooperative partial combine 输入大小溢出")?;
     let output_bytes = elements.checked_mul(2).ok_or("cooperative partial combine 输出大小溢出")?;
-    if elements == 0 || routed.device_id != device_id || shared.device_id != device_id || routed.bytes < input_bytes || shared.bytes < input_bytes {
-        return Err("ROCm cooperative partial combine 参数无效".to_owned());
-    }
-    set_device(device_id)?;
     // peer BAR 来源必须跨 stream/device 保活；直接写显式池，省掉普通 cast
     // 输出到稳定池的第二次 D2D 复制。
     let output = DeviceBuffer::allocate_peer(device_id, output_bytes)?;
+    try_ct_cooperative_combine_partial_bf16_into(device_id, routed, shared, &output, elements)?;
+    Ok(output)
+}
+
+/// graph 兼容的 into 变体：输出地址由调用方持有并固定。
+pub(crate) fn try_ct_cooperative_combine_partial_bf16_into(device_id: i32, routed: &DeviceBuffer, shared: &DeviceBuffer, output: &DeviceBuffer, elements: usize) -> Result<(), String> {
+    let input_bytes = elements.checked_mul(4).ok_or("cooperative partial combine 输入大小溢出")?;
+    let output_bytes = elements.checked_mul(2).ok_or("cooperative partial combine 输出大小溢出")?;
+    if elements == 0 || routed.device_id != device_id || shared.device_id != device_id || output.device_id != device_id || routed.bytes < input_bytes || shared.bytes < input_bytes || output.bytes < output_bytes {
+        return Err("ROCm cooperative partial combine 参数无效".to_owned());
+    }
+    set_device(device_id)?;
     let functions = ct_quantized_functions(device_id)?;
     let runtime = RocmRuntime::open()?;
     let launch = crate::kernel::rocm::hip::kernel_launch_trampoline;
@@ -622,8 +629,7 @@ pub(crate) fn try_ct_cooperative_combine_partial_bf16(device_id: i32, routed: &D
     if status != HIP_SUCCESS {
         return Err(runtime.hip_error(status, "cooperative partial combine"));
     }
-    synchronize_cooperative_kernel(device_id, "cooperative partial combine")?;
-    Ok(output)
+    Ok(())
 }
 
 pub(crate) fn try_ct_cooperative_partial_join_f32(device_id: i32, local_partial: &DeviceBuffer, peer_partial: &DeviceBuffer, residual: &DeviceBuffer, input_rows: usize, hidden_size: usize) -> Result<DeviceBuffer, String> {

@@ -288,7 +288,7 @@ mod gguf_fused_gemm_tests {
 
     #[test]
     fn iq4xs_block_dequant_prefill_matches_reference() {
-        // 覆盖 per-sub-block 向量化反量化 kernel(rows>=32 走 dequant+GEMM 路径)
+        // 32 行起走 fused GEMM(64×64 tile,stage 内反量化+simdgroup MMA)
         let ctx = MetalContext::new_default().unwrap();
         let m = 32;
         let columns = 512;
@@ -324,6 +324,100 @@ mod gguf_fused_gemm_tests {
                 assert!(err <= 0.05 + expected.abs() * 0.01, "iq4xs block dequant m={mi} n={ni} actual={actual_val} expected={expected} err={err}");
             }
         }
+    }
+
+    #[test]
+    fn iq4xs_fused_gemm_matches_dequantized_matmul() {
+        // 58 行:64 行 tile 的边界(6 行填充),覆盖 fused 路径的 M/N 越界守卫;
+        // 权重行也取 70 覆盖 N 方向的第二 tile 与不满块。
+        let ctx = MetalContext::new_default().unwrap();
+        let m = 58;
+        let columns = 512;
+        let n_rows = 70;
+        let row_bytes = 272; // 512 / 256 * 136
+        let input_values: Vec<f32> = (0..(m * columns)).map(|i| ((i as f32 * 0.0043) + 0.09).cos()).collect();
+        let rounded_input: Vec<f32> = input_values.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+        let input = ctx.tensor_from_f32(&input_values, m, columns).unwrap();
+        // 随机字节会生成 0..63 的 ib32 scale,dl 可达 ±32d;真实权重的组合
+        // scale 远小于该上界。d 取 0.002 让 |w| ≤ ~0.7,f16 staging 的相对
+        // 误差与既有 fused 测试同量级,阈值保持 0.05+1% 不放水。
+        let d_bytes = f16::from_f32(0.002).to_le_bytes();
+        let mut weights = vec![0u8; n_rows * row_bytes];
+        let mut seed = 0x9e3779b9u32;
+        for byte in weights.chunks_exact_mut(4) {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            byte.copy_from_slice(&seed.to_le_bytes());
+        }
+        for row in 0..n_rows {
+            for block in 0..2 {
+                let base = row * row_bytes + block * 136;
+                weights[base] = d_bytes[0];
+                weights[base + 1] = d_bytes[1];
+            }
+        }
+        let blob = ctx.resident_byte_weight_buffer(&weights);
+        let actual = gguf_matmul_tensor_resident(&ctx, &input, &blob, 23, row_bytes, n_rows, columns).unwrap();
+        let actual_flat = ctx.tensor_to_f32(&actual);
+        let decoded = crate::weight::codec::ggml::dequantize(23, &weights, n_rows * columns).unwrap();
+        let mut error_squared = 0.0f32;
+        let mut reference_squared = 0.0f32;
+        for mi in 0..m {
+            for ni in 0..n_rows {
+                let expected: f32 = (0..columns).map(|k| decoded[ni * columns + k] * rounded_input[mi * columns + k]).sum();
+                let actual_val = actual_flat[mi * n_rows + ni];
+                let err = (actual_val - expected).abs();
+                error_squared += err * err;
+                reference_squared += expected * expected;
+                assert!(err <= 0.05 + expected.abs() * 0.01, "fused iq4xs m={mi} n={ni} actual={actual_val} expected={expected} err={err}");
+            }
+        }
+        println!("[iq4xs-fused-oracle] rel_l2={}", (error_squared / reference_squared).sqrt());
+    }
+
+    #[test]
+    fn iq3s_fused_gemm_matches_dequantized_matmul() {
+        // 58 行覆盖 64 行 tile 的 M 边界;权重 70 行覆盖 N 方向第二 tile。
+        let ctx = MetalContext::new_default().unwrap();
+        let m = 58;
+        let columns = 512;
+        let n_rows = 70;
+        let row_bytes = 220; // 512 / 256 * 110
+        let input_values: Vec<f32> = (0..(m * columns)).map(|i| ((i as f32 * 0.0031) + 0.07).sin()).collect();
+        let rounded_input: Vec<f32> = input_values.iter().map(|&v| f16::from_f32(v).to_f32()).collect();
+        let input = ctx.tensor_from_f32(&input_values, m, columns).unwrap();
+        // 随机 scale(6 位)使 db 可达 63d;真实权重组合远小于此,d 取小值
+        // 把 f16 staging 误差压回与既有 fused 测试同量级。
+        let d_bytes = f16::from_f32(0.002).to_le_bytes();
+        let mut weights = vec![0u8; n_rows * row_bytes];
+        let mut seed = 0x85ebca6bu32;
+        for byte in weights.chunks_exact_mut(4) {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            byte.copy_from_slice(&seed.to_le_bytes());
+        }
+        for row in 0..n_rows {
+            for block in 0..2 {
+                let base = row * row_bytes + block * 110;
+                weights[base] = d_bytes[0];
+                weights[base + 1] = d_bytes[1];
+            }
+        }
+        let blob = ctx.resident_byte_weight_buffer(&weights);
+        let actual = gguf_matmul_tensor_resident(&ctx, &input, &blob, 21, row_bytes, n_rows, columns).unwrap();
+        let actual_flat = ctx.tensor_to_f32(&actual);
+        let decoded = crate::weight::codec::ggml::dequantize(21, &weights, n_rows * columns).unwrap();
+        let mut error_squared = 0.0f32;
+        let mut reference_squared = 0.0f32;
+        for mi in 0..m {
+            for ni in 0..n_rows {
+                let expected: f32 = (0..columns).map(|k| decoded[ni * columns + k] * rounded_input[mi * columns + k]).sum();
+                let actual_val = actual_flat[mi * n_rows + ni];
+                let err = (actual_val - expected).abs();
+                error_squared += err * err;
+                reference_squared += expected * expected;
+                assert!(err <= 0.05 + expected.abs() * 0.01, "fused iq3s m={mi} n={ni} actual={actual_val} expected={expected} err={err}");
+            }
+        }
+        println!("[iq3s-fused-oracle] rel_l2={}", (error_squared / reference_squared).sqrt());
     }
 
     #[test]

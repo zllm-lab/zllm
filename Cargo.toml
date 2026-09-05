@@ -1,6 +1,6 @@
 [package]
 name = "zllm"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2024"
 description = "跨平台跨模型的高性能 LLM 推理引擎"
 license = "Apache-2.0"
@@ -22,6 +22,7 @@ default = []
 with-cuda = ["dep:cudarc"]
 with-rocm = []
 with-vulkan = ["dep:pollster", "dep:wgpu"]
+with-qnn = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
@@ -67,6 +68,9 @@ libloading = "0.8"
 # server ws 端点的 loopback 集成测试客户端。
 tokio-tungstenite = { version = "0.28", features = ["connect"] }
 futures-util = "0.3"
+
+[build-dependencies]
+cc = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

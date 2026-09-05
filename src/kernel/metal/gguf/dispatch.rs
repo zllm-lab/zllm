@@ -8,7 +8,8 @@ mod tests;
 const GGUF_PREFILL_MPS_ROWS: usize = 32;
 
 fn gguf_prefill_mps_rows() -> usize {
-    GGUF_PREFILL_MPS_ROWS
+    // A/B 实验开关:同 binary 内切回物化+MPS 路径,消除跨重启热状态噪声。
+    std::env::var("ZLLM_GGUF_MPS_ROWS").ok().and_then(|value| value.parse().ok()).unwrap_or(GGUF_PREFILL_MPS_ROWS)
 }
 
 pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob: &metal::Buffer, tensor_type: u32, row_bytes: usize, weight_rows: usize, weight_cols: usize) -> Result<MetalTensor, String> {
@@ -37,7 +38,12 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
     let use_q3k_fused = input.dtype == MetalTensorDType::F16 && input.rows >= 4 && tensor_type == 11;
     let use_q6k_fused = input.dtype == MetalTensorDType::F16 && input.rows >= 4 && tensor_type == 14;
     let use_iq4nl_fused = input.dtype == MetalTensorDType::F16 && input.rows >= 4 && tensor_type == 20;
-    if use_q3k_fused || use_q6k_fused || use_iq4nl_fused {
+    // IQ4_XS 64×64 tile 的行利用率在 32 行以上才划算;4..31 行多行 gemv
+    // (权重读一次跨行共享)实测 ~80-100GB/s 更优。IQ3_S 同理(单矩阵版主要
+    // 服务 gated dual 的分解路径)。
+    let use_iq4xs_fused = input.dtype == MetalTensorDType::F16 && input.rows >= gguf_prefill_mps_rows() && tensor_type == 23;
+    let use_iq3s_fused = input.dtype == MetalTensorDType::F16 && input.rows >= gguf_prefill_mps_rows() && tensor_type == 21;
+    if use_q3k_fused || use_q6k_fused || use_iq4nl_fused || use_iq4xs_fused || use_iq3s_fused {
         // fused 路径不依赖 caller 的 dtype guard, 显式用 input dtype (F16)
         let m = validate_u32("GGUF M", input.rows)?;
         let n = validate_u32("GGUF N", weight_rows)?;
@@ -48,6 +54,10 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
             "gguf_gemm_q3k_fused_f16"
         } else if use_q6k_fused {
             "gguf_gemm_q6k_fused_f16"
+        } else if use_iq4xs_fused {
+            "gguf_gemm_iq4xs_fused_f16"
+        } else if use_iq3s_fused {
+            "gguf_gemm_iq3s_fused_f16"
         } else if ctx.metal4_available() {
             "gguf_gemm_iq4nl_mpp_f16"
         } else {
@@ -72,8 +82,10 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
         set_bytes(&encoder, 7, &row_bytes_u32);
         let groups = if kernel_name == "gguf_gemm_iq4nl_mpp_f16" {
             MTLSize::new(input.rows.div_ceil(128) as u64, weight_rows.div_ceil(64) as u64, 1)
-        } else if use_iq4nl_fused {
-            MTLSize::new(weight_rows.div_ceil(64) as u64, input.rows.div_ceil(64) as u64, 1)
+        } else if use_iq4nl_fused || use_iq4xs_fused || use_iq3s_fused {
+            // iq4nl 是 64×64 tile;iq4xs/iq3s 是 32×32 tile(MLX qmm 同款,
+            // 小布局换并发 TG)。
+            MTLSize::new(weight_rows.div_ceil(if use_iq4nl_fused { 64 } else { 32 }) as u64, input.rows.div_ceil(if use_iq4nl_fused { 64 } else { 32 }) as u64, 1)
         } else {
             MTLSize::new(weight_rows.div_ceil(4) as u64, input.rows.div_ceil(4) as u64, 1)
         };
@@ -204,8 +216,6 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
     };
     let columns = validate_u32("GGUF columns", weight_cols)?;
     let pipeline = ctx.pipeline(pipeline_name)?;
-    let iq_packed_rows =
-        matches!(pipeline_name, "gguf_gemv_iq4xs_f16" | "gguf_gemv_iq4xs_1r_f16" | "gguf_gemv_iq4nl_f16" | "gguf_gemv_iq4nl_1r_f16" | "gguf_gemv_iq4nl_4r_f16" | "gguf_gemv_iq3s_f16" | "gguf_gemv_q5k_f16" | "gguf_gemv_q5k_1r_f16");
     let iq_packed_rows = matches!(
         pipeline_name,
         "gguf_gemv_iq4xs_f16" | "gguf_gemv_iq4xs_1r_f16" | "gguf_gemv_iq4nl_f16" | "gguf_gemv_iq4nl_1r_f16" | "gguf_gemv_iq4nl_4r_f16" | "gguf_gemv_iq3s_f16" | "gguf_gemv_q4_0_f16" | "gguf_gemv_q5k_f16" | "gguf_gemv_q5k_1r_f16"
@@ -545,6 +555,13 @@ pub fn gguf_gated_matmul_tensor_resident(
     // IQ4_NL 长 prefill 复用 tiled fused GEMM，避免 gate/up 各自先展开整份
     // F16 权重。activation 仍走统一 epilogue，保持与分解路径相同的语义。
     if input.rows >= 4 && gate_type == 20 && up_type == 20 {
+        let gate = gguf_matmul_tensor_resident(ctx, input, gate_blob, gate_type, gate_row_bytes, gate_rows, gate_cols)?;
+        let up = gguf_matmul_tensor_resident(ctx, input, up_blob, up_type, up_row_bytes, up_rows, up_cols)?;
+        return gated_activation_tensor(ctx, &gate, &up, activation);
+    }
+    // IQ3_S gate/up 在 32 行以上同样走两次 fused GEMM + 激活 epilogue,
+    // 替代 dual_dequant 物化 + MPS 两步(58-token prefill 占 GPU 38%)。
+    if input.rows >= gguf_prefill_mps_rows() && gate_type == 21 && up_type == 21 {
         let gate = gguf_matmul_tensor_resident(ctx, input, gate_blob, gate_type, gate_row_bytes, gate_rows, gate_cols)?;
         let up = gguf_matmul_tensor_resident(ctx, input, up_blob, up_type, up_row_bytes, up_rows, up_cols)?;
         return gated_activation_tensor(ctx, &gate, &up, activation);

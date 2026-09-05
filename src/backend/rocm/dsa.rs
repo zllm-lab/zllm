@@ -312,6 +312,7 @@ pub struct RocmDsaState {
     gpu_wait_ns_sum: u64,
     gpu_wait_ns_max: u64,
     cooperative_peer: Option<RocmCooperativeDsaPeer>,
+    union_probe: Option<super::dsa_union_probe::DsaUnionProbe>,
     pub(super) decode_parallelism: usize,
 }
 
@@ -618,12 +619,15 @@ impl RocmDsaSelection {
         Ok(values)
     }
 
+    /// 双机边界接收侧专用：H2D 延迟到首个消费 stage 的 compute stream
+    /// （import_selection 处 enqueue_deferred_upload），避免独立 stream 的
+    /// host 同步在 decode 热路径上停 ~0.7ms/token。host 副本保留用于 to_host 快路径。
     pub fn from_host(context: &RocmContext, rows: usize, start: usize, values: &[u32]) -> Result<Self, BackendError> {
         if rows == 0 || values.is_empty() || !values.len().is_multiple_of(rows) {
             return Err(compute_error(format!("ROCm DSA selection host shape rows={rows} elements={} 无效", values.len())));
         }
         let bytes = std::mem::size_of_val(values);
-        let buffer = ops::hip::DeviceBuffer::upload_independent(context.device_id, unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), bytes) }).map_err(compute_error)?;
+        let buffer = ops::hip::DeviceBuffer::upload_ordered(context.device_id, unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), bytes) }).map_err(compute_error)?;
         Ok(Self { buffer: Arc::new(buffer), host: Some(Arc::new(values.to_vec())), rows, start, width: values.len() / rows, ownership: RocmDsaSelectionOwnership::Global })
     }
 }
@@ -672,6 +676,7 @@ impl RocmDsaState {
             gpu_wait_ns_sum: 0,
             gpu_wait_ns_max: 0,
             cooperative_peer: None,
+            union_probe: None,
             decode_parallelism: 1,
         })
     }
@@ -1405,6 +1410,13 @@ impl RocmDsaState {
             ROCM_KV_BLOCK_SIZE,
         )
         .map_err(compute_error)?;
+        if super::dsa_union_probe::enabled() && query.rows == 1 {
+            if self.union_probe.is_none() {
+                self.union_probe = Some(super::dsa_union_probe::DsaUnionProbe::new(context.device_id)?);
+            }
+            // score 必须在后续 kernel 覆盖 workspace 前下载（与既有 shadow 同约束）。
+            self.union_probe.as_mut().expect("刚创建").maybe_record_scores(layer, context_rows - 1, context_rows)?;
+        }
         let sample_shadow = !hadamard && self.kpool == 0 && query.rows == 1 && self.hadamard_shadow_counts.get(layer).copied().unwrap_or_default() < self.hadamard_shadow_samples;
         if sample_shadow {
             // 必须在 coarse 调用覆盖同一 score workspace 前读取 exact 分数。
@@ -1666,6 +1678,11 @@ impl RocmDsaState {
             self.gpu_host_inflight = true;
         } else {
             self.selection_host = None;
+        }
+        if query.rows == 1
+            && let Some(probe) = self.union_probe.as_mut()
+        {
+            probe.record_selection(layer, context_rows - 1, context_rows, self.top_k, &exact)?;
         }
         self.selection = Some(Arc::new(exact));
         self.selection_rows = query.rows;
@@ -2534,6 +2551,10 @@ impl RocmDsaState {
         if selection.rows == 0 || selection.buffer.bytes() < expected {
             return Err(compute_error(format!("ROCm DSA selection P2P shape 非法: rows={} bytes={} expected={expected}", selection.rows, selection.buffer.bytes())));
         }
+        // 边界接收的 selection 可能携带 deferred H2D（from_host 走 upload_ordered）：
+        // 在首个消费 stage 的 stream 上提交上传并保活到 stage 完成；非 deferred buffer 为空操作。
+        selection.buffer.enqueue_deferred_upload().map_err(compute_error)?;
+        selection.buffer.retain_for_active_stage();
         self.selection = Some(if selection.buffer.device_id() == context.device_id { selection.buffer } else { Arc::new(selection.buffer.copy_to_device(context.device_id).map_err(compute_error)?) });
         self.selection_host = selection.host;
         self.selection_rows = selection.rows;
