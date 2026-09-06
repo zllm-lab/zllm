@@ -67,18 +67,41 @@ pub fn try_rope_resident_f32(
     sin: &[f32],
     prefix: bool,
 ) -> Result<DeviceBuffer, String> {
-    let input_bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(4)).ok_or("resident RoPE 大小溢出")?;
-    validate_resident(input, device_id, input_bytes, "RoPE input")?;
     let half = rotary_dim / 2;
     let end = position.checked_add(rows).and_then(|n| n.checked_mul(half)).ok_or("resident RoPE table 大小溢出")?;
     if end > cos.len() || end > sin.len() {
         return Err("resident RoPE table 太短".to_owned());
     }
+    // cos/sin 对所有层和 token 相同；整表常驻后由 kernel 用 position 直接定位。
+    let (cosine, sine) = resident_rope_tables(device_id, cos, sin, half, position..position + rows)?;
+    try_rope_with_resident_tables_f32(device_id, input, rows, cols, head_count, rotary_dim, layout, position, &cosine, &sine, prefix)
+}
+
+/// 已取得常驻 RoPE 表时直接提交 kernel。双卡 operator worker 不能借用调用
+/// 线程上的 host slice，因此显式传递同设备的 resident buffer。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_rope_with_resident_tables_f32(
+    device_id: i32,
+    input: &DeviceBuffer,
+    rows: usize,
+    cols: usize,
+    head_count: usize,
+    rotary_dim: usize,
+    layout: RotaryLayout,
+    position: usize,
+    cosine: &DeviceBuffer,
+    sine: &DeviceBuffer,
+    prefix: bool,
+) -> Result<DeviceBuffer, String> {
+    let input_bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(4)).ok_or("resident RoPE 大小溢出")?;
+    validate_resident(input, device_id, input_bytes, "RoPE input")?;
+    let half = rotary_dim / 2;
+    let required_table_bytes = position.checked_add(rows).and_then(|n| n.checked_mul(half)).and_then(|n| n.checked_mul(4)).ok_or("resident RoPE table 大小溢出")?;
+    validate_resident(cosine, device_id, required_table_bytes, "RoPE cosine")?;
+    validate_resident(sine, device_id, required_table_bytes, "RoPE sine")?;
     set_device(device_id)?;
     let output = DeviceBuffer::allocate(device_id, input_bytes)?;
     let functions = tensor_functions(device_id)?;
-    // cos/sin 对所有层和 token 相同；整表常驻后由 kernel 用 position 直接定位。
-    let (cosine, sine) = resident_rope_tables(device_id, cos, sin, half, position..position + rows)?;
     let mut d_input = input.pointer;
     let mut d_cosine = cosine.pointer;
     let mut d_sine = sine.pointer;

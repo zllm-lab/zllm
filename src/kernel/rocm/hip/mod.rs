@@ -73,7 +73,7 @@ mod hiprtc;
 mod options;
 mod roctx;
 
-pub(crate) use peer_copy::try_peer_copy_kernel_ordered;
+pub(crate) use peer_copy::{try_peer_copy_kernel_ordered, try_peer_join_residual_f32};
 
 pub(crate) use graph::{StaticGraphRecorder, StaticHipGraph, kernel_launch_trampoline};
 

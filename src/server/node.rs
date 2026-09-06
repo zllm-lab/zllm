@@ -100,6 +100,11 @@ pub trait NodeEngine {
         let _ = (request, output_dir, cancellation, on_progress);
         Err(format!("模型 {} 不支持任务 {task_kind}", self.model_key()))
     }
+    /// 终点 cache 的 pin 共享句柄;scheduler 在 append 排队期间 pin 换出保护。
+    /// 返回 None 的实现没有 resident 换出路径,pin 是 no-op。
+    fn terminal_cache_pins(&self) -> Option<Arc<Mutex<HashSet<String>>>> {
+        None
+    }
 }
 
 pub struct NodeBatchRequest {
@@ -132,6 +137,8 @@ struct NodeExecutor {
     compute_steps: Arc<AtomicCounterU64>,
     accelerator_allocated: Arc<dyn Fn() -> u64 + Send + Sync>,
     max_concurrency: usize,
+    /// engine 终点 cache 的 pin 共享句柄;None = 模型没有换出路径(如无 swap)。
+    pins: Option<Arc<Mutex<HashSet<String>>>>,
 }
 
 struct ExecutionCommand {
@@ -253,7 +260,7 @@ struct PersistedTask {
 impl NodeExecutor {
     fn start(factory: NodeEngineFactory, configured_max_concurrency: Option<usize>) -> Result<Self, DynError> {
         let (command_tx, command_rx) = std::sync::mpsc::channel::<EngineCommand>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(String, NodeCapabilities, Arc<dyn Fn() -> u64 + Send + Sync>, usize), String>>(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(String, NodeCapabilities, Arc<dyn Fn() -> u64 + Send + Sync>, usize, Option<Arc<Mutex<HashSet<String>>>>), String>>(1);
         let runtime_caches = Arc::new(Mutex::new(Vec::new()));
         let runtime = Arc::new(Mutex::new(NodeRuntime::default()));
         let compute_steps = Arc::new(AtomicCounterU64::new(0));
@@ -270,7 +277,7 @@ impl NodeExecutor {
                         *caches = engine.terminal_cache_infos();
                     }
                     max_concurrency = node_max_concurrency(engine.max_concurrency(), configured_max_concurrency);
-                    let _ = ready_tx.send(Ok((model_key, capabilities, accelerator_allocated, max_concurrency)));
+                    let _ = ready_tx.send(Ok((model_key, capabilities, accelerator_allocated, max_concurrency, engine.terminal_cache_pins())));
                     engine
                 }
                 Err(error) => {
@@ -303,8 +310,28 @@ impl NodeExecutor {
             }
         })?;
         match ready_rx.recv()? {
-            Ok((model_key, capabilities, accelerator_allocated, max_concurrency)) => Ok(Self { commands: command_tx, runtime_caches, model_key, capabilities, runtime, compute_steps, accelerator_allocated, max_concurrency }),
+            Ok((model_key, capabilities, accelerator_allocated, max_concurrency, pins)) => Ok(Self { commands: command_tx, runtime_caches, model_key, capabilities, runtime, compute_steps, accelerator_allocated, max_concurrency, pins }),
             Err(error) => Err(error.into()),
+        }
+    }
+
+    /// 响应 scheduler 的 PinCache/UnpinCache:直接写共享句柄,不经 engine 命令
+    /// 队列(满载 batch 期间队列会推迟命令,而 pin 恰恰在这个窗口必须生效)。
+    /// 上限限流防止排队风暴锁死 resident;无换出路径的模型忽略并打日志。
+    fn set_pin(&self, cache_id: &str, pinned: bool) {
+        let Some(pins) = &self.pins else {
+            eprintln!("[zllm-node] 模型 {} 无终点 cache 换出路径,忽略 pin cache_id={cache_id}", self.model_key);
+            return;
+        };
+        let Ok(mut guard) = pins.lock() else { return };
+        if pinned {
+            if guard.len() >= crate::kv_cache::terminal_cache::TERMINAL_PIN_LIMIT && !guard.contains(cache_id) {
+                eprintln!("[zllm-node] pin 超过上限 {} 忽略 cache_id={cache_id}", crate::kv_cache::terminal_cache::TERMINAL_PIN_LIMIT);
+                return;
+            }
+            guard.insert(cache_id.to_owned());
+        } else {
+            guard.remove(cache_id);
         }
     }
 
@@ -700,6 +727,8 @@ impl NodeSession {
                     outgoing.send(NodeMessage::TaskStatus { task_id, status: "queued".to_owned(), error: Some(message), outputs: Vec::new() }).await.map_err(|_| "scheduler writer 已关闭")?;
                 }
             }
+            SchedulerMessage::PinCache { cache_id } => executor.set_pin(&cache_id, true),
+            SchedulerMessage::UnpinCache { cache_id } => executor.set_pin(&cache_id, false),
             SchedulerMessage::ArtifactCommitted { task_id, artifact_id } => {
                 artifact_acks.send((task_id, artifact_id)).await.map_err(|_| "artifact ACK 队列已经关闭")?;
             }

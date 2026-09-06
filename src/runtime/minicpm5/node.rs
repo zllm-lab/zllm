@@ -1,7 +1,9 @@
 //! MiniCPM5 节点适配器：只负责装载参数、请求转发与状态上报。
 
 #[cfg(target_os = "macos")]
-use std::sync::Arc;
+use std::collections::HashSet;
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_os = "macos"))]
 use crate::{config::MiniCpm5NodeModelConfig, server::node::DynError};
@@ -47,6 +49,10 @@ impl NodeEngine for MiniCpm5Engine {
 
     fn terminal_cache_infos(&self) -> Vec<CacheInfo> {
         MiniCpm5Engine::terminal_cache_infos(self)
+    }
+
+    fn terminal_cache_pins(&self) -> Option<Arc<Mutex<HashSet<String>>>> {
+        Some(MiniCpm5Engine::terminal_cache_pins(self))
     }
 
     fn max_concurrency(&self) -> usize {

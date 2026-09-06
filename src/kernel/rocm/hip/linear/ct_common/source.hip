@@ -427,7 +427,47 @@ __device__ __forceinline__ ZllmCtW8Rows2Dot zllm_ct_w8_group128_wave32_rows2_dot
     return { first, second_sum };
 }
 
-extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows2(
+__device__ __forceinline__ ZllmCtW8Rows2Dot zllm_ct_w8_group32_wave32_rows2_dot(
+    const unsigned short* input,
+    const unsigned int* packed,
+    unsigned long long packed_base,
+    unsigned int input_columns,
+    unsigned int group
+) {
+    const unsigned int word_base = group * 8u;
+    float first = 0.0f;
+    float second = 0.0f;
+    #pragma unroll
+    for (unsigned int word = 0u; word < 8u; ++word) {
+        const unsigned int codes = packed[packed_base + word_base + word];
+        const unsigned int column = group * 32u + word * 4u;
+        const zllm_ct_bf16x2 w01 = {
+            zllm_ct_i8_to_bf16(codes),
+            zllm_ct_i8_to_bf16(codes >> 8u)
+        };
+        const zllm_ct_bf16x2 w23 = {
+            zllm_ct_i8_to_bf16(codes >> 16u),
+            zllm_ct_i8_to_bf16(codes >> 24u)
+        };
+        const zllm_ct_bf16x2 first01 = { input[column], input[column + 1u] };
+        const zllm_ct_bf16x2 first23 = { input[column + 2u], input[column + 3u] };
+        const unsigned long long second_base =
+            (unsigned long long)input_columns + column;
+        const zllm_ct_bf16x2 second01 = {
+            input[second_base], input[second_base + 1u]
+        };
+        const zllm_ct_bf16x2 second23 = {
+            input[second_base + 2u], input[second_base + 3u]
+        };
+        first = __builtin_amdgcn_fdot2_f32_bf16(first01, w01, first, false);
+        first = __builtin_amdgcn_fdot2_f32_bf16(first23, w23, first, false);
+        second = __builtin_amdgcn_fdot2_f32_bf16(second01, w01, second, false);
+        second = __builtin_amdgcn_fdot2_f32_bf16(second23, w23, second, false);
+    }
+    return { first, second };
+}
+
+__device__ __forceinline__ void zllm_ct_w8_row_pairs(
     const unsigned short* input,
     const unsigned int* packed,
     const unsigned char* scales,
@@ -436,17 +476,42 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows2(
     unsigned int input_columns,
     unsigned int output_rows,
     unsigned int group_size,
-    unsigned int scale_dtype,
-    unsigned int bits
+    unsigned int scale_dtype
 ) {
-    if (input_rows != 2u || group_size != 128u || bits != 8u) return;
+    const unsigned int pair = blockIdx.y;
+    if (pair >= input_rows / 2u) return;
+    input += (unsigned long long)pair * 2u * input_columns;
+    output += (unsigned long long)pair * 2u * output_rows;
     const unsigned int lane = threadIdx.x & 31u;
     const unsigned int wave = threadIdx.x >> 5u;
     const unsigned int output_row = blockIdx.x * (blockDim.x >> 5u) + wave;
     if (output_row >= output_rows) return;
-    const unsigned int group_count = input_columns / 128u;
+    const unsigned int group_count = input_columns / group_size;
     const unsigned long long packed_base =
         (unsigned long long)output_row * (input_columns / 4u);
+    if (group_size == 32u) {
+        const unsigned long long scale_base =
+            (unsigned long long)output_row * group_count;
+        float first = 0.0f;
+        float second = 0.0f;
+        for (unsigned int group = lane; group < group_count; group += 32u) {
+            const ZllmCtW8Rows2Dot dot = zllm_ct_w8_group32_wave32_rows2_dot(
+                input, packed, packed_base, input_columns, group);
+            const float scale = zllm_scale(
+                scales, scale_base + group, scale_dtype);
+            first += dot.first * scale;
+            second += dot.second * scale;
+        }
+        for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+            first += __shfl_down(first, offset, 32);
+            second += __shfl_down(second, offset, 32);
+        }
+        if (lane == 0u) {
+            output[output_row] = first;
+            output[(unsigned long long)output_rows + output_row] = second;
+        }
+        return;
+    }
     float first_even = 0.0f;
     float first_odd = 0.0f;
     float second_even = 0.0f;
@@ -486,10 +551,30 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows2(
     }
 }
 
+extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows2(
+    const unsigned short* input,
+    const unsigned int* packed,
+    const unsigned char* scales,
+    float* output,
+    unsigned int input_rows,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int group_size,
+    unsigned int scale_dtype,
+    unsigned int bits
+) {
+    if (input_rows < 2u || input_rows > 8u || (input_rows & 1u) != 0u
+        || (group_size != 32u && group_size != 128u)
+        || bits != 8u) return;
+    zllm_ct_w8_row_pairs(
+        input, packed, scales, output, input_rows, input_columns,
+        output_rows, group_size, scale_dtype);
+}
+
 // 多行 verify 共享一次量化 code 与 scale 装载。W8 GEMV 的逐行 grid.y 会让
 // 超过 L2 的权重矩阵(如 154880 输出的 lm head ≈952MB)被每个 input row 重读
 // 一遍;ROWS 行共享后权重只读一次,每行累加顺序与单行路径逐位一致。
-template <int ROWS>
+template <int ROWS, unsigned int GROUP_SIZE>
 __device__ __forceinline__ void zllm_w8_rows_shared_wave32(
     const unsigned short* input,
     const unsigned int* packed,
@@ -503,11 +588,60 @@ __device__ __forceinline__ void zllm_w8_rows_shared_wave32(
     const unsigned int wave = threadIdx.x >> 5u;
     const unsigned int output_row = blockIdx.x * (blockDim.x >> 5u) + wave;
     if (output_row >= output_rows) return;
-    const unsigned int group_count = input_columns / 128u;
+    const unsigned int group_count = input_columns / GROUP_SIZE;
     const unsigned long long packed_base =
         (unsigned long long)output_row * (input_columns / 4u);
     const unsigned long long scale_base =
         (unsigned long long)output_row * group_count;
+    if (GROUP_SIZE == 32u) {
+        float sums[ROWS];
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) sums[r] = 0.0f;
+        for (unsigned int group = lane; group < group_count; group += 32u) {
+            float group_sums[ROWS];
+            #pragma unroll
+            for (int r = 0; r < ROWS; ++r) group_sums[r] = 0.0f;
+            const unsigned int word_base = group * 8u;
+            #pragma unroll
+            for (unsigned int word = 0u; word < 8u; ++word) {
+                const unsigned int codes = packed[packed_base + word_base + word];
+                const unsigned int column = group * 32u + word * 4u;
+                const zllm_ct_bf16x2 w01 = {
+                    zllm_ct_i8_to_bf16(codes),
+                    zllm_ct_i8_to_bf16(codes >> 8u)
+                };
+                const zllm_ct_bf16x2 w23 = {
+                    zllm_ct_i8_to_bf16(codes >> 16u),
+                    zllm_ct_i8_to_bf16(codes >> 24u)
+                };
+                #pragma unroll
+                for (int r = 0; r < ROWS; ++r) {
+                    const unsigned long long base =
+                        (unsigned long long)r * input_columns + column;
+                    const zllm_ct_bf16x2 x01 = { input[base], input[base + 1u] };
+                    const zllm_ct_bf16x2 x23 = { input[base + 2u], input[base + 3u] };
+                    group_sums[r] = __builtin_amdgcn_fdot2_f32_bf16(
+                        x01, w01, group_sums[r], false);
+                    group_sums[r] = __builtin_amdgcn_fdot2_f32_bf16(
+                        x23, w23, group_sums[r], false);
+                }
+            }
+            const float scale = zllm_scale(scales, scale_base + group, scale_dtype);
+            #pragma unroll
+            for (int r = 0; r < ROWS; ++r) sums[r] += group_sums[r] * scale;
+        }
+        #pragma unroll
+        for (int r = 0; r < ROWS; ++r) {
+            float sum = sums[r];
+            for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) {
+                sum += __shfl_down(sum, offset, 32);
+            }
+            if (lane == 0u) {
+                output[(unsigned long long)r * output_rows + output_row] = sum;
+            }
+        }
+        return;
+    }
     float even[ROWS];
     float odd[ROWS];
     #pragma unroll
@@ -596,8 +730,9 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows3(
     unsigned int bits
 ) {
     if (input_rows != 3u || group_size != 128u || bits != 8u) return;
-    zllm_w8_rows_shared_wave32<3>(
-        input, packed, scales, output, input_columns, output_rows, scale_dtype);
+    zllm_w8_rows_shared_wave32<3, 128u>(
+        input, packed, scales, output, input_columns, output_rows,
+        scale_dtype);
 }
 
 extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows4(
@@ -613,8 +748,9 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows4(
     unsigned int bits
 ) {
     if (input_rows != 4u || group_size != 128u || bits != 8u) return;
-    zllm_w8_rows_shared_wave32<4>(
-        input, packed, scales, output, input_columns, output_rows, scale_dtype);
+    zllm_w8_rows_shared_wave32<4, 128u>(
+        input, packed, scales, output, input_columns, output_rows,
+        scale_dtype);
 }
 
 extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows5(
@@ -630,8 +766,9 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows5(
     unsigned int bits
 ) {
     if (input_rows != 5u || group_size != 128u || bits != 8u) return;
-    zllm_w8_rows_shared_wave32<5>(
-        input, packed, scales, output, input_columns, output_rows, scale_dtype);
+    zllm_w8_rows_shared_wave32<5, 128u>(
+        input, packed, scales, output, input_columns, output_rows,
+        scale_dtype);
 }
 
 extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows6(
@@ -647,8 +784,9 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows6(
     unsigned int bits
 ) {
     if (input_rows != 6u || group_size != 128u || bits != 8u) return;
-    zllm_w8_rows_shared_wave32<6>(
-        input, packed, scales, output, input_columns, output_rows, scale_dtype);
+    zllm_w8_rows_shared_wave32<6, 128u>(
+        input, packed, scales, output, input_columns, output_rows,
+        scale_dtype);
 }
 
 extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows7(
@@ -664,8 +802,9 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows7(
     unsigned int bits
 ) {
     if (input_rows != 7u || group_size != 128u || bits != 8u) return;
-    zllm_w8_rows_shared_wave32<7>(
-        input, packed, scales, output, input_columns, output_rows, scale_dtype);
+    zllm_w8_rows_shared_wave32<7, 128u>(
+        input, packed, scales, output, input_columns, output_rows,
+        scale_dtype);
 }
 
 extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows8(
@@ -681,8 +820,63 @@ extern "C" __global__ void ct_quantized_matmul_bf16_w8_rows8(
     unsigned int bits
 ) {
     if (input_rows != 8u || group_size != 128u || bits != 8u) return;
-    zllm_w8_rows_shared_wave32<8>(
-        input, packed, scales, output, input_columns, output_rows, scale_dtype);
+    zllm_w8_rows_shared_wave32<8, 128u>(
+        input, packed, scales, output, input_columns, output_rows,
+        scale_dtype);
+}
+
+extern "C" __global__ void ct_quantized_matmul_bf16_w8_g32_rows4(
+    const unsigned short* input,
+    const unsigned int* packed,
+    const unsigned char* scales,
+    float* output,
+    unsigned int input_rows,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int group_size,
+    unsigned int scale_dtype,
+    unsigned int bits
+) {
+    if (input_rows != 4u || group_size != 32u || bits != 8u) return;
+    zllm_w8_rows_shared_wave32<4, 32u>(
+        input, packed, scales, output, input_columns, output_rows,
+        scale_dtype);
+}
+
+extern "C" __global__ void ct_quantized_matmul_bf16_w8_g32_rows6(
+    const unsigned short* input,
+    const unsigned int* packed,
+    const unsigned char* scales,
+    float* output,
+    unsigned int input_rows,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int group_size,
+    unsigned int scale_dtype,
+    unsigned int bits
+) {
+    if (input_rows != 6u || group_size != 32u || bits != 8u) return;
+    zllm_w8_rows_shared_wave32<6, 32u>(
+        input, packed, scales, output, input_columns, output_rows,
+        scale_dtype);
+}
+
+extern "C" __global__ void ct_quantized_matmul_bf16_w8_g32_rows8(
+    const unsigned short* input,
+    const unsigned int* packed,
+    const unsigned char* scales,
+    float* output,
+    unsigned int input_rows,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int group_size,
+    unsigned int scale_dtype,
+    unsigned int bits
+) {
+    if (input_rows != 8u || group_size != 32u || bits != 8u) return;
+    zllm_w8_rows_shared_wave32<8, 32u>(
+        input, packed, scales, output, input_columns, output_rows,
+        scale_dtype);
 }
 
 extern "C" __global__ void ct_quantized_matmul_bf16_w8_scalar(

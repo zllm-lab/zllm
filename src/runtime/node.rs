@@ -167,6 +167,27 @@ pub fn load_direct_engine(
                 Err("Mistral Metal console 只支持 macOS".into())
             }
         }
+        (NodeModelConfig::K2Horizon(model), NodeBackendConfig::Metal(metal)) => {
+            #[cfg(target_os = "macos")]
+            {
+                crate::runtime::k2_horizon::node::K2Engine::load(
+                    &model.weights_directory,
+                    model.max_sequence_length,
+                    model.execution.kv_cache_format == crate::config::KvCacheFormat::F16,
+                    metal.replay,
+                    model.execution.expert_cache_gib,
+                    model.lm_head_quantization,
+                    runtime,
+                    compute_steps,
+                )
+                .map(|engine| Box::new(engine) as Box<dyn crate::server::node::NodeEngine>)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (model, metal, runtime, compute_steps);
+                Err("K2-Horizon Metal console 只支持 macOS".into())
+            }
+        }
         (NodeModelConfig::MiniCpm5(model), NodeBackendConfig::Metal(metal)) => {
             #[cfg(target_os = "macos")]
             {
@@ -209,6 +230,17 @@ pub fn load_direct_engine(
                 Err("Ornith CUDA console 需要 --features with-cuda".into())
             }
         }
+        (NodeModelConfig::Qwen4Exp(model), NodeBackendConfig::Cuda(cuda)) => {
+            #[cfg(feature = "with-cuda")]
+            {
+                crate::runtime::qwen4exp::cuda_node::Qwen4ExpCudaEngine::load(model, &cuda, runtime, compute_steps).map(|engine| Box::new(engine) as Box<dyn crate::server::node::NodeEngine>)
+            }
+            #[cfg(not(feature = "with-cuda"))]
+            {
+                let _ = (model, cuda, runtime, compute_steps);
+                Err("Qwen4-Exp CUDA console 需要 --features with-cuda".into())
+            }
+        }
         (NodeModelConfig::Laguna(model), NodeBackendConfig::Cuda(cuda)) => {
             #[cfg(feature = "with-cuda")]
             {
@@ -229,6 +261,28 @@ pub fn load_direct_engine(
             {
                 let _ = (model, cuda, runtime, compute_steps);
                 Err("Mistral CUDA console 需要 --features with-cuda".into())
+            }
+        }
+        (NodeModelConfig::Ornith(model), NodeBackendConfig::Rocm(rocm)) => {
+            #[cfg(all(target_os = "linux", feature = "with-rocm"))]
+            {
+                crate::runtime::ornith::rocm_node::OrnithRocmEngine::load(
+                    &model.weights_directory,
+                    rocm.devices.clone(),
+                    rocm.allow_cpu_reference_fallback,
+                    model.max_sequence_length,
+                    model.layer_ends.clone(),
+                    crate::runtime::ornith::options::OrnithOptions::from(model.execution),
+                    model.lm_head_quantization,
+                    runtime,
+                    compute_steps,
+                )
+                .map(|engine| Box::new(engine) as Box<dyn crate::server::node::NodeEngine>)
+            }
+            #[cfg(not(all(target_os = "linux", feature = "with-rocm")))]
+            {
+                let _ = (model, rocm, runtime, compute_steps);
+                Err("Ornith ROCm console 需要 Linux + --features with-rocm".into())
             }
         }
         (model, backend) => Err(format!("console 尚未接入 model={model:?} backend={backend:?}").into()),
@@ -255,6 +309,20 @@ async fn run_parts(model: NodeModelConfig, backend: NodeBackendConfig, node_conf
                 }
             }
             _ => unreachable!("配置校验已保证 Laguna 只使用 CUDA"),
+        },
+        NodeModelConfig::Qwen4Exp(model) => match backend {
+            NodeBackendConfig::Cuda(cuda) => {
+                #[cfg(feature = "with-cuda")]
+                {
+                    crate::runtime::qwen4exp::cuda_node::run(model, cuda, node_config).await
+                }
+                #[cfg(not(feature = "with-cuda"))]
+                {
+                    let _ = (model, cuda, node_config);
+                    Err("Qwen4-Exp CUDA Node 需要 --features with-cuda".into())
+                }
+            }
+            _ => unreachable!("配置校验已保证 Qwen4-Exp 只使用 CUDA"),
         },
         NodeModelConfig::Ornith(model) => match backend {
             NodeBackendConfig::Metal(metal) => crate::runtime::ornith::node::run(model, metal, node_config).await,
@@ -395,6 +463,10 @@ async fn run_parts(model: NodeModelConfig, backend: NodeBackendConfig, node_conf
                 }
             }
             _ => unreachable!("配置校验已保证 Mistral 使用 Metal/CUDA"),
+        },
+        NodeModelConfig::K2Horizon(model) => match backend {
+            NodeBackendConfig::Metal(metal) => crate::runtime::k2_horizon::node::run(model, metal, node_config).await,
+            _ => unreachable!("配置校验已保证 K2-Horizon 使用 Metal"),
         },
         NodeModelConfig::MiniCpm5(model) => match backend {
             NodeBackendConfig::Metal(metal) => crate::runtime::minicpm5::node::run(model, metal, node_config).await,

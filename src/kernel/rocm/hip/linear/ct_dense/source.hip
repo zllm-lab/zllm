@@ -301,6 +301,95 @@ extern "C" __global__ void ct_quantized_dual_gemv_bf16_w8_g32(
     if (lane == 0u) output[output_row] = sum;
 }
 
+// 两行一组共享各自 projection 的权重读取，grid.z 再把两个无依赖投影放进
+// 同一次 dispatch；既保留逐位一致的行内累加，也避免 host 顺序发射两次。
+extern "C" __global__ void ct_quantized_dual_gemv_bf16_w8_rows2(
+    const unsigned short* input,
+    const unsigned int* first_packed,
+    const unsigned char* first_scales,
+    float* first_output,
+    unsigned int first_output_rows,
+    unsigned int first_scale_dtype,
+    const unsigned int* second_packed,
+    const unsigned char* second_scales,
+    float* second_output,
+    unsigned int second_output_rows,
+    unsigned int second_scale_dtype,
+    unsigned int input_rows,
+    unsigned int input_columns,
+    unsigned int group_size
+) {
+    if (input_rows < 2u || input_rows > 8u || (input_rows & 1u) != 0u
+        || (group_size != 32u && group_size != 128u)) return;
+    const bool second = blockIdx.z != 0u;
+    zllm_ct_w8_row_pairs(
+        input,
+        second ? second_packed : first_packed,
+        second ? second_scales : first_scales,
+        second ? second_output : first_output,
+        input_rows,
+        input_columns,
+        second ? second_output_rows : first_output_rows,
+        group_size,
+        second ? second_scale_dtype : first_scale_dtype);
+}
+
+template <int ROWS>
+__device__ __forceinline__ void zllm_ct_w8_dual_g32_rows(
+    const unsigned short* input,
+    const unsigned int* first_packed,
+    const unsigned char* first_scales,
+    float* first_output,
+    unsigned int first_output_rows,
+    unsigned int first_scale_dtype,
+    const unsigned int* second_packed,
+    const unsigned char* second_scales,
+    float* second_output,
+    unsigned int second_output_rows,
+    unsigned int second_scale_dtype,
+    unsigned int input_columns
+) {
+    const bool second = blockIdx.z != 0u;
+    zllm_w8_rows_shared_wave32<ROWS, 32u>(
+        input,
+        second ? second_packed : first_packed,
+        second ? second_scales : first_scales,
+        second ? second_output : first_output,
+        input_columns,
+        second ? second_output_rows : first_output_rows,
+        second ? second_scale_dtype : first_scale_dtype);
+}
+
+#define ZLLM_CT_W8_DUAL_G32_ROWS_KERNEL(ROWS) \
+extern "C" __global__ void ct_quantized_dual_gemv_bf16_w8_g32_rows##ROWS( \
+    const unsigned short* input, \
+    const unsigned int* first_packed, \
+    const unsigned char* first_scales, \
+    float* first_output, \
+    unsigned int first_output_rows, \
+    unsigned int first_scale_dtype, \
+    const unsigned int* second_packed, \
+    const unsigned char* second_scales, \
+    float* second_output, \
+    unsigned int second_output_rows, \
+    unsigned int second_scale_dtype, \
+    unsigned int input_rows, \
+    unsigned int input_columns, \
+    unsigned int group_size \
+) { \
+    if (input_rows != ROWS || group_size != 32u) return; \
+    zllm_ct_w8_dual_g32_rows<ROWS>( \
+        input, first_packed, first_scales, first_output, \
+        first_output_rows, first_scale_dtype, second_packed, second_scales, \
+        second_output, second_output_rows, second_scale_dtype, input_columns); \
+}
+
+ZLLM_CT_W8_DUAL_G32_ROWS_KERNEL(4)
+ZLLM_CT_W8_DUAL_G32_ROWS_KERNEL(6)
+ZLLM_CT_W8_DUAL_G32_ROWS_KERNEL(8)
+
+#undef ZLLM_CT_W8_DUAL_G32_ROWS_KERNEL
+
 // ===== W8G32 perm 直读臂（v_perm_b32 + v_dot2_f32_f16，消灭发散常量查表）=====
 // 原 w8_g32 每 group 32 次 zllm_ct_i8_bf16[] 发散 __constant__ 查表是 LSU
 // 吞吐瓶颈（dual q_a+kv_a 16MB 只跑 468GB/s，同族 q_b 614GB/s）。此臂：

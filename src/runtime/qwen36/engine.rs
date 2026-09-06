@@ -128,6 +128,9 @@ impl Qwen36Engine {
     pub(crate) fn terminal_cache_infos(&self) -> Vec<CacheInfo> {
         self.terminal_states.infos()
     }
+    pub(crate) fn terminal_cache_pins(&self) -> std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> {
+        self.terminal_states.pin_handle()
+    }
     pub(crate) fn kv_residency(&self) -> KvResidency {
         self.residency.report(&self.terminal_states)
     }

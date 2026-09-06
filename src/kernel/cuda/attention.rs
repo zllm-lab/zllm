@@ -780,31 +780,33 @@ extern "C" __global__ void full_attention_batched_f16(const __half * __restrict_
         output[q_base + dimension] = __float2half(accumulator / global_denominator);
     }
 }
-extern "C" __global__ void gated_delta_conv_f16(const __half *qkv, const float *weight, float *state, __half *output, unsigned int rows, unsigned int channels, unsigned int kernel_size) {
+extern "C" __global__ void gated_delta_conv_f16(const __half *qkv, const float *weight, float *state, __half *output, unsigned int rows, unsigned int channels, unsigned int kernel_size, float *checkpoints) {
     unsigned int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= channels) return;
     unsigned long long base = (unsigned long long)channel * kernel_size;
     for (unsigned int row = 0; row < rows; ++row) {
         for (unsigned int item = 1; item < kernel_size; ++item) state[base + item - 1] = state[base + item];
         state[base + kernel_size - 1] = __half2float(qkv[(unsigned long long)row * channels + channel]);
+        if (checkpoints) for (unsigned int item = 0; item < kernel_size; ++item) checkpoints[((unsigned long long)row * channels + channel) * kernel_size + item] = state[base + item];
         float sum = 0.0f;
         for (unsigned int item = 0; item < kernel_size; ++item) sum += state[base + item] * weight[base + item];
         output[(unsigned long long)row * channels + channel] = __float2half(sum / (1.0f + expf(-sum)));
     }
 }
-extern "C" __global__ void gated_delta_conv_weight_f16(const __half *qkv, const __half *weight, float *state, __half *output, unsigned int rows, unsigned int channels, unsigned int kernel_size) {
+extern "C" __global__ void gated_delta_conv_weight_f16(const __half *qkv, const __half *weight, float *state, __half *output, unsigned int rows, unsigned int channels, unsigned int kernel_size, float *checkpoints) {
     unsigned int channel = blockIdx.x * blockDim.x + threadIdx.x;
     if (channel >= channels) return;
     unsigned long long base = (unsigned long long)channel * kernel_size;
     for (unsigned int row = 0; row < rows; ++row) {
         for (unsigned int item = 1; item < kernel_size; ++item) state[base + item - 1] = state[base + item];
         state[base + kernel_size - 1] = __half2float(qkv[(unsigned long long)row * channels + channel]);
+        if (checkpoints) for (unsigned int item = 0; item < kernel_size; ++item) checkpoints[((unsigned long long)row * channels + channel) * kernel_size + item] = state[base + item];
         float sum = 0.0f;
         for (unsigned int item = 0; item < kernel_size; ++item) sum += state[base + item] * __half2float(weight[base + item]);
         output[(unsigned long long)row * channels + channel] = __float2half(sum / (1.0f + expf(-sum)));
     }
 }
-extern "C" __global__ void gated_delta_recurrent_f16(const __half *mixed, const __half *alpha, const __half *beta, const float *a_log, const float *dt_bias, float *state, __half *output, unsigned int rows, unsigned int key_heads, unsigned int value_heads, unsigned int key_head_dim, unsigned int value_head_dim, unsigned int grouped_heads) {
+extern "C" __global__ void gated_delta_recurrent_f16(const __half *mixed, const __half *alpha, const __half *beta, const float *a_log, const float *dt_bias, float *state, __half *output, unsigned int rows, unsigned int key_heads, unsigned int value_heads, unsigned int key_head_dim, unsigned int value_head_dim, unsigned int grouped_heads, float *checkpoints) {
     unsigned int value_head = blockIdx.x;
     unsigned int value_column = threadIdx.x;
     if (value_head >= value_heads || value_column >= value_head_dim) return;
@@ -844,12 +846,77 @@ extern "C" __global__ void gated_delta_recurrent_f16(const __half *mixed, const 
             float key_value = __half2float(mixed[key_base + k]) * key_scale;
             float updated = state[state_index] + key_value * delta;
             state[state_index] = updated;
+            if (checkpoints) checkpoints[(unsigned long long)row * value_heads * key_head_dim * value_head_dim + state_index] = updated;
             result += updated * __half2float(mixed[query_base + k]) * query_scale;
         }
         output[(unsigned long long)row * value_dim + (unsigned long long)value_head * value_head_dim + value_column] = __float2half(result);
     }
 }
-extern "C" __global__ void gated_delta_norm_gate_f16(const __half *input, const __half *gate, const float *weight, __half *output, unsigned int value_heads, unsigned int value_head_dim, float eps) {
+// 一个 block 负责一个 head 的 32 个 value 列,8 个 warp 分摊 key 维。
+// 状态读取保持连续,避免原路径每个线程串行扫描全部 key 且每层仅少数 block。
+extern "C" __global__ void gated_delta_recurrent_tiled_f16(const __half *mixed, const __half *alpha, const __half *beta, const float *a_log, const float *dt_bias, float *state, __half *output, unsigned int rows, unsigned int key_heads, unsigned int value_heads, unsigned int key_head_dim, unsigned int value_head_dim, unsigned int grouped_heads, float *checkpoints) {
+    const unsigned int head = blockIdx.x;
+    const unsigned int lane = threadIdx.x & 31u, warp = threadIdx.x >> 5;
+    const unsigned int column = blockIdx.y * 32u + lane;
+    const unsigned int key_head = grouped_heads ? head / (value_heads / key_heads) : head % key_heads;
+    const unsigned int key_dim = key_heads * key_head_dim, value_dim = value_heads * value_head_dim;
+    const unsigned long long state_head = (unsigned long long)head * key_head_dim * value_head_dim;
+    __shared__ float scales[4];
+    __shared__ float partial[8][32];
+    __shared__ float deltas[32];
+    for (unsigned int row = 0; row < rows; ++row) {
+        const unsigned long long base = (unsigned long long)row * (2u * key_dim + value_dim);
+        const unsigned long long qbase = base + key_head * key_head_dim, kbase = qbase + key_dim;
+        if (threadIdx.x == 0) {
+            float qsum = 0.0f, ksum = 0.0f;
+            for (unsigned int k = 0; k < key_head_dim; ++k) {
+                const float q = __half2float(mixed[qbase + k]), key = __half2float(mixed[kbase + k]);
+                qsum += q * q; ksum += key * key;
+            }
+            scales[0] = rsqrtf(fmaxf(qsum, 1.0e-12f)) * rsqrtf((float)key_head_dim);
+            scales[1] = rsqrtf(fmaxf(ksum, 1.0e-12f));
+            const float step = __half2float(alpha[(unsigned long long)row * value_heads + head]) + dt_bias[head];
+            const float softplus = step > 20.0f ? step : (step < -20.0f ? expf(step) : log1pf(expf(step)));
+            scales[2] = expf(-expf(a_log[head]) * softplus);
+            scales[3] = 1.0f / (1.0f + expf(-__half2float(beta[(unsigned long long)row * value_heads + head])));
+        }
+        __syncthreads();
+        float memory = 0.0f;
+        if (column < value_head_dim) {
+            for (unsigned int k = warp; k < key_head_dim; k += 8u) {
+                const unsigned long long i = state_head + (unsigned long long)k * value_head_dim + column;
+                memory += (state[i] * scales[2]) * __half2float(mixed[kbase + k]) * scales[1];
+            }
+        }
+        partial[warp][lane] = memory;
+        __syncthreads();
+        if (warp == 0) {
+            float sum = 0.0f;
+            for (unsigned int w = 0; w < 8; ++w) sum += partial[w][lane];
+            deltas[lane] = column < value_head_dim ? (__half2float(mixed[base + 2u * key_dim + head * value_head_dim + column]) - sum) * scales[3] : 0.0f;
+        }
+        __syncthreads();
+        float result = 0.0f;
+        if (column < value_head_dim) {
+            for (unsigned int k = warp; k < key_head_dim; k += 8u) {
+                const unsigned long long i = state_head + (unsigned long long)k * value_head_dim + column;
+                const float updated = state[i] * scales[2] + (__half2float(mixed[kbase + k]) * scales[1]) * deltas[lane];
+                state[i] = updated;
+                if (checkpoints) checkpoints[(unsigned long long)row * value_heads * key_head_dim * value_head_dim + i] = updated;
+                result += updated * __half2float(mixed[qbase + k]) * scales[0];
+            }
+        }
+        partial[warp][lane] = result;
+        __syncthreads();
+        if (warp == 0 && column < value_head_dim) {
+            float sum = 0.0f;
+            for (unsigned int w = 0; w < 8; ++w) sum += partial[w][lane];
+            output[(unsigned long long)row * value_dim + head * value_head_dim + column] = __float2half(sum);
+        }
+        __syncthreads();
+    }
+}
+extern "C" __global__ void gated_delta_norm_gate_f16(const __half *input, const __half *gate, const float *weight, __half *output, unsigned int value_heads, unsigned int value_head_dim, float eps, unsigned int sigmoid_only) {
     extern __shared__ float sums[];
     unsigned int group = blockIdx.x, lane = threadIdx.x;
     unsigned long long begin = (unsigned long long)group * value_head_dim;
@@ -859,7 +926,7 @@ extern "C" __global__ void gated_delta_norm_gate_f16(const __half *input, const 
     for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) { if (lane < stride) sums[lane] += sums[lane + stride]; __syncthreads(); }
     if (lane < value_head_dim) {
         float g = __half2float(gate[begin + lane]);
-        output[begin + lane] = __float2half(value * rsqrtf(sums[0] / value_head_dim + eps) * weight[lane] * g / (1.0f + expf(-g)));
+        output[begin + lane] = __float2half(value * rsqrtf(sums[0] / value_head_dim + eps) * weight[lane] * (sigmoid_only ? 1.0f : g) / (1.0f + expf(-g)));
     }
 }
 "#;
@@ -1294,7 +1361,11 @@ pub fn gated_delta_net_f16(
     recurrent_state: &cudarc::driver::safe::CudaSlice<f32>,
     head_layout: crate::attention::gated_delta_net::GatedDeltaNetHeadLayout,
     spec: &crate::attention::gated_delta_net::GatedDeltaNetSpec,
+    checkpoints: Option<(&cudarc::driver::safe::CudaSlice<f32>, &cudarc::driver::safe::CudaSlice<f32>)>,
 ) -> Result<CudaTensor, String> {
+    use cudarc::driver::safe::DevicePtr;
+    let conv_checkpoint = checkpoints.map_or(0u64, |(conv, _)| conv.device_ptr(ctx.stream()).0);
+    let recurrent_checkpoint = checkpoints.map_or(0u64, |(_, recurrent)| recurrent.device_ptr(ctx.stream()).0);
     let crate::attention::gated_delta_net::GatedDeltaNetInputs { qkv, z, alpha, beta } = inputs;
     let crate::attention::gated_delta_net::GatedDeltaNetWeightsRef { conv: conv_weight, a_log, dt_bias, norm: norm_weight } = weights;
     if qkv.cols != spec.conv_dim() || z.cols != spec.value_dim() || alpha.cols != spec.value_heads || beta.cols != spec.value_heads {
@@ -1321,6 +1392,7 @@ pub fn gated_delta_net_f16(
                 .arg(&(qkv.rows as u32))
                 .arg(&(spec.conv_dim() as u32))
                 .arg(&(spec.conv_kernel as u32))
+                .arg(&conv_checkpoint)
                 .launch(grid_1d(spec.conv_dim()))
                 .map_err(|error| format!("launch gated_delta_conv_f16: {error:?}"))?;
         }
@@ -1337,12 +1409,14 @@ pub fn gated_delta_net_f16(
                 .arg(&(qkv.rows as u32))
                 .arg(&(spec.conv_dim() as u32))
                 .arg(&(spec.conv_kernel as u32))
+                .arg(&conv_checkpoint)
                 .launch(grid_1d(spec.conv_dim()))
                 .map_err(|error| format!("launch gated_delta_conv_weight_f16: {error:?}"))?;
         }
     }
-    let recurrent = ctx.function("gated_delta_recurrent_f16")?;
-    let recurrent_cfg = LaunchConfig { grid_dim: (spec.value_heads as u32, 1, 1), block_dim: (spec.value_head_dim as u32, 1, 1), shared_mem_bytes: 0 };
+    let tiled = spec.key_head_dim >= 32 && spec.value_head_dim >= 32;
+    let recurrent = ctx.function(if tiled { "gated_delta_recurrent_tiled_f16" } else { "gated_delta_recurrent_f16" })?;
+    let recurrent_cfg = LaunchConfig { grid_dim: (spec.value_heads as u32, if tiled { spec.value_head_dim.div_ceil(32) as u32 } else { 1 }, 1), block_dim: (if tiled { 256 } else { spec.value_head_dim as u32 }, 1, 1), shared_mem_bytes: 0 };
     unsafe {
         ctx.stream()
             .launch_builder(&recurrent)
@@ -1359,6 +1433,7 @@ pub fn gated_delta_net_f16(
             .arg(&(spec.key_head_dim as u32))
             .arg(&(spec.value_head_dim as u32))
             .arg(&u32::from(matches!(head_layout, crate::attention::gated_delta_net::GatedDeltaNetHeadLayout::Grouped)))
+            .arg(&recurrent_checkpoint)
             .launch(recurrent_cfg)
             .map_err(|error| format!("launch gated_delta_recurrent_f16: {error:?}"))?;
     }
@@ -1374,6 +1449,7 @@ pub fn gated_delta_net_f16(
             .arg(&(spec.value_heads as u32))
             .arg(&(spec.value_head_dim as u32))
             .arg(&spec.rms_eps)
+            .arg(&u32::from(matches!(spec.output_gate, crate::attention::gated_delta_net::GdnOutputGate::Sigmoid)))
             .launch(norm_cfg)
             .map_err(|error| format!("launch gated_delta_norm_gate_f16: {error:?}"))?;
     }
@@ -1400,6 +1476,58 @@ mod tests {
             let err = (a - e).abs();
             let tol = atol + rtol * e.abs();
             assert!(err <= tol, "{name}[{i}] 偏差 {err:.4} 超阈值 {tol:.4}(actual={a:.4} expect={e:.4})");
+        }
+    }
+
+    #[test]
+    fn tiled_delta_recurrence_matches_serial_state() {
+        let ctx = ctx();
+        for (key_dim, value_dim) in [(32usize, 33usize), (64, 96), (128, 128)] {
+            for grouped in [0u32, 1u32] {
+                let (rows, key_heads, value_heads) = (5usize, 2usize, 4usize);
+                let values = |count: usize, modulus: usize| (0..count).map(|i| ((i * 17 % modulus) as f32 - modulus as f32 / 2.0) / modulus as f32).collect::<Vec<_>>();
+                let mixed = htod(&ctx, &values(rows * (2 * key_heads * key_dim + value_heads * value_dim), 53));
+                let alpha = htod(&ctx, &values(rows * value_heads, 31));
+                let beta = htod(&ctx, &values(rows * value_heads, 43));
+                let alog = ctx.stream().clone_htod(&vec![-0.7f32; value_heads]).unwrap();
+                let dt = ctx.stream().clone_htod(&vec![0.1f32; value_heads]).unwrap();
+                let initial = values(value_heads * key_dim * value_dim, 71);
+                let run = |tiled: bool| {
+                    let state = ctx.stream().clone_htod(&initial).unwrap();
+                    let output = ctx.tensor_uninit(rows, value_heads * value_dim).unwrap();
+                    let function = ctx.function(if tiled { "gated_delta_recurrent_tiled_f16" } else { "gated_delta_recurrent_f16" }).unwrap();
+                    let launch = LaunchConfig { grid_dim: (value_heads as u32, if tiled { value_dim.div_ceil(32) as u32 } else { 1 }, 1), block_dim: (if tiled { 256 } else { value_dim as u32 }, 1, 1), shared_mem_bytes: 0 };
+                    unsafe {
+                        ctx.stream()
+                            .launch_builder(&function)
+                            .arg(&mixed)
+                            .arg(&alpha)
+                            .arg(&beta)
+                            .arg(&alog)
+                            .arg(&dt)
+                            .arg(&state)
+                            .arg(&output.slice)
+                            .arg(&(rows as u32))
+                            .arg(&(key_heads as u32))
+                            .arg(&(value_heads as u32))
+                            .arg(&(key_dim as u32))
+                            .arg(&(value_dim as u32))
+                            .arg(&grouped)
+                            .arg(&0u64)
+                            .launch(launch)
+                            .unwrap();
+                    }
+                    (ctx.tensor_to_f32(&output).unwrap(), ctx.stream().clone_dtoh(&state).unwrap())
+                };
+                let (expected, expected_state) = run(false);
+                let (actual, actual_state) = run(true);
+                for (a, e) in actual.iter().zip(&expected) {
+                    assert!((a - e).abs() <= 2e-3 + 5e-3 * e.abs(), "GDN output key={key_dim} value={value_dim} grouped={grouped}: {a} != {e}");
+                }
+                for (a, e) in actual_state.iter().zip(&expected_state) {
+                    assert!((a - e).abs() <= 3e-6 + 2e-5 * e.abs(), "GDN state key={key_dim} value={value_dim} grouped={grouped}: {a} != {e}");
+                }
+            }
         }
     }
 

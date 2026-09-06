@@ -380,7 +380,9 @@ impl MetalKvCache {
             value_scale_offset: int8.then(|| self.state.layout().layer_gqa_value_scale_offset(layer)).transpose()?.map(|offset| offset as u64),
             rows: self.layer_len(layer),
             start: 0,
-            capacity: 0,
+            // F16 position-replay 仍使用普通连续 cache；把真实容量交给
+            // position kernel 后，position<capacity 时 ring 寻址与连续布局一致。
+            capacity: if int8 { 0 } else { self.capacity() },
             format: self.format(),
             group_size: self.group_size(),
         })

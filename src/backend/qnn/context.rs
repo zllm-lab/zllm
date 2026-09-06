@@ -113,21 +113,19 @@ impl BackendResources for QnnContext {
         // lm_head(vocab 64256)同样进 HTP:CPU gemv 实测 ~450ms/token,是 decode
         // 最大单项。embedding 不经过 prepare_weight。
         //
-        // 精度:全 W8。朴素 per-channel W4 已双重出局(质量回退 + INT4 在 HTP
-        // 按 unpacked 存储不省运行时内存,预算仍 ~800MB);全 W8 959MB 超预算的
-        // 尾部层由 6031 降级兜底,待 BLOCK 编码验证后重排。
-        let quantized = if rows > 1 {
-            let decoded = match weight {
-                LinearWeight::F32(values) => values.to_vec(),
-                LinearWeight::F16(values) => values.iter().map(|value| value.to_f32()).collect(),
-                LinearWeight::Bf16Bytes(values) => values.chunks_exact(2).map(|bytes| half::bf16::from_le_bytes([bytes[0], bytes[1]]).to_f32()).collect(),
-                LinearWeight::Quantized(matrix) => matrix.decode().map_err(|msg| BackendError::Compute { msg })?,
-            };
-            Some(quantize_linear_weight(&decoded, rows, cols, 8).map_err(|msg| BackendError::Compute { msg })?)
-        } else {
-            None
+        // 精度:层内矩阵全 W8(959MB 超出 ~800MB HTP 预算的尾部层由 6031 降级 CPU 兜底)。
+        // packed-W4 已全部证伪:SFIXED_POINT_4/BLOCK 编码被拒;weightsPacking setConfig
+        // 接受且数值无损但运行时内存不减;W4 per-channel 质量为重复循环级。
+        let decoded = match weight {
+            LinearWeight::F32(values) => Some(values.to_vec()),
+            LinearWeight::F16(values) => Some(values.iter().map(|value| value.to_f32()).collect()),
+            LinearWeight::Bf16Bytes(values) => Some(values.chunks_exact(2).map(|bytes| half::bf16::from_le_bytes([bytes[0], bytes[1]]).to_f32()).collect()),
+            LinearWeight::Quantized(matrix) => Some(matrix.decode().map_err(|msg| BackendError::Compute { msg })?),
         };
-        let cpu = self.cpu.prepare_weight(weight, rows, cols)?;
+        let quantized = if rows > 1 { Some(quantize_linear_weight(decoded.as_deref().expect("decoded 已生成"), rows, cols, 8).map_err(|msg| BackendError::Compute { msg })?) } else { None };
+        // lm_head(vocab 级)F32 常驻 CPU:BF16 GGUF gemv 实测 ~450ms/token,而 F32 gemv
+        // 路径快约 20×;不消耗 HTP 预算(host ~394MB RAM 换 decode 尾部大头)。
+        let cpu = if rows > 8192 { self.cpu.prepare_f32(decoded.as_deref().expect("decoded 已生成"), rows, cols)? } else { self.cpu.prepare_weight(weight, rows, cols)? };
         Ok(QnnWeight { cpu, q: quantized, decode: Mutex::new(None), dual_decode: Mutex::new(None), triple_decode: Mutex::new(None), mlp: Mutex::new(None) })
     }
 

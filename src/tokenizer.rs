@@ -623,8 +623,10 @@ impl Tokenizer {
     /// 预切分规则，未知 preset 保持 llama.cpp 兼容的 Legacy 行为。
     pub fn from_gguf_bpe_tokens(tokens: &[String], merges: &[String], special: &[bool], preset: Option<&str>) -> Result<Self, Box<dyn Error>> {
         let mut tokenizer = Self::from_bpe_tokens(tokens, merges, special)?;
-        if preset == Some("joyai-llm") {
-            tokenizer.pretokenizer = Pretokenizer::JoyAi;
+        match preset {
+            Some("glm4" | "chatglm-bpe") => tokenizer.pretokenizer = Pretokenizer::Cl100k,
+            Some("joyai-llm") => tokenizer.pretokenizer = Pretokenizer::JoyAi,
+            _ => {}
         }
         Ok(tokenizer)
     }
@@ -1634,6 +1636,21 @@ mod tests {
     fn cl100k_does_not_merge_space_with_number() {
         let tokenizer = Tokenizer::from_slice(&cl100k_tokenizer_json()).unwrap();
         assert_eq!(tokenizer.tokenize(b" 1"), vec![b' ' as u32, b'1' as u32]);
+    }
+
+    #[test]
+    fn gguf_glm4_presets_use_cl100k_pretokenizer() {
+        let mut tokens = (0..=255u8).map(|byte| encode_byte(byte).to_string()).collect::<Vec<_>>();
+        tokens.push(format!("{}1", encode_byte(b' ')));
+        let merges = [format!("{} 1", encode_byte(b' '))];
+        let special = vec![false; tokens.len()];
+
+        for preset in ["glm4", "chatglm-bpe"] {
+            let tokenizer = Tokenizer::from_gguf_bpe_tokens(&tokens, &merges, &special, Some(preset)).unwrap();
+            assert_eq!(tokenizer.tokenize(b" 1"), vec![b' ' as u32, b'1' as u32]);
+        }
+        let legacy = Tokenizer::from_gguf_bpe_tokens(&tokens, &merges, &special, None).unwrap();
+        assert_eq!(legacy.tokenize(b" 1"), vec![256]);
     }
 
     #[test]

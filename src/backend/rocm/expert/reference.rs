@@ -21,13 +21,13 @@ fn matmul(ctx: &RocmContext, input: &RocmTensor, weight: &[f32], output_columns:
     if output_elements != 0 {
         ops::hip::try_sgemm_f32(ctx.device_id, &input_data, weight, input.rows, input.cols, output_columns, &mut output).map_err(compute_error)?;
     }
-    Ok(RocmTensor { data: output, rows: input.rows, cols: output_columns, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None })
+    Ok(RocmTensor { data: output, rows: input.rows, cols: output_columns, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None, replica: None })
 }
 
 fn activate(gate: &RocmTensor, up: &RocmTensor, activation: &Activation) -> Result<RocmTensor, BackendError> {
     let mut output = vec![0.0; gate.data.len()];
     crate::kernel::rocm::hip::try_gated_activation_f32(&gate.data, &up.data, gate.rows, gate.cols, activation, &mut output).map_err(compute_error)?;
-    Ok(RocmTensor { data: output, rows: gate.rows, cols: gate.cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None })
+    Ok(RocmTensor { data: output, rows: gate.rows, cols: gate.cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None, replica: None })
 }
 
 pub(super) fn f32_expert(ctx: &RocmContext, input: &RocmTensor, gate_weight: &[f32], up_weight: &[f32], down_weight: &[f32], intermediate: usize, activation: &Activation) -> Result<RocmTensor, BackendError> {

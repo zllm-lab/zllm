@@ -1,4 +1,5 @@
 #include <QnnInterface.h>
+#include <HTP/QnnHtpGraph.h>
 #include <QnnOpDef.h>
 #include <QnnTypes.h>
 #include <dlfcn.h>
@@ -64,6 +65,10 @@ struct Linear {
     std::vector<int8_t> weights;
     std::vector<float> scales;
     std::vector<Qnn_ScaleOffset_t> scale_offsets;
+    std::vector<uint8_t> weights4;
+    std::array<uint32_t, 2> block_size = {1, 1};
+    std::vector<Qnn_ScaleOffset_t> block_scales;
+    bool four_bit = false;
     std::vector<int8_t> weights2;
     std::vector<float> scales2;
     std::vector<Qnn_ScaleOffset_t> scale_offsets2;
@@ -111,6 +116,20 @@ bool ok(Qnn_ErrorHandle_t status, Error* error, const char* stage) {
     if (status == QNN_SUCCESS) return true;
     fail(error, stage, status);
     return false;
+}
+
+// HTP weights packing(4-bit 范围的 8-bit 权重 finalize 时自动打包,内存减半;
+// experimental beta)。ZLLM_QNN_PACK=1 开启,仅对 4-bit 权重图有意义。
+static bool apply_weights_packing(const QNN_INTERFACE_VER_TYPE& api, Qnn_GraphHandle_t graph, uint32_t weight_bits, Error* error) {
+    if (weight_bits != 4 || getenv("ZLLM_QNN_PACK") == nullptr) return true;
+    QnnHtpGraph_CustomConfig_t htp_config = QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT;
+    htp_config.option = QNN_HTP_GRAPH_CONFIG_OPTION_WEIGHTS_PACKING;
+    htp_config.weightsPacking = true;
+    QnnGraph_Config_t graph_config = QNN_GRAPH_CONFIG_INIT;
+    graph_config.option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+    graph_config.customConfig = &htp_config;
+    const QnnGraph_Config_t* graph_configs[] = {&graph_config, nullptr};
+    return ok(api.graphSetConfig(graph, graph_configs), error, "QnnGraph_setConfig(weightsPacking)");
 }
 
 bool add_matmul(Linear* linear, const char* op_name, const Qnn_Tensor_t& input,
@@ -184,6 +203,7 @@ static void* create_linear(const char* backend_path, uint32_t rows, uint32_t inn
     linear->weight3_name = "weight3_" + suffix; linear->output3_name = "output3_" + suffix;
     linear->op3_name = "linear3_" + suffix;
     if (!ok(linear->api.graphCreate(linear->context, linear->graph_name.c_str(), nullptr, &linear->graph), error, "QnnGraph_create")) { delete linear; return nullptr; }
+    if (!apply_weights_packing(linear->api, linear->graph, weight_bits, error)) { delete linear; return nullptr; }
 
     linear->input_dims = {rows, inner};
     linear->weight_dims = {inner, columns};
@@ -318,6 +338,7 @@ extern "C" void* zllm_qnn_triple_linear_create(const char* backend_path, uint32_
 }
 
 
+
 // 共享 backend/device/context 初始化;成功后 shared_users 已计入本实例。
 static bool shared_init(const char* backend_path, Error* error) {
     std::lock_guard<std::recursive_mutex> lock(shared_mutex);
@@ -438,6 +459,131 @@ static void* create_elementwise(const char* backend_path, const char* op_type,
         char stage[160];
         std::snprintf(stage, sizeof(stage), "QnnGraph_finalize probe op=%s", op_type);
         fail(error, stage, finalize_status);
+        delete linear;
+        return nullptr;
+    }
+    return linear;
+}
+
+
+// ── packed INT4 探针:SFIXED_POINT_4 dtype(tightly packed)+ AXIS_SCALE_OFFSET per-channel ──
+extern "C" void* zllm_qnn_probe_int4_create(const char* backend_path, uint32_t rows, uint32_t inner, uint32_t columns,
+                                            const uint8_t* packed_weights, const float* scales,
+                                            float input_scale, float output_scale, uint32_t encoding, Error* error) {
+    auto* linear = new (std::nothrow) Linear();
+    if (linear == nullptr) { fail(error, "分配探针"); return nullptr; }
+    const auto graph_id = next_graph_id.fetch_add(1);
+    if (!shared_init(backend_path, error)) { delete linear; return nullptr; }
+    linear->api = shared_api;
+    Qnn_ContextHandle_t context = shared_contexts[(graph_id / 2) % shared_contexts.size()];
+    linear->input_dims = {rows, inner};
+    linear->weight_dims = {inner, columns};
+    linear->output_dims = {rows, columns};
+    linear->graph_name = "zllm_probe_int4_" + std::to_string(graph_id);
+    const QnnGraph_Config_t* graph_configs[2] = {nullptr, nullptr};
+    QnnGraph_Config_t packing_config;
+    QnnHtpGraph_CustomConfig_t htp_config = QNN_HTP_GRAPH_CUSTOM_CONFIG_INIT;
+    if (linear->four_bit) {
+        htp_config.option = QNN_HTP_GRAPH_CONFIG_OPTION_WEIGHTS_PACKING;
+        htp_config.weightsPacking = true;
+        packing_config = QNN_GRAPH_CONFIG_INIT;
+        packing_config.option = QNN_GRAPH_CONFIG_OPTION_CUSTOM;
+        packing_config.customConfig = &htp_config;
+        graph_configs[0] = &packing_config;
+    }
+    if (!ok(linear->api.graphCreate(context, linear->graph_name.c_str(), graph_configs, &linear->graph), error, "QnnGraph_create")) { delete linear; return nullptr; }
+
+    Qnn_QuantizeParams_t input_quant = QNN_QUANTIZE_PARAMS_INIT;
+    input_quant.encodingDefinition = QNN_DEFINITION_DEFINED;
+    input_quant.quantizationEncoding = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
+    input_quant.scaleOffsetEncoding.scale = input_scale;
+    input_quant.scaleOffsetEncoding.offset = 0;
+    Qnn_QuantizeParams_t output_quant = input_quant;
+    output_quant.scaleOffsetEncoding.scale = output_scale;
+    Qnn_QuantizeParams_t weight_quant = QNN_QUANTIZE_PARAMS_INIT;
+    weight_quant.encodingDefinition = QNN_DEFINITION_DEFINED;
+    linear->scale_offsets.assign(columns, {1.0f, 0});
+    for (uint32_t n = 0; n < columns; ++n) linear->scale_offsets[n] = {scales[n], 0};
+    switch (encoding) {
+        case 0:
+            weight_quant.quantizationEncoding = QNN_QUANTIZATION_ENCODING_SCALE_OFFSET;
+            weight_quant.scaleOffsetEncoding.scale = scales[0];
+            weight_quant.scaleOffsetEncoding.offset = 0;
+            break;
+        case 1:
+            weight_quant.quantizationEncoding = QNN_QUANTIZATION_ENCODING_AXIS_SCALE_OFFSET;
+            weight_quant.axisScaleOffsetEncoding.axis = 1;
+            weight_quant.axisScaleOffsetEncoding.numScaleOffsets = columns;
+            weight_quant.axisScaleOffsetEncoding.scaleOffset = linear->scale_offsets.data();
+            break;
+        case 2: {
+            // BLOCK:blockSize {min(64,K), 1} → 块数 = ceil(K/64)*N,行主 [kb][n]
+            const uint32_t block_rows = inner < 64 ? inner : 64;
+            const uint32_t blocks_along_k = (inner + block_rows - 1) / block_rows;
+            linear->block_size = {block_rows, 1};
+            linear->block_scales.assign(static_cast<size_t>(blocks_along_k) * columns, {scales[0], 0});
+            for (uint32_t n = 0; n < columns; ++n)
+                for (uint32_t b = 0; b < blocks_along_k; ++b)
+                    linear->block_scales[static_cast<size_t>(b) * columns + n] = {scales[n], 0};
+            weight_quant.quantizationEncoding = QNN_QUANTIZATION_ENCODING_BLOCK;
+            weight_quant.blockEncoding.blockSize = linear->block_size.data();
+            weight_quant.blockEncoding.scaleOffset = linear->block_scales.data();
+            break;
+        }
+        case 3:
+            weight_quant.quantizationEncoding = QNN_QUANTIZATION_ENCODING_BW_SCALE_OFFSET;
+            weight_quant.bwScaleOffsetEncoding.bitwidth = 4;
+            weight_quant.bwScaleOffsetEncoding.scale = scales[0];
+            weight_quant.bwScaleOffsetEncoding.offset = 0;
+            break;
+        case 5:
+            // S8 容器 + BW_AXIS bitwidth=4(既有工作形式)+ HTP weights packing
+            weight_quant.quantizationEncoding = QNN_QUANTIZATION_ENCODING_BW_AXIS_SCALE_OFFSET;
+            weight_quant.bwAxisScaleOffsetEncoding.bitwidth = 4;
+            weight_quant.bwAxisScaleOffsetEncoding.axis = 1;
+            weight_quant.bwAxisScaleOffsetEncoding.numElements = columns;
+            weight_quant.bwAxisScaleOffsetEncoding.scales = const_cast<float*>(scales);
+            weight_quant.bwAxisScaleOffsetEncoding.offsets = nullptr;
+            linear->four_bit = true;
+            break;
+        default:
+            fail(error, "未知 encoding");
+            delete linear;
+            return nullptr;
+    }
+
+    linear->input = quantized_tensor("p4_in", QNN_TENSOR_TYPE_APP_WRITE, QNN_DATATYPE_SFIXED_POINT_8, input_quant, linear->input_dims.data(), nullptr, 0);
+    Qnn_Tensor_t weight;
+    if (linear->four_bit) {
+        // S8 容器存 4-bit 值(高位忽略);weightsPacking 由 HTP 在 finalize 时打包。
+        const int8_t* unpacked = reinterpret_cast<const int8_t*>(packed_weights);
+        linear->weights.assign(unpacked, unpacked + static_cast<size_t>(inner) * columns);
+        weight = quantized_tensor("p4_w", QNN_TENSOR_TYPE_STATIC, QNN_DATATYPE_SFIXED_POINT_8, weight_quant, linear->weight_dims.data(), linear->weights.data(), static_cast<uint32_t>(linear->weights.size()));
+    } else {
+        linear->weights4.assign(packed_weights, packed_weights + (static_cast<size_t>(inner) * columns + 1) / 2);
+        weight = quantized_tensor("p4_w", QNN_TENSOR_TYPE_STATIC, QNN_DATATYPE_SFIXED_POINT_4, weight_quant, linear->weight_dims.data(), linear->weights4.data(), static_cast<uint32_t>(linear->weights4.size()));
+    }
+    linear->output = quantized_tensor("p4_out", QNN_TENSOR_TYPE_APP_READ, QNN_DATATYPE_SFIXED_POINT_8, output_quant, linear->output_dims.data(), nullptr, 0);
+    Qnn_Tensor_t* tensors[] = {&linear->input, &linear->output, &weight};
+    for (auto* t : tensors) {
+        char stage[160];
+        std::snprintf(stage, sizeof(stage), "QnnTensor_create(p4 %s)", t->v1.name);
+        if (!ok(linear->api.tensorCreateGraphTensor(linear->graph, t), error, stage)) { delete linear; return nullptr; }
+    }
+    std::array<Qnn_Tensor_t, 2> inputs = {linear->input, weight};
+    std::array<Qnn_Tensor_t, 1> outputs = {linear->output};
+    Qnn_OpConfig_t op = QNN_OPCONFIG_INIT;
+    op.v1.name = "p4_mm";
+    op.v1.packageName = QNN_OP_PACKAGE_NAME_QTI_AISW;
+    op.v1.typeName = QNN_OP_MAT_MUL;
+    op.v1.numOfInputs = 2;
+    op.v1.inputTensors = inputs.data();
+    op.v1.numOfOutputs = 1;
+    op.v1.outputTensors = outputs.data();
+    if (!ok(linear->api.graphAddNode(linear->graph, op), error, "QnnGraph_addNode(p4 MatMul)")) { delete linear; return nullptr; }
+    const auto finalize_status = linear->api.graphFinalize(linear->graph, nullptr, nullptr);
+    if (finalize_status != QNN_SUCCESS) {
+        fail(error, "QnnGraph_finalize(p4)", finalize_status);
         delete linear;
         return nullptr;
     }
@@ -579,6 +725,7 @@ extern "C" void* zllm_qnn_mlp_create(const char* backend_path, uint32_t rows, ui
     const auto graph_name = "zllm_mlp_" + suffix;
     Qnn_ContextHandle_t context = shared_contexts[(graph_id / 2) % shared_contexts.size()];
     if (!ok(mlp->api.graphCreate(context, graph_name.c_str(), nullptr, &mlp->graph), error, "QnnGraph_create(mlp)")) { delete mlp; return nullptr; }
+    if (!apply_weights_packing(mlp->api, mlp->graph, weight_bits, error)) { delete mlp; return nullptr; }
 
     auto tensor = [](const std::string& name, Qnn_TensorType_t type, Qnn_DataType_t dtype, Qnn_QuantizeParams_t quant, uint32_t* dims, void* data, uint32_t bytes) {
         Qnn_Tensor_t value = QNN_TENSOR_INIT;

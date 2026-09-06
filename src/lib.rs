@@ -5,7 +5,7 @@ pub mod attention;
 pub mod backend;
 pub mod config;
 pub mod diffusion;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "with-cuda", all(target_os = "linux", feature = "with-rocm")))]
 pub mod embedded;
 pub mod kernel;
 pub mod kv_cache;
@@ -22,5 +22,5 @@ pub mod weight;
 
 #[cfg(target_os = "macos")]
 pub use backend::metal;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", feature = "with-cuda", all(target_os = "linux", feature = "with-rocm")))]
 pub use embedded::{Cancellation, Engine, GenerationEvent, GenerationResult, KvResourceReport, SessionConfig};

@@ -69,10 +69,12 @@ fn merge_parity_bytes(owner: &[u8], peer: &[u8], rows: usize, row_bytes: usize) 
 struct RocmPagedDsaLayer {
     keys: Arc<ops::hip::DeviceBuffer>,
     scales: Arc<ops::hip::DeviceBuffer>,
-    /// CPU global Top-K 的 Q8 blocked 全历史副本；按需从 GPU cache 构建，此后每 token 只追加一行。
-    cpu_keys: Option<crate::kernel::cpu::dsa::Q8KeyBlocks>,
+    /// CPU global Top-K 的 BF16 blocked 全历史副本；key 保持 GPU WMMA 解量化后的 BF16 舍入语义。
+    cpu_keys: Option<crate::kernel::cpu::dsa::Bf16KeyBlocks>,
     /// Prefill 异步建立的全量主存记录；后续 GPU 分块 selection 直接以它为历史 owner。
     cpu_mirror: Option<std::sync::Mutex<RocmDsaCpuMirror>>,
+    /// true 时 `keys/scales` 只保留一个 decode staging block，全历史由 CPU 持有。
+    cpu_offloaded: bool,
     /// 仅 profile shadow 使用；不序列化，也不参与生产 selection。
     hadamard_shadow_keys: Option<Arc<ops::hip::DeviceBuffer>>,
     hadamard_shadow_scales: Option<Arc<ops::hip::DeviceBuffer>>,
@@ -160,7 +162,7 @@ impl RocmDsaCpuMirror {
         Ok(())
     }
 
-    fn queue(&mut self, device_id: i32, start: usize, rows: usize, head_dim: usize, keys: &ops::hip::DeviceBuffer, scales: &ops::hip::DeviceBuffer) -> Result<(), BackendError> {
+    fn queue(&mut self, device_id: i32, start: usize, source_start: usize, rows: usize, head_dim: usize, keys: &ops::hip::DeviceBuffer, scales: &ops::hip::DeviceBuffer) -> Result<(), BackendError> {
         self.finish_pending()?;
         if rows == 0 || start != self.record.rows {
             return Err(compute_error(format!("ROCm DSA CPU mirror queue start={start} rows={rows} mirror={}", self.record.rows)));
@@ -176,8 +178,8 @@ impl RocmDsaCpuMirror {
             self.transfer = Some(Arc::new(ops::hip::DeviceBuffer::allocate_reusable(device_id, transfer_bytes).map_err(compute_error)?));
         }
         let transfer = self.transfer.as_ref().expect("DSA mirror transfer 已创建");
-        transfer.copy_from_device(0, keys, start * head_dim, key_bytes).map_err(compute_error)?;
-        transfer.copy_from_device(key_bytes, scales, start * scale_row_bytes, scale_bytes).map_err(compute_error)?;
+        transfer.copy_from_device(0, keys, source_start * head_dim, key_bytes).map_err(compute_error)?;
+        transfer.copy_from_device(key_bytes, scales, source_start * scale_row_bytes, scale_bytes).map_err(compute_error)?;
         let mut download = match self.available_download.take() {
             Some(download) => download,
             None => ops::hip::AsyncHostDownload::new(device_id, transfer_bytes).map_err(compute_error)?,
@@ -288,7 +290,9 @@ pub struct RocmDsaState {
     hisa_shadow_counts: Vec<usize>,
     cpu_select: bool,
     cpu_select_counts: Vec<usize>,
-    cpu_workspace: crate::kernel::cpu::dsa::Q8DsaWorkspace,
+    cpu_order_drift_counts: Vec<usize>,
+    cpu_member_drift_counts: Vec<usize>,
+    cpu_workspace: crate::kernel::cpu::dsa::Bf16DsaWorkspace,
     cpu_dispatcher: Option<CpuDsaDispatcher>,
     cpu_pending: Option<CpuDsaPending>,
     cpu_host_downloads: std::collections::HashMap<i32, ops::hip::AsyncHostDownload>,
@@ -297,6 +301,7 @@ pub struct RocmDsaState {
     pending_pair_layers: Vec<Option<DsaLayerSerde>>,
     pending_pair_reserved_rows: usize,
     block_table: RocmBlockTable,
+    cpu_staging_table: RocmBlockTable,
     cooperative_staging_table: RocmBlockTable,
     pool_block_table: RocmBlockTable,
     kpool_apes: Vec<Option<Arc<ops::hip::DeviceBuffer>>>,
@@ -332,26 +337,25 @@ pub struct RocmDsaSelection {
 }
 
 struct CpuDsaWorkerResult {
-    keys: crate::kernel::cpu::dsa::Q8KeyBlocks,
-    workspace: crate::kernel::cpu::dsa::Q8DsaWorkspace,
+    keys: crate::kernel::cpu::dsa::Bf16KeyBlocks,
+    workspace: crate::kernel::cpu::dsa::Bf16DsaWorkspace,
     host_download: ops::hip::AsyncHostDownload,
     transfer_ms: f64,
-    candidates: Result<(Vec<u32>, f64, f64, f64, Option<(Vec<u32>, f64)>), String>,
+    selection: Result<(Vec<u32>, f64, f64, f64), String>,
 }
 
 struct CpuDsaTask {
-    keys: crate::kernel::cpu::dsa::Q8KeyBlocks,
-    workspace: crate::kernel::cpu::dsa::Q8DsaWorkspace,
+    keys: crate::kernel::cpu::dsa::Bf16KeyBlocks,
+    workspace: crate::kernel::cpu::dsa::Bf16DsaWorkspace,
     host_download: ops::hip::AsyncHostDownload,
     transfer_started: std::time::Instant,
     weight_offset: usize,
     key_offset: usize,
     scale_offset: usize,
-    append_row: bool,
+    append_rows: usize,
     head_count: usize,
     head_dim: usize,
-    requested_candidates: Option<usize>,
-    exact_top_k: Option<usize>,
+    top_k: usize,
 }
 
 struct CpuDsaDispatcher {
@@ -367,41 +371,23 @@ impl CpuDsaDispatcher {
             .name("zllm-dsa-dispatch".to_owned())
             .spawn(move || {
                 while let Ok(mut task) = task_receiver.recv() {
-                    let transfer = task.host_download.wait().map(|host| host.to_vec());
+                    // pinned 下载缓冲在结果送回前不会复用，直接读取，省去每次约
+                    // 16 KiB 的 pageable 分配/复制，并保留 HIP 保证的对齐。
+                    let transfer = task.host_download.wait();
                     let transfer_ms = task.transfer_started.elapsed().as_secs_f64() * 1e3;
-                    let candidates = transfer.and_then(|host| {
+                    let selection = transfer.and_then(|host| {
                         let select_started = std::time::Instant::now();
                         let query = unsafe { std::slice::from_raw_parts(host.as_ptr().cast::<f32>(), task.head_count * task.head_dim) };
                         let weights = unsafe { std::slice::from_raw_parts(host.as_ptr().add(task.weight_offset).cast::<f32>(), task.head_count) };
-                        if task.append_row {
-                            let key = unsafe { std::slice::from_raw_parts(host.as_ptr().add(task.key_offset).cast::<i8>(), task.head_dim) };
-                            let scales = unsafe { std::slice::from_raw_parts(host.as_ptr().add(task.scale_offset).cast::<u16>(), 1) };
-                            task.keys.append_q8_row(key, scales[0])?;
+                        for row in 0..task.append_rows {
+                            let key = unsafe { std::slice::from_raw_parts(host.as_ptr().add(task.key_offset + row * task.head_dim).cast::<i8>(), task.head_dim) };
+                            let scale = u16::from_ne_bytes([host[task.scale_offset + row * 2], host[task.scale_offset + row * 2 + 1]]);
+                            task.keys.append_q8_row(key, std::slice::from_ref(&scale), task.head_dim)?;
                         }
-                        let (candidates, score_ms, topk_ms, exact) = if let Some(candidate_count) = task.requested_candidates {
-                            let (candidates, score_ms, topk_ms) = crate::kernel::cpu::dsa::select_q8_blocked_candidates(&task.keys, query, weights, task.head_count, task.head_dim, candidate_count, &mut task.workspace)?;
-                            // selection 借用 workspace；先物化候选，再次可变借用同一 workspace 完成 final Top-K。
-                            let candidates = candidates.to_vec();
-                            let exact = task
-                                .exact_top_k
-                                .map(|top_k| {
-                                    let started = std::time::Instant::now();
-                                    let selection = crate::kernel::cpu::dsa::finish_q8_blocked_topk(top_k, &mut task.workspace)?.to_vec();
-                                    Ok::<_, String>((selection, started.elapsed().as_secs_f64() * 1e3))
-                                })
-                                .transpose()?;
-                            (candidates, score_ms, topk_ms, exact)
-                        } else if let Some(top_k) = task.exact_top_k {
-                            // 生产 decode：打分与 final Top-K 融合为单次 team run，省一次分发同步。
-                            let (selection, score_ms, topk_ms) = crate::kernel::cpu::dsa::score_q8_blocked_topk(&task.keys, query, weights, task.head_count, task.head_dim, top_k, &mut task.workspace)?;
-                            (Vec::new(), score_ms, 0.0, Some((selection.to_vec(), topk_ms)))
-                        } else {
-                            let score_ms = crate::kernel::cpu::dsa::score_q8_blocked_workspace(&task.keys, query, weights, task.head_count, task.head_dim, &mut task.workspace)?;
-                            (Vec::new(), score_ms, 0.0, None)
-                        };
-                        Ok((candidates, score_ms, topk_ms, select_started.elapsed().as_secs_f64() * 1e3, exact))
+                        let (selection, score_ms, topk_ms) = crate::kernel::cpu::dsa::select_bf16_blocked_timed(&task.keys, query, weights, task.head_count, task.head_dim, task.top_k, &mut task.workspace)?;
+                        Ok((selection.to_vec(), score_ms, topk_ms, select_started.elapsed().as_secs_f64() * 1e3))
                     });
-                    if result_sender.send(CpuDsaWorkerResult { keys: task.keys, workspace: task.workspace, host_download: task.host_download, transfer_ms, candidates }).is_err() {
+                    if result_sender.send(CpuDsaWorkerResult { keys: task.keys, workspace: task.workspace, host_download: task.host_download, transfer_ms, selection }).is_err() {
                         break;
                     }
                 }
@@ -414,23 +400,23 @@ impl CpuDsaDispatcher {
 struct CpuDsaPending {
     layer: usize,
     context_rows: usize,
-    head_count: usize,
     device_id: i32,
     transfer_bytes: usize,
     begin_ms: f64,
     started: std::time::Instant,
     dispatched: std::time::Instant,
-    keys: Arc<ops::hip::DeviceBuffer>,
-    scales: Arc<ops::hip::DeviceBuffer>,
-    table: Arc<ops::hip::DeviceBuffer>,
-    query: Arc<ops::hip::DeviceBuffer>,
-    weights: Arc<ops::hip::DeviceBuffer>,
     exact: Option<Vec<u32>>,
+    exact_scores: Option<Vec<u32>>,
 }
 
 const DSA_SHADOW_GUARDS: [usize; 9] = [0, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
 const DSA_HISA_POOL_SIZE: usize = 128;
 const DSA_HISA_BLOCK_BUDGETS: [usize; 4] = [32, 48, 64, 96];
+
+fn reusable_selection_metadata(has_selection: bool, cached_rows: usize, selection_rows: usize, selection_start: usize, selection_width: usize, position: usize, rows: usize, top_k: usize) -> bool {
+    has_selection && rows == 1 && cached_rows <= position && selection_rows == rows && selection_width == top_k && selection_start.checked_add(rows) == Some(position)
+}
+
 const DSA_CPU_SHADOW_REPEATS: usize = 64;
 const DSA_CPU_CANDIDATE_GUARD: usize = 2048;
 
@@ -652,7 +638,9 @@ impl RocmDsaState {
             hisa_shadow_counts: vec![0; layer_count],
             cpu_select,
             cpu_select_counts: vec![0; layer_count],
-            cpu_workspace: crate::kernel::cpu::dsa::Q8DsaWorkspace::default(),
+            cpu_order_drift_counts: vec![0; layer_count],
+            cpu_member_drift_counts: vec![0; layer_count],
+            cpu_workspace: crate::kernel::cpu::dsa::Bf16DsaWorkspace::default(),
             cpu_dispatcher: None,
             cpu_pending: None,
             cpu_host_downloads: std::collections::HashMap::new(),
@@ -661,6 +649,7 @@ impl RocmDsaState {
             pending_pair_layers: (0..layer_count).map(|_| None).collect(),
             pending_pair_reserved_rows: 0,
             block_table: RocmBlockTable::new(),
+            cpu_staging_table: RocmBlockTable::new(),
             cooperative_staging_table: RocmBlockTable::new(),
             pool_block_table: RocmBlockTable::new(),
             kpool_apes: (0..layer_count).map(|_| None).collect(),
@@ -701,11 +690,10 @@ impl RocmDsaState {
                 return Err(compute_error(format!("L{layer} ROCm DSA truncate rows={rows} 超过当前长度 {}", cached.rows)));
             }
             cached.rows = rows;
-            if cached.cpu_keys.as_ref().is_some_and(|keys| keys.rows() < rows) {
-                // CPU mirror 只在 select 时推进；会话保存可能发生在 GPU append 之后。
-                // 落后的 mirror 直接失效，下次 select 从 GPU cache 重建即可。
-                cached.cpu_keys = None;
-            } else if let Some(keys) = &mut cached.cpu_keys {
+            // CPU key 是已确认的前缀；落后水位由下一次 select 增量补齐。
+            if let Some(keys) = &mut cached.cpu_keys
+                && keys.rows() > rows
+            {
                 keys.truncate(rows).map_err(compute_error)?;
             }
             if let Some(mirror) = &cached.cpu_mirror {
@@ -752,10 +740,10 @@ impl RocmDsaState {
                 return Err(compute_error(format!("L{layer} ROCm DSA truncate rows={rows} 超过当前长度 {}", cached.rows)));
             }
             cached.rows = rows;
-            if cached.cpu_keys.as_ref().is_some_and(|keys| keys.rows() < rows) {
-                // 同步 decode 与异步 decode 都允许 CPU mirror 落后 GPU 一行。
-                cached.cpu_keys = None;
-            } else if let Some(keys) = &mut cached.cpu_keys {
+            // CPU key 是已确认的前缀；落后水位由下一次 select 增量补齐。
+            if let Some(keys) = &mut cached.cpu_keys
+                && keys.rows() > rows
+            {
                 keys.truncate(rows).map_err(compute_error)?;
             }
             if let Some(mirror) = &cached.cpu_mirror {
@@ -834,11 +822,22 @@ impl RocmDsaState {
         position < self.capacity && rows.map_or(position == 0, |rows| rows == position)
     }
 
-    fn prepare_append_storage(&mut self, context: &RocmContext, layer: usize, position: usize, rows: usize) -> Result<Arc<ops::hip::DeviceBuffer>, BackendError> {
+    fn prepare_append_storage(&mut self, context: &RocmContext, layer: usize, position: usize, rows: usize) -> Result<(Arc<ops::hip::DeviceBuffer>, usize), BackendError> {
         if rows == 0 || position.checked_add(rows).is_none_or(|end| end > self.capacity) {
             return Err(compute_error(format!("L{layer} ROCm paged DSA append position={position} rows={rows} capacity={} 非法", self.capacity)));
         }
         let end = position + rows;
+        if let Some(cached) = self.layers.get(layer).and_then(Option::as_ref)
+            && cached.cpu_offloaded
+        {
+            let cpu_rows = cached.cpu_keys.as_ref().map(crate::kernel::cpu::dsa::Bf16KeyBlocks::rows).unwrap_or(cached.rows);
+            let staging_rows = cached.rows.saturating_sub(cpu_rows);
+            if cached.rows != position || cpu_rows > cached.rows || staging_rows + rows > ROCM_KV_BLOCK_SIZE {
+                return Err(compute_error(format!("L{layer} CPU DSA staging append position={position} rows={rows} cache={} cpu={cpu_rows} staged={staging_rows} block={ROCM_KV_BLOCK_SIZE} 非法", cached.rows)));
+            }
+            let table = self.cpu_staging_table.get("DSA CPU staging", ROCM_KV_BLOCK_SIZE, context.device_id, staging_rows + rows)?;
+            return Ok((table, staging_rows));
+        }
         let committed_rows = self.layers.get(layer).and_then(Option::as_ref).map_or(0, |cached| cached.committed_rows);
         let next_committed = committed_cache_rows(committed_rows, end, self.capacity)?;
         let table = self.block_table.get("DSA", self.capacity, context.device_id, end)?;
@@ -854,9 +853,10 @@ impl RocmDsaState {
                 keys: Arc::new(ops::hip::DeviceBuffer::allocate(context.device_id, key_bytes).map_err(compute_error)?),
                 scales: Arc::new(ops::hip::DeviceBuffer::allocate(context.device_id, scale_bytes).map_err(compute_error)?),
                 cpu_keys: None,
-                cpu_mirror: (ops::hip::options().mla_cpu_hot_rows != 0 || ops::hip::options().prefill_attention_cpu)
+                cpu_mirror: (self.cpu_select || ops::hip::options().mla_cpu_hot_rows != 0 || ops::hip::options().prefill_attention_cpu)
                     .then(|| RocmDsaCpuMirror::new(self.capacity, self.head_dim, self.key_group_size, self.hadamard_i8).map(std::sync::Mutex::new))
                     .transpose()?,
+                cpu_offloaded: false,
                 hadamard_shadow_keys: None,
                 hadamard_shadow_scales: None,
                 hadamard: self.hadamard_i8,
@@ -884,28 +884,28 @@ impl RocmDsaState {
             }
             cached.committed_rows = next_committed;
         }
-        Ok(table)
+        Ok((table, position))
     }
 
     pub(super) fn append(&mut self, context: &RocmContext, layer: usize, position: usize, keys: &RocmTensor) -> Result<(), BackendError> {
         if keys.rows == 0 || keys.cols != self.head_dim || position.checked_add(keys.rows).is_none_or(|end| end > self.capacity) {
             return Err(compute_error(format!("L{layer} ROCm paged DSA append shape 非法: position={position} rows={} cols={} head_dim={} capacity={}", keys.rows, keys.cols, self.head_dim, self.capacity)));
         }
-        let table = self.prepare_append_storage(context, layer, position, keys.rows)?;
+        let (table, cache_position) = self.prepare_append_storage(context, layer, position, keys.rows)?;
         let key_group_size = self.key_group_size;
         let cached = self.layers.get_mut(layer).and_then(Option::as_mut).ok_or(BackendError::UnsupportedLayer { layer })?;
         let input = keys.device.as_deref().ok_or_else(|| compute_error("ROCm paged DSA keys 缺少 device buffer"))?;
         if cached.hadamard {
-            ops::hip::try_paged_cache_append_f32_q8_hadamard(context.device_id, input, &cached.keys, &cached.scales, &table, position, keys.rows, keys.cols, key_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute_error)?;
+            ops::hip::try_paged_cache_append_f32_q8_hadamard(context.device_id, input, &cached.keys, &cached.scales, &table, cache_position, keys.rows, keys.cols, key_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute_error)?;
         } else {
-            ops::hip::try_paged_cache_append_f32_q8(context.device_id, input, &cached.keys, &cached.scales, &table, position, keys.rows, keys.cols, key_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute_error)?;
+            ops::hip::try_paged_cache_append_f32_q8(context.device_id, input, &cached.keys, &cached.scales, &table, cache_position, keys.rows, keys.cols, key_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute_error)?;
             if let (Some(shadow_keys), Some(shadow_scales)) = (&cached.hadamard_shadow_keys, &cached.hadamard_shadow_scales) {
                 ops::hip::try_paged_cache_transform_q8_hadamard(context.device_id, &cached.keys, &cached.scales, shadow_keys, shadow_scales, &table, position, keys.rows, self.head_dim, ROCM_KV_BLOCK_SIZE).map_err(compute_error)?;
             }
         }
         cached.rows += keys.rows;
         if let Some(mirror) = &cached.cpu_mirror {
-            mirror.lock().map_err(|_| compute_error(format!("L{layer} ROCm DSA CPU mirror 锁中毒")))?.queue(context.device_id, position, keys.rows, self.head_dim, &cached.keys, &cached.scales)?;
+            mirror.lock().map_err(|_| compute_error(format!("L{layer} ROCm DSA CPU mirror 锁中毒")))?.queue(context.device_id, position, cache_position, keys.rows, self.head_dim, &cached.keys, &cached.scales)?;
         }
         self.drain_gpu_host_selection()?;
         self.selection = None;
@@ -918,6 +918,27 @@ impl RocmDsaState {
 
     pub(super) fn supports_layernorm_rope(&self, rows: usize, cols: usize) -> bool {
         rows > 0 && cols == self.head_dim && self.kpool == 0 && !self.hadamard_i8 && self.key_group_size == self.head_dim
+    }
+
+    pub(super) fn can_reuse_prefill_selection(&self, layer: usize, position: usize, rows: usize) -> bool {
+        self.cooperative_peer.is_none()
+            && position < self.capacity
+            && self
+                .layers
+                .get(layer)
+                .and_then(Option::as_ref)
+                .is_some_and(|cached| reusable_selection_metadata(self.selection.is_some(), cached.rows, self.selection_rows, self.selection_start, self.selection_width, position, rows, self.top_k))
+    }
+
+    pub(super) fn reuse_prefill_selection(&mut self, layer: usize, position: usize, rows: usize) -> Result<(), BackendError> {
+        if !self.can_reuse_prefill_selection(layer, position, rows) {
+            let cached_rows = self.layers.get(layer).and_then(Option::as_ref).map_or(0, |cached| cached.rows);
+            return Err(compute_error(format!("L{layer} ROCm DSA selection 不能从 start={} rows={} cache={cached_rows} 复用到 position={position} rows={rows}", self.selection_start, self.selection_rows)));
+        }
+        self.drain_gpu_host_selection()?;
+        self.selection_rows = rows;
+        self.selection_start = position;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -940,19 +961,37 @@ impl RocmDsaState {
             return Ok(false);
         }
         let input = keys.device.as_deref().ok_or_else(|| compute_error("ROCm fused DSA keys 缺少 device buffer"))?;
-        let table = self.prepare_append_storage(context, layer, position, keys.rows)?;
+        let (table, cache_position) = self.prepare_append_storage(context, layer, position, keys.rows)?;
         let cached = self.layers.get_mut(layer).and_then(Option::as_mut).ok_or(BackendError::UnsupportedLayer { layer })?;
         if cached.hadamard || cached.gates.is_some() {
             return Err(compute_error(format!("L{layer} ROCm fused DSA append 与现有 cache 约定不一致")));
         }
-        ops::hip::try_paged_dsa_append_layernorm_rope_q8(context.device_id, input, norm_weight, norm_bias, &cached.keys, &cached.scales, &table, position, keys.rows, keys.cols, rotary_dim, layout, cos, sin, ROCM_KV_BLOCK_SIZE, eps)
-            .map_err(compute_error)?;
+        ops::hip::try_paged_dsa_append_layernorm_rope_q8_at(
+            context.device_id,
+            input,
+            norm_weight,
+            norm_bias,
+            &cached.keys,
+            &cached.scales,
+            &table,
+            cache_position,
+            position,
+            keys.rows,
+            keys.cols,
+            rotary_dim,
+            layout,
+            cos,
+            sin,
+            ROCM_KV_BLOCK_SIZE,
+            eps,
+        )
+        .map_err(compute_error)?;
         if let (Some(shadow_keys), Some(shadow_scales)) = (&cached.hadamard_shadow_keys, &cached.hadamard_shadow_scales) {
             ops::hip::try_paged_cache_transform_q8_hadamard(context.device_id, &cached.keys, &cached.scales, shadow_keys, shadow_scales, &table, position, keys.rows, self.head_dim, ROCM_KV_BLOCK_SIZE).map_err(compute_error)?;
         }
         cached.rows += keys.rows;
         if let Some(mirror) = &cached.cpu_mirror {
-            mirror.lock().map_err(|_| compute_error(format!("L{layer} ROCm DSA CPU mirror 锁中毒")))?.queue(context.device_id, position, keys.rows, self.head_dim, &cached.keys, &cached.scales)?;
+            mirror.lock().map_err(|_| compute_error(format!("L{layer} ROCm DSA CPU mirror 锁中毒")))?.queue(context.device_id, position, cache_position, keys.rows, self.head_dim, &cached.keys, &cached.scales)?;
         }
         self.invalidate_selection();
         Ok(true)
@@ -1139,6 +1178,23 @@ impl RocmDsaState {
 
     fn rebuild_cpu_keys(&mut self, layer: usize, context_rows: usize) -> Result<(), BackendError> {
         let cached = self.layers.get(layer).and_then(Option::as_ref).ok_or(BackendError::UnsupportedLayer { layer })?;
+        if let Some(mirror) = &cached.cpu_mirror {
+            let mut mirror = mirror.lock().map_err(|_| compute_error(format!("L{layer} ROCm DSA CPU mirror 锁中毒")))?;
+            mirror.finish_pending()?;
+            if mirror.record.rows != context_rows {
+                return Err(compute_error(format!("L{layer} CPU DSA mirror rows={}，期望 {context_rows}", mirror.record.rows)));
+            }
+            let record = &mirror.record;
+            let keys = unsafe { std::slice::from_raw_parts(record.keys.as_ptr().cast::<i8>(), record.keys.len()) };
+            let scales = record.scales.chunks_exact(2).map(|bytes| u16::from_ne_bytes([bytes[0], bytes[1]])).collect::<Vec<_>>();
+            let blocked = crate::kernel::cpu::dsa::Bf16KeyBlocks::from_q8_row_major(keys, &scales, self.head_dim, self.key_group_size).map_err(compute_error)?;
+            drop(mirror);
+            self.layers[layer].as_mut().expect("CPU DSA layer 已校验").cpu_keys = Some(blocked);
+            return Ok(());
+        }
+        if cached.cpu_offloaded {
+            return Err(compute_error(format!("L{layer} CPU DSA 全历史已换出，但 host mirror 缺失")));
+        }
         let groups = self.head_dim / self.key_group_size;
         let key_bytes = context_rows.checked_mul(self.head_dim).ok_or_else(|| compute_error("CPU DSA key 下载大小溢出"))?;
         let scale_elements = context_rows.checked_mul(groups).ok_or_else(|| compute_error("CPU DSA scale 下载大小溢出"))?;
@@ -1146,8 +1202,45 @@ impl RocmDsaState {
         let mut scales = vec![0_u16; scale_elements];
         cached.keys.copy_to_host(unsafe { std::slice::from_raw_parts_mut(keys.as_mut_ptr().cast(), keys.len()) }).map_err(compute_error)?;
         cached.scales.copy_to_host(unsafe { std::slice::from_raw_parts_mut(scales.as_mut_ptr().cast(), scales.len() * 2) }).map_err(compute_error)?;
-        let blocked = crate::kernel::cpu::dsa::Q8KeyBlocks::from_q8_row_major(&keys, &scales, self.head_dim).map_err(compute_error)?;
+        let blocked = crate::kernel::cpu::dsa::Bf16KeyBlocks::from_q8_row_major(&keys, &scales, self.head_dim, self.key_group_size).map_err(compute_error)?;
         self.layers[layer].as_mut().expect("CPU DSA layer 已校验").cpu_keys = Some(blocked);
+        Ok(())
+    }
+
+    fn release_gpu_history(&mut self, context: &RocmContext, layer: usize) -> Result<(), BackendError> {
+        let cached = self.layers.get_mut(layer).and_then(Option::as_mut).ok_or(BackendError::UnsupportedLayer { layer })?;
+        if cached.cpu_offloaded {
+            return Ok(());
+        }
+        let cpu_rows = cached.cpu_keys.as_ref().map(crate::kernel::cpu::dsa::Bf16KeyBlocks::rows).unwrap_or(0);
+        if cpu_rows != cached.rows {
+            return Err(compute_error(format!("L{layer} CPU DSA 换出前 blocked rows={cpu_rows}，期望 {}", cached.rows)));
+        }
+        let mirror = cached.cpu_mirror.as_ref().ok_or_else(|| compute_error(format!("L{layer} CPU DSA 换出前 mirror 缺失")))?;
+        let mut mirror = mirror.lock().map_err(|_| compute_error(format!("L{layer} ROCm DSA CPU mirror 锁中毒")))?;
+        mirror.finish_pending()?;
+        if mirror.record.rows != cached.rows {
+            return Err(compute_error(format!("L{layer} CPU DSA 换出前 mirror rows={}，期望 {}", mirror.record.rows, cached.rows)));
+        }
+        drop(mirror);
+
+        let old_bytes = cached.keys.bytes() + cached.scales.bytes();
+        let groups = self.head_dim / self.key_group_size;
+        cached.keys = Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, ROCM_KV_BLOCK_SIZE * self.head_dim).map_err(compute_error)?);
+        cached.scales = Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, ROCM_KV_BLOCK_SIZE * groups * 2).map_err(compute_error)?);
+        cached.hadamard_shadow_keys = None;
+        cached.hadamard_shadow_scales = None;
+        cached.committed_rows = ROCM_KV_BLOCK_SIZE;
+        cached.cpu_offloaded = true;
+        if ops::hip::options().mla_hot_trace || ops::hip::options().kernel_profile {
+            eprintln!(
+                "[dsa-cpu-offload] device={} layer={layer} rows={} released_mib={:.2} staging_kib={:.2}",
+                context.device_id,
+                cached.rows,
+                old_bytes as f64 / (1024.0 * 1024.0),
+                (cached.keys.bytes() + cached.scales.bytes()) as f64 / 1024.0,
+            );
+        }
         Ok(())
     }
 
@@ -1165,10 +1258,10 @@ impl RocmDsaState {
             return Err(compute_error("CPU DSA begin 前一份 selection 尚未 finish"));
         }
         let total_started = std::time::Instant::now();
-        let cpu_rows = self.layers[layer].as_ref().and_then(|cached| cached.cpu_keys.as_ref()).map(crate::kernel::cpu::dsa::Q8KeyBlocks::rows);
-        let append_row = match cpu_rows {
-            Some(rows) if rows == context_rows => false,
-            Some(rows) if rows + 1 == context_rows => true,
+        let cpu_rows = self.layers[layer].as_ref().and_then(|cached| cached.cpu_keys.as_ref()).map(crate::kernel::cpu::dsa::Bf16KeyBlocks::rows);
+        let append_rows = match cpu_rows {
+            // MTP 的复用和 cache-only 追赶可一次新增多行，不能因此重建全历史。
+            Some(rows) if rows <= context_rows => context_rows - rows,
             Some(rows) if rows > context_rows => return Err(compute_error(format!("L{layer} CPU DSA rows={rows} 超过 GPU context={context_rows}"))),
             _ => {
                 let rebuild_started = std::time::Instant::now();
@@ -1176,14 +1269,14 @@ impl RocmDsaState {
                 if ops::hip::options().kernel_profile {
                     eprintln!("[dsa-cpu-select-warm] device={} layer={layer} context={context_rows} rebuild_ms={:.3}", context.device_id, rebuild_started.elapsed().as_secs_f64() * 1e3);
                 }
-                false
+                0
             }
         };
 
         let query_bytes = head_count.checked_mul(self.head_dim).and_then(|n| n.checked_mul(4)).ok_or_else(|| compute_error("CPU DSA query 下载大小溢出"))?;
         let weight_bytes = head_count.checked_mul(4).ok_or_else(|| compute_error("CPU DSA weight 下载大小溢出"))?;
-        let key_bytes = usize::from(append_row) * self.head_dim;
-        let scale_bytes = usize::from(append_row) * (self.head_dim / self.key_group_size) * 2;
+        let key_bytes = append_rows * self.head_dim;
+        let scale_bytes = append_rows * (self.head_dim / self.key_group_size) * 2;
         let weight_offset = query_bytes;
         let key_offset = weight_offset + weight_bytes;
         let scale_offset = key_offset + key_bytes;
@@ -1195,18 +1288,19 @@ impl RocmDsaState {
         };
         let cached = self.layers[layer].as_ref().expect("CPU DSA layer 已校验");
         let mut segments = vec![(&*query_device, 0, query_bytes), (&*weight_device, 0, weight_bytes)];
-        if append_row {
-            segments.push((&cached.keys, (context_rows - 1) * self.head_dim, key_bytes));
-            segments.push((&cached.scales, (context_rows - 1) * (self.head_dim / self.key_group_size) * 2, scale_bytes));
+        if append_rows != 0 {
+            let source_start = if cached.cpu_offloaded { 0 } else { context_rows - append_rows };
+            segments.push((&cached.keys, source_start * self.head_dim, key_bytes));
+            segments.push((&cached.scales, source_start * (self.head_dim / self.key_group_size) * 2, scale_bytes));
         }
         if let Err(error) = host_download.enqueue_segments(&segments) {
             self.cpu_host_downloads.insert(context.device_id, host_download);
             return Err(compute_error(error));
         }
 
-        // profile 下覆盖足够长的真实 decode 前缀，捕获 CPU/GPU score 在后续 query 上的首个 Top-K 分叉。
-        let validate = ops::hip::options().kernel_profile && self.cpu_select_counts[layer] < 80;
-        let exact = if validate {
+        // profile 是正确性门禁，必须覆盖完整生成；只抽查前缀会漏掉长 decode 后段的 Top-K 边界分叉。
+        let validate = ops::hip::options().kernel_profile;
+        let (exact, exact_scores) = if validate {
             let exact = ops::hip::try_dsa_select_paged_q8(
                 context.device_id,
                 &self.layers[layer].as_ref().unwrap().keys,
@@ -1226,11 +1320,12 @@ impl RocmDsaState {
                 ROCM_KV_BLOCK_SIZE,
             )
             .map_err(compute_error)?;
+            let scores = ops::hip::try_download_last_dsa_score_keys(context.device_id, context_rows).map_err(compute_error)?;
             let mut values = vec![0_u32; self.top_k];
             exact.copy_to_host(unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast(), values.len() * 4) }).map_err(compute_error)?;
-            Some(values)
+            (Some(values), Some(scores))
         } else {
-            None
+            (None, None)
         };
 
         if self.cpu_dispatcher.is_none() {
@@ -1244,11 +1339,10 @@ impl RocmDsaState {
             weight_offset,
             key_offset,
             scale_offset,
-            append_row,
+            append_rows,
             head_count,
             head_dim: self.head_dim,
-            requested_candidates: validate.then_some((self.top_k + DSA_CPU_CANDIDATE_GUARD).min(context_rows)),
-            exact_top_k: Some(self.top_k),
+            top_k: self.top_k,
         };
         let dispatched = std::time::Instant::now();
         if let Err(error) = self.cpu_dispatcher.as_ref().unwrap().tasks.send(task) {
@@ -1258,23 +1352,7 @@ impl RocmDsaState {
             self.cpu_host_downloads.insert(context.device_id, task.host_download);
             return Err(compute_error(format!("L{layer} CPU DSA dispatcher 已退出")));
         }
-        let cached = self.layers[layer].as_ref().unwrap();
-        self.cpu_pending = Some(CpuDsaPending {
-            layer,
-            context_rows,
-            head_count,
-            device_id: context.device_id,
-            transfer_bytes,
-            begin_ms: total_started.elapsed().as_secs_f64() * 1e3,
-            started: total_started,
-            dispatched,
-            keys: cached.keys.clone(),
-            scales: cached.scales.clone(),
-            table,
-            query: query_device,
-            weights: weight_device,
-            exact,
-        });
+        self.cpu_pending = Some(CpuDsaPending { layer, context_rows, device_id: context.device_id, transfer_bytes, begin_ms: total_started.elapsed().as_secs_f64() * 1e3, started: total_started, dispatched, exact, exact_scores });
         Ok(())
     }
 
@@ -1293,49 +1371,63 @@ impl RocmDsaState {
         self.cpu_workspace = worker.workspace;
         self.cpu_host_downloads.insert(pending.device_id, worker.host_download);
         let transfer_ms = worker.transfer_ms;
-        let (candidates, score_ms, topk_ms, select_ms, cpu_exact) = worker.candidates.map_err(compute_error)?;
-        let candidate_count = candidates.len();
-        let (cpu_selection, cpu_rerank_ms) = cpu_exact.ok_or_else(|| compute_error("CPU DSA exact rerank 结果缺失"))?;
+        let (cpu_selection, score_ms, topk_ms, select_ms) = worker.selection.map_err(compute_error)?;
         let selection_bytes = unsafe { std::slice::from_raw_parts(cpu_selection.as_ptr().cast(), std::mem::size_of_val(cpu_selection.as_slice())) };
         let selection = Arc::new(ops::hip::DeviceBuffer::upload_ordered(context.device_id, selection_bytes).map_err(compute_error)?);
         selection.enqueue_deferred_upload().map_err(compute_error)?;
         selection.retain_for_active_stage();
         if let Some(exact) = pending.exact {
-            let candidate_bytes = unsafe { std::slice::from_raw_parts(candidates.as_ptr().cast(), std::mem::size_of_val(candidates.as_slice())) };
-            let candidate_buffer = Arc::new(ops::hip::DeviceBuffer::upload_ordered(context.device_id, candidate_bytes).map_err(compute_error)?);
-            candidate_buffer.enqueue_deferred_upload().map_err(compute_error)?;
-            candidate_buffer.retain_for_active_stage();
-            let gpu_reranked = ops::hip::try_dsa_rerank_paged_q8_candidates(
-                context.device_id,
-                &pending.keys,
-                &pending.scales,
-                self.key_group_size,
-                &pending.table,
-                &pending.query,
-                &pending.weights,
-                &candidate_buffer,
-                1,
-                pending.context_rows,
-                pending.context_rows - 1,
-                pending.head_count,
-                self.head_dim,
-                candidate_count,
-                self.top_k,
-                ROCM_KV_BLOCK_SIZE,
-            )
-            .map_err(compute_error)?;
-            let mut reranked = vec![0_u32; self.top_k];
-            gpu_reranked.copy_to_host(unsafe { std::slice::from_raw_parts_mut(reranked.as_mut_ptr().cast(), reranked.len() * 4) }).map_err(compute_error)?;
-            let recall = exact.iter().filter(|token| candidates.binary_search(token).is_ok()).count();
-            let rerank_exact = reranked.as_slice() == exact.as_slice();
-            let cpu_rerank_exact = cpu_selection.as_slice() == exact.as_slice();
             let sample = self.cpu_select_counts[pending.layer];
-            if sample == 0 || recall != self.top_k || !rerank_exact || !cpu_rerank_exact {
+            let order_exact = cpu_selection.as_slice() == exact.as_slice();
+            let mut cpu_members = cpu_selection.clone();
+            let mut gpu_members = exact.clone();
+            cpu_members.sort_unstable();
+            gpu_members.sort_unstable();
+            let member_exact = cpu_members == gpu_members;
+            let overlap = cpu_members.iter().filter(|token| gpu_members.binary_search(token).is_ok()).count();
+            let first_diff = cpu_selection.iter().zip(&exact).position(|(cpu, gpu)| cpu != gpu);
+            self.cpu_order_drift_counts[pending.layer] += usize::from(!order_exact);
+            self.cpu_member_drift_counts[pending.layer] += usize::from(!member_exact);
+            let mut boundary_ok = true;
+            if !member_exact {
+                let gpu_scores = pending.exact_scores.as_deref().ok_or_else(|| compute_error("CPU DSA oracle 缺少 GPU scores"))?;
+                let cpu_scores = self.cpu_workspace.scores();
+                let cpu_only = cpu_members.iter().copied().filter(|token| gpu_members.binary_search(token).is_err()).collect::<Vec<_>>();
+                let gpu_only = gpu_members.iter().copied().filter(|token| cpu_members.binary_search(token).is_err()).collect::<Vec<_>>();
+                let different = cpu_only.len();
+                let mut cpu_boundary = cpu_only.iter().chain(&gpu_only).map(|&token| cpu_scores[token as usize]);
+                let first_cpu = cpu_boundary.next().expect("成员不同必有对称差");
+                let (cpu_min, cpu_max) = cpu_boundary.fold((first_cpu, first_cpu), |(min, max), score| (min.min(score), max.max(score)));
+                let mut gpu_boundary = cpu_only.iter().chain(&gpu_only).map(|&token| gpu_scores[token as usize]);
+                let first_gpu = gpu_boundary.next().expect("成员不同必有对称差");
+                let (gpu_min, gpu_max) = gpu_boundary.fold((first_gpu, first_gpu), |(min, max), score| (min.min(score), max.max(score)));
+                let cpu_span_ulps = cpu_max - cpu_min;
+                let gpu_span_ulps = gpu_max - gpu_min;
+                // 两种实现读取同一份 Q8/BF16 数据，只允许 Top-K 边界少量、数个
+                // F32 ULP 内的互换；更大偏差仍视为 scorer 或 cache 生命周期错误。
+                boundary_ok = different <= 8 && cpu_span_ulps <= 32 && gpu_span_ulps <= 32;
+                for (&cpu_token, &gpu_token) in cpu_only.iter().zip(&gpu_only).take(4) {
+                    let cpu_prefers = score_from_ordered(cpu_scores[cpu_token as usize]) - score_from_ordered(cpu_scores[gpu_token as usize]);
+                    let gpu_prefers = score_from_ordered(gpu_scores[gpu_token as usize]) - score_from_ordered(gpu_scores[cpu_token as usize]);
+                    let boundary = score_from_ordered(gpu_scores[gpu_token as usize]);
+                    eprintln!(
+                        "[dsa-cpu-select-boundary] device={} layer={} sample={sample} cpu_token={cpu_token} gpu_token={gpu_token} cpu_prefers={cpu_prefers:.9e} gpu_prefers={gpu_prefers:.9e} gpu_boundary={boundary:.9e} different={different} cpu_span_ulps={cpu_span_ulps} gpu_span_ulps={gpu_span_ulps} boundary_ok={boundary_ok}",
+                        context.device_id, pending.layer
+                    );
+                }
+            }
+            if sample == 0 || !boundary_ok || ((!order_exact || !member_exact) && sample.is_multiple_of(128)) {
                 eprintln!(
-                    "[dsa-cpu-select-oracle] device={} layer={} sample={sample} context={} candidate_recall={recall}/{} rerank_exact={rerank_exact} cpu_rerank_exact={cpu_rerank_exact} cpu_rerank_ms={cpu_rerank_ms:.3}",
-                    context.device_id, pending.layer, pending.context_rows, self.top_k
+                    "[dsa-cpu-select-oracle] device={} layer={} sample={sample} context={} member_exact={member_exact} order_exact={order_exact} overlap={overlap}/{} first_diff={first_diff:?} order_drifts={} member_drifts={} boundary_ok={boundary_ok}",
+                    context.device_id, pending.layer, pending.context_rows, self.top_k, self.cpu_order_drift_counts[pending.layer], self.cpu_member_drift_counts[pending.layer]
                 );
             }
+            if !boundary_ok {
+                return Err(compute_error(format!("L{} CPU DSA Top-K 差异超过数值边界: sample={sample} context={} overlap={overlap}/{}", pending.layer, pending.context_rows, self.top_k)));
+            }
+        }
+        if !ops::hip::options().kernel_profile {
+            self.release_gpu_history(context, pending.layer)?;
         }
         self.selection = Some(selection);
         self.selection_host = (ops::hip::options().mla_cpu_hot_rows != 0).then(|| Arc::new(cpu_selection));
@@ -1346,7 +1438,7 @@ impl RocmDsaState {
         self.cpu_select_counts[pending.layer] += 1;
         if ops::hip::options().mla_hot_trace && (sample < 2 || sample.is_multiple_of(128)) {
             eprintln!(
-                "[dsa-cpu-select] device={} layer={} sample={sample} context={} candidates={candidate_count} d2h_bytes={} d2h_ms={:.3} begin_ms={:.3} overlap_ms={overlap_ms:.3} wait_ms={wait_ms:.3} score_ms={score_ms:.3} topk_ms={topk_ms:.3} cpu_final_topk_ms={cpu_rerank_ms:.3} select_ms={select_ms:.3} total_ms={:.3} selection=cpu_async_q8_final",
+                "[dsa-cpu-select] device={} layer={} sample={sample} context={} d2h_bytes={} d2h_ms={:.3} begin_ms={:.3} overlap_ms={overlap_ms:.3} wait_ms={wait_ms:.3} score_ms={score_ms:.3} topk_ms={topk_ms:.3} select_ms={select_ms:.3} total_ms={:.3} selection=cpu_async_bf16",
                 context.device_id,
                 pending.layer,
                 pending.context_rows,
@@ -1388,7 +1480,7 @@ impl RocmDsaState {
         let scales = self.layers[layer].as_ref().unwrap().scales.clone();
         let hadamard = self.layers[layer].as_ref().unwrap().hadamard;
         let table = self.block_table.get("DSA", self.capacity, context.device_id, context_rows)?;
-        if self.cpu_select && context_rows > self.top_k + DSA_CPU_CANDIDATE_GUARD && !hadamard && self.kpool == 0 && self.decode_parallelism == 1 && query.rows == 1 && head_count == 32 && self.head_dim == 128 {
+        if self.cpu_select && context_rows > self.top_k + DSA_CPU_CANDIDATE_GUARD && !hadamard && self.kpool == 0 && query.rows == 1 && head_count == 32 && self.head_dim == 128 && self.key_group_size == self.head_dim {
             return self.select_cpu_begin(context, layer, query.device.as_ref().unwrap().clone(), head_weights.device.as_ref().unwrap().clone(), table, context_rows, head_count);
         }
         let exact = ops::hip::try_dsa_select_paged_q8(
@@ -1775,6 +1867,7 @@ impl RocmDsaState {
                 scales: upload_cache_buffer(owner.device_id, &owner_scales, owner_capacity * scale_row_bytes)?,
                 cpu_keys: None,
                 cpu_mirror: None,
+                cpu_offloaded: false,
                 hadamard_shadow_keys: None,
                 hadamard_shadow_scales: None,
                 hadamard: false,
@@ -1815,6 +1908,7 @@ impl RocmDsaState {
                     scales: Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, committed_rows * groups * 2).map_err(compute_error)?),
                     cpu_keys: None,
                     cpu_mirror: None,
+                    cpu_offloaded: false,
                     hadamard_shadow_keys: None,
                     hadamard_shadow_scales: None,
                     hadamard: false,
@@ -2523,6 +2617,10 @@ impl RocmDsaState {
         (self.selection_rows == rows && self.selection_start == query_start).then_some(self.selection_host.as_deref()).flatten().map(Vec::as_slice)
     }
 
+    pub(super) fn host_selection_arc(&self, rows: usize, query_start: usize) -> Option<Arc<Vec<u32>>> {
+        (self.selection_rows == rows && self.selection_start == query_start).then(|| self.selection_host.clone()).flatten()
+    }
+
     pub(crate) fn export_selection(&self) -> Option<RocmDsaSelection> {
         Some(RocmDsaSelection {
             buffer: self.selection.as_ref()?.clone(),
@@ -2567,6 +2665,17 @@ impl RocmDsaState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtp_selection_reuse_requires_one_contiguous_row() {
+        assert!(reusable_selection_metadata(true, 46_159, 1, 46_158, 2_048, 46_159, 1, 2_048));
+        assert!(reusable_selection_metadata(true, 46_159, 1, 46_160, 2_048, 46_161, 1, 2_048));
+        assert!(!reusable_selection_metadata(false, 46_159, 1, 46_158, 2_048, 46_159, 1, 2_048));
+        assert!(!reusable_selection_metadata(true, 46_160, 1, 46_158, 2_048, 46_159, 1, 2_048));
+        assert!(!reusable_selection_metadata(true, 46_159, 1, 46_158, 2_048, 46_160, 1, 2_048));
+        assert!(!reusable_selection_metadata(true, 46_159, 2, 46_158, 2_048, 46_160, 2, 2_048));
+        assert!(!reusable_selection_metadata(true, 46_159, 1, 46_158, 1_024, 46_159, 1, 2_048));
+    }
 
     #[test]
     fn dsa_parity_bytes_roundtrip_block_boundaries() {
@@ -2864,7 +2973,8 @@ impl RocmDsaState {
                 keys,
                 scales,
                 cpu_keys: None,
-                cpu_mirror: (ops::hip::options().mla_cpu_hot_rows != 0 || ops::hip::options().prefill_attention_cpu).then(|| std::sync::Mutex::new(RocmDsaCpuMirror::from_record(record.clone(), self.head_dim))),
+                cpu_mirror: (self.cpu_select || ops::hip::options().mla_cpu_hot_rows != 0 || ops::hip::options().prefill_attention_cpu).then(|| std::sync::Mutex::new(RocmDsaCpuMirror::from_record(record.clone(), self.head_dim))),
+                cpu_offloaded: false,
                 hadamard_shadow_keys: None,
                 hadamard_shadow_scales: None,
                 hadamard: record.hadamard,

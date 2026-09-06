@@ -23,7 +23,7 @@ use tokio::{
 };
 
 pub const SCHEDULER_ALPN: &[u8] = b"zllm/scheduler/1";
-pub const SCHEDULER_PROTOCOL_VERSION: u32 = 8;
+pub const SCHEDULER_PROTOCOL_VERSION: u32 = 9;
 const MAX_MESSAGE_BYTES: usize = 80 * 1024 * 1024;
 pub(super) const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 static ARTIFACT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -50,11 +50,37 @@ pub enum NodeMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SchedulerMessage {
-    Registered { node_id: String, heartbeat_seconds: u64, task_ids: Vec<String> },
-    NewPrefill { request_id: String, model: String, request: Value },
-    Cancel { request_id: String },
-    NewTask { task_id: String, model: String, task_kind: String, request: Value },
-    ArtifactCommitted { task_id: String, artifact_id: String },
+    Registered {
+        node_id: String,
+        heartbeat_seconds: u64,
+        task_ids: Vec<String>,
+    },
+    NewPrefill {
+        request_id: String,
+        model: String,
+        request: Value,
+    },
+    Cancel {
+        request_id: String,
+    },
+    NewTask {
+        task_id: String,
+        model: String,
+        task_kind: String,
+        request: Value,
+    },
+    ArtifactCommitted {
+        task_id: String,
+        artifact_id: String,
+    },
+    /// append 请求在 owner 满载排队期间 pin 终点 cache,节点换出循环跳过被 pin
+    /// 条目,排到队时命中内存而不是 swap 慢路径;`UnpinCache` 解除。
+    PinCache {
+        cache_id: String,
+    },
+    UnpinCache {
+        cache_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -183,11 +209,98 @@ impl NodeCommands {
     }
 }
 
+/// 一次推理执行的事件分发中枢。节点数据面(wire 的 publish 或本地节点的直连
+/// 通道)把事件送入 entry,分发 task 追加历史并转发给全部订阅者;同一请求的
+/// 重复提交(重试)在这里合并——新订阅者在锁内重放完整历史后实时跟进,
+/// 第一个 token 延迟只剩已生成部分的重放耗时。
+struct EventHub {
+    entry: mpsc::Sender<InferenceEvent>,
+    state: std::sync::Mutex<HubState>,
+}
+
+struct HubState {
+    history: Vec<InferenceEvent>,
+    subscribers: Vec<(String, mpsc::Sender<InferenceEvent>)>,
+    /// 节点认识的 request_id;向节点发 Cancel 必须用它。
+    primary_request_id: String,
+    /// 终态已进入历史(与 push 在同一临界区内置位),此后不再接受合并订阅。
+    finished: bool,
+}
+
+impl EventHub {
+    fn new(entry: mpsc::Sender<InferenceEvent>, primary_request_id: String) -> Arc<Self> {
+        Arc::new(Self { entry, state: std::sync::Mutex::new(HubState { history: Vec::new(), subscribers: Vec::new(), primary_request_id, finished: false }) })
+    }
+
+    /// 重试合并:锁内重放历史并加入订阅。容量 ≥ 历史长度保证 try_send 必成;
+    /// 终态已到(finished)则只重放不订阅——receiver 在 tx drop 后自然关闭。
+    /// 与 distribute 的 push/clone 临界区互斥,事件不重不漏:订阅先于 push 则
+    /// 实时收到,晚于 push 则历史里已有。
+    fn subscribe(&self, request_id: String) -> mpsc::Receiver<InferenceEvent> {
+        let mut state = self.state.lock().expect("事件枢纽锁中毒");
+        let (sender, receiver) = mpsc::channel(64 + state.history.len().max(1));
+        for event in &state.history {
+            let _ = sender.try_send(event.clone());
+        }
+        if !state.finished {
+            state.subscribers.push((request_id, sender));
+        }
+        receiver
+    }
+
+    /// 分发一个事件(可能终态);订阅者已关闭时移除。
+    async fn distribute(&self, event: InferenceEvent) {
+        let terminal = event.terminal();
+        let subscribers = {
+            let mut state = self.state.lock().expect("事件枢纽锁中毒");
+            state.history.push(event.clone());
+            if terminal {
+                state.finished = true;
+            }
+            state.subscribers.clone()
+        };
+        for (request_id, sender) in subscribers {
+            if sender.send(event.clone()).await.is_err() {
+                if let Ok(mut state) = self.state.lock() {
+                    state.subscribers.retain(|(existing, _)| existing != &request_id);
+                }
+            }
+        }
+    }
+
+    /// 节点异常断开时对所有订阅者补一个终态错误;已 finished 则无事可做。
+    async fn abort(&self, message: &str) {
+        let subscribers = {
+            let mut state = self.state.lock().expect("事件枢纽锁中毒");
+            if state.finished {
+                return;
+            }
+            state.finished = true;
+            let event = InferenceEvent::Error { message: message.to_owned() };
+            state.history.push(event.clone());
+            state.subscribers.clone()
+        };
+        for (_, sender) in subscribers {
+            let _ = sender.send(InferenceEvent::Error { message: message.to_owned() }).await;
+        }
+    }
+
+    /// 摘除一个订阅者;返回 (primary_request_id, 是否已无订阅者)。
+    /// writer 的生死由订阅者计数决定:全部订阅者断开才应该取消节点执行。
+    fn unsubscribe(&self, request_id: &str) -> (String, bool) {
+        let mut state = self.state.lock().expect("事件枢纽锁中毒");
+        state.subscribers.retain(|(existing, _)| existing != request_id);
+        (state.primary_request_id.clone(), state.subscribers.is_empty() && !state.finished)
+    }
+}
+
 struct InflightRequest {
     node_id: String,
-    events: mpsc::Sender<InferenceEvent>,
+    hub: Arc<EventHub>,
     cache_id: Option<String>,
     cancelled: bool,
+    /// 是否占用节点并发槽位(primary=true;重试合并条目没有真实 NewPrefill,不占)。
+    counted: bool,
 }
 
 struct InflightTask {
@@ -256,7 +369,6 @@ impl Default for SchedulerConfig {
 #[derive(Debug)]
 pub enum DispatchError {
     NoAvailableNode(String),
-    CacheWriterBusy(String),
     NodeDisconnected,
 }
 
@@ -264,7 +376,6 @@ impl std::fmt::Display for DispatchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NoAvailableNode(model) => write!(formatter, "模型 {model} 没有可用节点"),
-            Self::CacheWriterBusy(model) => write!(formatter, "模型 {model} 的同 cache_id writer 尚未提交"),
             Self::NodeDisconnected => formatter.write_str("选中的节点已经断开"),
         }
     }
@@ -367,7 +478,15 @@ impl Scheduler {
             }
             state.nodes.remove(node_id);
             let request_ids = state.requests.iter().filter_map(|(request_id, request)| (request.node_id == node_id).then_some(request_id.clone())).collect::<Vec<_>>();
-            let pending = request_ids.into_iter().filter_map(|request_id| state.requests.remove(&request_id).map(|request| request.events)).collect::<Vec<_>>();
+            // 同一 hub 可能挂多个条目(primary + 重试合并),去重后统一补终态错误。
+            let mut pending = Vec::new();
+            for request_id in request_ids {
+                if let Some(request) = state.requests.remove(&request_id)
+                    && !pending.iter().any(|hub: &Arc<EventHub>| Arc::ptr_eq(hub, &request.hub))
+                {
+                    pending.push(request.hub);
+                }
+            }
             let tasks = state
                 .tasks
                 .iter()
@@ -376,8 +495,8 @@ impl Scheduler {
                 .collect::<Vec<_>>();
             (pending, tasks)
         };
-        for events in pending {
-            let _ = events.send(InferenceEvent::Error { message: "推理节点连接已断开".to_owned() }).await;
+        for hub in pending {
+            hub.abort("推理节点连接已断开").await;
         }
         for (task_id, task_kind) in tasks {
             let (status, error) = if task_kind == "video_generation" { ("queued", "执行节点连接已断开，等待持久化任务恢复") } else { ("failed", "执行节点连接已断开") };
@@ -409,10 +528,17 @@ impl Scheduler {
     pub async fn dispatch(&self, request_id: String, model: String, cache_id: Option<&str>, request: Value) -> Result<mpsc::Receiver<InferenceEvent>, DispatchError> {
         let events = {
             let mut state = self.state.lock().await;
-            // 同一 cache_id 是一个线性 session writer。cancel 只发撤销信号，旧 writer
-            // 要到 checkpoint/终态后才释放；retry 在这里等待，避免跨 node 半写分叉。
-            if cache_id.is_some_and(|cache_id| state.requests.values().any(|request| request.cache_id.as_deref() == Some(cache_id))) {
-                return Err(DispatchError::CacheWriterBusy(model));
+            // 同 cache_id 已有 writer = 同一请求的重复提交:正常对话的 cache_id
+            // 随对话历史单调前进,只有重试会重放旧 id。合并到现有事件流——历史
+            // 重放 + 实时跟进,不发 NewPrefill、不占节点槽位、无需排队等待。
+            if let Some(cache_id) = cache_id
+                && let Some(existing) = state.requests.values().find(|request| request.cache_id.as_deref() == Some(cache_id))
+            {
+                let hub = existing.hub.clone();
+                let node_id = existing.node_id.clone();
+                let receiver = hub.subscribe(request_id.clone());
+                state.requests.insert(request_id.clone(), InflightRequest { node_id, hub, cache_id: Some(cache_id.to_owned()), cancelled: false, counted: false });
+                return Ok(receiver);
             }
             let cached_nodes = cache_id
                 .map_or_else(Vec::new, |cache_id| state.nodes.iter().filter(|(_, node)| node.view.model == model && node.view.caches.iter().any(|cache| cache.cache_id == cache_id)).map(|(node_id, _)| node_id.clone()).collect::<Vec<_>>());
@@ -441,21 +567,23 @@ impl Scheduler {
             node.last_dispatched = dispatch;
             node.pending_pressure = node.pending_pressure.saturating_add(admission_pressure);
             let commands = node.commands.clone();
-            let (event_tx, event_rx) = mpsc::channel(64);
-            state.requests.insert(request_id.clone(), InflightRequest { node_id: node_id.clone(), events: event_tx.clone(), cache_id: cache_id.map(str::to_owned), cancelled: false });
+            let (entry_tx, entry_rx) = mpsc::channel(64);
+            let hub = EventHub::new(entry_tx.clone(), request_id.clone());
+            let receiver = hub.subscribe(request_id.clone());
+            state.requests.insert(request_id.clone(), InflightRequest { node_id: node_id.clone(), hub: hub.clone(), cache_id: cache_id.map(str::to_owned), cancelled: false, counted: true });
             if let Some(node) = state.nodes.get_mut(&node_id) {
                 node.view.active_requests += 1;
             }
-            // try_send 让“登记 inflight + 入 node 命令队列”在同一无 await 临界区
+            // try_send 让"登记 inflight + 入 node 命令队列"在同一无 await 临界区
             // 完成；handler future 不可能停在已登记但 NewPrefill 尚未入队的状态。
-            // 本地节点的 NewPrefill 直接携带事件通道,token 数据面不再经过 scheduler。
+            // 本地节点的 NewPrefill 直接携带事件入口,token 数据面不再经过 scheduler。
             let retry_model = model.clone();
             let sent = match &commands {
                 NodeCommands::Wire(tx) => tx.try_send(SchedulerMessage::NewPrefill { request_id: request_id.clone(), model, request }).map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => DispatchError::NoAvailableNode(retry_model.clone()),
                     mpsc::error::TrySendError::Closed(_) => DispatchError::NodeDisconnected,
                 }),
-                NodeCommands::Local(tx) => tx.try_send(LocalNodeCommand::NewPrefill { request_id: request_id.clone(), model, request, events: event_tx }).map_err(|error| match error {
+                NodeCommands::Local(tx) => tx.try_send(LocalNodeCommand::NewPrefill { request_id: request_id.clone(), model, request, events: entry_tx }).map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => DispatchError::NoAvailableNode(retry_model.clone()),
                     mpsc::error::TrySendError::Closed(_) => DispatchError::NodeDisconnected,
                 }),
@@ -468,34 +596,95 @@ impl Scheduler {
                 }
                 return Err(error);
             }
-            event_rx
+            self.spawn_hub_dispatcher(entry_rx, hub);
+            receiver
         };
         Ok(events)
     }
 
+    /// hub 分发 task:消费节点事件入口,追加历史并转发给全部订阅者;终态后
+    /// 摘除该 hub 的合并条目(primary 条目由 publish/note_terminal 摘除)。
+    /// 入口关闭而未终态(节点进程消失)时补发终态错误,订阅者不会挂死。
+    fn spawn_hub_dispatcher(&self, mut entry: mpsc::Receiver<InferenceEvent>, hub: Arc<EventHub>) {
+        let scheduler = self.clone();
+        tokio::spawn(async move {
+            while let Some(event) = entry.recv().await {
+                let terminal = event.terminal();
+                hub.distribute(event).await;
+                if terminal {
+                    scheduler.reap_hub_entries(&hub).await;
+                    return;
+                }
+            }
+            hub.abort("推理节点事件流已关闭").await;
+            scheduler.reap_hub_entries(&hub).await;
+        });
+    }
+
+    /// 摘除 hub 上未被终态簿记清理的重试合并条目(不影响节点槽位计数)。
+    async fn reap_hub_entries(&self, hub: &Arc<EventHub>) {
+        self.state.lock().await.requests.retain(|_, request| !Arc::ptr_eq(&request.hub, hub) || request.counted);
+    }
+
+    /// 查 `cache_id` 的全部持有者节点及命令通道(`cache_owner` 只返回最早一个)。
+    async fn cache_holders(&self, cache_id: &str) -> Vec<(String, NodeCommands)> {
+        self.state.lock().await.nodes.iter().filter(|(_, node)| node.view.caches.iter().any(|cache| cache.cache_id == cache_id)).map(|(node_id, node)| (node_id.clone(), node.commands.clone())).collect()
+    }
+
     /// 节点真实并发槽位暂满时等待流式 runtime 释放容量；模型未注册则立即返回。
+    /// 同 cache_id 的重试请求在 dispatch 内即时合并,不进入这条等待路径。
+    /// append 排队期间对 cache 持有者下发 pin:排队等的是"槽位",不能再让
+    /// LRU 换出把等待目标挪到 SSD,排到队时退化为 swap-in 慢路径。
     pub async fn dispatch_wait(&self, request_id: String, model: String, cache_id: Option<&str>, request: Value) -> Result<mpsc::Receiver<InferenceEvent>, DispatchError> {
         let deadline = tokio::time::Instant::now() + self.dispatch_wait;
-        loop {
+        let mut pinned: Vec<(String, NodeCommands)> = Vec::new();
+        let result = loop {
             match self.dispatch(request_id.clone(), model.clone(), cache_id, request.clone()).await {
-                Err(DispatchError::CacheWriterBusy(_)) => {
-                    if !self.state.lock().await.nodes.values().any(|node| node.view.model == model) {
-                        return Err(DispatchError::NoAvailableNode(model));
-                    }
-                    // cache writer 的排空/跨节点 ACK 可长于普通容量等待；只由调用方
-                    // 断连取消等待，不把可靠 resume 降级成固定 30 秒后 503。
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
                 Err(DispatchError::NoAvailableNode(_)) => {
                     let model_registered = self.state.lock().await.nodes.values().any(|node| node.view.model == model);
                     if !model_registered || tokio::time::Instant::now() >= deadline {
-                        return Err(DispatchError::NoAvailableNode(model));
+                        break Err(DispatchError::NoAvailableNode(model));
+                    }
+                    if pinned.is_empty()
+                        && let Some(cache_id) = cache_id
+                        && let Some(holder_commands) = self.try_pin_holders(cache_id).await
+                    {
+                        pinned = holder_commands;
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-                result => return result,
+                result => break result,
+            }
+        };
+        if !pinned.is_empty()
+            && let Some(cache_id) = cache_id
+        {
+            // 解 pin 对象覆盖 pin 时刻与退出时刻持有者的并集:窗口内持有者变化时
+            // 多发的 unpin 在节点侧是无害 no-op。
+            let mut targets = self.cache_holders(cache_id).await;
+            for (node_id, commands) in pinned {
+                if !targets.iter().any(|(existing, _)| existing == &node_id) {
+                    targets.push((node_id, commands));
+                }
+            }
+            for (_, commands) in targets {
+                let _ = commands.send(SchedulerMessage::UnpinCache { cache_id: cache_id.to_owned() }).await;
             }
         }
+        result
+    }
+
+    /// 首次排队时 pin 该 cache 的全部持有者(内存与 SSD 持有者都算,最终选中谁
+    /// 由容量与 location rank 决定);无持有者返回 None,保持未 pin 状态。
+    async fn try_pin_holders(&self, cache_id: &str) -> Option<Vec<(String, NodeCommands)>> {
+        let holders = self.cache_holders(cache_id).await;
+        if holders.is_empty() {
+            return None;
+        }
+        for (_, commands) in &holders {
+            let _ = commands.send(SchedulerMessage::PinCache { cache_id: cache_id.to_owned() }).await;
+        }
+        Some(holders)
     }
 
     /// 查 `cache_id` 的 owner node + CacheInfo（供 `GET /v1/caches/{cache_id}`）。
@@ -513,21 +702,21 @@ impl Scheduler {
 
     async fn publish(&self, node_id: &str, request_id: &str, event: InferenceEvent) {
         let terminal = event.terminal();
-        let events = {
+        let entry = {
             let mut state = self.state.lock().await;
             let Some(request) = state.requests.get(request_id).filter(|request| request.node_id == node_id) else {
                 return;
             };
-            let events = request.events.clone();
+            let entry = request.hub.entry.clone();
             if terminal {
                 let request = state.requests.remove(request_id).expect("刚确认请求存在");
                 if let Some(node) = state.nodes.get_mut(&request.node_id) {
                     node.view.active_requests = node.view.active_requests.saturating_sub(1);
                 }
             }
-            events
+            entry
         };
-        let _ = events.send(event).await;
+        let _ = entry.send(event).await;
     }
 
     pub async fn cancel(&self, request_id: &str) {
@@ -540,11 +729,15 @@ impl Scheduler {
                 return;
             }
             request.cancelled = true;
+            let hub = request.hub.clone();
             let node_id = request.node_id.clone();
-            state.nodes.get(&node_id).map(|node| node.commands.clone())
+            // 只摘除该请求的事件订阅;writer 的生死由订阅者计数决定——重试
+            // 订阅者还在时不向节点发 Cancel,执行继续为存活的连接产出。
+            let (primary_request_id, last_subscriber) = hub.unsubscribe(request_id);
+            last_subscriber.then(|| state.nodes.get(&node_id).map(|node| node.commands.clone())).flatten().map(|commands| (commands, primary_request_id))
         };
-        if let Some(commands) = command {
-            let _ = commands.send(SchedulerMessage::Cancel { request_id: request_id.to_owned() }).await;
+        if let Some((commands, primary_request_id)) = command {
+            let _ = commands.send(SchedulerMessage::Cancel { request_id: primary_request_id }).await;
         }
     }
 
@@ -626,8 +819,9 @@ impl Scheduler {
 
     #[cfg(test)]
     pub(super) async fn track_test_request(&self, request_id: &str) {
-        let (events, _receiver) = mpsc::channel(1);
-        self.state.lock().await.requests.insert(request_id.to_owned(), InflightRequest { node_id: String::new(), events, cache_id: None, cancelled: false });
+        let (entry, _entry_rx) = mpsc::channel(1);
+        let hub = EventHub::new(entry, request_id.to_owned());
+        self.state.lock().await.requests.insert(request_id.to_owned(), InflightRequest { node_id: String::new(), hub, cache_id: None, cancelled: false, counted: false });
     }
 
     #[cfg(test)]
@@ -1315,19 +1509,20 @@ mod tests {
         .await
         .unwrap();
 
-        // cancel 只给旧 writer 发撤销信号；同 cache_id retry 要等旧 writer
-        // checkpoint heartbeat + terminal，不能利用剩余并发槽在另一条 session 分叉。
+        // cancel 只给旧 writer 发撤销信号(订阅者清零才发);同 cache_id 的重试
+        // 请求即时合并到现有事件流(tee),不排队、不占节点执行槽。
         let mut cancelled_events = scheduler.dispatch("req_cancelled_writer".to_owned(), "ornith".to_owned(), Some("retry-cache"), json!({"model":"ornith"})).await.unwrap();
         assert!(matches!(read_json_line::<_, SchedulerMessage>(&mut reader).await.unwrap(), SchedulerMessage::NewPrefill { ref request_id, .. } if request_id == "req_cancelled_writer"));
         scheduler.cancel("req_cancelled_writer").await;
         assert!(matches!(read_json_line::<_, SchedulerMessage>(&mut reader).await.unwrap(), SchedulerMessage::Cancel { ref request_id } if request_id == "req_cancelled_writer"));
-        assert!(matches!(scheduler.dispatch("req_early_retry".to_owned(), "ornith".to_owned(), Some("retry-cache"), json!({"model":"ornith"})).await, Err(DispatchError::CacheWriterBusy(_))));
-        assert_eq!(scheduler.nodes().await[0].active_requests, 1, "取消信号不等于 node 已释放执行槽");
+        let mut retry_tee = scheduler.dispatch("req_early_retry".to_owned(), "ornith".to_owned(), Some("retry-cache"), json!({"model":"ornith"})).await.unwrap();
+        assert_eq!(scheduler.nodes().await[0].active_requests, 1, "合并请求不占节点执行槽");
+        drop(cancelled_events);
 
         let retry_cache = CacheInfo { cache_id: "retry-cache".to_owned(), model_key: "ornith-test".to_owned(), cache_format: "gqa-int8".to_owned(), last_layer: 7, prompt_tokens: 96, bytes: 3072, modified_unix: 2 };
         write_json_line(&mut send, &NodeMessage::Heartbeat { caches: vec![retry_cache], runtime: NodeRuntime::default() }).await.unwrap();
         write_json_line(&mut send, &NodeMessage::Event { request_id: "req_cancelled_writer".to_owned(), event: InferenceEvent::Completed { finish_reason: "cancelled".to_owned(), prompt_tokens: 128, completion_tokens: 0 } }).await.unwrap();
-        assert!(matches!(cancelled_events.recv().await, Some(InferenceEvent::Completed { ref finish_reason, .. }) if finish_reason == "cancelled"));
+        assert!(matches!(retry_tee.recv().await, Some(InferenceEvent::Completed { ref finish_reason, .. }) if finish_reason == "cancelled"), "合并订阅者应收到重放的终态");
         tokio::time::timeout(Duration::from_secs(1), async {
             while scheduler.nodes().await[0].active_requests != 0 || scheduler.cache_owner("retry-cache").await.is_none() {
                 tokio::task::yield_now().await;
@@ -1558,6 +1753,60 @@ mod tests {
         // 清理:推 terminal 让 active_requests 归零,避免 drop 节点时仍在 inflight。
         drop(events);
         scheduler.publish("owner", "req_1", InferenceEvent::Completed { finish_reason: "stop".to_owned(), prompt_tokens: 1, completion_tokens: 0 }).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn 同cache_id重试即时合并tee且订阅计数决定cancel() {
+        let scheduler = Scheduler::default();
+        let mut node = register_local_node(&scheduler, "node", "glm-5.2", 4, Vec::new()).await;
+        let _first = scheduler.dispatch("req-1".to_owned(), "glm-5.2".to_owned(), Some("session-a"), json!({"model":"glm-5.2"})).await.unwrap();
+        match tokio::time::timeout(Duration::from_millis(200), node.commands.recv()).await {
+            Ok(Some(LocalNodeCommand::NewPrefill { ref request_id, .. })) if request_id == "req-1" => {}
+            other => panic!("节点应收到一次 NewPrefill: {other:?}"),
+        }
+        // writer 进行中,事件已流入历史
+        scheduler.publish("node", "req-1", InferenceEvent::Started).await;
+        scheduler.publish("node", "req-1", InferenceEvent::Token { token_id: 1, text: "你".to_owned() }).await;
+        // 同 cache_id 重试到达:立即合并,历史重放,不再排队等待
+        let mut retry = scheduler.dispatch("req-1-retry".to_owned(), "glm-5.2".to_owned(), Some("session-a"), json!({"model":"glm-5.2"})).await.unwrap();
+        assert!(matches!(retry.recv().await, Some(InferenceEvent::Started)), "重试订阅者应立即重放历史");
+        assert!(matches!(retry.recv().await, Some(InferenceEvent::Token { ref text, .. }) if text == "你"));
+        assert_eq!(scheduler.nodes().await[0].active_requests, 1, "合并请求不占节点执行槽");
+        assert!(tokio::time::timeout(Duration::from_millis(100), node.commands.recv()).await.is_err(), "合并请求不应触发第二次 NewPrefill");
+        // 第一个连接断开:重试订阅者仍存活,不得向节点发 Cancel
+        scheduler.cancel("req-1").await;
+        assert!(tokio::time::timeout(Duration::from_millis(50), node.commands.recv()).await.is_err(), "仍有订阅者时不应发 Cancel");
+        // 终态:存活订阅者收到完整终态,合并条目与槽位全部清理
+        scheduler.publish("node", "req-1", InferenceEvent::Completed { finish_reason: "stop".to_owned(), prompt_tokens: 3, completion_tokens: 1 }).await;
+        assert!(matches!(retry.recv().await, Some(InferenceEvent::Completed { .. })));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while scheduler.nodes().await[0].active_requests != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn append排队期间pin持有者cache() {
+        // owner 满载时 dispatch_wait 排队:进入等待即 PinCache 持有者,超时退出即
+        // UnpinCache——排队等的是槽位,不能让 LRU 把等待目标换出到 SSD。
+        let scheduler = Scheduler::new(&SchedulerConfig { dispatch_wait: Duration::from_millis(150), ..SchedulerConfig::default() });
+        let cache = CacheInfo { cache_id: "session-a".to_owned(), model_key: "glm-5.2".to_owned(), cache_format: "mla".to_owned(), last_layer: 77, prompt_tokens: 128, bytes: 4096, modified_unix: 1 };
+        let mut owner = register_local_node(&scheduler, "owner", "glm-5.2", 1, vec![cache]).await;
+        scheduler.state.lock().await.nodes.get_mut("owner").unwrap().view.active_requests = 1;
+
+        let result = scheduler.dispatch_wait("req-queued".to_owned(), "glm-5.2".to_owned(), Some("session-a"), json!({"model":"glm-5.2"})).await;
+        assert!(matches!(result, Err(DispatchError::NoAvailableNode(_))));
+        match tokio::time::timeout(Duration::from_secs(1), owner.commands.recv()).await {
+            Ok(Some(LocalNodeCommand::Wire(SchedulerMessage::PinCache { ref cache_id }))) if cache_id == "session-a" => {}
+            other => panic!("排队期间节点应收到 PinCache: {other:?}"),
+        }
+        match tokio::time::timeout(Duration::from_secs(1), owner.commands.recv()).await {
+            Ok(Some(LocalNodeCommand::Wire(SchedulerMessage::UnpinCache { ref cache_id }))) if cache_id == "session-a" => {}
+            other => panic!("排队结束节点应收到 UnpinCache: {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

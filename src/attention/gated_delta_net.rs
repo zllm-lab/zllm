@@ -8,6 +8,14 @@ use crate::{
     backend::{Backend, BackendError},
 };
 
+/// GDN 输出门激活:Qwen3.5/3.6/Ornith 用 silu(z·sigmoid(z)),
+/// Qwen4-Exp 改为纯 sigmoid(z)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GdnOutputGate {
+    Silu,
+    Sigmoid,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GatedDeltaNetSpec {
     pub key_heads: usize,
@@ -16,6 +24,7 @@ pub struct GatedDeltaNetSpec {
     pub value_head_dim: usize,
     pub conv_kernel: usize,
     pub rms_eps: f32,
+    pub output_gate: GdnOutputGate,
 }
 
 impl GatedDeltaNetSpec {
@@ -151,6 +160,10 @@ impl<S> GatedDeltaNetState<S> {
         self.inner.layer_storage(layer)
     }
 
+    pub fn layer_storage_mut(&mut self, layer: usize) -> Option<&mut S> {
+        self.inner.layer_storage_mut(layer)
+    }
+
     /// 快照恢复：注入层 storage 并把 position 推进到快照时的 token 数。
     pub fn restore_layer(&mut self, layer: usize, position: usize, storage: S) -> Result<(), BackendError> {
         self.inner.restore_layer(layer, position, storage)
@@ -206,7 +219,7 @@ mod tests {
 
     #[test]
     fn ornith_state_budget_matches_real_shape() {
-        let spec = GatedDeltaNetSpec { key_heads: 16, value_heads: 32, key_head_dim: 128, value_head_dim: 128, conv_kernel: 4, rms_eps: 1e-6 };
+        let spec = GatedDeltaNetSpec { key_heads: 16, value_heads: 32, key_head_dim: 128, value_head_dim: 128, conv_kernel: 4, rms_eps: 1e-6, output_gate: GdnOutputGate::Silu };
         assert_eq!(spec.key_dim(), 2_048);
         assert_eq!(spec.value_dim(), 4_096);
         assert_eq!(spec.conv_dim(), 8_192);
@@ -216,7 +229,7 @@ mod tests {
 
     #[test]
     fn head_layout_matches_source_weight_order() {
-        let spec = GatedDeltaNetSpec { key_heads: 16, value_heads: 32, key_head_dim: 128, value_head_dim: 128, conv_kernel: 4, rms_eps: 1e-6 };
+        let spec = GatedDeltaNetSpec { key_heads: 16, value_heads: 32, key_head_dim: 128, value_head_dim: 128, conv_kernel: 4, rms_eps: 1e-6, output_gate: GdnOutputGate::Silu };
         let heads = [0, 1, 15, 16, 17, 31];
         assert_eq!(heads.map(|head| GatedDeltaNetHeadLayout::Grouped.key_head_for_value(&spec, head)), [0, 0, 7, 8, 8, 15]);
         assert_eq!(heads.map(|head| GatedDeltaNetHeadLayout::Tiled.key_head_for_value(&spec, head)), [0, 1, 15, 0, 1, 15]);

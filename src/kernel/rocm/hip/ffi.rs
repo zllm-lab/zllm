@@ -132,6 +132,25 @@ static INDEPENDENT_COMPUTE_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceL
 static BACKGROUND_STAGE_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
 static COOPERATIVE_PEER_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
 static COOPERATIVE_SHARED_STREAMS: OnceLock<Mutex<HashMap<i32, usize>>> = OnceLock::new();
+static CACHE_PREFETCH_STREAMS: OnceLock<Mutex<HashMap<(i32, usize), usize>>> = OnceLock::new();
+
+/// 各层分别记录预取队列，消费近层时无需等待同卡较远层的搬运。
+pub(crate) fn cache_prefetch_stream(device_id: i32, layer: usize) -> Result<usize, String> {
+    let mut streams = CACHE_PREFETCH_STREAMS.get_or_init(|| Mutex::new(HashMap::new())).lock().map_err(|_| "ROCm cache prefetch stream 注册表已损坏")?;
+    if let Some(&stream) = streams.get(&(device_id, layer)) {
+        return Ok(stream);
+    }
+    set_device(device_id)?;
+    let runtime = RocmRuntime::open()?;
+    let create: Symbol<HipStreamCreateWithFlags> = runtime.symbol(&runtime.hip, b"hipStreamCreateWithFlags\0")?;
+    let mut stream = ptr::null_mut();
+    let status = unsafe { create(&mut stream, HIP_STREAM_NON_BLOCKING) };
+    if status != HIP_SUCCESS {
+        return Err(runtime.hip_error(status, "hipStreamCreateWithFlags cache prefetch"));
+    }
+    streams.insert((device_id, layer), stream as usize);
+    Ok(stream as usize)
+}
 
 fn low_priority_compute_stream(device_id: i32, registry: &'static OnceLock<Mutex<HashMap<i32, usize>>>, label: &'static str) -> Result<usize, String> {
     let mut streams = registry.get_or_init(|| Mutex::new(HashMap::new())).lock().map_err(|_| format!("ROCm {label} stream 注册表已损坏"))?;
@@ -188,7 +207,13 @@ pub(crate) fn initialized_background_stage_stream(device_id: i32) -> Option<usiz
 }
 
 pub(crate) fn order_stream_after(device_id: i32, source_stream: usize, destination_stream: usize) -> Result<(), String> {
-    if source_stream == destination_stream {
+    order_streams_after(device_id, source_stream, &[destination_stream])
+}
+
+/// 多条目标 stream 等待同一个源位置，只记录一次 event。用于同一 selection
+/// 扇出到多层 cache 预取，避免逐层重复 event create/record/destroy。
+pub(crate) fn order_streams_after(device_id: i32, source_stream: usize, destination_streams: &[usize]) -> Result<(), String> {
+    if destination_streams.iter().all(|&stream| stream == source_stream) {
         return set_device(device_id);
     }
     set_device(device_id)?;
@@ -207,13 +232,55 @@ pub(crate) fn order_stream_after(device_id: i32, source_stream: usize, destinati
         if status != HIP_SUCCESS {
             return Err(runtime.hip_error(status, "hipEventRecord stream handoff source"));
         }
-        let status = unsafe { wait(destination_stream as *mut c_void, event, 0) };
-        if status != HIP_SUCCESS {
-            return Err(runtime.hip_error(status, "hipStreamWaitEvent stream handoff destination"));
+        for &destination_stream in destination_streams {
+            if destination_stream == source_stream {
+                continue;
+            }
+            let status = unsafe { wait(destination_stream as *mut c_void, event, 0) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipStreamWaitEvent stream handoff destination"));
+            }
         }
         Ok(())
     })();
     let _ = unsafe { destroy(event) };
+    result
+}
+
+/// 让 destination device 的 stream 等待 source device 的 stream。用于只有
+/// 单向 P2P、没有结果回传的路径；只建立设备事件依赖，不等待 host。
+pub(crate) fn order_device_stream_after(source_device_id: i32, source_stream: usize, destination_device_id: i32, destination_stream: usize) -> Result<(), String> {
+    if source_device_id == destination_device_id {
+        return order_stream_after(source_device_id, source_stream, destination_stream);
+    }
+    set_device(source_device_id)?;
+    let runtime = RocmRuntime::open()?;
+    let create = runtime.event_create()?;
+    let record = runtime.event_record()?;
+    let wait: Symbol<HipStreamWaitEvent> = runtime.symbol(&runtime.hip, b"hipStreamWaitEvent\0")?;
+    let destroy = runtime.event_destroy()?;
+    let mut event = ptr::null_mut();
+    let status = unsafe { create(&mut event, HIP_EVENT_DISABLE_TIMING) };
+    if status != HIP_SUCCESS {
+        return Err(runtime.hip_error(status, "hipEventCreateWithFlags cross-device stream handoff"));
+    }
+    let result = (|| {
+        let status = unsafe { record(event, source_stream as *mut c_void) };
+        if status != HIP_SUCCESS {
+            return Err(runtime.hip_error(status, "hipEventRecord cross-device stream handoff source"));
+        }
+        set_device(destination_device_id)?;
+        let status = unsafe { wait(destination_stream as *mut c_void, event, 0) };
+        if status != HIP_SUCCESS {
+            return Err(runtime.hip_error(status, "hipStreamWaitEvent cross-device stream handoff destination"));
+        }
+        Ok(())
+    })();
+    let _ = set_device(source_device_id).and_then(|()| {
+        let status = unsafe { destroy(event) };
+        if status == HIP_SUCCESS { Ok(()) } else { Err(runtime.hip_error(status, "hipEventDestroy cross-device stream handoff")) }
+    });
+    set_device(destination_device_id)?;
     result
 }
 

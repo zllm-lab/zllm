@@ -176,7 +176,7 @@ mod tests {
             }
         };
         let mut rocm_storage = rocm.allocate_kda_storage(&spec).expect("ROCm KDA storage 分配失败");
-        let rocm_tensor = |data: &[f32], cols: usize| RocmTensor { data: data.to_vec(), rows, cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None };
+        let rocm_tensor = |data: &[f32], cols: usize| RocmTensor { data: data.to_vec(), rows, cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None, replica: None };
         let rocm_conv_weight = rocm.prepare_weight(LinearWeight::F32(&conv_weight), projection, spec.short_conv_kernel_size).expect("ROCm conv_weight prepare 失败");
         let rocm_a_log = rocm.prepare_f32(&a_log, 1, spec.num_heads).expect("ROCm a_log prepare 失败");
         let rocm_dt_bias = rocm.prepare_f32(&dt_bias, 1, projection).expect("ROCm dt_bias prepare 失败");

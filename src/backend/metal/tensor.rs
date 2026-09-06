@@ -112,7 +112,8 @@ impl BackendResources for MetalContext {
     fn begin_decode_batch(&self) {
         self.clear_f16_casts();
         self.set_deferred_layer_scope_sync(true);
-        self.set_deferred_batch_max_operations(self.decode_batch_max_operations());
+        let operations = if self.detailed_gpu_profiles_enabled() { 1 } else { self.decode_batch_max_operations() };
+        self.set_deferred_batch_max_operations(operations);
         self.set_deferred_waits(true);
     }
 
@@ -383,6 +384,12 @@ impl Backend for MetalContext {
             ) if input.rows == 1 && first_cols == second_cols && input.cols == *first_cols => {
                 // decode 单行 Q/K(q4k×q4k)合并 dispatch;行数可不同(GQA)
                 ops::gguf::gguf_dual_gemv_q4k_tensor(self, input, first_blob, *first_row_bytes, *first_rows, second_blob, *second_row_bytes, *second_rows, *first_cols).map_err(|msg| BackendError::Compute { msg })
+            }
+            (
+                MetalWeight::Gguf { blob: first_blob, tensor_type: first_type @ (18 | 21), row_bytes: first_row_bytes, rows: first_rows, cols: first_cols },
+                MetalWeight::Gguf { blob: second_blob, tensor_type: second_type @ (18 | 21), row_bytes: second_row_bytes, rows: second_rows, cols: second_cols },
+            ) if input.rows == 1 && first_cols == second_cols && input.cols == *first_cols => {
+                ops::gguf::gguf_dual_gemv_iq3_tensor(self, input, first_blob, *first_type, *first_row_bytes, *first_rows, second_blob, *second_type, *second_row_bytes, *second_rows, *first_cols).map_err(|msg| BackendError::Compute { msg })
             }
             _ => Ok((self.linear(input, first)?, self.linear(input, second)?)),
         }
@@ -690,6 +697,28 @@ impl Backend for MetalContext {
             _ => Err("F32 RMSNorm 需要 resident F16/F32 权重".to_owned()),
         }
         .map_err(|msg| BackendError::Compute { msg })
+    }
+
+    fn grouped_rmsnorm(&self, input: &MetalTensor, weight: &MetalWeight, eps: f32, groups: usize) -> Result<MetalTensor, BackendError> {
+        // 层 norm 权重统一走 prepare_f32(见 prepare_mistral_layer),只接 F32 权重;
+        // F16 权重形态没有分组内核,显式报错避免静默走错精度。
+        let MetalWeight::F32 { buffer, len } = weight else {
+            return Err(BackendError::Compute { msg: "Metal grouped RMSNorm 需要 resident F32 权重(prepare_f32 源)".to_owned() });
+        };
+        match input.dtype {
+            MetalTensorDType::F16 => ops::tensor::grouped_rmsnorm_f16_in_f32_weight_tensor_resident(self, input, buffer, *len, eps, groups),
+            MetalTensorDType::F32 => ops::tensor::grouped_rmsnorm_f32_in_f32_weight_to_f16_tensor_resident(self, input, buffer, *len, eps, groups),
+            dtype => return Err(BackendError::Compute { msg: format!("Metal grouped RMSNorm 输入必须是 F16/F32，实际 {dtype:?}") }),
+        }
+        .map_err(|msg| BackendError::Compute { msg })
+    }
+
+    fn grouped_rmsnorm_f32(&self, input: &MetalTensor, weight: &MetalWeight, eps: f32, groups: usize) -> Result<MetalTensor, BackendError> {
+        let MetalWeight::F32 { buffer, len } = weight else {
+            return Err(BackendError::Compute { msg: "Metal F32 grouped RMSNorm 需要 resident F32 权重(prepare_f32 源)".to_owned() });
+        };
+        let input = ops::to_f32_tensor(self, input).map_err(|msg| BackendError::Compute { msg })?;
+        ops::tensor::grouped_rmsnorm_f32_tensor_resident(self, &input, buffer, *len, eps, groups).map_err(|msg| BackendError::Compute { msg })
     }
 
     fn rmsnorm_add_scaled(&self, left: &MetalTensor, right: &MetalTensor, weight: &MetalWeight, eps: f32, scale: f32) -> Result<MetalTensor, BackendError> {

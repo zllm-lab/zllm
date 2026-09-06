@@ -27,7 +27,7 @@ extern "C" __global__ void moe_route_softmax_topk_f32(
     unsigned int row = blockIdx.x;
     unsigned int lane = threadIdx.x;
     if (row >= rows) return;
-    if (lane < num_experts) values[lane] = logits[(unsigned long long)row * num_experts + lane] + bias[lane];
+    for (unsigned int expert = lane; expert < num_experts; expert += blockDim.x) values[expert] = logits[(unsigned long long)row * num_experts + expert] + bias[expert];
     __syncthreads();
     if (lane != 0) return;
 
@@ -174,7 +174,7 @@ pub fn moe_route_softmax_topk_device_f32(
     scaling_factor: f32,
     normalize_selected: bool,
 ) -> Result<(Vec<u32>, CudaSlice<f32>), String> {
-    if num_experts == 0 || num_experts > THREADS as usize || top_k == 0 || top_k > num_experts {
+    if num_experts == 0 || num_experts > 1024 || top_k == 0 || top_k > num_experts {
         return Err(format!("CUDA softmax router experts={num_experts} top_k={top_k} 超出单 block 能力"));
     }
     if bias.len() != num_experts {
@@ -375,6 +375,26 @@ pub fn gather_rows_f32(ctx: &CudaContext, input: &CudaTensor, rows: &[u32]) -> R
 #[cfg(all(test, target_os = "linux", feature = "with-cuda"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn softmax_512_experts_matches_reference() {
+        let ctx = CudaContext::new_default().unwrap();
+        let input = ctx.tensor_from_f32(&[1.0, -1.0], 2, 1).unwrap();
+        let host_weights: Vec<f32> = (0..512).map(|i| (i as f32 - 256.0) / 64.0).collect();
+        let weight = ctx.stream().clone_htod(&host_weights).unwrap();
+        let bias = ctx.stream().alloc_zeros::<f32>(512).unwrap();
+        for normalize in [true, false] {
+            let (ids, weights) = moe_route_softmax_topk_f32(&ctx, &input, &weight, &bias, 512, 10, 1.0, normalize).unwrap();
+            for row in 0..2 {
+                let logits: Vec<f32> = host_weights.iter().map(|v| if row == 0 { *v } else { -*v }).collect();
+                let reference = crate::moe::routing::route_softmax_logits(&logits, 10, 1.0, normalize).unwrap();
+                assert_eq!(&ids[row * 10..(row + 1) * 10], reference.experts.iter().map(|&i| i as u32).collect::<Vec<_>>());
+                for (a, b) in weights[row * 10..(row + 1) * 10].iter().zip(reference.weights) {
+                    assert!((a - b).abs() < 1e-6);
+                }
+            }
+        }
+    }
 
     #[test]
     fn gather_rows_f32_preserves_device_dtype() {

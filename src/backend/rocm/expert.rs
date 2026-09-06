@@ -1,5 +1,8 @@
 use super::*;
-use crate::moe::topk_moe::{RoutedMoeInputs, RoutedMoeWeightsRef, SharedExpertRef};
+use crate::moe::{
+    dense_mlp::{DenseMlpSpec, DenseMlpWeightsRef},
+    topk_moe::{RoutedMoeInputs, RoutedMoeWeightsRef, SharedExpertRef},
+};
 
 mod reference;
 use reference::{f32_expert as reference_f32_expert_batch, nvfp4_expert as reference_nvfp4_expert_batch, route_cpu};
@@ -7,6 +10,13 @@ use reference::{f32_expert as reference_f32_expert_batch, nvfp4_expert as refere
 // 中等 route 批次优先保留逐 route F32 累加；更大的并发批次才用 WMMA grouped。
 const MXFP4_DIRECT_ROUTE_LIMIT: usize = 4 * 1024;
 static GGUF_MOE_PREFLIGHT_LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+struct RocmCooperativeMoeReplicaInput {
+    input: RocmTensor,
+    residual: RocmTensor,
+    route_ids: Arc<ops::hip::DeviceBuffer>,
+    route_weights: Arc<ops::hip::DeviceBuffer>,
+}
 
 impl MoePrefillBackend for RocmContext {
     type MoeAccumulator = RocmTensor;
@@ -149,20 +159,23 @@ mod tests {
     }
 
     #[test]
-    fn gguf_packed_column_halves_preserve_each_row() {
-        let tensor_type = crate::weight::container::gguf::GgmlType(12);
-        let row_bytes = tensor_type.storage_bytes(512).unwrap();
-        let half_row_bytes = tensor_type.storage_bytes(256).unwrap();
-        let mut bytes = vec![0_u8; row_bytes * 3];
-        for (row, data) in bytes.chunks_exact_mut(row_bytes).enumerate() {
-            data[..half_row_bytes].fill((row * 2 + 1) as u8);
-            data[half_row_bytes..].fill((row * 2 + 2) as u8);
-        }
+    fn gguf_q3k_q4k_column_halves_preserve_each_row() {
+        // GLM-5.3 当前 MTP 路径的 gate/up=Q3_K、down=Q4_K；两种 block
+        // 都必须按每行 256 列边界拆，不能把整块字节流直接一刀两半。
+        for tensor_type in [11, 12].map(crate::weight::container::gguf::GgmlType) {
+            let row_bytes = tensor_type.storage_bytes(512).unwrap();
+            let half_row_bytes = tensor_type.storage_bytes(256).unwrap();
+            let mut bytes = vec![0_u8; row_bytes * 3];
+            for (row, data) in bytes.chunks_exact_mut(row_bytes).enumerate() {
+                data[..half_row_bytes].fill((row * 2 + 1) as u8);
+                data[half_row_bytes..].fill((row * 2 + 2) as u8);
+            }
 
-        let [low, high] = gguf_packed_column_halves_bytes(&bytes, 3, 512, tensor_type).unwrap();
-        for row in 0..3 {
-            assert!(low[row * half_row_bytes..(row + 1) * half_row_bytes].iter().all(|&value| value == (row * 2 + 1) as u8));
-            assert!(high[row * half_row_bytes..(row + 1) * half_row_bytes].iter().all(|&value| value == (row * 2 + 2) as u8));
+            let [low, high] = gguf_packed_column_halves_bytes(&bytes, 3, 512, tensor_type).unwrap();
+            for row in 0..3 {
+                assert!(low[row * half_row_bytes..(row + 1) * half_row_bytes].iter().all(|&value| value == (row * 2 + 1) as u8));
+                assert!(high[row * half_row_bytes..(row + 1) * half_row_bytes].iter().all(|&value| value == (row * 2 + 2) as u8));
+            }
         }
     }
 
@@ -174,6 +187,72 @@ mod tests {
 }
 
 impl RocmContext {
+    #[allow(clippy::too_many_arguments)]
+    fn operator_gguf_moe_partial(
+        &self,
+        layer: usize,
+        route_input: &RocmTensor,
+        expert_input: &RocmTensor,
+        router: &RocmWeight,
+        bias: &RocmWeight,
+        routed: &ops::hip::GgufGroupedMetas,
+        shared: Option<(&ops::hip::GgufGroupedMetas, usize)>,
+        rows: usize,
+        hidden: usize,
+        intermediate: usize,
+        expert_count: usize,
+        top_k: usize,
+        scoring: u32,
+        scaling: f32,
+    ) -> Result<Arc<ops::hip::DeviceBuffer>, BackendError> {
+        // paired attention/P2P 会在同一 host 线程切换 device；只恢复 owner
+        // device，保留 scheduler 为本次 submission 选择的 stage stream。
+        ops::hip::set_device(self.device_id).map_err(compute_error)?;
+        let route_input = route_input.device.as_deref().ok_or_else(|| compute_error(format!("L{layer} operator route input 缺少 device buffer")))?;
+        let expert_input = expert_input.device.as_deref().ok_or_else(|| compute_error(format!("L{layer} operator expert input 缺少 device buffer")))?;
+        let router = router.router_resident(self.device_id, ops::hip::options().precise_router)?;
+        let bias = resident_weight(bias, "operator router bias")?;
+        let route_count = rows.checked_mul(top_k).ok_or_else(|| compute_error(format!("L{layer} operator route 数溢出")))?;
+
+        // 与最新 non-pair MTP 热路径保持同一生命周期：route/logits 使用
+        // deferred workspace，本卡 consumer 全部 enqueue 后才记录槽位 event。
+        // pair 只改变 intermediate 工作域，不复制一套旧的 route dispatch。
+        let main_stream = ops::hip::active_compute_stream() as usize;
+        // shared 只放到 peer 时，owner 完全跳过 shared stream 与两次 event；
+        // peer 仍让完整 shared 和 routed 半片并行。
+        let shared_output = shared
+            .map(|(shared, shared_intermediate)| {
+                let shared_stream = ops::hip::cooperative_shared_stream(self.device_id).map_err(compute_error)?;
+                ops::hip::order_stream_after(self.device_id, main_stream, shared_stream).map_err(compute_error)?;
+                ops::hip::activate_compute_stream(self.device_id, shared_stream).map_err(compute_error)?;
+                let output = ops::hip::try_gguf_cooperative_shared_bf16(self.device_id, expert_input, rows, hidden, shared_intermediate, shared);
+                ops::hip::activate_compute_stream(self.device_id, main_stream).map_err(compute_error)?;
+                Ok::<_, BackendError>((shared_stream, output.map_err(compute_error)?))
+            })
+            .transpose()?;
+        let routed_output = ops::hip::with_moe_route_resident_device_f32(self.device_id, route_input, router, bias, rows, hidden, expert_count, top_k, scoring, scaling, |route_ids, route_weights, route_len| {
+            if route_len != route_count {
+                return Err(format!("L{layer} operator route 数异常: {route_len}/{route_count}"));
+            }
+            if route_count <= 64 {
+                let output = ops::hip::DeviceBuffer::allocate_reusable(self.device_id, rows.saturating_mul(hidden) * 4)?;
+                ops::hip::try_gguf_fused_decode_experts(self.device_id, expert_input, rows, hidden, intermediate, top_k, route_ids, route_weights, route_len, routed, &output)?;
+                Ok(output)
+            } else {
+                ops::hip::try_gguf_grouped_wmma_experts(self.device_id, expert_input, rows, hidden, intermediate, top_k, route_ids, route_weights, route_len, routed, expert_count)
+            }
+        })
+        .map_err(|error| compute_error(format!("L{layer} operator GGUF MoE: {error}")))?;
+        let combined = if let Some((shared_stream, shared_output)) = shared_output {
+            ops::hip::order_stream_after(self.device_id, shared_stream, main_stream).map_err(compute_error)?;
+            ops::hip::try_add_resident_f32(self.device_id, &routed_output, &shared_output, rows * hidden, 1.0).map_err(compute_error)?
+        } else {
+            routed_output
+        };
+        let combined = if combined.is_async_allocated() { combined.copy_to_stable_deferred().map_err(compute_error)? } else { combined };
+        Ok(Arc::new(combined))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prefill_resident_routed_experts_impl(
         &self,
@@ -576,7 +655,146 @@ impl RocmContext {
         if route.len != expected_routes {
             return Err(compute_error(format!("ROCm cooperative route 数异常: {}/{}", route.len, expected_routes)));
         }
-        self.cooperative_moe_device_add(spec, layer, experts, inputs.expert, residual, Arc::new(route.expert_ids), Arc::new(route.weights), route.len).map_err(|error| compute_error(format!("ROCm cooperative L{layer}: {error:?}")))
+        self.cooperative_moe_device_add(spec, layer, experts, inputs.expert, residual, Arc::new(route.expert_ids), Arc::new(route.weights), route.len, None).map_err(|error| compute_error(format!("ROCm cooperative L{layer}: {error:?}")))
+    }
+
+    fn operator_moe_add(
+        &self,
+        spec: &TopkMoeSpec,
+        weights: RoutedMoeWeightsRef<'_, RocmWeight>,
+        shared_experts: &[SharedExpertRef<'_, RocmWeight>],
+        layer: usize,
+        experts: &mut RocmPrefillExperts,
+        inputs: RoutedMoeInputs<'_, RocmTensor>,
+        residual: &RocmTensor,
+    ) -> Result<RocmTensor, BackendError> {
+        if !matches!(experts.archive, RocmExpertArchive::Gguf(_))
+            || !ops::hip::options().decode_moe_fused
+            || !matches!(spec.activation, Activation::Silu)
+            || spec.num_shared_experts != 1
+            || shared_experts.len() != 1
+            || spec.shared_intermediate_size != spec.intermediate_size
+            || !spec.intermediate_size.is_multiple_of(2)
+            || inputs.route.rows == 0
+            || inputs.route.rows != inputs.expert.rows
+            || residual.rows != inputs.expert.rows
+            || inputs.route.cols != inputs.expert.cols
+            || residual.cols != inputs.expert.cols
+            || !matches!(inputs.expert.dtype, RocmTensorDType::Bf16 | RocmTensorDType::F32)
+        {
+            return Err(compute_error(format!("ROCm operator pair MoE L{layer} 不满足 fused TP 前提")));
+        }
+        let shared = &shared_experts[0];
+        if shared.output_gate.is_some()
+            || shared.gate.rows != spec.intermediate_size
+            || shared.up.rows != spec.intermediate_size
+            || shared.down.rows != inputs.expert.cols
+            || shared.gate.cols != inputs.expert.cols
+            || shared.up.cols != inputs.expert.cols
+            || shared.down.cols != spec.intermediate_size
+        {
+            return Err(compute_error(format!("ROCm operator pair shared expert L{layer} shape 不兼容")));
+        }
+        let route_device = inputs.route.device.as_deref().ok_or_else(|| compute_error("ROCm operator pair route 缺少 device input"))?;
+        let input = self.tensor_to_stable_deferred(inputs.expert.clone())?;
+        let input_device = input.device.as_ref().ok_or_else(|| compute_error("ROCm operator pair expert 缺少 device input"))?.clone();
+        let residual = f32_tensor(self, residual)?;
+        let residual_device = residual.device.as_ref().ok_or_else(|| compute_error("ROCm operator pair residual 缺少 F32 device input"))?.clone();
+        let worker = experts.operator_peer()?.worker.clone();
+        let owner_device = self.device_id;
+        let peer_device = experts.operator_peer()?.context.device_id;
+        let local_routed = experts.gguf_routed_grouped(self.device_id, layer)?.clone();
+        let remote_routed = experts.gguf_routed_grouped(peer_device, layer)?.clone();
+        let local_shared = experts.gguf_grouped.get(&(self.device_id, layer)).and_then(|layer| layer.shared.as_ref()).cloned().ok_or_else(|| compute_error(format!("L{layer} operator pair owner shared metas 缺失")))?;
+        let remote_shared = experts.gguf_grouped.get(&(peer_device, layer)).and_then(|layer| layer.shared.as_ref()).cloned().ok_or_else(|| compute_error(format!("L{layer} operator pair peer shared metas 缺失")))?;
+        let route = match weights.selected_experts {
+            Some(selected) => {
+                let weight_device = resident_weight(weights.router, "selected router")?;
+                ops::hip::try_moe_route_selected_resident_device_f32(self.device_id, route_device, weight_device, selected, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, spec.routed_scaling_factor)
+            }
+            None => {
+                let weight_device = weights.router.router_resident(self.device_id, ops::hip::options().precise_router)?;
+                let bias_device = resident_weight(weights.bias, "router bias")?;
+                let scoring = match spec.scoring_func {
+                    crate::moe::topk_moe::ScoringFunc::Softmax => 0,
+                    crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
+                    crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
+                };
+                ops::hip::try_moe_route_resident_device_f32(self.device_id, route_device, weight_device, bias_device, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor)
+            }
+        }
+        .map_err(|error| compute_error(format!("ROCm operator pair route L{layer}: {error}")))?;
+        let route_count = inputs.route.rows.checked_mul(spec.top_k).ok_or_else(|| compute_error("ROCm operator pair route 数溢出"))?;
+        if route.len != route_count {
+            return Err(compute_error(format!("ROCm operator pair route 数异常: {}/{}", route.len, route_count)));
+        }
+        let route_ids = Arc::new(route.expert_ids);
+        let route_weights = Arc::new(route.weights);
+        let rows = inputs.expert.rows;
+        let hidden = inputs.expert.cols;
+        let half_intermediate = spec.intermediate_size / 2;
+        let top_k = spec.top_k;
+        let expert_count = spec.num_experts;
+        let peer_input_dtype = inputs.expert.dtype;
+        let peer_input_source = input_device.clone();
+        let peer_route_ids_source = route_ids.clone();
+        let peer_route_weights_source = route_weights.clone();
+        let peer_transfer_sources = vec![peer_route_ids_source, peer_route_weights_source, peer_input_source, residual_device.clone()];
+        let peer_transferred =
+            ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&peer_transfer_sources, peer_device, owner_device).map_err(|error| compute_error(format!("L{layer} operator pair 输入 owner->peer: {error}")))?;
+        let ticket = worker.submit(move |peer| {
+            peer.activate().map_err(compute_error)?;
+            let [peer_route_ids, peer_route_weights, peer_input, peer_residual]: [ops::hip::DeviceBuffer; 4] = peer_transferred.try_into().map_err(|_| compute_error(format!("L{layer} operator pair peer 输入数量异常")))?;
+            let peer_route_ids = Arc::new(peer_route_ids);
+            let peer_route_weights = Arc::new(peer_route_weights);
+            let peer_input = device_tensor_with_dtype(peer_input, rows, hidden, peer_input_dtype);
+            let peer_residual = device_tensor_with_dtype(peer_residual, rows, hidden, RocmTensorDType::F32);
+            let peer_input_device = peer_input.device.as_deref().expect("peer input 刚创建");
+            let routed = if route_count <= 64 {
+                let output = ops::hip::DeviceBuffer::allocate_reusable(peer.device_id, rows.saturating_mul(hidden) * 4).map_err(compute_error)?;
+                ops::hip::try_gguf_fused_decode_experts(peer.device_id, peer_input_device, rows, hidden, half_intermediate, top_k, &peer_route_ids, &peer_route_weights, route_count, &remote_routed, &output).map_err(compute_error)?;
+                output
+            } else {
+                ops::hip::try_gguf_grouped_wmma_experts(peer.device_id, peer_input_device, rows, hidden, half_intermediate, top_k, &peer_route_ids, &peer_route_weights, route_count, &remote_routed, expert_count).map_err(compute_error)?
+            };
+            let shared = ops::hip::try_gguf_cooperative_shared_bf16(peer.device_id, peer_input_device, rows, hidden, half_intermediate, &remote_shared).map_err(compute_error)?;
+            let combined = ops::hip::try_add_resident_f32(peer.device_id, &routed, &shared, rows * hidden, 1.0).map_err(compute_error)?;
+            let combined = if combined.is_async_allocated() { combined.copy_to_stable_deferred().map_err(compute_error)? } else { combined };
+            let combined = Arc::new(combined);
+            Ok((combined, peer_residual))
+        })?;
+        worker.retain_for_stage(peer_transfer_sources)?;
+
+        let local_routed_output = if route_count <= 64 {
+            let output = ops::hip::DeviceBuffer::allocate_reusable(self.device_id, rows.saturating_mul(hidden) * 4).map_err(compute_error)?;
+            ops::hip::try_gguf_fused_decode_experts(self.device_id, &input_device, rows, hidden, half_intermediate, top_k, &route_ids, &route_weights, route_count, &local_routed, &output).map_err(compute_error)?;
+            output
+        } else {
+            ops::hip::try_gguf_grouped_wmma_experts(self.device_id, &input_device, rows, hidden, half_intermediate, top_k, &route_ids, &route_weights, route_count, &local_routed, expert_count).map_err(compute_error)?
+        };
+        let local_shared_output = ops::hip::try_gguf_cooperative_shared_bf16(self.device_id, &input_device, rows, hidden, half_intermediate, &local_shared).map_err(compute_error)?;
+        let local_combined = ops::hip::try_add_resident_f32(self.device_id, &local_routed_output, &local_shared_output, rows * hidden, 1.0).map_err(compute_error)?;
+        let (peer_combined, peer_residual) = ticket.wait()?;
+        let local_combined = Arc::new(if local_combined.is_async_allocated() { local_combined.copy_to_stable_deferred().map_err(compute_error)? } else { local_combined });
+        let (mut owner_on_peer, mut peer_on_owner) = ops::hip::DeviceBuffer::exchange_stable_groups_ordered_async_retained_by(&[local_combined.clone()], &[peer_combined.clone()], self.device_id)
+            .map_err(|error| compute_error(format!("L{layer} operator pair MoE partial exchange: {error}")))?;
+        let owner_on_peer = owner_on_peer.pop().ok_or_else(|| compute_error(format!("L{layer} operator pair MoE owner partial->peer 缺失")))?;
+        let peer_on_owner = peer_on_owner.pop().ok_or_else(|| compute_error(format!("L{layer} operator pair MoE peer partial->owner 缺失")))?;
+        worker.retain_for_stage(vec![local_combined.clone(), peer_combined.clone()])?;
+        let peer_combined_for_join = peer_combined.clone();
+        let peer_join = worker.submit(move |peer| {
+            peer.activate().map_err(compute_error)?;
+            let peer_residual = peer_residual.device.as_deref().ok_or_else(|| compute_error("operator pair MoE peer residual 缺少 device buffer"))?;
+            let sum = ops::hip::try_add_resident_f32(peer.device_id, &peer_combined_for_join, &owner_on_peer, rows * hidden, 1.0).map_err(compute_error)?;
+            let output = ops::hip::try_add_resident_f32(peer.device_id, &sum, peer_residual, rows * hidden, 1.0).map_err(compute_error)?;
+            Ok(Arc::new(output))
+        })?;
+        let owner_sum = ops::hip::try_add_resident_f32(self.device_id, &local_combined, &peer_on_owner, rows * hidden, 1.0).map_err(compute_error)?;
+        let owner_output = ops::hip::try_add_resident_f32(self.device_id, &owner_sum, &residual_device, rows * hidden, 1.0).map_err(compute_error)?;
+        let mut output = device_tensor_f32(owner_output, rows, hidden);
+        let replica = peer_join.wait()?;
+        output.replica = Some(RocmTensorReplica { device_id: peer_device, dtype: RocmTensorDType::F32, device: replica });
+        Ok(output)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -590,6 +808,7 @@ impl RocmContext {
         route_ids: Arc<ops::hip::DeviceBuffer>,
         route_weights: Arc<ops::hip::DeviceBuffer>,
         route_count: usize,
+        replicated_peer: Option<RocmCooperativeMoeReplicaInput>,
     ) -> Result<RocmTensor, BackendError> {
         let peer = experts.cooperative_peer.ok_or_else(|| compute_error("ROCm cooperative expert peer 缺失"))?;
         let is_gguf = matches!(experts.archive, RocmExpertArchive::Gguf(_));
@@ -613,26 +832,33 @@ impl RocmContext {
         let owner_stream = ops::hip::active_compute_stream() as usize;
         ops::hip::order_stream_after(self.device_id, owner_stream, 0).map_err(compute_error)?;
         ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
-        // 三个小输入均先稳定再排入 peer stream；源 buffer 统一由 owner stage
-        // completion 保活，整个路由与传输路径不再访问 host。
+        // 普通路径把 route/input 发给 peer；副本路径已经在 peer 独立完成
+        // norm/router，只需沿用各自设备上的输入与路由。
         let stable_route_ids = route_ids;
         let stable_route_weights = route_weights;
-        let stable_input = self.tensor_to_stable_deferred(input.clone())?;
-        let source = stable_input.device.as_ref().ok_or_else(|| compute_error("ROCm cooperative stable input 缺少 device buffer"))?;
         // 每个双卡组只有 owner 拥有 pipeline stage；peer 的 legacy stream 专供
         // 本组 MoE。显式 source/destination event 串起跨卡依赖，同时复用 HIP
         // 默认流成熟的 buffer 生命周期，避免临时 dedicated stream 脱离 stage 回收。
         let profile_pair = ops::hip::device_profile_enabled();
         peer.context.activate().map_err(compute_error)?;
         if profile_pair {
-            ops::hip::device_profile_scope_begin(peer.context.device_id, "glm_pair_moe_peer").map_err(compute_error)?;
+            ops::hip::device_profile_scope_begin(peer.context.device_id, "glm_pair_moe_peer_input").map_err(compute_error)?;
         }
-        let [peer_route_ids, peer_route_weights, peer_input]: [ops::hip::DeviceBuffer; 3] =
-            ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&[stable_route_ids.clone(), stable_route_weights.clone(), source.clone()], peer.context.device_id, self.device_id)
-                .map_err(|error| compute_error(format!("L{layer} route/input owner->peer: {error}")))?
-                .try_into()
-                .map_err(|_| compute_error(format!("L{layer} cooperative P2P 输入数量异常")))?;
-        let peer_input = device_tensor_with_dtype(peer_input, input.rows, input.cols, input.dtype);
+        let (peer_route_ids, peer_route_weights, peer_input, peer_residual) = if let Some(replica) = replicated_peer {
+            (replica.route_ids, replica.route_weights, replica.input, Some(replica.residual))
+        } else {
+            let stable_input = self.tensor_to_stable_deferred(input.clone())?;
+            let source = stable_input.device.as_ref().ok_or_else(|| compute_error("ROCm cooperative stable input 缺少 device buffer"))?;
+            let [peer_route_ids, peer_route_weights, peer_input]: [ops::hip::DeviceBuffer; 3] =
+                ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&[stable_route_ids.clone(), stable_route_weights.clone(), source.clone()], peer.context.device_id, self.device_id)
+                    .map_err(|error| compute_error(format!("L{layer} route/input owner->peer: {error}")))?
+                    .try_into()
+                    .map_err(|_| compute_error(format!("L{layer} cooperative P2P 输入数量异常")))?;
+            (Arc::new(peer_route_ids), Arc::new(peer_route_weights), device_tensor_with_dtype(peer_input, input.rows, input.cols, input.dtype), None)
+        };
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(peer.context.device_id, "glm_pair_moe_peer_compute").map_err(compute_error)?;
+        }
 
         let peer_input_device = peer_input.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative peer input 缺少 device buffer"))?;
         let half_intermediate = spec.intermediate_size / 2;
@@ -668,16 +894,19 @@ impl RocmContext {
         }
         .map_err(compute_error)?;
         ops::hip::order_stream_after(peer.context.device_id, peer_shared_stream, 0).map_err(compute_error)?;
-        // peer 直接把 routed/shared 融合压成稳定 BF16；不生成 F32 combined，
-        // 也不再为跨卡生命周期额外复制一次 12MiB BF16。
-        let stable_peer_combined = Arc::new(ops::hip::try_ct_cooperative_combine_partial_bf16(peer.context.device_id, &peer_output, &peer_shared_output, input.rows * input.cols).map_err(compute_error)?);
+        // 副本路径保留 F32 partial，供双向交换后在两卡按同一顺序归并；
+        // 普通路径仍直接压成稳定 BF16，避免额外保留一份 F32 combined。
+        let peer_combined_f32 = peer_residual.as_ref().map(|_| ops::hip::try_add_resident_f32(peer.context.device_id, &peer_output, &peer_shared_output, input.rows * input.cols, 1.0).map_err(compute_error)).transpose()?;
+        let stable_peer_combined_bf16 =
+            if peer_combined_f32.is_none() { Some(Arc::new(ops::hip::try_ct_cooperative_combine_partial_bf16(peer.context.device_id, &peer_output, &peer_shared_output, input.rows * input.cols).map_err(compute_error)?)) } else { None };
         if profile_pair {
+            ops::hip::device_profile_scope_operator(peer.context.device_id, "glm_pair_moe_peer_output").map_err(compute_error)?;
             ops::hip::device_profile_scope_end(peer.context.device_id).map_err(compute_error)?;
         }
 
         ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
         if profile_pair {
-            ops::hip::device_profile_scope_begin(self.device_id, "glm_pair_moe_owner").map_err(compute_error)?;
+            ops::hip::device_profile_scope_begin(self.device_id, "glm_pair_moe_owner_compute").map_err(compute_error)?;
         }
         let input_device = input.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative local input 缺少 device buffer"))?;
         let local_shared_stream = ops::hip::cooperative_shared_stream(self.device_id).map_err(compute_error)?;
@@ -712,11 +941,44 @@ impl RocmContext {
         let local_combined = ops::hip::try_add_resident_f32(self.device_id, &local_output, &local_shared_output, input.rows * input.cols, 1.0).map_err(compute_error)?;
         if profile_pair {
             ops::hip::device_profile_scope_end(self.device_id).map_err(compute_error)?;
-            ops::hip::device_profile_scope_begin(self.device_id, "glm_pair_moe_join").map_err(compute_error)?;
+            ops::hip::device_profile_scope_begin(self.device_id, "glm_pair_moe_join_wait").map_err(compute_error)?;
         }
+        if let (Some(peer_combined), Some(peer_residual)) = (peer_combined_f32, peer_residual) {
+            let stable_owner_combined = Arc::new(if local_combined.is_async_allocated() { local_combined.copy_to_stable_deferred().map_err(compute_error)? } else { local_combined });
+            let stable_peer_combined = Arc::new(if peer_combined.is_async_allocated() { peer_combined.copy_to_stable_deferred().map_err(compute_error)? } else { peer_combined });
+            let (mut owner_on_peer, mut peer_on_owner) = ops::hip::DeviceBuffer::exchange_stable_groups_ordered_async_retained_by(&[stable_owner_combined.clone()], &[stable_peer_combined.clone()], self.device_id)
+                .map_err(|error| compute_error(format!("L{layer} MoE partial exchange: {error}")))?;
+            let owner_on_peer = owner_on_peer.pop().ok_or_else(|| compute_error(format!("L{layer} MoE owner partial->peer 缺失")))?;
+            let peer_on_owner = peer_on_owner.pop().ok_or_else(|| compute_error(format!("L{layer} MoE peer partial->owner 缺失")))?;
+
+            peer.context.activate().map_err(compute_error)?;
+            let peer_residual_device = peer_residual.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative peer residual 缺少 F32 device buffer"))?;
+            let peer_sum = ops::hip::try_add_resident_f32(peer.context.device_id, &owner_on_peer, &stable_peer_combined, input.rows * input.cols, 1.0).map_err(compute_error)?;
+            let peer_output = ops::hip::try_add_resident_f32(peer.context.device_id, &peer_sum, peer_residual_device, input.rows * input.cols, 1.0).map_err(compute_error)?;
+            let peer_output = Arc::new(peer_output);
+
+            ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+            let residual = f32_tensor(self, residual)?;
+            let residual_device = residual.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative residual 缺少 F32 device buffer"))?;
+            let owner_sum = ops::hip::try_add_resident_f32(self.device_id, &stable_owner_combined, &peer_on_owner, input.rows * input.cols, 1.0).map_err(compute_error)?;
+            let owner_output = ops::hip::try_add_resident_f32(self.device_id, &owner_sum, residual_device, input.rows * input.cols, 1.0).map_err(compute_error)?;
+            let mut output = device_tensor_f32(owner_output, input.rows, input.cols);
+            output.replica = Some(RocmTensorReplica { device_id: peer.context.device_id, dtype: RocmTensorDType::F32, device: peer_output });
+            if profile_pair {
+                ops::hip::device_profile_scope_end(self.device_id).map_err(compute_error)?;
+            }
+            ops::hip::order_stream_after(self.device_id, 0, owner_stream).map_err(compute_error)?;
+            ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
+            return Ok(output);
+        }
+
+        let stable_peer_combined = stable_peer_combined_bf16.expect("普通 cooperative MoE 必须生成 BF16 peer partial");
         let peer_combined_on_owner = stable_peer_combined.copy_stable_to_device_ordered_async_retained_by(self.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} output peer->owner: {error}")))?;
 
         ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(self.device_id, "glm_pair_moe_join_add").map_err(compute_error)?;
+        }
         let residual = f32_tensor(self, residual)?;
         let residual_device = residual.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative residual 缺少 F32 device buffer"))?;
         let output = ops::hip::try_ct_cooperative_partial_join_f32(self.device_id, &local_combined, &peer_combined_on_owner, residual_device, input.rows, input.cols).map_err(compute_error)?;
@@ -922,6 +1184,433 @@ impl RocmContext {
 impl ExpertPrefillBackend for RocmContext {
     type PrefillExperts = RocmPrefillExperts;
 
+    fn prefetch_stage_selected_kv(
+        &self,
+        experts: &Self::PrefillExperts,
+        cache: &mut Self::Cache,
+        dsa: &<Self as crate::backend::DecodeBackend>::DsaState,
+        layers: std::ops::Range<usize>,
+        position: usize,
+        rows: usize,
+    ) -> Result<(), BackendError> {
+        if ops::hip::options().mla_cpu_hot_rows == 0 || layers.is_empty() || rows != 1 {
+            return Ok(());
+        }
+        let Some(selection) = dsa.host_selection_arc(rows, position) else { return Ok(()) };
+        // peer 必须由自己的提交线程预取，临时上传 buffer 才能由该线程的 stage
+        // completion 保活。owner 线程直接跨卡提交会绕过这个生命周期。
+        let ticket = if let Some(operator) = experts.operator_peer.as_ref() {
+            let peer_cache = cache.ensure_operator_peer(self, &operator.context)?;
+            let selection = selection.clone();
+            let layers = layers.clone();
+            Some(operator.worker.submit(move |peer| peer_cache.lock().map_err(|_| compute_error("ROCm peer KV 预取锁中毒"))?.prefetch_selected_layers(&peer, layers, &selection, position, rows))?)
+        } else {
+            None
+        };
+        let owner = cache.prefetch_selected_layers(self, layers, &selection, position, rows);
+        let peer = ticket.map(|ticket| ticket.wait()).transpose();
+        owner?;
+        peer?;
+        Ok(())
+    }
+
+    fn move_parallel_stage_tensor_ordered(&self, experts: &Self::PrefillExperts, tensor: &Self::Tensor) -> Result<Option<Self::Tensor>, BackendError> {
+        let Some(operator) = experts.operator_peer.as_ref() else {
+            return Ok(None);
+        };
+        let Some(source) = tensor.device.as_ref() else {
+            return Ok(None);
+        };
+        let Some(replica) = tensor.replica.as_ref() else {
+            return Ok(None);
+        };
+        let peer_device = operator.context.device_id;
+        let expected = tensor.rows.checked_mul(tensor.cols).and_then(|elements| elements.checked_mul(tensor.dtype.element_bytes())).ok_or_else(|| compute_error("ROCm operator pair stage handoff 大小溢出"))?;
+        if source.bytes() != expected || replica.device.bytes() != expected || replica.dtype != tensor.dtype {
+            return Err(compute_error(format!(
+                "ROCm operator pair stage handoff shape/dtype 不匹配: tensor=[{},{}] {:?} owner_bytes={} peer={:?}/{} expected={expected}",
+                tensor.rows,
+                tensor.cols,
+                tensor.dtype,
+                source.bytes(),
+                replica.dtype,
+                replica.device.bytes(),
+            )));
+        }
+        if source.device_id() == self.device_id && replica.device_id == peer_device {
+            return Ok(Some(tensor.clone()));
+        }
+
+        // 前一 pair 已经在两张卡各留一份同值 hidden。两个方向分别记录源
+        // stream event，再排入下一 pair 的两张卡；都挂到 next owner completion
+        // 保活，避免先丢 replica、随后在首层重新复制整份 activation。
+        let owner = source.copy_stable_to_device_ordered_async_retained_by(self.device_id, self.device_id).map_err(|error| compute_error(format!("ROCm operator pair owner stage handoff: {error}")))?;
+        let peer = replica.device.copy_stable_to_device_ordered_async_retained_by(peer_device, self.device_id).map_err(|error| compute_error(format!("ROCm operator pair peer stage handoff: {error}")))?;
+        let mut output = device_tensor_with_dtype(owner, tensor.rows, tensor.cols, tensor.dtype);
+        output.replica = Some(RocmTensorReplica { device_id: peer_device, dtype: tensor.dtype, device: Arc::new(peer) });
+        Ok(Some(output))
+    }
+
+    fn supports_parallel_mla_prefill(&self, layer: usize, experts: &Self::PrefillExperts) -> bool {
+        !ops::hip::options().prefill_attention_cpu && experts.operator_mla.contains_key(&layer)
+    }
+
+    fn begin_parallel_mla_query(&self, layer: usize, experts: &Self::PrefillExperts, normalized_q_lora: &Self::Tensor, position: usize, cosine: &[f32], sine: &[f32], mla: &crate::attention::mla::MlaSpec) -> Result<bool, BackendError> {
+        self.begin_operator_mla_query_impl(layer, experts, normalized_q_lora, position, cosine, sine, mla)
+    }
+
+    fn parallel_mla_prefill_add(
+        &self,
+        layer: usize,
+        experts: &Self::PrefillExperts,
+        normalized_q_lora: &Self::Tensor,
+        latent: &Self::Tensor,
+        k_rope: &Self::Tensor,
+        residual: &Self::Tensor,
+        cache: Option<&mut Self::Cache>,
+        dsa_state: Option<&<Self as DecodeBackend>::DsaState>,
+        position: usize,
+        cosine: &[f32],
+        sine: &[f32],
+        mla: &crate::attention::mla::MlaSpec,
+        dsa: &crate::attention::dsa::DsaSpec,
+    ) -> Result<Self::Tensor, BackendError> {
+        self.operator_mla_prefill_add_impl(layer, experts, normalized_q_lora, latent, k_rope, residual, cache, dsa_state, position, cosine, sine, mla, dsa)
+    }
+
+    fn parallel_mla_cache_append(&self, layer: usize, experts: &Self::PrefillExperts, cache: &mut Self::Cache, latent: &Self::Tensor, k_rope: &Self::Tensor, position: usize) -> Result<bool, BackendError> {
+        if !self.supports_parallel_mla_prefill(layer, experts) {
+            return Ok(false);
+        }
+        self.operator_mla_cache_append_impl(layer, experts, cache, latent, k_rope, position)
+    }
+
+    fn finish_parallel_mla_cache_submission(&self, experts: &Self::PrefillExperts) -> Result<(), BackendError> {
+        self.finish_operator_mla_cache_submission_impl(experts)
+    }
+
+    fn parallel_dense_mlp_rmsnorm_add(
+        &self,
+        spec: &DenseMlpSpec,
+        weights: DenseMlpWeightsRef<'_, Self::Weight>,
+        layer: usize,
+        experts: &Self::PrefillExperts,
+        hidden: &Self::Tensor,
+        norm_weight: &Self::Weight,
+        eps: f32,
+    ) -> Result<Option<Self::Tensor>, BackendError> {
+        if hidden.dtype != RocmTensorDType::F32 || !experts.operator_dense.contains_key(&layer) || !matches!(spec.activation, Activation::Silu) {
+            return Ok(None);
+        }
+        let (operator, prepared) = experts.operator_dense_layer(layer)?;
+        let Some(replica) =
+            hidden.replica.as_ref().filter(|replica| replica.device_id == operator.context.device_id && replica.dtype == RocmTensorDType::F32 && replica.device.bytes() == hidden.rows * hidden.cols * std::mem::size_of::<f32>())
+        else {
+            return Ok(None);
+        };
+        let half = spec.intermediate_size / 2;
+        if !spec.intermediate_size.is_multiple_of(2)
+            || weights.gate.rows != spec.intermediate_size
+            || weights.up.rows != spec.intermediate_size
+            || weights.down.rows != hidden.cols
+            || weights.down.cols != spec.intermediate_size
+            || prepared.owner.gate.rows != half
+            || prepared.owner.up.rows != half
+            || prepared.owner.down.rows != hidden.cols
+            || prepared.owner.down.cols != half
+            || prepared.peer.gate.rows != half
+            || prepared.peer.up.rows != half
+            || prepared.peer.down.rows != hidden.cols
+            || prepared.peer.down.cols != half
+        {
+            return Err(compute_error(format!("L{layer} operator dense shard shape 非法")));
+        }
+        let peer = operator.context;
+        let worker = operator.worker.clone();
+        let peer_weights = prepared.peer.clone();
+        let peer_norm = prepared.peer_norm.clone();
+        let peer_hidden = device_tensor_with_arc(replica.device.clone(), hidden.rows, hidden.cols, RocmTensorDType::F32);
+        let peer_residual = replica.device.clone();
+        let rows = hidden.rows;
+        let cols = hidden.cols;
+        let peer_ticket = worker.submit(move |peer| {
+            peer.activate().map_err(compute_error)?;
+            let normed = peer.rmsnorm_quantized(&peer_hidden, &peer_norm, eps)?;
+            let activated = peer.gated_linear(&normed, &peer_weights.gate, &peer_weights.up, &Activation::Silu)?;
+            let partial = peer.tensor_to_stable_deferred(peer.tensor_as_f32(peer.linear(&activated, &peer_weights.down)?)?)?;
+            Ok(partial.device.ok_or_else(|| compute_error(format!("L{layer} operator dense peer partial 缺失")))?)
+        })?;
+
+        let owner_normed = self.rmsnorm_quantized(hidden, norm_weight, eps)?;
+        let owner_activated = self.gated_linear(&owner_normed, &prepared.owner.gate, &prepared.owner.up, &Activation::Silu)?;
+        let owner_partial = self.tensor_to_stable_deferred(self.tensor_as_f32(self.linear(&owner_activated, &prepared.owner.down)?)?)?;
+        let owner_partial = owner_partial.device.ok_or_else(|| compute_error(format!("L{layer} operator dense owner partial 缺失")))?;
+        let peer_partial = peer_ticket.wait()?;
+        let (mut owner_on_peer, mut peer_on_owner) = ops::hip::DeviceBuffer::exchange_stable_groups_ordered_async_retained_by(&[owner_partial.clone()], &[peer_partial.clone()], self.device_id)
+            .map_err(|error| compute_error(format!("L{layer} operator dense partial exchange: {error}")))?;
+        let owner_on_peer = owner_on_peer.pop().ok_or_else(|| compute_error(format!("L{layer} operator dense owner partial->peer 缺失")))?;
+        let peer_on_owner = peer_on_owner.pop().ok_or_else(|| compute_error(format!("L{layer} operator dense peer partial->owner 缺失")))?;
+        worker.retain_for_stage(vec![owner_partial.clone(), peer_partial.clone()])?;
+        let peer_partial_for_join = peer_partial.clone();
+        let peer_join = worker.submit(move |peer| {
+            peer.activate().map_err(compute_error)?;
+            let sum = ops::hip::try_add_resident_f32(peer.device_id, &peer_partial_for_join, &owner_on_peer, rows * cols, 1.0).map_err(compute_error)?;
+            let output = ops::hip::try_add_resident_f32(peer.device_id, &sum, &peer_residual, rows * cols, 1.0).map_err(compute_error)?;
+            Ok(Arc::new(output))
+        })?;
+        let residual = f32_tensor(self, hidden)?;
+        let residual = residual.device.as_deref().ok_or_else(|| compute_error(format!("L{layer} operator dense owner residual 缺失")))?;
+        let owner_sum = ops::hip::try_add_resident_f32(self.device_id, &owner_partial, &peer_on_owner, rows * cols, 1.0).map_err(compute_error)?;
+        let owner_output = ops::hip::try_add_resident_f32(self.device_id, &owner_sum, residual, rows * cols, 1.0).map_err(compute_error)?;
+        let mut output = device_tensor_f32(owner_output, rows, cols);
+        let replica = peer_join.wait()?;
+        output.replica = Some(RocmTensorReplica { device_id: peer.device_id, dtype: RocmTensorDType::F32, device: replica });
+        Ok(Some(output))
+    }
+
+    fn concat_parallel_stage_tensors(&self, experts: &Self::PrefillExperts, tensors: &[&Self::Tensor]) -> Result<Option<Self::Tensor>, BackendError> {
+        let Some(operator) = experts.operator_peer.as_ref() else { return Ok(None) };
+        let first = tensors.first().ok_or_else(|| compute_error("ROCm operator pair concat 输入为空"))?;
+        let peer_device = operator.context.device_id;
+        let mut peer_tensors = Vec::with_capacity(tensors.len());
+        for tensor in tensors {
+            let replica = tensor
+                .replica
+                .as_ref()
+                .filter(|replica| replica.device_id == peer_device && replica.dtype == first.dtype && replica.device.bytes() == tensor.rows * tensor.cols * replica.dtype.element_bytes())
+                .ok_or_else(|| compute_error("ROCm operator pair concat 缺少兼容 peer replica"))?;
+            peer_tensors.push(device_tensor_with_arc(replica.device.clone(), tensor.rows, tensor.cols, replica.dtype));
+        }
+        let ticket = operator.worker.submit(move |peer| {
+            let inputs = peer_tensors.iter().collect::<Vec<_>>();
+            let output = <RocmContext as crate::backend::SegmentedTensorBackend>::concat_token_rows(&peer, &inputs)?;
+            output.device.ok_or_else(|| compute_error("ROCm operator pair peer concat 缺少 device buffer"))
+        })?;
+        let mut output = <RocmContext as crate::backend::SegmentedTensorBackend>::concat_token_rows(self, tensors)?;
+        let peer_output = ticket.wait()?;
+        output.replica = Some(RocmTensorReplica { device_id: peer_device, dtype: first.dtype, device: peer_output });
+        Ok(Some(output))
+    }
+
+    fn compact_parallel_stage_tensor(&self, experts: &Self::PrefillExperts, tensor: &Self::Tensor) -> Result<Option<Self::Tensor>, BackendError> {
+        let Some(operator) = experts.operator_peer.as_ref() else { return Ok(None) };
+        let replica = tensor.replica.as_ref().filter(|replica| replica.device_id == operator.context.device_id).cloned().ok_or_else(|| compute_error("ROCm operator pair layer 输出缺少 peer replica"))?;
+        if replica.device.bytes() != tensor.rows * tensor.cols * replica.dtype.element_bytes() {
+            return Err(compute_error("ROCm operator pair layer 输出 replica shape 不匹配"));
+        }
+        if tensor.dtype == RocmTensorDType::Bf16 && replica.dtype == RocmTensorDType::Bf16 {
+            return Ok(Some(tensor.clone()));
+        }
+        if tensor.dtype != RocmTensorDType::F32 || replica.dtype != RocmTensorDType::F32 {
+            return Err(compute_error(format!("ROCm operator pair compact dtype 不匹配: owner={:?} peer={:?}", tensor.dtype, replica.dtype)));
+        }
+        let rows = tensor.rows;
+        let cols = tensor.cols;
+        let peer_tensor = device_tensor_with_arc(replica.device, rows, cols, RocmTensorDType::F32);
+        let ticket = operator.worker.submit(move |peer| {
+            let compact = peer.tensor_to_stable_deferred(peer.tensor_as_bf16(peer_tensor)?)?;
+            compact.device.ok_or_else(|| compute_error("ROCm operator pair compact peer buffer 缺失"))
+        })?;
+        let mut compact = self.tensor_as_bf16(tensor.clone())?;
+        let peer_compact = ticket.wait()?;
+        compact.replica = Some(RocmTensorReplica { device_id: operator.context.device_id, dtype: RocmTensorDType::Bf16, device: peer_compact });
+        Ok(Some(compact))
+    }
+
+    fn finish_parallel_stage_submission(&self, experts: &Self::PrefillExperts, tensor: &Self::Tensor) -> Result<(), BackendError> {
+        let Some(operator) = experts.operator_peer.as_ref() else { return Ok(()) };
+        let replica = tensor.replica.as_ref().filter(|replica| replica.device_id == operator.context.device_id).map(|replica| replica.device.clone()).ok_or_else(|| compute_error("ROCm operator pair stage 输出缺少 peer replica"))?;
+        if let Some(completion) = operator.worker.finish_stage(vec![replica])? {
+            super::pair_worker::attach_pair_stage_completion(self.device_id, completion);
+        }
+        Ok(())
+    }
+
+    fn parallel_moe_rmsnorm_add(
+        &self,
+        spec: &crate::moe::topk_moe::TopkMoeSpec,
+        weights: crate::moe::topk_moe::RoutedMoeWeightsRef<'_, Self::Weight>,
+        shared_experts: &[crate::moe::topk_moe::SharedExpertRef<'_, Self::Weight>],
+        layer: usize,
+        experts: &mut Self::PrefillExperts,
+        hidden: &Self::Tensor,
+        norm_weight: &Self::Weight,
+        eps: f32,
+    ) -> Result<Option<Self::Tensor>, BackendError> {
+        if weights.selected_experts.is_some() || hidden.dtype != RocmTensorDType::F32 || !experts.operator_moe.contains_key(&layer) {
+            return Ok(None);
+        }
+        if !matches!(experts.archive, RocmExpertArchive::Gguf(_))
+            || !ops::hip::options().decode_moe_fused
+            || !matches!(spec.activation, Activation::Silu)
+            || spec.num_shared_experts != 1
+            || shared_experts.len() != 1
+            || spec.shared_intermediate_size != spec.intermediate_size
+            || !spec.intermediate_size.is_multiple_of(2)
+            || hidden.rows == 0
+        {
+            return Err(compute_error(format!("ROCm operator pair MoE L{layer} 不满足 fused TP 前提")));
+        }
+        let shared = &shared_experts[0];
+        if shared.output_gate.is_some()
+            || shared.gate.rows != spec.intermediate_size
+            || shared.up.rows != spec.intermediate_size
+            || shared.down.rows != hidden.cols
+            || shared.gate.cols != hidden.cols
+            || shared.up.cols != hidden.cols
+            || shared.down.cols != spec.intermediate_size
+        {
+            return Err(compute_error(format!("ROCm operator pair shared expert L{layer} shape 不兼容")));
+        }
+        let (operator, peer_weights) = experts.operator_moe_layer(layer)?;
+        let peer_weights = peer_weights.clone();
+        let Some(replica) =
+            hidden.replica.as_ref().filter(|replica| replica.device_id == operator.context.device_id && replica.dtype == RocmTensorDType::F32 && replica.device.bytes() == hidden.rows * hidden.cols * std::mem::size_of::<f32>())
+        else {
+            return Ok(None);
+        };
+        let worker = operator.worker.clone();
+        let peer_hidden = RocmTensor { data: Vec::new(), rows: hidden.rows, cols: hidden.cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: Some(replica.device.clone()), replica: None };
+        let peer_residual = replica.device.clone();
+        let rows = hidden.rows;
+        let cols = hidden.cols;
+        let half_intermediate = spec.intermediate_size / 2;
+        let shared_intermediate = spec.intermediate_size;
+        let num_experts = spec.num_experts;
+        let top_k = spec.top_k;
+        let scaling = spec.routed_scaling_factor;
+        let scoring = match spec.scoring_func {
+            crate::moe::topk_moe::ScoringFunc::Softmax => 0,
+            crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
+            crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
+        };
+        let peer_device = operator.context.device_id;
+        let local_routed = experts.gguf_routed_grouped(self.device_id, layer)?.clone();
+        let remote_routed = experts.gguf_routed_grouped(peer_device, layer)?.clone();
+        let remote_shared = experts.gguf_grouped.get(&(peer_device, layer)).and_then(|layer| layer.shared.as_ref()).cloned().ok_or_else(|| compute_error(format!("L{layer} operator pair peer shared metas 缺失")))?;
+        // hidden replica 是上一算子的输出；peer stream 完成本层前必须保活，不能
+        // 依赖 owner 线程何时丢弃 RocmTensor 外壳。
+        worker.retain_for_stage(vec![replica.device.clone()])?;
+        let (local_partial, peer_partial) = if rows == 1 {
+            // shared 不依赖 router。peer 只生成专家所需的 BF16 norm，并先在
+            // shared stream 排完整 shared expert；owner 同时完成唯一一份 router。
+            let peer_shared_ticket = worker.submit(move |peer| {
+                peer.activate().map_err(compute_error)?;
+                let peer_hidden = peer_hidden.device.as_deref().ok_or_else(|| compute_error(format!("L{layer} operator peer hidden 缺失")))?;
+                let norm_weight = peer_weights.post_attn_norm.resident().map(Arc::as_ref).ok_or_else(|| compute_error(format!("L{layer} operator peer RMSNorm weight 缺失")))?;
+                let expert_input = Arc::new(ops::hip::try_rmsnorm_resident_weight_to_bf16(peer.device_id, peer_hidden, norm_weight, rows, cols, eps, false).map_err(compute_error)?);
+                let main_stream = ops::hip::active_compute_stream() as usize;
+                let shared_stream = ops::hip::cooperative_shared_stream(peer.device_id).map_err(compute_error)?;
+                ops::hip::order_stream_after(peer.device_id, main_stream, shared_stream).map_err(compute_error)?;
+                ops::hip::activate_compute_stream(peer.device_id, shared_stream).map_err(compute_error)?;
+                let shared = ops::hip::try_gguf_cooperative_shared_bf16(peer.device_id, &expert_input, rows, cols, shared_intermediate, &remote_shared).map_err(compute_error);
+                ops::hip::activate_compute_stream(peer.device_id, main_stream).map_err(compute_error)?;
+                Ok((expert_input, main_stream, shared_stream, Arc::new(shared?)))
+            })?;
+
+            let Some((route_input, expert_input)) = self.rmsnorm_quantized_pair(hidden, norm_weight, eps)? else {
+                return Ok(None);
+            };
+            let route_input = route_input.device.as_deref().ok_or_else(|| compute_error(format!("L{layer} operator owner route input 缺失")))?;
+            let expert_input = expert_input.device.as_ref().ok_or_else(|| compute_error(format!("L{layer} operator owner expert input 缺失")))?.clone();
+            let router = weights.router.router_resident(self.device_id, ops::hip::options().precise_router)?;
+            let bias = resident_weight(weights.bias, "operator router bias")?;
+            let route = ops::hip::try_moe_route_resident_device_f32(self.device_id, route_input, router, bias, rows, cols, num_experts, top_k, scoring, scaling)
+                .map_err(|error| compute_error(format!("L{layer} operator owner GGUF route: {error}")))?;
+            let route_count = rows.checked_mul(top_k).ok_or_else(|| compute_error(format!("L{layer} operator route 数溢出")))?;
+            if route.len != route_count {
+                return Err(compute_error(format!("L{layer} operator route 数异常: {}/{}", route.len, route_count)));
+            }
+            let route_ids = Arc::new(route.expert_ids);
+            let route_weights = Arc::new(route.weights);
+            let (peer_input, peer_main_stream, peer_shared_stream, peer_shared) = peer_shared_ticket.wait()?;
+
+            // route 表每层只有 top-k 个 id/weight。显式指定 peer worker 的 main
+            // stream，令 tiny P2P 在 owner routed 与 peer shared 之间穿过，不引入
+            // host/device 同步，也不依赖 owner 线程残留的跨卡 TLS stream 映射。
+            let owner_stream = ops::hip::active_compute_stream() as usize;
+            ops::hip::activate_compute_stream(peer_device, peer_main_stream).map_err(compute_error)?;
+            ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
+            let route_sources = vec![route_ids.clone(), route_weights.clone()];
+            let peer_routes =
+                ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&route_sources, peer_device, self.device_id).map_err(|error| compute_error(format!("L{layer} operator route owner->peer: {error}")))?;
+            ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
+
+            let local_output = ops::hip::DeviceBuffer::allocate_reusable(self.device_id, rows * cols * std::mem::size_of::<f32>()).map_err(compute_error)?;
+            ops::hip::try_gguf_fused_decode_experts(self.device_id, &expert_input, rows, cols, half_intermediate, top_k, &route_ids, &route_weights, route_count, &local_routed, &local_output).map_err(compute_error)?;
+            let local_output = if local_output.is_async_allocated() { local_output.copy_to_stable_deferred().map_err(compute_error)? } else { local_output };
+
+            let peer_ticket = worker.submit(move |peer| {
+                peer.activate().map_err(compute_error)?;
+                let [peer_route_ids, peer_route_weights]: [ops::hip::DeviceBuffer; 2] = peer_routes.try_into().map_err(|_| compute_error(format!("L{layer} operator peer route 数量异常")))?;
+                let routed = ops::hip::DeviceBuffer::allocate_reusable(peer.device_id, rows * cols * std::mem::size_of::<f32>()).map_err(compute_error)?;
+                ops::hip::try_gguf_fused_decode_experts(peer.device_id, &peer_input, rows, cols, half_intermediate, top_k, &peer_route_ids, &peer_route_weights, route_count, &remote_routed, &routed).map_err(compute_error)?;
+                ops::hip::order_stream_after(peer.device_id, peer_shared_stream, peer_main_stream).map_err(compute_error)?;
+                let combined = ops::hip::try_add_resident_f32(peer.device_id, &routed, &peer_shared, rows * cols, 1.0).map_err(compute_error)?;
+                let combined = if combined.is_async_allocated() { combined.copy_to_stable_deferred().map_err(compute_error)? } else { combined };
+                Ok(Arc::new(combined))
+            })?;
+            worker.retain_for_stage(route_sources)?;
+            (Arc::new(local_output), peer_ticket.wait()?)
+        } else {
+            let peer_ticket = worker.submit(move |peer| {
+                peer.activate().map_err(compute_error)?;
+                let Some((route_input, expert_input)) = peer.rmsnorm_quantized_pair(&peer_hidden, &peer_weights.post_attn_norm, eps)? else {
+                    return Err(compute_error(format!("L{layer} operator peer RMSNorm 未提供量化双输出")));
+                };
+                peer.operator_gguf_moe_partial(
+                    layer,
+                    &route_input,
+                    &expert_input,
+                    &peer_weights.router,
+                    &peer_weights.bias,
+                    &remote_routed,
+                    Some((&remote_shared, shared_intermediate)),
+                    rows,
+                    cols,
+                    half_intermediate,
+                    num_experts,
+                    top_k,
+                    scoring,
+                    scaling,
+                )
+            })?;
+            let Some((route_input, expert_input)) = self.rmsnorm_quantized_pair(hidden, norm_weight, eps)? else {
+                return Ok(None);
+            };
+            let local_partial = self.operator_gguf_moe_partial(layer, &route_input, &expert_input, weights.router, weights.bias, &local_routed, None, rows, cols, half_intermediate, num_experts, top_k, scoring, scaling)?;
+            (local_partial, peer_ticket.wait()?)
+        };
+        let (mut owner_on_peer, mut peer_on_owner) = ops::hip::DeviceBuffer::exchange_stable_groups_ordered_async_retained_by(&[local_partial.clone()], &[peer_partial.clone()], self.device_id)
+            .map_err(|error| compute_error(format!("L{layer} operator pair MoE partial exchange: {error}")))?;
+        let owner_on_peer = owner_on_peer.pop().ok_or_else(|| compute_error(format!("L{layer} operator pair MoE owner partial->peer 缺失")))?;
+        let peer_on_owner = peer_on_owner.pop().ok_or_else(|| compute_error(format!("L{layer} operator pair MoE peer partial->owner 缺失")))?;
+        worker.retain_for_stage(vec![local_partial.clone(), peer_partial.clone()])?;
+        let peer_partial_for_join = peer_partial.clone();
+        let peer_join = worker.submit(move |peer| {
+            peer.activate().map_err(compute_error)?;
+            // partial 已落本卡；融合归并只省中间 sum，原跨卡事件不变。
+            let output = if (rows * cols).is_multiple_of(4) {
+                ops::hip::try_peer_join_residual_f32(peer.device_id, &peer_partial_for_join, &owner_on_peer, &peer_residual, rows * cols).map_err(compute_error)?
+            } else {
+                let sum = ops::hip::try_add_resident_f32(peer.device_id, &peer_partial_for_join, &owner_on_peer, rows * cols, 1.0).map_err(compute_error)?;
+                ops::hip::try_add_resident_f32(peer.device_id, &sum, &peer_residual, rows * cols, 1.0).map_err(compute_error)?
+            };
+            Ok(Arc::new(output))
+        })?;
+        let residual = f32_tensor(self, hidden)?;
+        let residual = residual.device.as_deref().ok_or_else(|| compute_error(format!("L{layer} operator pair owner residual 缺失")))?;
+        let owner_output = if (rows * cols).is_multiple_of(4) {
+            ops::hip::try_peer_join_residual_f32(self.device_id, &local_partial, &peer_on_owner, residual, rows * cols).map_err(compute_error)?
+        } else {
+            let owner_sum = ops::hip::try_add_resident_f32(self.device_id, &local_partial, &peer_on_owner, rows * cols, 1.0).map_err(compute_error)?;
+            ops::hip::try_add_resident_f32(self.device_id, &owner_sum, residual, rows * cols, 1.0).map_err(compute_error)?
+        };
+        let mut output = device_tensor_f32(owner_output, rows, cols);
+        output.replica = Some(RocmTensorReplica { device_id: peer_device, dtype: RocmTensorDType::F32, device: peer_join.wait()? });
+        Ok(Some(output))
+    }
+
     fn supports_cooperative_mla_prefill(&self, layer: usize, experts: &Self::PrefillExperts) -> bool {
         !ops::hip::options().prefill_attention_cpu && experts.cooperative_mla.contains_key(&layer)
     }
@@ -1006,6 +1695,94 @@ impl ExpertPrefillBackend for RocmContext {
         self.cooperative_mla_prefill_add_impl(layer, experts, normalized_q_lora, latent, k_rope, residual, cache, dsa_state, position, cosine, sine, mla, dsa)
     }
 
+    fn cooperative_moe_rmsnorm_add(
+        &self,
+        spec: &crate::moe::topk_moe::TopkMoeSpec,
+        weights: crate::moe::topk_moe::RoutedMoeWeightsRef<'_, Self::Weight>,
+        shared_experts: &[crate::moe::topk_moe::SharedExpertRef<'_, Self::Weight>],
+        layer: usize,
+        experts: &mut Self::PrefillExperts,
+        hidden: &Self::Tensor,
+        norm_weight: &Self::Weight,
+        eps: f32,
+    ) -> Result<Option<Self::Tensor>, BackendError> {
+        if !ops::hip::options().cooperative_mla_decode_replicated
+            || hidden.rows != 1
+            || hidden.dtype != RocmTensorDType::F32
+            || weights.selected_experts.is_some()
+            || !ops::hip::options().decode_moe_fused
+            || !matches!(&experts.archive, RocmExpertArchive::Ct(_) | RocmExpertArchive::Gguf(_))
+            || !matches!(spec.activation, Activation::Silu)
+            || spec.num_shared_experts != 1
+            || shared_experts.len() != 1
+            || spec.shared_intermediate_size != spec.intermediate_size
+            || !spec.intermediate_size.is_multiple_of(2)
+        {
+            return Ok(None);
+        }
+        let shared = &shared_experts[0];
+        if shared.output_gate.is_some()
+            || shared.gate.rows != spec.intermediate_size
+            || shared.up.rows != spec.intermediate_size
+            || shared.down.rows != hidden.cols
+            || shared.gate.cols != hidden.cols
+            || shared.up.cols != hidden.cols
+            || shared.down.cols != spec.intermediate_size
+        {
+            return Ok(None);
+        }
+        let (peer, peer_weights) = {
+            let (peer, layer_weights) = experts.cooperative_mla_layer(layer)?;
+            if !layer_weights.decode_replicated() {
+                return Ok(None);
+            }
+            (peer, layer_weights.peer_moe.clone().expect("decode_replicated 已校验 peer MoE 权重"))
+        };
+        let Some(replica) = hidden.replica.as_ref().filter(|replica| replica.device_id == peer.device_id && replica.dtype == RocmTensorDType::F32 && replica.device.bytes() == hidden.cols * std::mem::size_of::<f32>()) else {
+            return Ok(None);
+        };
+        let peer_hidden = RocmTensor { data: Vec::new(), rows: hidden.rows, cols: hidden.cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: Some(replica.device.clone()), replica: None };
+
+        ops::hip::set_device(self.device_id).map_err(compute_error)?;
+        let Some((owner_route_input, owner_expert_input)) = self.rmsnorm_quantized_pair(hidden, norm_weight, eps)? else {
+            return Ok(None);
+        };
+        peer.activate().map_err(compute_error)?;
+        let Some((peer_route_input, peer_expert_input)) = peer.rmsnorm_quantized_pair(&peer_hidden, &peer_weights.post_attn_norm, eps)? else {
+            return Ok(None);
+        };
+        let route = |context: &RocmContext, input: &RocmTensor, router: &RocmWeight, bias: &RocmWeight| -> Result<(Arc<ops::hip::DeviceBuffer>, Arc<ops::hip::DeviceBuffer>, usize), BackendError> {
+            let input = input.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative router input 缺少 device buffer"))?;
+            let router = router.router_resident(context.device_id, ops::hip::options().precise_router)?;
+            let bias = resident_weight(bias, "cooperative router bias")?;
+            let scoring = match spec.scoring_func {
+                crate::moe::topk_moe::ScoringFunc::Softmax => 0,
+                crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
+                crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
+            };
+            let route = ops::hip::try_moe_route_resident_device_f32(context.device_id, input, router, bias, 1, hidden.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor).map_err(compute_error)?;
+            Ok((Arc::new(route.expert_ids), Arc::new(route.weights), route.len))
+        };
+        let (peer_route_ids, peer_route_weights, peer_route_count) = route(&peer, &peer_route_input, &peer_weights.router, &peer_weights.bias)?;
+        ops::hip::set_device(self.device_id).map_err(compute_error)?;
+        let (owner_route_ids, owner_route_weights, owner_route_count) = route(self, &owner_route_input, weights.router, weights.bias)?;
+        if owner_route_count != peer_route_count || owner_route_count != spec.top_k {
+            return Err(compute_error(format!("L{layer} cooperative 双 router 数量异常: owner={owner_route_count} peer={peer_route_count} top_k={}", spec.top_k)));
+        }
+        self.cooperative_moe_device_add(
+            spec,
+            layer,
+            experts,
+            &owner_expert_input,
+            hidden,
+            owner_route_ids,
+            owner_route_weights,
+            owner_route_count,
+            Some(RocmCooperativeMoeReplicaInput { input: peer_expert_input, residual: peer_hidden, route_ids: peer_route_ids, route_weights: peer_route_weights }),
+        )
+        .map(Some)
+    }
+
     fn prefill_resident_moe_add(
         &self,
         spec: &crate::moe::topk_moe::TopkMoeSpec,
@@ -1018,6 +1795,9 @@ impl ExpertPrefillBackend for RocmContext {
     ) -> Result<Option<Self::Tensor>, BackendError> {
         let route_input = inputs.route;
         let expert_input = inputs.expert;
+        if experts.operator_peer.is_some() {
+            return self.operator_moe_add(spec, weights, shared_experts, layer, experts, inputs, residual).map(Some);
+        }
         if experts.cooperative_peer.is_some() {
             return self.cooperative_moe_add(spec, weights, shared_experts, layer, experts, inputs, residual).map(Some);
         }
@@ -1740,6 +2520,7 @@ struct RocmCooperativeMoeGraph {
     _shared_out: Arc<ops::hip::DeviceBuffer>,
     _shared_ids: Arc<ops::hip::DeviceBuffer>,
     _shared_weights: Arc<ops::hip::DeviceBuffer>,
+    _activated: Arc<ops::hip::DeviceBuffer>,
     device_id: i32,
     stream: usize,
     /// owner 段含 route 时持有：route GEMV+top-k 的固定输入与 workspace。
@@ -1771,6 +2552,7 @@ impl RocmCooperativeMoeGraph {
         let shared_out = Arc::new(ops::hip::DeviceBuffer::allocate(device_id, hidden * 4)?);
         // peer 的 combined 会被 owner 跨卡读；统一用显式稳定池。
         let combined = Arc::new(ops::hip::DeviceBuffer::allocate_peer(device_id, if owner_join_add { hidden * 4 } else { hidden * 2 })?);
+        let activated = Arc::new(ops::hip::DeviceBuffer::allocate(device_id, top_k.checked_mul(half_intermediate).and_then(|elements| elements.checked_mul(2)).ok_or("ROCm cooperative MoE graph activated 尺寸溢出")?)?);
         let (shared_ids, shared_weights) = ops::hip::cooperative_single_expert_route(device_id, 1)?;
         let route = with_route.then(|| ops::hip::MoeRouteGraphBuffers::new(device_id, 1, expert_count, top_k)).transpose()?;
         let route_input = with_route.then(|| ops::hip::DeviceBuffer::allocate(device_id, hidden * 4).map(Arc::new)).transpose()?;
@@ -1791,8 +2573,8 @@ impl RocmCooperativeMoeGraph {
         if let (Some(route), Some(route_input), Some((router_weight, router_bias))) = (&route, &route_input, router) {
             route.launch(device_id, route_input, router_weight, router_bias, 1, hidden, expert_count, top_k, scoring, scaling)?;
         }
-        ops::hip::try_gguf_fused_decode_experts_typed(device_id, &expert_input, 1, hidden, half_intermediate, top_k, &route_ids, &route_weights, top_k, &routed.buffer, &routed_out, routed.uniform_types)?;
-        ops::hip::try_gguf_fused_decode_experts_typed(device_id, &expert_input, 1, hidden, half_intermediate, 1, &shared_ids, &shared_weights, 1, &shared.buffer, &shared_out, shared.uniform_types)?;
+        ops::hip::try_gguf_fused_decode_experts_typed_with_workspace(device_id, &expert_input, 1, hidden, half_intermediate, top_k, &route_ids, &route_weights, top_k, &routed.buffer, &routed_out, routed.uniform_types, &activated)?;
+        ops::hip::try_gguf_fused_decode_experts_typed_with_workspace(device_id, &expert_input, 1, hidden, half_intermediate, 1, &shared_ids, &shared_weights, 1, &shared.buffer, &shared_out, shared.uniform_types, &activated)?;
         if owner_join_add {
             ops::hip::try_add_resident_f32_into(device_id, &routed_out, &shared_out, &combined, hidden, 1.0)?;
         } else {
@@ -1803,7 +2585,22 @@ impl RocmCooperativeMoeGraph {
             return Err(format!("ROCm cooperative MoE graph 节点过少: {}", graph.node_count()));
         }
         eprintln!("[rocm-moe-graph] device={device_id} 录制完成 nodes={} 绑定流={stream:p}", graph.node_count());
-        Ok(Self { graph, expert_input, route_ids, route_weights, combined, _routed_out: routed_out, _shared_out: shared_out, _shared_ids: shared_ids, _shared_weights: shared_weights, device_id, stream: stream as usize, route_input, route })
+        Ok(Self {
+            graph,
+            expert_input,
+            route_ids,
+            route_weights,
+            combined,
+            _routed_out: routed_out,
+            _shared_out: shared_out,
+            _shared_ids: shared_ids,
+            _shared_weights: shared_weights,
+            _activated: activated,
+            device_id,
+            stream: stream as usize,
+            route_input,
+            route,
+        })
     }
 
     /// owner 段 replay（不含 route 的 A/B 诊断路径）：route 已由外层 eager 完成，
@@ -1961,7 +2758,8 @@ fn prepare_fp8_packed_expert(backend: &RocmContext, weights: crate::weight::form
     Ok(Arc::new(RocmFp8ResidentExpert { gate: prepare(weights.gate)?, up: prepare(weights.up)?, down: prepare(weights.down)? }))
 }
 
-/// GGUF expert → GPU 常驻形态：Q4_K/Q5_K 打包常驻，其余(Q6_K)由 prepare_weight 反量化为 BF16。
+/// GGUF expert → GPU 常驻形态：包括当前 GLM-5.3 MTP 使用的
+/// Q3_K/Q4_K 在内，支持的 GGUF block 都保持 packed resident。
 fn prepare_gguf_expert(backend: &RocmContext, weights: &crate::weight::expert_source::GgufExpertWeights) -> Result<Arc<RocmResidentExpert>, BackendError> {
     let prepare = |matrix: &crate::weight::container::gguf::GgufMatrix| backend.prepare_gguf_packed(matrix);
     Ok(Arc::new(RocmResidentExpert { gate: prepare(&weights.gate)?, up: prepare(&weights.up)?, down: prepare(&weights.down)? }))
@@ -1996,7 +2794,13 @@ fn gguf_packed_column_halves(matrix: &crate::weight::container::gguf::GgufMatrix
 
 /// 一次顺序读取三块 expert 权重，再把两个 TP shard 并行上传到 owner/peer。
 /// gate/up 的行半段本来连续；down 只做 block-aligned 行内拷贝。
-fn prepare_gguf_expert_tp_shards(owner: &RocmContext, peer: &RocmContext, weights: &crate::weight::expert_source::GgufExpertWeights, owner_partition: usize) -> Result<(Arc<RocmResidentExpert>, Arc<RocmResidentExpert>), BackendError> {
+fn prepare_gguf_expert_tp_shards(
+    owner: &RocmContext,
+    peer: &RocmContext,
+    weights: &crate::weight::expert_source::GgufExpertWeights,
+    owner_partition: usize,
+    q8_prefill_layout: bool,
+) -> Result<(Arc<RocmResidentExpert>, Arc<RocmResidentExpert>), BackendError> {
     if owner_partition >= 2
         || !weights.gate.rows.is_multiple_of(2)
         || weights.gate.rows != weights.up.rows
@@ -2020,9 +2824,14 @@ fn prepare_gguf_expert_tp_shards(owner: &RocmContext, peer: &RocmContext, weight
     let half = weights.gate.rows / 2;
     let prepare = |backend: &RocmContext, partition: usize| -> Result<Arc<RocmResidentExpert>, BackendError> {
         backend.activate().map_err(compute_error)?;
-        let gate = backend.prepare_gguf_packed_bytes(gate[partition], weights.gate.tensor_type.0, half, weights.gate.columns)?;
-        let up = backend.prepare_gguf_packed_bytes(up[partition], weights.up.tensor_type.0, half, weights.up.columns)?;
-        let down = backend.prepare_gguf_packed_bytes(&down[partition], weights.down.tensor_type.0, weights.down.rows, half)?;
+        // Dense operator pair 直接走通用 linear，Q8_0 必须采用与普通
+        // prefill 相同的 W8A16 布局；原始 GGUF packed 只留给 grouped MoE。
+        let prepare_weight = |bytes: &[u8], tensor_type: u32, rows: usize, columns: usize| {
+            if q8_prefill_layout && tensor_type == 8 { backend.prepare_gguf_q8_bytes(bytes, rows, columns) } else { backend.prepare_gguf_packed_bytes(bytes, tensor_type, rows, columns) }
+        };
+        let gate = prepare_weight(gate[partition], weights.gate.tensor_type.0, half, weights.gate.columns)?;
+        let up = prepare_weight(up[partition], weights.up.tensor_type.0, half, weights.up.columns)?;
+        let down = prepare_weight(&down[partition], weights.down.tensor_type.0, weights.down.rows, half)?;
         Ok(Arc::new(RocmResidentExpert { gate, up, down }))
     };
     let peer_partition = 1 - owner_partition;
@@ -2051,6 +2860,16 @@ pub struct RocmPrefillExperts {
     cooperative_moe_graphs: HashMap<(i32, usize), RocmCooperativeMoeGraphState>,
     /// 单路实验只在同机相邻卡间拆 routed experts；Attention/KV/DSA 仍由当前卡持有。
     cooperative_peer: Option<RocmCooperativeExpertPeer>,
+    /// 新路径保留单卡融合算子的边界，只把算子工作域拆到 peer；peer 的
+    /// kernel 必须由独立 host 线程提交，不能复用 cooperative owner 串行协议。
+    operator_peer: Option<RocmOperatorPeer>,
+    /// 当前单卡 MLA 算子的 head 工作域分片。q_b/kv_b 按输出行拆，o_proj
+    /// 按输入列拆；与 sequence-parallel cooperative 权重完全分开。
+    operator_mla: HashMap<usize, RocmOperatorMlaWeights>,
+    /// peer 独立执行 post-attention RMSNorm/router 所需的小权重。
+    operator_moe: HashMap<usize, RocmOperatorMoeWeights>,
+    /// dense MLP 沿中间维拆分后的 gate/up/down，以及 peer 侧 norm。
+    operator_dense: HashMap<usize, RocmOperatorDenseWeights>,
     /// sequence-parallel attention 的 q_b/kv_b/o_proj 在两卡完整驻留。两边
     /// 各自把本地 KV shard 算到 full-hidden partial，最后只归约 hidden。
     cooperative_mla: HashMap<usize, RocmCooperativeMlaWeights>,
@@ -2062,6 +2881,43 @@ pub struct RocmPrefillExperts {
 struct RocmCooperativeExpertPeer {
     context: RocmContext,
     local_partition: usize,
+}
+
+#[derive(Clone)]
+pub(super) struct RocmOperatorPeer {
+    pub(super) context: RocmContext,
+    pub(super) worker: super::RocmPairWorker,
+    pending_queries: Arc<std::sync::Mutex<HashMap<(usize, usize), RocmOperatorPendingQuery>>>,
+}
+
+pub(super) struct RocmOperatorPendingQuery {
+    pub(super) owner_query: RocmTensor,
+    pub(super) peer_q_lora: RocmTensor,
+    pub(super) owner_query_stream: usize,
+}
+
+#[derive(Clone)]
+pub(super) struct RocmOperatorMlaWeights {
+    pub(super) owner_q_b: RocmWeight,
+    pub(super) peer_q_b: RocmWeight,
+    pub(super) owner_kv_b: RocmWeight,
+    pub(super) peer_kv_b: RocmWeight,
+    pub(super) owner_o: RocmWeight,
+    pub(super) peer_o: RocmWeight,
+}
+
+#[derive(Clone)]
+pub(super) struct RocmOperatorMoeWeights {
+    pub(super) post_attn_norm: RocmWeight,
+    pub(super) router: RocmWeight,
+    pub(super) bias: RocmWeight,
+}
+
+#[derive(Clone)]
+struct RocmOperatorDenseWeights {
+    owner: Arc<RocmResidentExpert>,
+    peer: Arc<RocmResidentExpert>,
+    peer_norm: RocmWeight,
 }
 
 struct RocmGgufGroupedLayer {
@@ -2085,6 +2941,17 @@ pub(super) struct RocmCooperativeMlaWeights {
     pub(super) owner_o_full: RocmWeight,
     pub(super) owner_o: RocmWeight,
     pub(super) peer_o: RocmWeight,
+    /// token 行归属 prefill 与副本 decode 需要 peer 的完整 o_proj；普通半头路径不加载。
+    pub(super) peer_o_full: Option<RocmWeight>,
+    /// decode attention 已在 peer 生成同值 hidden 时，peer 可独立完成 norm/router。
+    pub(super) peer_moe: Option<RocmCooperativeMoeReplicaWeights>,
+}
+
+#[derive(Clone)]
+pub(super) struct RocmCooperativeMoeReplicaWeights {
+    pub(super) post_attn_norm: RocmWeight,
+    pub(super) router: RocmWeight,
+    pub(super) bias: RocmWeight,
 }
 
 impl RocmCooperativeMlaWeights {
@@ -2094,6 +2961,14 @@ impl RocmCooperativeMlaWeights {
 
     pub(super) fn o_head_sharded(&self) -> bool {
         self.owner_o.cols == self.peer_o.cols && self.owner_o.cols.checked_add(self.peer_o.cols) == Some(self.owner_q_b.rows)
+    }
+
+    pub(super) fn full_o(&self) -> Option<(&RocmWeight, &RocmWeight)> {
+        Some((&self.owner_o_full, self.peer_o_full.as_ref()?))
+    }
+
+    pub(super) fn decode_replicated(&self) -> bool {
+        self.full_o().is_some() && self.peer_moe.is_some()
     }
 }
 
@@ -2117,6 +2992,10 @@ impl RocmPrefillExperts {
             ct_moe_graphs: HashMap::new(),
             cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
+            operator_peer: None,
+            operator_mla: HashMap::new(),
+            operator_moe: HashMap::new(),
+            operator_dense: HashMap::new(),
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
         })
@@ -2134,6 +3013,10 @@ impl RocmPrefillExperts {
             ct_moe_graphs: HashMap::new(),
             cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
+            operator_peer: None,
+            operator_mla: HashMap::new(),
+            operator_moe: HashMap::new(),
+            operator_dense: HashMap::new(),
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
         }
@@ -2150,6 +3033,10 @@ impl RocmPrefillExperts {
             ct_moe_graphs: HashMap::new(),
             cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
+            operator_peer: None,
+            operator_mla: HashMap::new(),
+            operator_moe: HashMap::new(),
+            operator_dense: HashMap::new(),
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
         }
@@ -2166,6 +3053,10 @@ impl RocmPrefillExperts {
             ct_moe_graphs: HashMap::new(),
             cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
+            operator_peer: None,
+            operator_mla: HashMap::new(),
+            operator_moe: HashMap::new(),
+            operator_dense: HashMap::new(),
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
         }
@@ -2182,6 +3073,10 @@ impl RocmPrefillExperts {
             ct_moe_graphs: HashMap::new(),
             cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
+            operator_peer: None,
+            operator_mla: HashMap::new(),
+            operator_moe: HashMap::new(),
+            operator_dense: HashMap::new(),
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
         }
@@ -2198,6 +3093,10 @@ impl RocmPrefillExperts {
             ct_moe_graphs: HashMap::new(),
             cooperative_moe_graphs: HashMap::new(),
             cooperative_peer: None,
+            operator_peer: None,
+            operator_mla: HashMap::new(),
+            operator_moe: HashMap::new(),
+            operator_dense: HashMap::new(),
             cooperative_mla: HashMap::new(),
             cooperative_dsa_wq_b: HashMap::new(),
         }
@@ -2214,6 +3113,116 @@ impl RocmPrefillExperts {
         Ok(())
     }
 
+    pub fn enable_operator_peer(&mut self, context: RocmContext) -> Result<(), BackendError> {
+        if !matches!(&self.archive, RocmExpertArchive::Ct(_) | RocmExpertArchive::Gguf(_)) {
+            return Err(compute_error("ROCm operator pair 当前只支持 compressed-tensors/GGUF"));
+        }
+        if self.cooperative_peer.is_some() || self.operator_peer.is_some() {
+            return Err(compute_error("ROCm expert peer 已经配置"));
+        }
+        let worker = super::RocmPairWorker::new(context)?;
+        self.operator_peer = Some(RocmOperatorPeer { context, worker, pending_queries: Arc::new(std::sync::Mutex::new(HashMap::new())) });
+        Ok(())
+    }
+
+    pub(super) fn operator_peer(&self) -> Result<&RocmOperatorPeer, BackendError> {
+        self.operator_peer.as_ref().ok_or_else(|| compute_error("ROCm operator pair peer 缺失"))
+    }
+
+    pub(super) fn store_operator_mla_query(&self, layer: usize, position: usize, pending: RocmOperatorPendingQuery) -> Result<(), BackendError> {
+        let mut queries = self.operator_peer()?.pending_queries.lock().map_err(|_| compute_error("ROCm operator pending query 锁中毒"))?;
+        if queries.insert((layer, position), pending).is_some() {
+            return Err(compute_error(format!("L{layer} position={position} operator pending query 重复")));
+        }
+        Ok(())
+    }
+
+    pub(super) fn take_operator_mla_query(&self, layer: usize, position: usize) -> Result<Option<RocmOperatorPendingQuery>, BackendError> {
+        self.operator_peer()?.pending_queries.lock().map_err(|_| compute_error("ROCm operator pending query 锁中毒")).map(|mut queries| queries.remove(&(layer, position)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_operator_mla_layer(&mut self, layer: usize, owner_q_b: RocmWeight, peer_q_b: RocmWeight, owner_kv_b: RocmWeight, peer_kv_b: RocmWeight, owner_o: RocmWeight, peer_o: RocmWeight) -> Result<(), BackendError> {
+        if self.operator_peer.is_none() {
+            return Err(compute_error(format!("L{layer} operator MLA 缺少 peer")));
+        }
+        let q_rows = owner_q_b.rows.checked_add(peer_q_b.rows);
+        let kv_rows = owner_kv_b.rows.checked_add(peer_kv_b.rows);
+        let o_cols = owner_o.cols.checked_add(peer_o.cols);
+        if owner_q_b.rows == 0
+            || peer_q_b.rows == 0
+            || owner_q_b.cols != peer_q_b.cols
+            || owner_kv_b.rows == 0
+            || peer_kv_b.rows == 0
+            || owner_kv_b.cols != peer_kv_b.cols
+            || owner_o.rows != peer_o.rows
+            || owner_o.cols != owner_q_b.rows
+            || peer_o.cols != peer_q_b.rows
+            || q_rows != o_cols
+            || kv_rows.is_none()
+        {
+            return Err(compute_error(format!(
+                "L{layer} operator MLA shard shape 非法: q={:?}/{:?} kv={:?}/{:?} o={:?}/{:?}",
+                (owner_q_b.rows, owner_q_b.cols),
+                (peer_q_b.rows, peer_q_b.cols),
+                (owner_kv_b.rows, owner_kv_b.cols),
+                (peer_kv_b.rows, peer_kv_b.cols),
+                (owner_o.rows, owner_o.cols),
+                (peer_o.rows, peer_o.cols),
+            )));
+        }
+        self.operator_mla.insert(layer, RocmOperatorMlaWeights { owner_q_b, peer_q_b, owner_kv_b, peer_kv_b, owner_o, peer_o });
+        Ok(())
+    }
+
+    pub(super) fn operator_mla_layer(&self, layer: usize) -> Result<(&RocmOperatorPeer, &RocmOperatorMlaWeights), BackendError> {
+        let peer = self.operator_peer()?;
+        let weights = self.operator_mla.get(&layer).ok_or_else(|| compute_error(format!("L{layer} operator MLA 权重缺失")))?;
+        Ok((peer, weights))
+    }
+
+    pub fn set_operator_moe_layer(&mut self, layer: usize, post_attn_norm: RocmWeight, router: RocmWeight, bias: RocmWeight) -> Result<(), BackendError> {
+        if self.operator_peer.is_none() {
+            return Err(compute_error(format!("L{layer} operator MoE 缺少 peer")));
+        }
+        self.operator_moe.insert(layer, RocmOperatorMoeWeights { post_attn_norm, router, bias });
+        Ok(())
+    }
+
+    pub(super) fn operator_moe_layer(&self, layer: usize) -> Result<(&RocmOperatorPeer, &RocmOperatorMoeWeights), BackendError> {
+        let peer = self.operator_peer()?;
+        let weights = self.operator_moe.get(&layer).ok_or_else(|| compute_error(format!("L{layer} operator MoE 权重缺失")))?;
+        Ok((peer, weights))
+    }
+
+    pub(crate) fn prepare_operator_dense_layer_gguf(
+        &mut self,
+        owner: &RocmContext,
+        peer: &RocmContext,
+        layer: usize,
+        post_attn_norm: &[f32],
+        gate: crate::weight::container::gguf::GgufMatrix,
+        up: crate::weight::container::gguf::GgufMatrix,
+        down: crate::weight::container::gguf::GgufMatrix,
+    ) -> Result<(), BackendError> {
+        let operator = self.operator_peer()?;
+        if operator.context.device_id != peer.device_id || owner.device_id == peer.device_id {
+            return Err(compute_error(format!("L{layer} operator dense owner/peer 配置不一致")));
+        }
+        let weights = crate::weight::expert_source::GgufExpertWeights { gate, up, down };
+        let (owner, peer_weights) = prepare_gguf_expert_tp_shards(owner, peer, &weights, 0, true)?;
+        peer.activate().map_err(compute_error)?;
+        let peer_norm = peer.prepare_f32(post_attn_norm, 1, weights.gate.columns)?;
+        self.operator_dense.insert(layer, RocmOperatorDenseWeights { owner, peer: peer_weights, peer_norm });
+        Ok(())
+    }
+
+    fn operator_dense_layer(&self, layer: usize) -> Result<(&RocmOperatorPeer, &RocmOperatorDenseWeights), BackendError> {
+        let peer = self.operator_peer()?;
+        let weights = self.operator_dense.get(&layer).ok_or_else(|| compute_error(format!("L{layer} operator dense 权重缺失")))?;
+        Ok((peer, weights))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn set_cooperative_mla_layer(
         &mut self,
@@ -2225,12 +3234,14 @@ impl RocmPrefillExperts {
         owner_o_full: RocmWeight,
         owner_o: RocmWeight,
         peer_o: RocmWeight,
+        peer_o_full: Option<RocmWeight>,
     ) -> Result<(), BackendError> {
         if self.cooperative_peer.is_none() {
             return Err(compute_error(format!("L{layer} cooperative MLA 缺少 peer")));
         }
         let full_o = owner_o.cols == owner_q_b.rows && peer_o.cols == owner_q_b.rows;
         let sharded_o = owner_o.cols == peer_o.cols && owner_o.cols.checked_add(peer_o.cols) == Some(owner_q_b.rows);
+        let peer_full_valid = peer_o_full.as_ref().is_none_or(|peer| peer.rows == owner_o_full.rows && peer.cols == owner_q_b.rows);
         if owner_q_b.rows != peer_q_b.rows
             || owner_q_b.cols != peer_q_b.cols
             || owner_kv_b.rows != peer_kv_b.rows
@@ -2239,6 +3250,7 @@ impl RocmPrefillExperts {
             || owner_o_full.cols != owner_q_b.rows
             || owner_o.rows != peer_o.rows
             || !(full_o || sharded_o)
+            || !peer_full_valid
         {
             return Err(compute_error(format!(
                 "L{layer} cooperative MLA shard shape 非法: q={:?}/{:?} kv={:?}/{:?} o_full={:?} o={:?}/{:?}",
@@ -2260,7 +3272,16 @@ impl RocmPrefillExperts {
         } else {
             (None, None)
         };
-        self.cooperative_mla.insert(layer, RocmCooperativeMlaWeights { owner_q_b, peer_q_b, owner_decode_q_b, peer_decode_q_b, owner_kv_b, peer_kv_b, owner_o_full, owner_o, peer_o });
+        self.cooperative_mla.insert(layer, RocmCooperativeMlaWeights { owner_q_b, peer_q_b, owner_decode_q_b, peer_decode_q_b, owner_kv_b, peer_kv_b, owner_o_full, owner_o, peer_o, peer_o_full, peer_moe: None });
+        Ok(())
+    }
+
+    pub fn set_cooperative_moe_replica_layer(&mut self, layer: usize, post_attn_norm: RocmWeight, router: RocmWeight, bias: RocmWeight) -> Result<(), BackendError> {
+        let weights = self.cooperative_mla.get_mut(&layer).ok_or_else(|| compute_error(format!("L{layer} cooperative MLA 权重缺失")))?;
+        if post_attn_norm.rows.checked_mul(post_attn_norm.cols) != Some(router.cols) || router.rows != bias.rows.checked_mul(bias.cols).unwrap_or(0) {
+            return Err(compute_error(format!("L{layer} cooperative peer norm/router shape 非法: norm={:?} router={:?} bias={:?}", (post_attn_norm.rows, post_attn_norm.cols), (router.rows, router.cols), (bias.rows, bias.cols),)));
+        }
+        weights.peer_moe = Some(RocmCooperativeMoeReplicaWeights { post_attn_norm, router, bias });
         Ok(())
     }
 
@@ -2448,86 +3469,92 @@ impl RocmPrefillExperts {
     }
 
     pub fn preload_layer(&mut self, backend: &RocmContext, layer: usize, expert_count: usize) -> Result<(), BackendError> {
-        if let Some(peer) = self.cooperative_peer {
-            let remote_partition = 1 - peer.local_partition;
+        let operator_pair = self.operator_peer.is_some() && self.cooperative_peer.is_none();
+        let pair = self.cooperative_peer.map(|peer| (peer.context, peer.local_partition)).or_else(|| self.operator_peer.as_ref().map(|peer| (peer.context, 0)));
+        if let Some((peer_context, local_partition)) = pair {
+            let remote_partition = 1 - local_partition;
             match &self.archive {
                 RocmExpertArchive::Ct(source) => {
                     let source = source.clone();
-                    let missing = (0..expert_count).filter(|&expert| !self.resident.contains_key(&(backend.device_id, layer, expert)) || !self.resident.contains_key(&(peer.context.device_id, layer, expert))).collect::<Vec<_>>();
+                    let missing = (0..expert_count).filter(|&expert| !self.resident.contains_key(&(backend.device_id, layer, expert)) || !self.resident.contains_key(&(peer_context.device_id, layer, expert))).collect::<Vec<_>>();
                     let load_width = ops::hip::options().expert_load_width.max(1);
                     for chunk in missing.chunks(load_width) {
                         let prepared = chunk
                             .par_iter()
                             .map(|&expert| {
                                 let weights = source.load_expert_ct(layer, expert).map_err(BackendError::ExpertLoad)?;
-                                let (local, remote) = rayon::join(|| prepare_ct_expert_tp_shard(backend, &weights, peer.local_partition), || prepare_ct_expert_tp_shard(&peer.context, &weights, remote_partition));
+                                let (local, remote) = rayon::join(|| prepare_ct_expert_tp_shard(backend, &weights, local_partition), || prepare_ct_expert_tp_shard(&peer_context, &weights, remote_partition));
                                 Ok((expert, local?, remote?))
                             })
                             .collect::<Result<Vec<_>, BackendError>>()?;
                         for (expert, local, remote) in prepared {
                             self.resident.insert((backend.device_id, layer, expert), local);
-                            self.resident.insert((peer.context.device_id, layer, expert), remote);
+                            self.resident.insert((peer_context.device_id, layer, expert), remote);
                         }
                     }
-                    if !self.resident.contains_key(&(backend.device_id, layer, expert_count)) || !self.resident.contains_key(&(peer.context.device_id, layer, expert_count)) {
+                    if !self.resident.contains_key(&(backend.device_id, layer, expert_count)) || !self.resident.contains_key(&(peer_context.device_id, layer, expert_count)) {
                         let weights = load_ct_shared_expert(&source, layer).map_err(BackendError::ExpertLoad)?;
-                        let (local, remote) = rayon::join(|| prepare_ct_expert_tp_shard(backend, &weights, peer.local_partition), || prepare_ct_expert_tp_shard(&peer.context, &weights, remote_partition));
+                        let (local, remote) = rayon::join(|| prepare_ct_expert_tp_shard(backend, &weights, local_partition), || prepare_ct_expert_tp_shard(&peer_context, &weights, remote_partition));
                         self.resident.insert((backend.device_id, layer, expert_count), local?);
-                        self.resident.insert((peer.context.device_id, layer, expert_count), remote?);
+                        self.resident.insert((peer_context.device_id, layer, expert_count), remote?);
                     }
-                    let local = self.cooperative_resident_partition(backend, layer, expert_count, peer.local_partition)?;
-                    let remote = self.cooperative_resident_partition(&peer.context, layer, expert_count, remote_partition)?;
+                    let local = self.cooperative_resident_partition(backend, layer, expert_count, local_partition)?;
+                    let remote = self.cooperative_resident_partition(&peer_context, layer, expert_count, remote_partition)?;
                     ops::hip::preload_ct_grouped_expert_metas(backend.device_id, &grouped_w4_experts(&local)?).map_err(compute_error)?;
-                    ops::hip::preload_ct_grouped_expert_metas(peer.context.device_id, &grouped_w4_experts(&remote)?).map_err(compute_error)?;
-                    let local_shared = self.cooperative_resident_shared(backend, layer, expert_count, peer.local_partition)?;
-                    let remote_shared = self.cooperative_resident_shared(&peer.context, layer, expert_count, remote_partition)?;
+                    ops::hip::preload_ct_grouped_expert_metas(peer_context.device_id, &grouped_w4_experts(&remote)?).map_err(compute_error)?;
+                    let local_shared = self.cooperative_resident_shared(backend, layer, expert_count, local_partition)?;
+                    let remote_shared = self.cooperative_resident_shared(&peer_context, layer, expert_count, remote_partition)?;
                     ops::hip::preload_ct_grouped_expert_metas(backend.device_id, &grouped_w4_experts(std::slice::from_ref(&local_shared))?).map_err(compute_error)?;
-                    ops::hip::preload_ct_grouped_expert_metas(peer.context.device_id, &grouped_w4_experts(std::slice::from_ref(&remote_shared))?).map_err(compute_error)?;
+                    ops::hip::preload_ct_grouped_expert_metas(peer_context.device_id, &grouped_w4_experts(std::slice::from_ref(&remote_shared))?).map_err(compute_error)?;
                 }
                 RocmExpertArchive::Gguf(source) => {
                     let source = source.clone();
-                    let missing = (0..expert_count).filter(|&expert| !self.resident.contains_key(&(backend.device_id, layer, expert)) || !self.resident.contains_key(&(peer.context.device_id, layer, expert))).collect::<Vec<_>>();
+                    let missing = (0..expert_count).filter(|&expert| !self.resident.contains_key(&(backend.device_id, layer, expert)) || !self.resident.contains_key(&(peer_context.device_id, layer, expert))).collect::<Vec<_>>();
                     let load_width = ops::hip::options().expert_load_width.max(1);
                     for chunk in missing.chunks(load_width) {
                         let prepared = chunk
                             .par_iter()
                             .map(|&expert| {
                                 let weights = source.load_expert_gguf(layer, expert).map_err(BackendError::ExpertLoad)?;
-                                let (local, remote) = prepare_gguf_expert_tp_shards(backend, &peer.context, &weights, peer.local_partition)?;
+                                let (local, remote) = prepare_gguf_expert_tp_shards(backend, &peer_context, &weights, local_partition, false)?;
                                 Ok((expert, local, remote))
                             })
                             .collect::<Result<Vec<_>, BackendError>>()?;
                         for (expert, local, remote) in prepared {
                             self.resident.insert((backend.device_id, layer, expert), local);
-                            self.resident.insert((peer.context.device_id, layer, expert), remote);
+                            self.resident.insert((peer_context.device_id, layer, expert), remote);
                         }
                     }
-                    if !self.resident.contains_key(&(backend.device_id, layer, expert_count)) || !self.resident.contains_key(&(peer.context.device_id, layer, expert_count)) {
+                    if operator_pair && !self.resident.contains_key(&(peer_context.device_id, layer, expert_count)) {
                         let weights = source.load_shared_expert_gguf(layer).map_err(BackendError::ExpertLoad)?;
-                        let (local, remote) = prepare_gguf_expert_tp_shards(backend, &peer.context, &weights, peer.local_partition)?;
+                        let remote = prepare_gguf_expert(&peer_context, &weights)?;
+                        self.resident.insert((peer_context.device_id, layer, expert_count), remote);
+                    } else if !operator_pair && (!self.resident.contains_key(&(backend.device_id, layer, expert_count)) || !self.resident.contains_key(&(peer_context.device_id, layer, expert_count))) {
+                        let weights = source.load_shared_expert_gguf(layer).map_err(BackendError::ExpertLoad)?;
+                        let (local, remote) = prepare_gguf_expert_tp_shards(backend, &peer_context, &weights, local_partition, false)?;
                         self.resident.insert((backend.device_id, layer, expert_count), local);
-                        self.resident.insert((peer.context.device_id, layer, expert_count), remote);
+                        self.resident.insert((peer_context.device_id, layer, expert_count), remote);
                     }
-                    let local = self.cooperative_resident_partition(backend, layer, expert_count, peer.local_partition)?;
-                    let remote = self.cooperative_resident_partition(&peer.context, layer, expert_count, remote_partition)?;
-                    let local_shared = self.cooperative_resident_shared(backend, layer, expert_count, peer.local_partition)?;
-                    let remote_shared = self.cooperative_resident_shared(&peer.context, layer, expert_count, remote_partition)?;
+                    let local = self.cooperative_resident_partition(backend, layer, expert_count, local_partition)?;
+                    let remote = self.cooperative_resident_partition(&peer_context, layer, expert_count, remote_partition)?;
+                    let local_shared = (!operator_pair).then(|| self.cooperative_resident_shared(backend, layer, expert_count, local_partition)).transpose()?;
+                    let remote_shared = self.cooperative_resident_shared(&peer_context, layer, expert_count, remote_partition)?;
                     let local_routed = gguf_grouped_metas_from_residents(layer, &local)?;
                     let remote_routed = gguf_grouped_metas_from_residents(layer, &remote)?;
-                    let local_shared = gguf_grouped_metas_from_residents(layer, std::slice::from_ref(&local_shared))?;
+                    let local_shared = local_shared.as_ref().map(|shared| gguf_grouped_metas_from_residents(layer, std::slice::from_ref(shared))).transpose()?;
                     let remote_shared = gguf_grouped_metas_from_residents(layer, std::slice::from_ref(&remote_shared))?;
                     let local_grouped = RocmGgufGroupedLayer {
                         routed: ops::hip::resident_gguf_grouped_metas(backend.device_id, &local_routed).map_err(compute_error)?,
-                        shared: Some(ops::hip::resident_gguf_grouped_metas(backend.device_id, &local_shared).map_err(compute_error)?),
+                        shared: local_shared.as_ref().map(|shared| ops::hip::resident_gguf_grouped_metas(backend.device_id, shared).map_err(compute_error)).transpose()?,
                     };
                     let remote_grouped = RocmGgufGroupedLayer {
-                        routed: ops::hip::resident_gguf_grouped_metas(peer.context.device_id, &remote_routed).map_err(compute_error)?,
-                        shared: Some(ops::hip::resident_gguf_grouped_metas(peer.context.device_id, &remote_shared).map_err(compute_error)?),
+                        routed: ops::hip::resident_gguf_grouped_metas(peer_context.device_id, &remote_routed).map_err(compute_error)?,
+                        shared: Some(ops::hip::resident_gguf_grouped_metas(peer_context.device_id, &remote_shared).map_err(compute_error)?),
                     };
                     self.gguf_grouped.insert((backend.device_id, layer), local_grouped);
-                    self.gguf_grouped.insert((peer.context.device_id, layer), remote_grouped);
+                    self.gguf_grouped.insert((peer_context.device_id, layer), remote_grouped);
                 }
-                _ => return Err(compute_error("ROCm cooperative row shard 只支持 compressed-tensors/GGUF")),
+                _ => return Err(compute_error("ROCm 双卡 expert row shard 只支持 compressed-tensors/GGUF")),
             }
             return Ok(());
         }

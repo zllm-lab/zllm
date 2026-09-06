@@ -23,6 +23,7 @@ use crate::{
     diffusion::ModulationSegment,
     moe::{
         Activation,
+        dense_mlp::{DenseMlpSpec, DenseMlpWeightsRef},
         routing::ExpertAssignments,
         topk_moe::{RoutedMoeInputs, RoutedMoeWeightsRef, SharedExpertRef, TopkMoeSpec},
     },
@@ -496,6 +497,19 @@ pub trait Backend: BackendResources {
     /// 路由等精度敏感路径可要求归一化结果保持 F32；原生 tensor 已是 F32 的 backend 无需覆盖。
     fn rmsnorm_f32(&self, input: &Self::Tensor, weight: &Self::Weight, eps: f32) -> Result<Self::Tensor, BackendError> {
         self.rmsnorm(input, weight, eps)
+    }
+    /// 分组 RMSNorm(K2-Horizon):hidden 按组等分、组内独立归一化后乘全长度权重。
+    /// `groups == 1` 等价 `rmsnorm` 并直接复用;未实现分组路径的 backend 对
+    /// `groups > 1` 显式报错,而不是静默退化为整行归一化。
+    fn grouped_rmsnorm(&self, input: &Self::Tensor, weight: &Self::Weight, eps: f32, groups: usize) -> Result<Self::Tensor, BackendError> {
+        if groups == 1 {
+            return self.rmsnorm(input, weight, eps);
+        }
+        Err(BackendError::Compute { msg: format!("当前 backend 未实现 grouped RMSNorm(groups={groups})") })
+    }
+    /// 分组 RMSNorm 的精度敏感版本,与 `rmsnorm_f32` 保持相同控制面语义。
+    fn grouped_rmsnorm_f32(&self, input: &Self::Tensor, weight: &Self::Weight, eps: f32, groups: usize) -> Result<Self::Tensor, BackendError> {
+        self.grouped_rmsnorm(input, weight, eps, groups)
     }
     fn gemma_rmsnorm(&self, input: &Self::Tensor, weight: &Self::Weight, eps: f32) -> Result<Self::Tensor, BackendError>;
     /// GemmaRMSNorm 的精度敏感版本，与 `rmsnorm_f32` 保持相同控制面语义。
@@ -1131,6 +1145,25 @@ pub trait DecodeBackend: Backend {
 pub trait DsaPrefillBackend: MlaPrefillBackend + DecodeBackend {
     fn dsa_select_prefill(&self, state: &mut Self::DsaState, layer: usize, query: &Self::Tensor, head_weights: &Self::Tensor, spec: &DsaSpec) -> Result<(), BackendError>;
 
+    /// 允许单行路径把 selection 等待推迟到独立的 query/KV 投影之后；调用方
+    /// 无论投影成功与否，都必须调用 dsa_select_topk_finish 收回在途状态。
+    fn dsa_select_prefill_begin(&self, state: &mut Self::DsaState, layer: usize, query: &Self::Tensor, head_weights: &Self::Tensor, spec: &DsaSpec) -> Result<(), BackendError> {
+        self.dsa_select_prefill(state, layer, query, head_weights, spec)
+    }
+
+    /// MTP 单链后续迭代可复用首个 draft-extend 的 DSA selection。后续迭代
+    /// 不再执行 indexer，也不追加临时 DSA key，只推进 MLA cache。
+    fn supports_dsa_prefill_selection_reuse(&self, state: &Self::DsaState, layer: usize, position: usize, rows: usize, spec: &DsaSpec) -> bool {
+        let _ = (state, layer, position, rows, spec);
+        false
+    }
+
+    /// 把首步 selection 重定位到当前 query；buffer 内容与 DSA cache 水位均不变。
+    fn reuse_dsa_prefill_selection(&self, state: &mut Self::DsaState, layer: usize, position: usize, rows: usize, spec: &DsaSpec) -> Result<(), BackendError> {
+        let _ = (state, layer, position, rows, spec);
+        Err(BackendError::Compute { msg: "backend 未实现 DSA prefill selection 复用".to_owned() })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn mla_prefill_attention_selected(
         &self,
@@ -1526,6 +1559,126 @@ pub trait MoePrefillBackend: Backend {
 pub trait ExpertPrefillBackend: MoePrefillBackend {
     type PrefillExperts;
 
+    /// runtime 指定复用当前 selection 的层；实际设备、搬运及消费依赖由后端安排。
+    fn prefetch_stage_selected_kv(&self, experts: &Self::PrefillExperts, cache: &mut Self::Cache, dsa: &<Self as DecodeBackend>::DsaState, layers: std::ops::Range<usize>, position: usize, rows: usize) -> Result<(), BackendError>
+    where
+        Self: DsaPrefillBackend,
+    {
+        let _ = (experts, cache, dsa, layers, position, rows);
+        Ok(())
+    }
+
+    /// 相邻 operator pair 已各自持有同值 hidden 时，同时迁移 owner 与 peer
+    /// 副本。返回 None 表示沿用普通单 tensor stage handoff。
+    fn move_parallel_stage_tensor_ordered(&self, _experts: &Self::PrefillExperts, _tensor: &Self::Tensor) -> Result<Option<Self::Tensor>, BackendError> {
+        Ok(None)
+    }
+
+    /// 当前单卡融合 MLA 已按 head 工作域拆到两张卡时返回 true。该能力与
+    /// sequence-parallel cooperative 协议互斥。
+    fn supports_parallel_mla_prefill(&self, _layer: usize, _experts: &Self::PrefillExperts) -> bool {
+        false
+    }
+
+    /// 单行 decode 可在 KV 前导开始前，提前把 query half 排入 owner/peer。
+    /// 返回 true 表示后续 parallel MLA 会消费这次预提交；批量 prefill 默认
+    /// 保持原路径，避免为多 segment 引入跨调用状态。
+    #[allow(clippy::too_many_arguments)]
+    fn begin_parallel_mla_query(&self, _layer: usize, _experts: &Self::PrefillExperts, _normalized_q_lora: &Self::Tensor, _position: usize, _cosine: &[f32], _sine: &[f32], _mla: &MlaSpec) -> Result<bool, BackendError> {
+        Ok(false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn parallel_mla_prefill_add(
+        &self,
+        layer: usize,
+        experts: &Self::PrefillExperts,
+        normalized_q_lora: &Self::Tensor,
+        latent: &Self::Tensor,
+        k_rope: &Self::Tensor,
+        residual: &Self::Tensor,
+        cache: Option<&mut Self::Cache>,
+        dsa_state: Option<&<Self as DecodeBackend>::DsaState>,
+        position: usize,
+        cosine: &[f32],
+        sine: &[f32],
+        mla: &MlaSpec,
+        dsa: &DsaSpec,
+    ) -> Result<Self::Tensor, BackendError>
+    where
+        Self: DsaPrefillBackend,
+    {
+        let _ = (layer, experts, normalized_q_lora, latent, k_rope, residual, cache, dsa_state, position, cosine, sine, mla, dsa);
+        Err(BackendError::Compute { msg: "backend 未实现 parallel MLA prefill".to_owned() })
+    }
+
+    /// MTP accepted-token 追赶只写 MLA cache、不计算 attention。operator pair
+    /// 必须在这里同步推进 peer cache，否则下一轮 L78 会读到不同长度的历史。
+    /// 返回 true 表示 owner 与 peer 的 append 都已提交。
+    fn parallel_mla_cache_append(&self, _layer: usize, _experts: &Self::PrefillExperts, _cache: &mut Self::Cache, _latent: &Self::Tensor, _k_rope: &Self::Tensor, _position: usize) -> Result<bool, BackendError>
+    where
+        Self: DecodeBackend,
+    {
+        Ok(false)
+    }
+
+    /// cache-only pair append 没有 attention 的反向 partial 可建立依赖，需在
+    /// batch 尾显式把 peer stream 接回 owner stream；默认后端无需处理。
+    fn finish_parallel_mla_cache_submission(&self, _experts: &Self::PrefillExperts) -> Result<(), BackendError> {
+        Ok(())
+    }
+
+    /// attention 已在两张卡留下同值 hidden 时，两侧各自完成 RMSNorm/router，
+    /// 再以当前 fused expert 算子计算本地中间维分片。返回 None 表示走普通路径。
+    #[allow(clippy::too_many_arguments)]
+    fn parallel_moe_rmsnorm_add(
+        &self,
+        _spec: &TopkMoeSpec,
+        _weights: RoutedMoeWeightsRef<'_, Self::Weight>,
+        _shared_experts: &[SharedExpertRef<'_, Self::Weight>],
+        _layer: usize,
+        _experts: &mut Self::PrefillExperts,
+        _hidden: &Self::Tensor,
+        _norm_weight: &Self::Weight,
+        _eps: f32,
+    ) -> Result<Option<Self::Tensor>, BackendError> {
+        Ok(None)
+    }
+
+    /// attention 已在两张卡留下同值 hidden 时，dense MLP 沿中间维拆分
+    /// gate/up/down，并在两端各自保留归并后的 residual 副本。
+    #[allow(clippy::too_many_arguments)]
+    fn parallel_dense_mlp_rmsnorm_add(
+        &self,
+        _spec: &DenseMlpSpec,
+        _weights: DenseMlpWeightsRef<'_, Self::Weight>,
+        _layer: usize,
+        _experts: &Self::PrefillExperts,
+        _hidden: &Self::Tensor,
+        _norm_weight: &Self::Weight,
+        _eps: f32,
+    ) -> Result<Option<Self::Tensor>, BackendError> {
+        Ok(None)
+    }
+
+    /// segmented batch 的各段已经在两卡各留一份结果时，两侧并行 concat，
+    /// 避免 owner concat 后丢掉 replica、下一算子重新搬整份 hidden。
+    fn concat_parallel_stage_tensors(&self, _experts: &Self::PrefillExperts, _tensors: &[&Self::Tensor]) -> Result<Option<Self::Tensor>, BackendError> {
+        Ok(None)
+    }
+
+    /// operator pair 的 layer 输出需要在两卡同时 compact，才能把 replica
+    /// 直接交给下一层。返回 None 表示使用普通单卡 compact。
+    fn compact_parallel_stage_tensor(&self, _experts: &Self::PrefillExperts, _tensor: &Self::Tensor) -> Result<Option<Self::Tensor>, BackendError> {
+        Ok(None)
+    }
+
+    /// 一个逻辑 stage 的 pair kernel 已全部 enqueue；把 peer completion
+    /// 附到本次 stage completion，而不是在每层 owner stream 上等待 peer。
+    fn finish_parallel_stage_submission(&self, _experts: &Self::PrefillExperts, _tensor: &Self::Tensor) -> Result<(), BackendError> {
+        Ok(())
+    }
+
     /// 同一 MLA 层已经为两张卡准备 query-head / KV-B / O-proj 分片时返回 true。
     fn supports_cooperative_mla_prefill(&self, _layer: usize, _experts: &Self::PrefillExperts) -> bool {
         false
@@ -1627,6 +1780,24 @@ pub trait ExpertPrefillBackend: MoePrefillBackend {
         residual: &Self::Tensor,
     ) -> Result<Option<Self::Tensor>, BackendError> {
         let _ = (spec, weights, shared_experts, layer, experts, inputs, residual);
+        Ok(None)
+    }
+
+    /// cooperative attention 已在两卡留下同值单 token hidden 时，两边可各自
+    /// 完成 RMSNorm/router 和本地 TP expert，再只在 MoE 线性边界归约一次。
+    /// 返回 `None` 表示没有可消费的 peer 副本或 backend 不支持该路径。
+    #[allow(clippy::too_many_arguments)]
+    fn cooperative_moe_rmsnorm_add(
+        &self,
+        _spec: &TopkMoeSpec,
+        _weights: RoutedMoeWeightsRef<'_, Self::Weight>,
+        _shared_experts: &[SharedExpertRef<'_, Self::Weight>],
+        _layer: usize,
+        _experts: &mut Self::PrefillExperts,
+        _hidden: &Self::Tensor,
+        _norm_weight: &Self::Weight,
+        _eps: f32,
+    ) -> Result<Option<Self::Tensor>, BackendError> {
         Ok(None)
     }
 

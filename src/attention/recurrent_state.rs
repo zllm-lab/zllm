@@ -30,6 +30,10 @@ impl<S, Spec: PartialEq> RecurrentState<S, Spec> {
         self.layers.get(layer).and_then(|state| state.as_ref().map(|state| &state.storage))
     }
 
+    pub fn layer_storage_mut(&mut self, layer: usize) -> Option<&mut S> {
+        self.layers.get_mut(layer).and_then(|state| state.as_mut().map(|state| &mut state.storage))
+    }
+
     /// 快照恢复：直接注入 storage 与已推进的 position，绕过 position 连续性检查。
     pub fn restore_layer(&mut self, layer: usize, position: usize, storage: S) -> Result<(), BackendError> {
         let slot = self.layers.get_mut(layer).ok_or(BackendError::UnsupportedLayer { layer })?;

@@ -1324,8 +1324,11 @@ where
                                     profile_decode_completion_waits += 1;
                                     profile_decode_completion_wait_micros = profile_decode_completion_wait_micros.saturating_add(started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64);
                                 }
-                            } else {
+                            } else if in_flight.is_empty() {
                                 backoff.wait();
+                            } else {
+                                // completion 仍在途时不把空闲睡眠串入 decode 关键路径。
+                                std::thread::yield_now();
                             }
                         }
                         continue;

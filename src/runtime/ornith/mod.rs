@@ -646,6 +646,7 @@ impl OrnithConfig {
             value_head_dim: self.linear_value_head_dim,
             conv_kernel: self.linear_conv_kernel,
             rms_eps: self.rms_eps,
+            output_gate: crate::attention::gated_delta_net::GdnOutputGate::Silu,
         }
     }
 

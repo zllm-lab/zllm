@@ -138,8 +138,8 @@ pub(super) fn gqa_decode_attention_direct_q8_append_buffers(
         || !head_dim.is_multiple_of(32)
         || !head_dim.is_multiple_of(group_size)
         || !group_size.is_multiple_of(4)
-        || kv_head_count * head_dim > 512
-        || kv_head_count * (head_dim / group_size) > 8
+        || kv_head_count * head_dim > 1024
+        || kv_head_count * (head_dim / group_size) > 16
     {
         return Err(format!("GQA direct-append 维度不符: heads={head_count}, kv_heads={kv_head_count}, head_dim={head_dim}, group={group_size}"));
     }
@@ -152,8 +152,8 @@ pub(super) fn gqa_decode_attention_direct_q8_append_buffers(
     if THREADS as u64 > pipeline.max_total_threads_per_threadgroup() {
         return Err("GQA direct-append 需要 256 threads，超过 Metal pipeline 上限".to_owned());
     }
-    let source_rows_u32 = validate_u32("GQA direct-append rows", source_rows)?;
     let first_visible_u32 = validate_u32("GQA direct-append first visible", first_visible)?;
+    let kv_rows_u32 = validate_u32("GQA direct-append KV rows", kv_rows)?;
     let heads_u32 = validate_u32("GQA direct-append heads", head_count)?;
     let kv_heads_u32 = validate_u32("GQA direct-append KV heads", kv_head_count)?;
     let dimension_u32 = validate_u32("GQA direct-append head dim", head_dim)?;
@@ -171,13 +171,13 @@ pub(super) fn gqa_decode_attention_direct_q8_append_buffers(
     encoder.set_buffer(5, Some(value), value_scale_offset);
     encoder.set_buffer(6, Some(&new_key.buffer), 0);
     encoder.set_buffer(7, Some(&new_value.buffer), 0);
-    set_bytes(&encoder, 8, &source_rows_u32);
+    let decode_state = [kv_rows_u32 - 1, kv_rows_u32, first_visible_u32];
+    set_bytes(&encoder, 8, &decode_state);
     set_bytes(&encoder, 9, &heads_u32);
     set_bytes(&encoder, 10, &kv_heads_u32);
     set_bytes(&encoder, 11, &dimension_u32);
     set_bytes(&encoder, 12, &score_scale);
     set_bytes(&encoder, 13, &bf16_flag);
-    set_bytes(&encoder, 14, &first_visible_u32);
     set_bytes(&encoder, 15, &group_size_u32);
     set_bytes(&encoder, 16, &groups_per_head_u32);
     let head_groups = kv_head_count * (head_count / kv_head_count).div_ceil(2);
@@ -347,6 +347,7 @@ pub fn gqa_decode_attention_split_kv_buffers(
     }
 
     let source_rows_u32 = validate_u32("GQA Split-KV rows", source_rows)?;
+    let kv_rows_u32 = validate_u32("GQA Split-KV KV rows", kv_rows)?;
     let first_visible_u32 = validate_u32("GQA Split-KV first visible", first_visible)?;
     let kv_capacity_u32 = validate_u32("GQA Split-KV capacity", kv_capacity)?;
     let heads_u32 = validate_u32("GQA Split-KV heads", head_count)?;
@@ -365,7 +366,14 @@ pub fn gqa_decode_attention_split_kv_buffers(
     encoder.set_buffer(2, Some(value), value_offset);
     encoder.set_buffer(3, Some(&statistics), 0);
     encoder.set_buffer(4, Some(&partial_values), 0);
-    set_bytes(&encoder, 5, &source_rows_u32);
+    let decode_state = [kv_rows_u32.saturating_sub(1), kv_rows_u32, first_visible_u32];
+    // BF16 vectorized kernel 保留原有 source_rows/first_visible 参数；只有
+    // gqa_decode_split_kv 从三槽 state 读取动态范围，供 replay 复用。
+    if use_flash_q8 || bf16 {
+        set_bytes(&encoder, 5, &source_rows_u32);
+    } else {
+        set_bytes(&encoder, 5, &decode_state);
+    }
     set_bytes(&encoder, 6, &heads_u32);
     set_bytes(&encoder, 7, &kv_heads_u32);
     set_bytes(&encoder, 8, &dimension_u32);
@@ -373,7 +381,9 @@ pub fn gqa_decode_attention_split_kv_buffers(
     set_bytes(&encoder, 10, &block_count_u32);
     set_bytes(&encoder, 11, &score_scale);
     set_bytes(&encoder, 12, &bf16_flag);
-    set_bytes(&encoder, 13, &first_visible_u32);
+    if use_flash_q8 || bf16 {
+        set_bytes(&encoder, 13, &first_visible_u32);
+    }
     set_bytes(&encoder, 14, &kv_capacity_u32);
     if let Some(storage) = &q8 {
         encoder.set_buffer(15, Some(storage.key), storage.key_offset);

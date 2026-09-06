@@ -149,6 +149,29 @@ impl PinnedUploadRing {
     }
 }
 
+// 锁页注册持有原始数据所有者,直到全部 DMA 完成后解除注册。
+// 即使调用方提前释放 source,上传用的主存地址也不会失效。
+struct RegisteredHostMemory {
+    context: Arc<CudaCtx>,
+    _owner: Arc<dyn Send + Sync>,
+    ranges: Vec<(usize, usize)>,
+    data_ranges: Vec<(usize, usize)>,
+}
+
+impl Drop for RegisteredHostMemory {
+    fn drop(&mut self) {
+        if let Err(error) = self.context.synchronize() {
+            eprintln!("CUDA host registration 释放前同步失败: {error:?}");
+        }
+        for &(start, _) in &self.ranges {
+            let status = unsafe { cudarc::driver::sys::cuMemHostUnregister(start as *mut std::ffi::c_void) };
+            if let Err(error) = status.result() {
+                eprintln!("CUDA host unregister 失败: address={start:#x}: {error:?}");
+            }
+        }
+    }
+}
+
 pub struct CudaContext {
     ctx: Arc<CudaCtx>,
     stream: Arc<CudaStream>,
@@ -165,6 +188,7 @@ pub struct CudaContext {
     pinned_f32_src: Mutex<Option<cudarc::driver::safe::PinnedHostSlice<f32>>>,
     /// expert 流式上传的 pinned 槽环:槽复用前只等自己的 DMA 事件,不排空计算流。
     pinned_u8_ring: Mutex<PinnedUploadRing>,
+    registered_host: Mutex<Option<RegisteredHostMemory>>,
     /// expert 流式上传专用 copy 流:分配/DMA 不进计算流 backlog,消费侧
     /// wait copy fence 事件拿跨流依赖。
     copy_stream: Arc<cudarc::driver::safe::CudaStream>,
@@ -263,12 +287,31 @@ impl CudaContext {
             pinned_f16: Mutex::new(None),
             pinned_f32_src: Mutex::new(None),
             pinned_u8_ring: Mutex::new(PinnedUploadRing::default()),
+            registered_host: Mutex::new(None),
             copy_stream,
             copy_fence: Mutex::new(None),
             copy_fence_dirty: AtomicBool::new(false),
             gpu_nanoseconds: AtomicU64::new(0),
             command_buffers: AtomicU64::new(0),
         })
+    }
+
+    /// 仅失败路径查询物理池用量,避免逐 token 同步改变性能。
+    pub(crate) fn memory_diagnostics(&self) -> String {
+        use cudarc::driver::sys;
+        let mut pool = std::ptr::null_mut();
+        let mut used = 0u64;
+        let mut reserved = 0u64;
+        unsafe {
+            sys::cuDeviceGetDefaultMemPool(&mut pool, self.ctx.cu_device());
+            if !pool.is_null() {
+                sys::cuMemPoolGetAttribute(pool, sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT, (&mut used as *mut u64).cast());
+                sys::cuMemPoolGetAttribute(pool, sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT, (&mut reserved as *mut u64).cast());
+            }
+        }
+        let rope = self.rope_windows.lock().map(|cache| (cache.len(), cache.values().map(|x| x.len() * 2).sum::<usize>()));
+        let rows = self.row_maps.lock().map(|cache| (cache.len(), cache.values().map(|x| x.len() * 4).sum::<usize>()));
+        format!("memory={:?} default_pool_used={used} default_pool_reserved={reserved} rope={rope:?} row_maps={rows:?}", self.mem_info())
     }
 
     pub fn copy_stream(&self) -> &Arc<cudarc::driver::safe::CudaStream> {
@@ -278,7 +321,10 @@ impl CudaContext {
     /// 在 copy 流上记录栅栏;消费侧通过 wait_copy_fence 建立跨流依赖。
     fn record_copy_fence(&self) -> Result<(), String> {
         let mut guard = self.copy_fence.lock().map_err(|_| "CUDA copy fence 锁已中毒".to_owned())?;
-        let event = guard.get_or_insert_with(|| self.ctx.new_event(None).unwrap_or_else(|_| unreachable!("copy fence 事件创建失败")));
+        if guard.is_none() {
+            *guard = Some(self.ctx.new_event(None).map_err(|e| format!("CUDA copy fence 事件创建失败: {e:?}"))?);
+        }
+        let event = guard.as_ref().expect("copy fence 已创建");
         event.record(&self.copy_stream).map_err(|e| format!("CUDA copy fence 记录失败: {e:?}"))?;
         self.copy_fence_dirty.store(true, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -449,6 +495,60 @@ impl CudaContext {
         Ok(buf)
     }
 
+    /// 设备内偏移拷贝(QSA raw K 追加:D2D,绕开 CudaView 只读限制)。
+    pub fn copy_dtod_at(&self, src: &CudaSlice<f16>, dst: &mut CudaSlice<f16>, offset_elems: usize) -> Result<(), String> {
+        if offset_elems.checked_add(src.len()).ok_or_else(|| "CUDA copy_dtod_at 偏移溢出".to_owned())? > dst.len() {
+            return Err(format!("CUDA copy_dtod_at offset={offset_elems} + src={} > dst.len={}", src.len(), dst.len()));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        use cudarc::driver::safe::{DevicePtr, DevicePtrMut};
+        let (src_ptr, _src_sync) = src.device_ptr(&self.stream);
+        let (dst_base, _dst_sync) = dst.device_ptr_mut(&self.stream);
+        let dst_ptr = unsafe { (dst_base as *const u8).add(offset_elems * std::mem::size_of::<f16>()) } as u64;
+        let nbytes = src.len().checked_mul(std::mem::size_of::<f16>()).ok_or_else(|| "CUDA copy_dtod_at 字节数溢出".to_owned())?;
+        self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA context 失败: {e:?}"))?;
+        let status = unsafe { cudarc::driver::sys::cuMemcpyDtoDAsync_v2(dst_ptr, src_ptr as u64, nbytes, self.stream.cu_stream()) };
+        if let Err(e) = status.result() {
+            return Err(format!("CUDA copy_dtod_at cuMemcpyDtoDAsync 失败: {e:?}"));
+        }
+        Ok(())
+    }
+
+    /// f16 主机数组 → 设备 buffer 的偏移写入(QSA raw K 追加);pinned 中转同款。
+    pub fn upload_f16_pinned_at(&self, src: &[f16], dst: &mut CudaSlice<f16>, offset_elems: usize) -> Result<(), String> {
+        if offset_elems.checked_add(src.len()).ok_or_else(|| "CUDA upload_f16_pinned_at 偏移溢出".to_owned())? > dst.len() {
+            return Err(format!("CUDA upload_f16_pinned_at offset={offset_elems} + src={} > dst.len={}", src.len(), dst.len()));
+        }
+        if src.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.pinned_f16.lock().map_err(|_| "CUDA pinned f16 cache 锁已中毒".to_owned())?;
+        if guard.as_ref().is_none_or(|pinned| pinned.len() < src.len()) {
+            let target = src.len().checked_next_power_of_two().ok_or_else(|| "CUDA pinned_f16 容量溢出".to_owned())?.max(4096);
+            let pinned = unsafe { self.ctx.alloc_pinned::<f16>(target) }.map_err(|e| format!("CUDA pinned_f16 alloc 失败: {e:?}"))?;
+            *guard = Some(pinned);
+        }
+        let pinned = guard.as_mut().ok_or_else(|| "CUDA pinned_f16 cache 初始化失败".to_owned())?;
+        let host_ptr = pinned.as_mut_ptr().map_err(|e| format!("pinned_f16 as_mut_ptr 失败: {e:?}"))?;
+        let staging = unsafe { std::slice::from_raw_parts_mut(host_ptr, pinned.len()) };
+        staging[..src.len()].copy_from_slice(src);
+        let src_ptr = pinned.as_ptr().map_err(|e| format!("pinned_f16 as_ptr 失败: {e:?}"))?;
+        use cudarc::driver::safe::DevicePtrMut;
+        let (base_ptr, _sync) = dst.device_ptr_mut(&self.stream);
+        let dev_ptr = unsafe { (base_ptr as *const u8).add(offset_elems * std::mem::size_of::<f16>()) } as u64;
+        let nbytes = src.len().checked_mul(std::mem::size_of::<f16>()).ok_or_else(|| "CUDA pinned_f16 字节数溢出".to_owned())?;
+        self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA context 失败: {e:?}"))?;
+        let status = unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(dev_ptr, src_ptr as *const std::ffi::c_void, nbytes, self.stream.cu_stream()) };
+        self.ctx.synchronize().map_err(|e| format!("CUDA pinned_f16 同步失败: {e:?}"))?;
+        drop(_sync);
+        if let Err(e) = status.result() {
+            return Err(format!("CUDA pinned_f16 cuMemcpyHtoDAsync 失败: {e:?}"));
+        }
+        Ok(())
+    }
+
     /// f16 主机数组 → 设备 buffer,经 pinned 中转。
     /// cudarc 的 `stream.clone_htod(&Vec<f16>)` 在重型 stream 上 SyncOnDrop 会 stall
     /// ~30s(pageable 主机指针触发内部 stream sync)。pinned 路径绕开。
@@ -559,11 +659,102 @@ impl CudaContext {
         if src.is_empty() {
             return Ok(());
         }
+        let registered = self.registered_host.lock().map_err(|_| "CUDA registered host 锁已中毒")?;
+        let start = src.as_ptr() as usize;
+        let end = start.checked_add(src.len()).ok_or("CUDA upload host range 溢出")?;
+        if registered.as_ref().is_some_and(|memory| {
+            let index = memory.data_ranges.partition_point(|&(address, _)| address <= start);
+            index > 0 && end <= memory.data_ranges[index - 1].1
+        }) {
+            use cudarc::driver::safe::DevicePtrMut;
+            let use_copy = std::env::var_os("ZLLM_CUDA_COPY_STREAM").is_some();
+            let stream = if use_copy { &self.copy_stream } else { &self.stream };
+            let (device, _sync) = dst.device_ptr_mut(stream);
+            self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA context 失败: {e:?}"))?;
+            unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(device, src.as_ptr().cast(), src.len(), stream.cu_stream()) }.result().map_err(|e| format!("CUDA registered host upload bytes={}: {e:?}", src.len()))?;
+            if use_copy {
+                self.record_copy_fence()?;
+            }
+            return Ok(());
+        }
+        drop(registered);
         let mut ring = self.pinned_u8_ring.lock().map_err(|_| "CUDA pinned u8 ring 锁已中毒".to_owned())?;
         let (slot_index, mut slot) = ring.take_slot();
         let result = self.upload_u8_slot(&mut slot, src, dst);
         ring.release_slot(slot_index, slot);
         result
+    }
+
+    /// 只用于预先完成分配的专家 arena;调用者还须保证该区域的旧计算已经结束。
+    /// 每次上传立即把完成事件接到计算流,错误退出时区域释放也不会越过 DMA。
+    pub(crate) unsafe fn upload_registered_expert_overlap(&self, src: &[u8], dst: &mut CudaSlice<u8>) -> Result<(), String> {
+        use cudarc::driver::safe::DevicePtrMut;
+        let registered = self.registered_host.lock().map_err(|_| "CUDA registered host 锁已中毒")?;
+        let start = src.as_ptr() as usize;
+        let end = start.checked_add(src.len()).ok_or("CUDA overlap host range 溢出")?;
+        let covered = registered.as_ref().is_some_and(|memory| {
+            let index = memory.data_ranges.partition_point(|&(address, _)| address <= start);
+            index > 0 && end <= memory.data_ranges[index - 1].1
+        });
+        if !covered || dst.len() < src.len() {
+            return Err("CUDA expert overlap 需要已注册的长期源数据和足够大的目标区域".into());
+        }
+        self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA overlap context: {e:?}"))?;
+        let (device, _sync) = dst.device_ptr_mut(&self.copy_stream);
+        unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(device, src.as_ptr().cast(), src.len(), self.copy_stream.cu_stream()) }.result().map_err(|e| format!("CUDA expert overlap DMA: {e:?}"))?;
+        let result = self.record_copy_fence().and_then(|()| self.wait_copy_fence());
+        if result.is_err() {
+            let _ = self.copy_stream.synchronize();
+        }
+        result
+    }
+
+    /// 注册长期不可变数据,owner 保证切片在 context 生命周期内有效。
+    /// 页边界合并避免相邻分配共享页时重复注册;只允许一次注册以保持所有权直接。
+    #[cfg(unix)]
+    pub fn register_host_memory<T: Send + Sync + 'static>(&self, owner: Arc<T>, slices: impl FnOnce(&T) -> Result<Vec<&[u8]>, String>) -> Result<usize, String> {
+        let mut registered = self.registered_host.lock().map_err(|_| "CUDA registered host 锁已中毒")?;
+        if registered.is_some() {
+            return Err("CUDA host memory 已注册".into());
+        }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            return Err(format!("读取 host page size 失败: {page}"));
+        }
+        let page = page as usize;
+        let mut ranges = Vec::new();
+        let mut data_ranges = Vec::new();
+        for bytes in slices(&owner)? {
+            if bytes.is_empty() {
+                continue;
+            }
+            let start = bytes.as_ptr() as usize;
+            let data_end = start.checked_add(bytes.len()).ok_or("CUDA host range 溢出")?;
+            let end = data_end.checked_add(page - 1).ok_or("CUDA host page range 溢出")? / page * page;
+            ranges.push((start / page * page, end));
+            // 直传只认所有者提供的原始切片,不能把共享锁页的临时分配也当成长期数据。
+            data_ranges.push((start, data_end));
+        }
+        ranges.sort_unstable();
+        data_ranges.sort_unstable();
+        let mut merged: Vec<(usize, usize)> = Vec::new();
+        for (start, end) in ranges {
+            if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
+                last.1 = last.1.max(end);
+            } else {
+                merged.push((start, end));
+            }
+        }
+        self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA context 失败: {e:?}"))?;
+        let mut registration = RegisteredHostMemory { context: self.ctx.clone(), _owner: owner, ranges: Vec::new(), data_ranges };
+        let mut total = 0;
+        for (start, end) in merged {
+            unsafe { cudarc::driver::sys::cuMemHostRegister_v2(start as *mut std::ffi::c_void, end - start, 0) }.result().map_err(|e| format!("CUDA host register address={start:#x} bytes={}: {e:?}", end - start))?;
+            registration.ranges.push((start, end));
+            total += end - start;
+        }
+        *registered = Some(registration);
+        Ok(total)
     }
 
     /// 槽内执行一次上传;`slot` 为 None 时按需创建新槽。
@@ -682,5 +873,74 @@ impl CudaContext {
     /// 统计:累计的 command buffer / launch 数。
     pub fn command_buffers(&self) -> u64 {
         self.command_buffers.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod host_registration_tests {
+    use super::*;
+
+    #[test]
+    fn rope_positions_share_small_table_and_match_cpu() {
+        use crate::attention::rope::{RopeTable, RotaryLayout, RotaryPlacement, apply_f32};
+        let ctx = CudaContext::new_default().unwrap();
+        let table = RopeTable::precompute(17, 8, 10000.0);
+        let values: Vec<f32> = (0..48).map(|i| (i as f32 - 17.0) / 16.0).collect();
+        let input = ctx.tensor_from_f32(&values, 2, 24).unwrap();
+        // reference 使用与设备相同的表量化,覆盖首/中/末位置及两种旋转区间。
+        let cos: Vec<f32> = table.cos.iter().map(|v| f16::from_f32(*v).to_f32()).collect();
+        let sin: Vec<f32> = table.sin.iter().map(|v| f16::from_f32(*v).to_f32()).collect();
+        for position in [0usize, 3, 15] {
+            for prefix in [false, true] {
+                let actual = if prefix {
+                    crate::kernel::cuda::tensor::apply_rope_prefix_f16(&ctx, &input, 2, 8, position, &table.cos, &table.sin)
+                } else {
+                    crate::kernel::cuda::tensor::apply_rope_partial_f16(&ctx, &input, 2, 8, position, &table.cos, &table.sin)
+                }
+                .unwrap();
+                let expected = apply_f32(&values, 2, 24, 2, 8, position, &cos, &sin, RotaryLayout::SplitHalf, if prefix { RotaryPlacement::Prefix } else { RotaryPlacement::Suffix }).unwrap();
+                let actual = ctx.stream().clone_dtoh(&actual.slice).unwrap();
+                for (got, want) in actual.iter().zip(expected) {
+                    assert!((got.to_f32() - want).abs() < 0.003);
+                }
+            }
+        }
+        assert_eq!(ctx.rope_windows.lock().unwrap().len(), 2, "不同位置应只保留 cos/sin 两份表");
+    }
+
+    #[test]
+    fn registered_host_upload_keeps_owner_and_exact_bytes() {
+        let ctx = CudaContext::new_default().unwrap();
+        let owner = Arc::new(vec![(0..12345).map(|i| (i * 31) as u8).collect::<Vec<_>>(), vec![197u8; 8193]]);
+        let weak = Arc::downgrade(&owner);
+        ctx.register_host_memory(owner.clone(), |data| Ok(data.iter().map(|bytes| &bytes[16..bytes.len() - 16]).collect())).unwrap();
+        drop(owner);
+        let retained = weak.upgrade().expect("注册必须持有主存数据");
+        for source in retained.iter() {
+            // 上传内部切片同时覆盖注册范围二分查找的边界。
+            let source = &source[33..source.len() - 33];
+            let mut device = ctx.buffer_uninit::<u8>(source.len()).unwrap();
+            ctx.upload_u8_pinned(source, &mut device).unwrap();
+            let actual = ctx.stream().clone_dtoh(&device).unwrap();
+            assert_eq!(actual, source);
+            // 从零缓冲读取可暴露遗漏跨流等待;不能用上一轮相同内容掩盖旧数据。
+            let mut device = ctx.stream().alloc_zeros::<u8>(source.len()).unwrap();
+            ctx.stream().synchronize().unwrap();
+            unsafe { ctx.upload_registered_expert_overlap(source, &mut device) }.unwrap();
+            let copied = device.clone();
+            assert_eq!(ctx.stream().clone_dtoh(&copied).unwrap(), source);
+            assert!(unsafe { ctx.upload_registered_expert_overlap(&retained[0][..8], &mut device) }.is_err());
+        }
+        assert!(ctx.pinned_u8_ring.lock().unwrap().slots.is_empty(), "已注册原始切片必须直接上传");
+        // 同一页中未被声明为长期切片的区域仍须经过 staging。
+        let source = &retained[0][..8];
+        let mut device = ctx.buffer_uninit::<u8>(source.len()).unwrap();
+        ctx.upload_u8_pinned(source, &mut device).unwrap();
+        assert_eq!(ctx.stream().clone_dtoh(&device).unwrap(), source);
+        assert!(!ctx.pinned_u8_ring.lock().unwrap().slots.is_empty());
+        drop(device);
+        drop(retained);
+        drop(ctx);
+        assert!(weak.upgrade().is_none(), "解除锁页后必须释放所有者");
     }
 }

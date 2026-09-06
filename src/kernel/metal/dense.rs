@@ -464,6 +464,119 @@ kernel void rms_norm_f16_in_f32_weight_f16(
         output[offset + column] = finite_f16(float(input[offset + column]) * scale * (weight[column] + weight_offset));
     }
 }
+// K2-Horizon grouped RMSNorm:hidden 按组等分、组内独立归一化、乘全长度权重。
+// 单 simdgroup 逐行,顺序处理各组:组间无依赖,组内 simd_sum 归约不需要 barrier。
+kernel void grouped_rms_norm_f16_in_f32_weight_f16_simd(
+    device const half *input [[buffer(0)]],
+    device const float *weight [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant float &epsilon [[buffer(4)]],
+    constant uint &groups [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint segment = columns / groups;
+    const ulong row_base = ulong(row) * columns;
+    if (group >= groups) return;
+    const ulong base = row_base + ulong(group) * segment;
+    float sum = 0.0f;
+    for (uint column = lane; column < segment; column += 32) {
+        const float value = float(input[base + column]);
+        sum += value * value;
+    }
+    const float scale = rsqrt(simd_sum(sum) / float(segment) + epsilon);
+    for (uint column = lane; column < segment; column += 32) {
+        const ulong index = base + column;
+        output[index] = finite_f16(float(input[index]) * scale * weight[base - row_base + column]);
+    }
+}
+// F32 residual 直接归一到 F16，避免 K2 每个子层先单独 cast 整个 hidden。
+kernel void grouped_rms_norm_f32_in_f32_weight_f16_simd(
+    device const float *input [[buffer(0)]],
+    device const float *weight [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant float &epsilon [[buffer(4)]],
+    constant uint &groups [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint segment = columns / groups;
+    const ulong row_base = ulong(row) * columns;
+    if (group >= groups) return;
+    const ulong base = row_base + ulong(group) * segment;
+    float sum = 0.0f;
+    for (uint column = lane; column < segment; column += 32) {
+        const float value = input[base + column];
+        sum += value * value;
+    }
+    const float scale = rsqrt(simd_sum(sum) / float(segment) + epsilon);
+    for (uint column = lane; column < segment; column += 32) {
+        const ulong index = base + column;
+        output[index] = finite_f16(input[index] * scale * weight[base - row_base + column]);
+    }
+}
+// K2 residual add 后立即归一化：一次遍历保留 F32 residual，并产出下个子层的 F16 输入。
+kernel void add_f32_f16_grouped_rms_norm_f32_weight_f16_simd(
+    device const float *left [[buffer(0)]],
+    device const half *right [[buffer(1)]],
+    device const float *weight [[buffer(2)]],
+    device float *residual [[buffer(3)]],
+    device half *normalized [[buffer(4)]],
+    constant uint &columns [[buffer(5)]],
+    constant float &epsilon [[buffer(6)]],
+    constant uint &groups [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint segment = columns / groups;
+    const ulong row_base = ulong(row) * columns;
+    if (group >= groups) return;
+    const ulong base = row_base + ulong(group) * segment;
+    float sum = 0.0f;
+    for (uint column = lane; column < segment; column += 32) {
+        const ulong index = base + column;
+        const float value = left[index] + float(right[index]);
+        residual[index] = value;
+        sum += value * value;
+    }
+    const float scale = rsqrt(simd_sum(sum) / float(segment) + epsilon);
+    for (uint column = lane; column < segment; column += 32) {
+        const ulong index = base + column;
+        normalized[index] = finite_f16(residual[index] * scale * weight[base - row_base + column]);
+    }
+}
+// 同上,F32 输入/输出:output head 精度敏感路径(norm_f32=true)。
+kernel void grouped_rms_norm_f32_in_f32_weight_f32(
+    device const float *input [[buffer(0)]],
+    device const float *weight [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant float &epsilon [[buffer(4)]],
+    constant uint &groups [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint segment = columns / groups;
+    const ulong row_base = ulong(row) * columns;
+    if (group >= groups) return;
+    const ulong base = row_base + ulong(group) * segment;
+    float sum = 0.0f;
+    for (uint column = lane; column < segment; column += 32) {
+        const float value = input[base + column];
+        sum += value * value;
+    }
+    const float scale = rsqrt(simd_sum(sum) / float(segment) + epsilon);
+    for (uint column = lane; column < segment; column += 32) {
+        const ulong index = base + column;
+        output[index] = input[index] * scale * weight[base - row_base + column];
+    }
+}
 kernel void cast_f32_f16_x4(
     device const float *input [[buffer(0)]],
     device half *output [[buffer(1)]],

@@ -95,7 +95,7 @@ impl GatedDeltaNetKernel for RocmContext {
 mod tests {
     use super::*;
     use crate::{
-        attention::gated_delta_net::{GatedDeltaNetInputs, GatedDeltaNetKernel, GatedDeltaNetSpec, GatedDeltaNetWeightsRef},
+        attention::gated_delta_net::{GatedDeltaNetInputs, GatedDeltaNetKernel, GatedDeltaNetSpec, GatedDeltaNetWeightsRef, GdnOutputGate},
         backend::cpu::CpuContext,
         backend::{BackendResources, LinearWeight},
         kernel::cpu::CpuTensor,
@@ -105,7 +105,7 @@ mod tests {
     #[test]
     fn rocm_gated_delta_net_matches_cpu() {
         // 使用小 spec 加速测试:2 key_heads, 4 value_heads, 16 dim。
-        let spec = GatedDeltaNetSpec { key_heads: 2, value_heads: 4, key_head_dim: 16, value_head_dim: 16, conv_kernel: 4, rms_eps: 1e-6 };
+        let spec = GatedDeltaNetSpec { key_heads: 2, value_heads: 4, key_head_dim: 16, value_head_dim: 16, conv_kernel: 4, rms_eps: 1e-6, output_gate: GdnOutputGate::Silu };
         let rows = 3;
         let value_dim = spec.value_dim();
         let conv_dim = spec.conv_dim();
@@ -149,10 +149,10 @@ mod tests {
             }
         };
         let mut rocm_storage = rocm.allocate_gated_delta_net_storage(&spec).expect("ROCm GDN storage 分配失败");
-        let rocm_qkv = RocmTensor { data: qkv_data.clone(), rows, cols: conv_dim, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None };
-        let rocm_z = RocmTensor { data: z_data.clone(), rows, cols: value_dim, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None };
-        let rocm_alpha = RocmTensor { data: alpha_data.clone(), rows, cols: spec.value_heads, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None };
-        let rocm_beta = RocmTensor { data: beta_data.clone(), rows, cols: spec.value_heads, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None };
+        let rocm_qkv = RocmTensor { data: qkv_data.clone(), rows, cols: conv_dim, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None, replica: None };
+        let rocm_z = RocmTensor { data: z_data.clone(), rows, cols: value_dim, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None, replica: None };
+        let rocm_alpha = RocmTensor { data: alpha_data.clone(), rows, cols: spec.value_heads, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None, replica: None };
+        let rocm_beta = RocmTensor { data: beta_data.clone(), rows, cols: spec.value_heads, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None, replica: None };
         let rocm_conv_weight = rocm.prepare_weight(LinearWeight::F32(&conv_weight_data), conv_dim, spec.conv_kernel).expect("ROCm conv_weight prepare 失败");
         let rocm_a_log = rocm.prepare_f32(&a_log_data, 1, spec.value_heads).expect("ROCm a_log prepare 失败");
         let rocm_dt_bias = rocm.prepare_f32(&dt_bias_data, 1, spec.value_heads).expect("ROCm dt_bias prepare 失败");

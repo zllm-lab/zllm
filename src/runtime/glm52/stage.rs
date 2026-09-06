@@ -32,6 +32,54 @@ pub enum Glm52PrefillLayer<W> {
     Moe(Glm52MoePrefillLayer<W>),
 }
 
+fn index_share_layers<W>(layers: &[Glm52PrefillLayer<W>], stage_start: usize, first: usize) -> std::ops::Range<usize> {
+    let end = layers
+        .iter()
+        .enumerate()
+        .skip(first - stage_start)
+        .find_map(|(offset, layer)| {
+            let has_indexer = match layer {
+                Glm52PrefillLayer::Dense(weights) => weights.indexer.is_some(),
+                Glm52PrefillLayer::Moe(weights) => weights.indexer.is_some(),
+            };
+            has_indexer.then_some(stage_start + offset)
+        })
+        .unwrap_or(stage_start + layers.len());
+    first..end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_share_prefetch_stops_at_indexer_and_stage_boundary() {
+        let layers = [false, true, false, false, true, false].map(|has_indexer| {
+            Glm52PrefillLayer::Dense(Glm52DensePrefillLayer {
+                indexer: has_indexer.then_some(super::super::Glm52IndexerDecodeWeights { wq_b: (), wk: (), weights_proj: (), k_norm_weight: (), k_norm_bias: () }),
+                input_norm: (),
+                q_a_proj: (),
+                q_a_norm: (),
+                q_b_proj: (),
+                kv_a_proj: (),
+                kv_a_norm: (),
+                kv_b_proj: (),
+                o_proj: (),
+                post_attn_norm: (),
+                gate_proj: (),
+                up_proj: (),
+                down_proj: (),
+            })
+        });
+        assert_eq!(index_share_layers(&layers, 9, 9), 9..10);
+        assert_eq!(index_share_layers(&layers, 9, 10), 10..10);
+        assert_eq!(index_share_layers(&layers, 9, 11), 11..13);
+        assert_eq!(index_share_layers(&layers, 9, 14), 14..15);
+        assert_eq!(index_share_layers(&layers, 9, 15), 15..15);
+        assert_eq!(index_share_layers::<()>(&[], 9, 9), 9..9);
+    }
+}
+
 pub struct Glm52StageState<B>
 where
     B: DsaStageBackend + ExpertPrefillBackend,
@@ -152,6 +200,9 @@ where
     let setup_micros = total_started.map_or(0, |started| started.elapsed().as_micros());
     let mut layer_micros = Vec::with_capacity(usize::from(diagnose) * state.layers.len());
     let compute_started = diagnose.then(Instant::now);
+    if token_count == 1 {
+        backend.prefetch_stage_selected_kv(&*experts, cache, dsa, index_share_layers(layers, layer_start, layer_start), position, token_count)?;
+    }
     let hidden = glm52_prefill_stage_observed(
         &backend,
         cfg,
@@ -167,7 +218,13 @@ where
                 Glm52PrefillLayer::Dense(resident) => glm52_dense_prefill_layer(&backend, cfg, mla, resident, layer, Some(&*experts), Some(dsa), &hidden, rope, Some(cache), position),
                 Glm52PrefillLayer::Moe(resident) => glm52_moe_prefill_layer(&backend, cfg, mla, resident, layer, experts, None, Some(dsa), &hidden, rope, Some(cache), position),
             }?;
-            let output = backend.compact_stage_tensor(output)?;
+            if token_count == 1 {
+                backend.prefetch_stage_selected_kv(&*experts, cache, dsa, index_share_layers(layers, layer_start, layer + 1), position, token_count)?;
+            }
+            let output = match backend.compact_parallel_stage_tensor(&*experts, &output)? {
+                Some(output) => output,
+                None => backend.compact_stage_tensor(output)?,
+            };
             backend.profile_device_operator("glm_layer_tail")?;
             let retire_started = crate::runtime::prefill_scheduler::stage_event_trace_enabled().then(|| (Instant::now(), crate::runtime::prefill_scheduler::stage_trace_timestamp_us()));
             drop(hidden);
@@ -193,6 +250,7 @@ where
             Ok(())
         },
     )?;
+    backend.finish_parallel_stage_submission(&*experts, &hidden)?;
     let compute_micros = compute_started.map_or(0, |started| started.elapsed().as_micros());
     let aux_started = diagnose.then(Instant::now);
     if let Some(projected) = aux_hidden.take() {
@@ -390,12 +448,27 @@ where
     for layer in layer_start..layer_end {
         let mut segments =
             states.iter_mut().enumerate().filter_map(|(session, state)| metadata[session].map(|(position, rows, _, _, _, _)| Glm52PrefillSegment { position, rows, cache: &mut state.cache, dsa: &mut state.dsa })).collect::<Vec<_>>();
+        if layer == layer_start {
+            for segment in &mut segments {
+                if segment.rows == 1 {
+                    backend.prefetch_stage_selected_kv(&*experts, segment.cache, segment.dsa, index_share_layers(&layers, layer_start, layer), segment.position, segment.rows)?;
+                }
+            }
+        }
         let output = match &layers[layer - layer_start] {
             Glm52PrefillLayer::Dense(resident) => glm52_dense_prefill_layer_segmented(&backend, cfg, mla, resident, layer, &*experts, &hidden, rope, &mut segments),
-            Glm52PrefillLayer::Moe(resident) => glm52_moe_prefill_layer_segmented(&backend, cfg, mla, resident, layer, &mut *experts, &hidden, rope, &mut segments),
+            Glm52PrefillLayer::Moe(resident) => glm52_moe_prefill_layer_segmented(&backend, cfg, mla, resident, layer, &mut *experts, &hidden, rope, false, &mut segments),
         }
         .map_err(|error| BackendError::Compute { msg: format!("distributed batch stage={stage} backend={backend_label} layer={layer} rows={total_rows}: {error:?}") })?;
-        hidden = backend.compact_stage_tensor(output)?;
+        for segment in &mut segments {
+            if segment.rows == 1 {
+                backend.prefetch_stage_selected_kv(&*experts, segment.cache, segment.dsa, index_share_layers(&layers, layer_start, layer + 1), segment.position, segment.rows)?;
+            }
+        }
+        hidden = match backend.compact_parallel_stage_tensor(&*experts, &output)? {
+            Some(output) => output,
+            None => backend.compact_stage_tensor(output)?,
+        };
         backend.profile_device_operator("glm_layer_tail")?;
         for projector in projectors.iter().filter(|projector| projector.boundary() == layer + 1) {
             aux_hidden = Some(projector.project_add(&backend, &hidden, aux_hidden.take())?);
@@ -404,6 +477,7 @@ where
             }
         }
     }
+    backend.finish_parallel_stage_submission(&*experts, &hidden)?;
     aux_hidden = aux_hidden.map(|hidden| backend.compact_stage_tensor(hidden)).transpose()?;
     let mut offset = 0usize;
     let mut output = Vec::with_capacity(hiddens.len());
@@ -471,7 +545,13 @@ where
     let mut ready_batch = Vec::with_capacity(batch.len());
     for (compact_session, (_, position, mut value)) in batch.into_iter().enumerate() {
         let backend = compact[compact_session].backend.clone();
-        value.hidden = backend.move_tensor_to_stage_ordered(value.hidden)?;
+        value.hidden = {
+            let experts = compact[compact_session].experts.lock().map_err(|_| BackendError::Compute { msg: format!("GLM dynamic stage={stage} session={} expert 锁中毒", sessions[compact_session]) })?;
+            match backend.move_parallel_stage_tensor_ordered(&*experts, &value.hidden)? {
+                Some(hidden) => hidden,
+                None => backend.move_tensor_to_stage_ordered(value.hidden)?,
+            }
+        };
         value.aux_hidden = value.aux_hidden.map(|hidden| backend.move_tensor_to_stage_ordered(hidden)).transpose()?;
         value.selection = value.selection.map(|selection| backend.move_selection_to_stage_ordered(selection)).transpose()?;
         ready_batch.push((compact_session, position, value));
@@ -783,16 +863,21 @@ where
     for layer in layer_start..layer_end {
         let placement = layer_ends.iter().position(|&end| layer <= end).ok_or_else(|| BackendError::Compute { msg: format!("L{layer} 没有 prefill backend") })?;
         let backend = &backends[placement];
-        backend.activate_stage()?;
-        if layer < cfg.dense_layer_count {
-            let resident = load_prepare_dense_prefill_layer(backend, cfg, mla, weights, layer, mla_decode_resident).map_err(|error| BackendError::Compute { msg: format!("准备 prefill L{layer}: {error:?}") })?;
-            layers.push(Glm52PrefillLayer::Dense(resident));
-        } else {
-            let resident = load_prepare_moe_prefill_layer(backend, cfg, mla, weights, layer, mla_decode_resident).map_err(|error| BackendError::Compute { msg: format!("准备 prefill L{layer}: {error:?}") })?;
-            layers.push(Glm52PrefillLayer::Moe(resident));
-        }
+        layers.push(prepare_prefill_layer(backend, cfg, mla, weights, layer, mla_decode_resident)?);
     }
     Ok(layers)
+}
+
+pub fn prepare_prefill_layer<B>(backend: &B, cfg: &Glm52Config, mla: &MlaSpec, weights: &Glm52Weights, layer: usize, mla_decode_resident: bool) -> Result<Glm52PrefillLayer<B::Weight>, BackendError>
+where
+    B: DsaStageBackend + ExpertPrefillBackend,
+{
+    backend.activate_stage()?;
+    if layer < cfg.dense_layer_count {
+        load_prepare_dense_prefill_layer(backend, cfg, mla, weights, layer, mla_decode_resident).map(Glm52PrefillLayer::Dense).map_err(|error| BackendError::Compute { msg: format!("准备 prefill L{layer}: {error:?}") })
+    } else {
+        load_prepare_moe_prefill_layer(backend, cfg, mla, weights, layer, mla_decode_resident).map(Glm52PrefillLayer::Moe).map_err(|error| BackendError::Compute { msg: format!("准备 prefill L{layer}: {error:?}") })
+    }
 }
 
 fn weight_error(error: impl std::fmt::Debug) -> BackendError {

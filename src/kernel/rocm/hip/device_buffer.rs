@@ -1693,6 +1693,12 @@ impl DeviceBuffer {
         self.copy_stable_to_device_ordered_async_retained_by_inner(device_id, completion_device_id, true, Some((source_stream, destination_stream)))
     }
 
+    /// 在显式 source/destination stream 之间异步复制，不等待 host。用于双卡
+    /// query 交换：transfer stream 与本卡 MLA 默认流并行，远端象限前再汇合。
+    pub(crate) fn copy_stable_to_device_ordered_async_on_streams_retained_by(self: &std::sync::Arc<Self>, device_id: i32, completion_device_id: i32, source_stream: usize, destination_stream: usize) -> Result<Self, String> {
+        self.copy_stable_to_device_ordered_async_retained_by_inner(device_id, completion_device_id, false, Some((source_stream, destination_stream)))
+    }
+
     fn copy_stable_to_device_ordered_async_retained_by_inner(self: &std::sync::Arc<Self>, device_id: i32, completion_device_id: i32, synchronize_source_event: bool, explicit_streams: Option<(usize, usize)>) -> Result<Self, String> {
         if self.async_allocated {
             return Err("ordered P2P source 不能是 async allocation".to_owned());
@@ -1952,6 +1958,109 @@ impl DeviceBuffer {
         Ok((left_on_right, right_on_left))
     }
 
+    /// 两张卡各自直接读取对端 stable partial，并在本卡一次完成
+    /// `(local + peer) + residual`。与先双向复制再各做两次 add 相比，保留
+    /// 两份等值输出，但不物化中间 P2P 副本。
+    pub(crate) fn join_peer_partials_residual_ordered_async_retained_by(
+        left_partial: &std::sync::Arc<Self>,
+        right_partial: &std::sync::Arc<Self>,
+        left_residual: &Self,
+        right_residual: &Self,
+        elements: usize,
+        completion_device_id: i32,
+    ) -> Result<(Self, Self), String> {
+        let left_device_id = left_partial.device_id;
+        let right_device_id = right_partial.device_id;
+        let bytes = elements.checked_mul(std::mem::size_of::<f32>()).ok_or("peer partial join 大小溢出")?;
+        if elements == 0
+            || !elements.is_multiple_of(4)
+            || left_device_id == right_device_id
+            || left_partial.async_allocated
+            || right_partial.async_allocated
+            || left_partial.bytes < bytes
+            || right_partial.bytes < bytes
+            || left_residual.device_id != left_device_id
+            || right_residual.device_id != right_device_id
+            || left_residual.bytes < bytes
+            || right_residual.bytes < bytes
+        {
+            return Err("ordered peer partial join 参数无效".to_owned());
+        }
+        let runtime = RocmRuntime::open()?;
+        enable_peer_access(right_device_id, left_device_id)?;
+        enable_peer_access(left_device_id, right_device_id)?;
+        let create: Symbol<HipEventCreateWithFlags> = runtime.symbol(&runtime.hip, b"hipEventCreateWithFlags\0")?;
+        let record: Symbol<HipEventRecord> = runtime.symbol(&runtime.hip, b"hipEventRecord\0")?;
+        let wait: Symbol<HipStreamWaitEvent> = runtime.symbol(&runtime.hip, b"hipStreamWaitEvent\0")?;
+        let destroy: Symbol<HipEventDestroy> = runtime.symbol(&runtime.hip, b"hipEventDestroy\0")?;
+        let left_stream = compute_stream_for(left_device_id);
+        let right_stream = compute_stream_for(right_device_id);
+        let mut left_event = device_buffer_pool(left_device_id).and_then(|pool| pool.lock().ok()?.available_events.pop()).map(|event| event as HipEvent).unwrap_or(ptr::null_mut());
+        let create_event = |device_id: i32, event: &mut HipEvent| -> Result<(), String> {
+            set_device(device_id)?;
+            if event.is_null() {
+                let status = unsafe { create(event, HIP_EVENT_DISABLE_TIMING) };
+                if status != HIP_SUCCESS {
+                    return Err(runtime.hip_error(status, "hipEventCreateWithFlags peer partial join"));
+                }
+            }
+            Ok(())
+        };
+        create_event(left_device_id, &mut left_event)?;
+        let mut right_event = device_buffer_pool(right_device_id).and_then(|pool| pool.lock().ok()?.available_events.pop()).map(|event| event as HipEvent).unwrap_or(ptr::null_mut());
+        if let Err(error) = create_event(right_device_id, &mut right_event) {
+            set_device(left_device_id)?;
+            let _ = unsafe { destroy(left_event) };
+            return Err(error);
+        }
+        let result = (|| {
+            set_device(left_device_id)?;
+            let status = unsafe { record(left_event, left_stream) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventRecord peer partial join left"));
+            }
+            set_device(right_device_id)?;
+            let status = unsafe { record(right_event, right_stream) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventRecord peer partial join right"));
+            }
+
+            set_device(left_device_id)?;
+            let status = unsafe { wait(left_stream, right_event, 0) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipStreamWaitEvent peer partial join left"));
+            }
+            super::device_profile_operator(left_device_id, "handoff_join")?;
+            let left_output = super::peer_copy::try_peer_join_residual_f32(left_device_id, left_partial, right_partial, left_residual, elements)?;
+
+            set_device(right_device_id)?;
+            let status = unsafe { wait(right_stream, left_event, 0) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipStreamWaitEvent peer partial join right"));
+            }
+            super::device_profile_operator(right_device_id, "handoff_join")?;
+            let right_output = super::peer_copy::try_peer_join_residual_f32(right_device_id, right_partial, left_partial, right_residual, elements)?;
+            PENDING_P2P_SOURCES.with(|pending| {
+                let mut pending = pending.borrow_mut();
+                let entries = pending.entry(completion_device_id).or_default();
+                entries.push(PendingP2pSource { sources: vec![left_partial.clone()], event: left_event as usize });
+                entries.push(PendingP2pSource { sources: vec![right_partial.clone()], event: right_event as usize });
+            });
+            Ok((left_output, right_output))
+        })();
+        if result.is_err() {
+            for (device_id, event) in [(left_device_id, left_event), (right_device_id, right_event)] {
+                let _ = set_device(device_id).and_then(|()| {
+                    let status = unsafe { destroy(event) };
+                    if status == HIP_SUCCESS { Ok(()) } else { Err(runtime.hip_error(status, "hipEventDestroy peer partial join")) }
+                });
+            }
+        }
+        let outputs = result?;
+        set_device(completion_device_id)?;
+        Ok(outputs)
+    }
+
     /// 与 grouped ordered P2P 相同，但直接写入调用方持有的固定目标地址。
     /// pair-native cache 用它把增量落到 peer cache offset，省掉临时 P2P
     /// allocation 与随后一次同卡 D2D。
@@ -1991,14 +2100,25 @@ impl DeviceBuffer {
                 return Err(runtime.hip_error(status, "hipStreamWaitEvent grouped ordered P2P destination"));
             }
             super::device_profile_operator(device_id, "handoff_copy")?;
-            for (source, (destination, offset)) in sources.iter().zip(destinations) {
-                let destination_pointer = unsafe { destination.pointer.cast::<u8>().add(*offset).cast() };
-                if source.bytes % 16 == 0 && crate::kernel::rocm::hip::active_compute_stream() == destination_stream {
-                    super::peer_copy::try_peer_copy_kernel_ordered(device_id, destination_pointer, source.pointer, source.bytes)?;
-                } else {
-                    let status = unsafe { copy(destination_pointer, device_id, source.pointer, source_device_id, source.bytes, destination_stream) };
-                    if status != HIP_SUCCESS {
-                        return Err(format!("{}: source_device={source_device_id} destination_device={device_id} bytes={}", runtime.hip_error(status, "hipMemcpyPeerAsync grouped ordered P2P"), source.bytes));
+            let copy3 = sources.len() == 3
+                && sources.iter().all(|source| source.bytes.is_multiple_of(16) && source.bytes <= 4096)
+                && sources.iter().map(|source| source.bytes).sum::<usize>() <= 4096
+                && sources.iter().zip(destinations).all(|(source, (destination, offset))| (source.pointer as usize).is_multiple_of(16) && (destination.pointer as usize + offset).is_multiple_of(16))
+                && crate::kernel::rocm::hip::active_compute_stream() == destination_stream;
+            if copy3 {
+                let source_pointers = std::array::from_fn(|index| sources[index].pointer);
+                let destination_pointers = std::array::from_fn(|index| unsafe { destinations[index].0.pointer.cast::<u8>().add(destinations[index].1).cast() });
+                super::peer_copy::try_peer_copy3_kernel_ordered(device_id, source_pointers, destination_pointers, std::array::from_fn(|index| sources[index].bytes))?;
+            } else {
+                for (source, (destination, offset)) in sources.iter().zip(destinations) {
+                    let destination_pointer = unsafe { destination.pointer.cast::<u8>().add(*offset).cast() };
+                    if source.bytes % 16 == 0 && (source.pointer as usize).is_multiple_of(16) && (destination_pointer as usize).is_multiple_of(16) && crate::kernel::rocm::hip::active_compute_stream() == destination_stream {
+                        super::peer_copy::try_peer_copy_kernel_ordered(device_id, destination_pointer, source.pointer, source.bytes)?;
+                    } else {
+                        let status = unsafe { copy(destination_pointer, device_id, source.pointer, source_device_id, source.bytes, destination_stream) };
+                        if status != HIP_SUCCESS {
+                            return Err(format!("{}: source_device={source_device_id} destination_device={device_id} bytes={}", runtime.hip_error(status, "hipMemcpyPeerAsync grouped ordered P2P"), source.bytes));
+                        }
                     }
                 }
             }

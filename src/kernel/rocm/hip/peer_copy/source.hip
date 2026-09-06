@@ -28,3 +28,47 @@ extern "C" __global__ void zllm_peer_copy_f32x4(
     for (; index < vectors; index += total)
         target[index] = source[index];
 }
+
+// 三段增量共用一个 CTA，省去逐段 launch；大小由调用方传入，保持原始字节。
+extern "C" __global__ void zllm_peer_copy3_f32x4(
+    const float4* source0,
+    const float4* source1,
+    const float4* source2,
+    float4* target0,
+    float4* target1,
+    float4* target2,
+    const unsigned int vectors0,
+    const unsigned int vectors1,
+    const unsigned int vectors2)
+{
+    unsigned int index = threadIdx.x;
+    if (index < vectors0) {
+        target0[index] = source0[index];
+    } else if ((index -= vectors0) < vectors1) {
+        target1[index] = source1[index];
+    } else if ((index -= vectors1) < vectors2) {
+        target2[index] = source2[index];
+    }
+}
+
+// 两卡 partial 已在各自 stream 上完成后，直接通过 PCIe BAR 读取对端值，
+// 在目标卡一次完成 partial 归并和 residual add。这样两边仍各自留下同值
+// hidden，但不再为 24KiB decode hidden 额外物化 P2P 副本。
+extern "C" __global__ void zllm_peer_join_residual_f32x4(
+    const float4* local_partial,
+    const float4* peer_partial,
+    const float4* residual,
+    float4* output,
+    const unsigned int vectors)
+{
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= vectors) return;
+    const float4 local = local_partial[index];
+    const float4 peer = peer_partial[index];
+    const float4 skip = residual[index];
+    output[index] = make_float4(
+        skip.x + (local.x + peer.x),
+        skip.y + (local.y + peer.y),
+        skip.z + (local.z + peer.z),
+        skip.w + (local.w + peer.w));
+}

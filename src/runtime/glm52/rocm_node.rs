@@ -5,15 +5,15 @@
 //!   `zllm-rt-rocm` 进程，走 StageTransport，对 axum 透明。
 //! - **跨请求 KV 复用**：`TerminalCache<Glm52HeadState>`，线性会话只留最长。
 //! - **PP 编排**：A 跑 L0..L38，B 跑 L39..L77；B 只回传最终 hidden。
-//! - **输出环**：默认由 A0 执行 final norm、LM head、sampling 与 MTP L78；
-//!   输出/采样/MTP 由本机首卡 A0 执行,decode 回传 hidden。
+//! - **输出环**：final norm、LM head 与 sampling 由 A0 执行；operator pair 下
+//!   MTP L78 使用 A0/A1，其余形态仍在 A0。tail 只回传 hidden。
 //!
 //! ⚠️ PP 编排时序（send_prefill/recv token/cancel 解锁）需 16 卡 + GLM-5.2 真权重
 //! 端到端验证；本文件编译通过 + 结构对齐 rocm front stage（`zllm-rt-rocm` 已跑通）。
 
 #![cfg(target_os = "linux")]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -152,6 +152,9 @@ pub struct Glm52Engine {
     accept_phase_profile: [u128; 7],
     resident_states: Option<Vec<Glm52StageState>>,
     terminal_states: TerminalCache<Glm52HeadState>,
+    /// scheduler 在 append 排队期间 pin 的 cache_id,A/B 换出(`evict_oldest_terminal`)
+    /// 跳过它们;共享句柄让 PinCache 不进 engine 命令队列。
+    pinned: Arc<Mutex<HashSet<String>>>,
     swap: Option<Arc<Glm52SwapStore>>,
     persist_kv_cache: bool,
     pending_messages: HashMap<RequestId, VecDeque<StageMessage>>,
@@ -513,9 +516,10 @@ impl Glm52Engine {
         if stage_end == 0 || stage_end >= cfg.layer_count {
             return Err(format!("Glm52Engine stage_end 必须在 1..{}，实际 {stage_end}", cfg.layer_count).into());
         }
-        let (contexts, cooperative_peer_contexts) = if options.cooperative_expert_pairs {
+        let paired_operators = options.cooperative_expert_pairs || options.parallel_operator_pairs;
+        let (contexts, cooperative_peer_contexts) = if paired_operators {
             if devices.len() < 2 || devices.len() % 2 != 0 || layer_ends.len() != devices.len() / 2 {
-                return Err(format!("cooperative_expert_pairs 要求每两张物理卡对应一个 layer_ends：devices={} layer_ends={}", devices.len(), layer_ends.len()).into());
+                return Err(format!("双卡算子要求每两张物理卡对应一个 layer_ends：devices={} layer_ends={}", devices.len(), layer_ends.len()).into());
             }
             let owner_devices = devices.iter().step_by(2).copied().collect::<Vec<_>>();
             let peer_devices = devices.iter().skip(1).step_by(2).copied().collect::<Vec<_>>();
@@ -526,12 +530,18 @@ impl Glm52Engine {
         } else {
             (crate::runtime::rocm_chain::RocmDeviceChain::new(&devices, layer_ends.clone(), stage_end - 1, false).map_err(|error| -> DynError { format!("GLM-5.2 设备链: {error}").into() })?.contexts, Vec::new())
         };
+        for (owner, peer) in contexts.iter().zip(&cooperative_peer_contexts) {
+            owner.enable_peer_access_from(peer.device_id()).map_err(|error| -> DynError { format!("初始化 ROCm pair P2P {} -> {} 失败: {error}", peer.device_id(), owner.device_id()).into() })?;
+            peer.enable_peer_access_from(owner.device_id()).map_err(|error| -> DynError { format!("初始化 ROCm pair P2P {} -> {} 失败: {error}", owner.device_id(), peer.device_id()).into() })?;
+        }
         let output_context = contexts[0];
         let embedding_table = load_resident_embedding(&output_context, &weights, &cfg).map_err(|error| -> DynError { error.into() })?;
-        // LM head、采样与 MTP 全部驻留 A0;输出运行时由 rocm_tail 的统一装配入口
-        // 提供(含 FR-Spec draft head 与 lm_head 量化),不再有尾端采样形态。
+        // LM head/采样驻留 A0；operator pair 下 MTP L78 使用 A0/A1，仍沿用
+        // 最新 segmented cohort、cache-only catch-up 与 fused kernel 路径。
+        let mtp_operator_peer = options.parallel_operator_pairs.then(|| &cooperative_peer_contexts[0]);
         let (output_head, mtp_runtime) =
-            prepare_head_output_runtime(&output_context, &weights, &cfg, &mla, options.mtp, options.mtp_draft_tokens, None, lm_head_quantization, embedding_table.clone()).map_err(|error| -> DynError { error.into() })?;
+            prepare_head_output_runtime(&output_context, mtp_operator_peer, &weights, &cfg, &mla, options.mtp, options.mtp_draft_tokens, options.mtp_draft_vocabulary.as_deref(), lm_head_quantization, embedding_table.clone())
+                .map_err(|error| -> DynError { error.into() })?;
         let dspark_runtime = options
             .dspark_directory
             .as_deref()
@@ -584,7 +594,8 @@ impl Glm52Engine {
         };
         let token_signatures = build_token_signatures(&detokenizer, cfg.vocab_size);
         let rope = Arc::new(RopeTable::precompute(max_seq_len, mla.qk_rope_head_dim, mla.rope_theta));
-        prepare_glm52_rope_resident(&contexts, &rope)?;
+        let rope_contexts = contexts.iter().chain(&cooperative_peer_contexts).copied().collect::<Vec<_>>();
+        prepare_glm52_rope_resident(&rope_contexts, &rope)?;
         let pipeline_chunk_size = options.prefill_chunk_size;
         let mut link = StageTransport::connect(downstream_ticket, downstream_iroh).map_err(|error| -> DynError { format!("连接下游 stage: {error}").into() })?;
         let (downstream_memory, downstream_session_capacity) = match link.recv().map_err(|error| -> DynError { format!("接收下游设备资源: {error}").into() })?.message {
@@ -630,6 +641,7 @@ impl Glm52Engine {
             accept_phase_profile: [0; 7],
             resident_states: None,
             terminal_states: TerminalCache::new(terminal_limit),
+            pinned: Arc::new(Mutex::new(HashSet::new())),
             swap,
             persist_kv_cache,
             pending_messages: HashMap::new(),
@@ -663,6 +675,39 @@ impl Glm52Engine {
                 .map_err(|error| format!("准备 prefill layers: {error:?}"))?;
             let mut experts = (0..self.contexts.len()).map(|_| self.new_experts()).collect::<Result<Vec<_>, _>>()?;
             let preload_experts = self.options.preload_experts;
+            if self.options.parallel_operator_pairs {
+                if !preload_experts || self.options.preload_layers_per_device.is_some() || !self.weights.source_is_gguf() || self.contexts.len() != self.cooperative_peer_contexts.len() {
+                    return Err("parallel_operator_pairs 当前要求 GGUF 权重、preload_experts=true、完整预载且每个逻辑 stage 有一张 peer 卡".to_owned());
+                }
+                for (stage, (expert, &peer)) in experts.iter_mut().zip(&self.cooperative_peer_contexts).enumerate() {
+                    expert.enable_operator_peer(peer).map_err(|error| format!("配置 ROCm operator pair stage={stage}: {error:?}"))?;
+                }
+                let mla_started = Instant::now();
+                for (layer, resident) in layers.iter().enumerate() {
+                    let placement = self.layer_ends.iter().position(|&end| layer <= end).ok_or_else(|| format!("L{layer} 没有 head operator MLA device"))?;
+                    let owner_weights = match resident {
+                        glm52_stage::Glm52PrefillLayer::Dense(weights) => (&weights.q_b_proj, &weights.kv_b_proj),
+                        glm52_stage::Glm52PrefillLayer::Moe(weights) => (&weights.q_b_proj, &weights.kv_b_proj),
+                    };
+                    match resident {
+                        glm52_stage::Glm52PrefillLayer::Dense(_) => {
+                            let raw = self.weights.load_dense_layer_gguf(layer).map_err(|error| format!("加载 L{layer} dense GGUF operator MLA 权重: {error}"))?;
+                            super::rocm::prepare_operator_mla_dense_layer_gguf(&self.contexts[placement], &self.cooperative_peer_contexts[placement], &mut experts[placement], &self.cfg, &self.mla, layer, raw, owner_weights)?;
+                        }
+                        glm52_stage::Glm52PrefillLayer::Moe(_) => {
+                            let raw = self.weights.load_moe_layer_gguf(layer).map_err(|error| format!("加载 L{layer} MoE GGUF operator MLA 权重: {error}"))?;
+                            super::rocm::prepare_operator_mla_layer_gguf(&self.contexts[placement], &self.cooperative_peer_contexts[placement], &mut experts[placement], &self.cfg, &self.mla, layer, raw, owner_weights)?;
+                        }
+                    }
+                }
+                eprintln!(
+                    "[glm52-head-operator-pairs] physical_devices={} pairs={} logical_stages={} mode=current-fused-operators partition=attention-head+expert-intermediate independent-host-submit",
+                    self.contexts.len() + self.cooperative_peer_contexts.len(),
+                    self.contexts.len(),
+                    self.contexts.len(),
+                );
+                eprintln!("[glm52-head-operator-mla-resident] layers={} wall={:.3}s", layers.len(), mla_started.elapsed().as_secs_f64());
+            }
             if self.options.cooperative_expert_pairs {
                 if !preload_experts || self.options.preload_layers_per_device.is_some() || !(self.weights.source_is_ct() || self.weights.source_is_gguf()) || self.contexts.len() != self.cooperative_peer_contexts.len() {
                     return Err("cooperative_expert_pairs 要求 CT/GGUF 权重、preload_experts=true、完整预载且每个逻辑 stage 有一张 peer 卡".to_owned());
@@ -815,7 +860,7 @@ impl Glm52Engine {
     }
 
     fn output_context(&self) -> RocmContext {
-        // 输出/采样/MTP 固定驻留 A0 执行。
+        // 输出/采样和 MTP owner 固定 A0；operator pair 的 MTP peer 是 A1。
         self.contexts[0]
     }
 
@@ -923,8 +968,15 @@ impl Glm52Engine {
     }
 
     /// A/B 必须按同一个 cache_id 一起换出；成功后返回可复用的 GPU session。
+    /// 被排队 append pin 的 cache 跳过不换;候选全部被 pin 时报错而不是破坏保护。
     fn evict_oldest_terminal(&mut self) -> Result<Option<Vec<Glm52StageState>>, String> {
-        let Some((cache_id, tokens, state)) = self.terminal_states.take_oldest() else { return Ok(None) };
+        let pinned = self.pinned.lock().map_err(|_| "pin 集合锁中毒".to_owned())?;
+        let candidate = self.terminal_states.oldest_unpinned(&pinned).map(|(cache_id, _, _)| cache_id.to_owned());
+        drop(pinned);
+        let Some(cache_id) = candidate else {
+            return Err("terminal cache 已满且换出候选全部被 pin".to_owned());
+        };
+        let Some((tokens, state)) = self.terminal_states.take(&cache_id) else { return Ok(None) };
         let request_id = RequestId::from_cache_id(&cache_id);
         let prompt_tokens = state.info.prompt_tokens;
         if !self.persist_kv_cache {
@@ -974,16 +1026,27 @@ impl Glm52Engine {
         let kv_bytes_per_layer_token = if self.options.cooperative_expert_pairs { mla_bytes.div_ceil(2) + index_bytes } else { mla_bytes + index_bytes };
         let mut layer_start = 0usize;
         let mut token_capacity = usize::MAX;
-        let mut devices = Vec::with_capacity(self.contexts.len() + self.downstream_memory.len());
+        let mut devices = Vec::with_capacity(self.contexts.len() + self.cooperative_peer_contexts.len() + self.downstream_memory.len());
         for (device_index, (context, &layer_end)) in self.contexts.iter().zip(&self.layer_ends).enumerate() {
             let layers = layer_end + 1 - layer_start + usize::from(device_index == 0 && self.options.mtp) * self.cfg.mtp_layer_count;
             layer_start = layer_end + 1;
-            let free = context.stage_available_bytes().map_err(|error| format!("查询 ROCm device {} 可用显存: {error:?}", context.device_id()))?;
-            let total = context.stage_total_bytes().map_err(|error| format!("查询 ROCm device {} 总显存: {error:?}", context.device_id()))?;
-            let device = crate::runtime::rocm_chain::kv_capacity_from_free(format!("local/rocm-device-{}", context.device_id()), free, total, layers, kv_bytes_per_layer_token, safety_bytes, admission_layers)?;
-            token_capacity = token_capacity.min(device.token_capacity);
-            eprintln!("[glm52-head] {} kv_budget={:.2}GiB layers={} admission_layers={} kv_bytes/token={}", device.device, device.available_bytes as f64 / (1_u64 << 30) as f64, layers, layers.max(admission_layers), device.bytes_per_token,);
-            devices.push(device);
+            for (role, context) in std::iter::once(("owner", context)).chain(self.cooperative_peer_contexts.get(device_index).map(|peer| ("peer", peer))) {
+                let free = context.stage_available_bytes().map_err(|error| format!("查询 ROCm device {} 可用显存: {error:?}", context.device_id()))?;
+                let total = context.stage_total_bytes().map_err(|error| format!("查询 ROCm device {} 总显存: {error:?}", context.device_id()))?;
+                // operator peer 不保存 DSA，沿用 owner 的每 token 字节数会略保守；
+                // 但必须把完整 MLA replica 与 MTP L78 计入 admission 下界。
+                let device = crate::runtime::rocm_chain::kv_capacity_from_free(format!("local/{role}/rocm-device-{}", context.device_id()), free, total, layers, kv_bytes_per_layer_token, safety_bytes, admission_layers)?;
+                token_capacity = token_capacity.min(device.token_capacity);
+                eprintln!(
+                    "[glm52-head] {} kv_budget={:.2}GiB layers={} admission_layers={} kv_bytes/token={}",
+                    device.device,
+                    device.available_bytes as f64 / (1_u64 << 30) as f64,
+                    layers,
+                    layers.max(admission_layers),
+                    device.bytes_per_token,
+                );
+                devices.push(device);
+            }
         }
         for report in &self.downstream_memory {
             let free = usize::try_from(report.available_bytes).map_err(|_| format!("下游 device {} 可用显存超过 usize", report.device))?;
@@ -1077,6 +1140,10 @@ impl NodeEngine for Glm52Engine {
             runtime.ssd_cache_ids = self.swap.as_ref().map_or_else(Vec::new, |swap| swap.infos().into_iter().map(|info| info.cache_id).collect());
             runtime.ssd_cache_ids.sort();
         }
+    }
+
+    fn terminal_cache_pins(&self) -> Option<Arc<Mutex<HashSet<String>>>> {
+        Some(self.pinned.clone())
     }
 
     fn terminal_cache_infos(&self) -> Vec<CacheInfo> {
@@ -1250,7 +1317,8 @@ impl Glm52Engine {
         }
         let diagnostics = self.options.diagnostics;
         let weights = Arc::clone(&self.weights);
-        let decode_pipeline_stage_count = self.contexts.len().saturating_add(self.downstream_memory.len());
+        let downstream_stages = if self.options.cooperative_expert_pairs || self.options.parallel_operator_pairs { self.downstream_memory.len() / 2 } else { self.downstream_memory.len() };
+        let decode_pipeline_stage_count = self.contexts.len().saturating_add(downstream_stages);
         let run = drive_glm52_stream_stage_pipeline_stateful(initial_states, capacity, &cfg, &mla, &rope, scheduler_policy, |pipeline| {
             let backend_error = |msg: String| crate::backend::BackendError::Compute { msg };
             let mut request_sessions = slots.iter().enumerate().filter_map(|(session, task)| task.as_ref().map(|task| (task.stage_id, session))).collect::<HashMap<_, _>>();
@@ -1312,6 +1380,7 @@ impl Glm52Engine {
             )?;
 
             let mut reported_load = None;
+            let mut reported_mtp_drafts = None;
             loop {
                 let load = slots.iter().flatten().fold((0usize, 0usize, 0usize), |mut load, task| {
                     if task.prefill_position >= task.tokens.len() {
@@ -1596,10 +1665,21 @@ impl Glm52Engine {
                     }
                     let boundary_started = profile_boundaries.then(Instant::now);
                     let active_decode = slots.iter().enumerate().filter(|(session, task)| !closing[*session] && task.as_ref().is_some_and(|task| task.prefill_position >= task.tokens.len())).count();
+                    let active_prefill = slots.iter().enumerate().filter(|(session, task)| !closing[*session] && task.as_ref().is_some_and(|task| task.prefill_position < task.tokens.len())).count();
+                    let mtp_draft_tokens = crate::runtime::session::effective_mtp_draft_tokens(self.options.mtp_draft_tokens, active_decode, active_prefill);
+                    if self.mtp_runtime.is_some() && reported_mtp_drafts != Some(mtp_draft_tokens) {
+                        eprintln!(
+                            "[glm52-mtp-depth] ts_us={} decode={active_decode} prefill={active_prefill} load={} configured={} drafts={mtp_draft_tokens}",
+                            crate::runtime::prefill_scheduler::stage_trace_timestamp_us(),
+                            active_decode.saturating_add(active_prefill.saturating_mul(4)),
+                            self.options.mtp_draft_tokens,
+                        );
+                        reported_mtp_drafts = Some(mtp_draft_tokens);
+                    }
                     let maximum_dspark_drafts = crate::runtime::session::effective_dspark_draft_tokens(self.options.dspark_draft_tokens, active_decode);
                     let minimum_dspark_drafts = active_decode.checked_sub(1).map_or(0, |_| decode_pipeline_stage_count.div_ceil(active_decode).saturating_sub(1)).min(maximum_dspark_drafts);
                     let ready_count = tail_ready.len();
-                    let decisions = self.accept_tail_batch(&mut slots, tail_ready, minimum_dspark_drafts, maximum_dspark_drafts, profile_completion, on_token, on_tool_call_delta).map_err(backend_error)?;
+                    let decisions = self.accept_tail_batch(&mut slots, tail_ready, mtp_draft_tokens, minimum_dspark_drafts, maximum_dspark_drafts, profile_completion, on_token, on_tool_call_delta).map_err(backend_error)?;
                     if crate::kernel::rocm::hip::options().kernel_profile && allocation_profile_round < 2 {
                         crate::kernel::rocm::hip::hip_api_stats::report_phase(&format!("glm52-round-{allocation_profile_round}-post-accept"));
                         allocation_profile_round += 1;
@@ -2303,11 +2383,15 @@ impl Glm52Engine {
         }
         let sampling_state = SamplingState::new(sampling)?;
         let batch_guard = BatchTokenGuard::new(&self.runtime, tokens.len().saturating_sub(prefill_position));
-        let prefill_policy = AdaptiveChunkPolicy {
-            initial_chunk_size: self.pipeline_chunk_size,
-            append_chunk_size: self.options.scheduling.append_prefill_chunk_size,
-            long_context_threshold_tokens: self.options.scheduling.long_prefill_threshold_tokens,
-            long_context_chunk_size: self.options.scheduling.long_prefill_chunk_size,
+        let requested_prefill_chunk = input.request.get("prefill_chunk_size").and_then(Value::as_u64).and_then(|value| usize::try_from(value).ok()).map(|value| value.min(self.pipeline_chunk_size).min(self.max_seq_len));
+        let prefill_policy = match requested_prefill_chunk {
+            Some(chunk_size) => AdaptiveChunkPolicy { initial_chunk_size: chunk_size, append_chunk_size: chunk_size, long_context_threshold_tokens: usize::MAX, long_context_chunk_size: chunk_size },
+            None => AdaptiveChunkPolicy {
+                initial_chunk_size: self.pipeline_chunk_size,
+                append_chunk_size: self.options.scheduling.append_prefill_chunk_size,
+                long_context_threshold_tokens: self.options.scheduling.long_prefill_threshold_tokens,
+                long_context_chunk_size: self.options.scheduling.long_prefill_chunk_size,
+            },
         };
         let cache_request_id = matched_cache_id.as_deref().filter(|_| cache_hit).map(RequestId::from_cache_id);
         self.send_open_with_reconnect(stage_id, cache_request_id, cached_tokens.len(), reserved_tokens.min(self.max_seq_len), cache_hit, sampling).map_err(|error| format!("命令下游打开 cache: {error}"))?;
@@ -2433,7 +2517,7 @@ impl Glm52Engine {
             StageMessage::Sampled { position, token, eos, .. } => Ok(Glm52TailReady {
                 session,
                 position,
-                hidden: RocmTensor { data: Vec::new(), rows: 1, cols: 0, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: None },
+                hidden: RocmTensor { data: Vec::new(), rows: 1, cols: 0, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: None, replica: None },
                 aux_hidden: None,
                 aux_taps: 0,
                 decode: true,
@@ -2445,7 +2529,7 @@ impl Glm52Engine {
             StageMessage::Speculative { tokens, retained_rows, drafts, eos } => Ok(Glm52TailReady {
                 session,
                 position: task.cached_tokens.len().saturating_sub(task.pending_verify_rows),
-                hidden: RocmTensor { data: Vec::new(), rows: 1, cols: 0, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: None },
+                hidden: RocmTensor { data: Vec::new(), rows: 1, cols: 0, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: None, replica: None },
                 aux_hidden: None,
                 aux_taps: 0,
                 decode: true,
@@ -2521,6 +2605,7 @@ impl Glm52Engine {
         &mut self,
         slots: &mut [Option<Glm52BatchTask>],
         ready: Vec<Glm52TailReady>,
+        mtp_draft_tokens: usize,
         minimum_dspark_drafts: usize,
         maximum_dspark_drafts: usize,
         profile_completion: bool,
@@ -2669,7 +2754,7 @@ impl Glm52Engine {
                     Some(RocmMtpCatchUp { session: mtp, target_position: position, target_inputs: inputs, target_hidden: hidden })
                 })
                 .collect::<Vec<_>>();
-            mtp_catch_up_batch(runtime, &mut batch, &weights, &cfg, &mla, &self.rope).map_err(|error| format!("A0 MTP cohort catch-up: {error:?}"))?;
+            mtp_catch_up_batch(runtime, &mut batch, &weights, self.output_head.as_ref().ok_or("A0 MTP output head 未加载")?, &cfg, &mla, &self.rope).map_err(|error| format!("A0 MTP cohort catch-up: {error:?}"))?;
         }
         if let Some(started) = completion_phase_started.as_mut() {
             completion_phase_micros[0] = started.elapsed().as_micros();
@@ -2979,7 +3064,7 @@ impl Glm52Engine {
                     Some(RocmMtpCatchUp { session: mtp, target_position: position, target_inputs: inputs, target_hidden: hidden })
                 })
                 .collect::<Vec<_>>();
-            mtp_catch_up_batch(runtime, &mut batch, &weights, &cfg, &mla, &self.rope).map_err(|error| format!("A0 MTP verify cohort catch-up: {error:?}"))?;
+            mtp_catch_up_batch(runtime, &mut batch, &weights, self.output_head.as_ref().ok_or("A0 MTP output head 未加载")?, &cfg, &mla, &self.rope).map_err(|error| format!("A0 MTP verify cohort catch-up: {error:?}"))?;
             if profile_mtp {
                 runtime.backend.synchronize().map_err(|error| format!("同步 A0 MTP verify catch-up: {error:?}"))?;
             }
@@ -3005,7 +3090,9 @@ impl Glm52Engine {
                     let mtp = task.mtp.as_mut().filter(|mtp| mtp.active)?;
                     let latest = *outcome.tokens.last()?;
                     let remaining = mtp.max_decode.saturating_sub(task.completion_tokens.saturating_add(outcome.tokens.len()));
-                    let count = mtp.draft_tokens.min(remaining.saturating_sub(1));
+                    // 已发出的 verify 按原行数完成；动态深度只约束下一轮 draft，
+                    // 不重置常驻 MTP 权重、KV 或 pending hidden。
+                    let count = mtp.draft_tokens.min(mtp_draft_tokens).min(remaining.saturating_sub(1));
                     let hidden = mtp.pending_hidden.clone()?;
                     let mut fence = task.token_fence.clone();
                     fence.advance(latest);

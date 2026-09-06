@@ -221,7 +221,8 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
         "gguf_gemv_iq4xs_f16" | "gguf_gemv_iq4xs_1r_f16" | "gguf_gemv_iq4nl_f16" | "gguf_gemv_iq4nl_1r_f16" | "gguf_gemv_iq4nl_4r_f16" | "gguf_gemv_iq3s_f16" | "gguf_gemv_q4_0_f16" | "gguf_gemv_q5k_f16" | "gguf_gemv_q5k_1r_f16"
     );
     let packed_simd_rows = matches!(pipeline_name, "gguf_gemv_q8_0_f16" | "gguf_gemv_q3k_f16" | "gguf_gemv_q4k_f16" | "gguf_gemv_q4k_3m_f16" | "gguf_gemv_q6k_f16" | "gguf_gemv_qk_f16" | "gguf_gemv_iq2s_f16" | "gguf_gemv_iq3xxs_f16");
-    let threads = if matches!(pipeline_name, "gguf_gemv_q6k_f16" | "gguf_gemv_q3k_f16") {
+    let iq3_four_rows = matches!(pipeline_name, "gguf_gemv_iq3xxs_f16" | "gguf_gemv_iq3s_f16");
+    let threads = if matches!(pipeline_name, "gguf_gemv_q6k_f16" | "gguf_gemv_q3k_f16") || iq3_four_rows {
         64
     } else if iq_packed_rows {
         128
@@ -253,12 +254,14 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
     encoder.dispatch_thread_groups(
         MTLSize::new(
             if pipeline_name == "gguf_gemv_q6k_f16" {
-                weight_rows.div_ceil(2)
+                weight_rows.div_ceil(8)
             } else if pipeline_name == "gguf_gemv_iq4nl_1r_f16" || pipeline_name == "gguf_gemv_iq4nl_4r_f16" {
                 // iq4nl 单行/4 行版:每 simdgroup 一行权重,128 threads = 4 行/threadgroup
                 weight_rows.div_ceil(4)
             } else if pipeline_name == "gguf_gemv_iq4xs_f16" || pipeline_name == "gguf_gemv_iq4xs_1r_f16" || pipeline_name == "gguf_gemv_iq4nl_f16" || pipeline_name == "gguf_gemv_q4_0_f16" {
                 // iq4xs/iq4nl/q4_0 是 16 K-lane x 2 行/simdgroup,128 threads = 8 行/threadgroup
+                weight_rows.div_ceil(8)
+            } else if iq3_four_rows {
                 weight_rows.div_ceil(8)
             } else if pipeline_name == "gguf_gemv_q3k_f16" || iq_packed_rows {
                 weight_rows.div_ceil(4)
@@ -368,6 +371,87 @@ pub fn gguf_dual_gemv_q4k_tensor(
     encoder.end_encoding();
     let shape = format!("input=[1,{columns}],first={first_rows},second={second_rows},type=12");
     ctx.commit_and_wait_profiled(&command, "gguf_dual_gemv_q4k_2r_f16", &shape, input.buffer.length() + (first_rows * first_row_bytes + second_rows * second_row_bytes) as u64, first_output.buffer.length() + second_output.buffer.length());
+    Ok((first_output, second_output))
+}
+
+/// Decode 单行的两路 IQ3_XS/IQ3_S 投影共享一个 compute encoder。
+/// 两个 dispatch 保持各自量化布局，只合并 host 编码与 command-buffer 记账。
+#[allow(clippy::too_many_arguments)]
+pub fn gguf_dual_gemv_iq3_tensor(
+    ctx: &MetalContext,
+    input: &MetalTensor,
+    first_blob: &metal::Buffer,
+    first_type: u32,
+    first_row_bytes: usize,
+    first_rows: usize,
+    second_blob: &metal::Buffer,
+    second_type: u32,
+    second_row_bytes: usize,
+    second_rows: usize,
+    columns: usize,
+) -> Result<(MetalTensor, MetalTensor), String> {
+    if input.rows != 1 || input.cols != columns || input.dtype != MetalTensorDType::F16 {
+        return Err(format!("IQ3 dual gemv 输入不符: [{},{}] {:?} columns={columns}", input.rows, input.cols, input.dtype));
+    }
+    let pipeline_name = |tensor_type| match tensor_type {
+        18 => Ok("gguf_gemv_iq3xxs_f16"),
+        21 => Ok("gguf_gemv_iq3s_f16"),
+        _ => Err(format!("IQ3 dual gemv 不支持 type={tensor_type}")),
+    };
+    for (tensor_type, row_bytes) in [(first_type, first_row_bytes), (second_type, second_row_bytes)] {
+        let (block_elements, block_bytes) = metal_block_layout(tensor_type)?;
+        let expected = columns / block_elements * block_bytes;
+        if !columns.is_multiple_of(block_elements) || row_bytes != expected {
+            return Err(format!("IQ3 dual gemv type={tensor_type} row_bytes={row_bytes}，期望 {expected}"));
+        }
+    }
+    validate_size("IQ3 dual first buffer", first_rows.checked_mul(first_row_bytes).ok_or("IQ3 dual first 大小溢出")?, first_blob.length() as usize)?;
+    validate_size("IQ3 dual second buffer", second_rows.checked_mul(second_row_bytes).ok_or("IQ3 dual second 大小溢出")?, second_blob.length() as usize)?;
+    let first_output = ctx.tensor_uninit(1, first_rows);
+    let second_output = ctx.tensor_uninit(1, second_rows);
+    let grid = ctx.resident_byte_weight_buffer(as_bytes(crate::weight::codec::ggml::iq2s_grid()));
+    let columns_u32 = validate_u32("IQ3 dual columns", columns)?;
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    if first_type == 18 && second_type == 21 && first_rows == second_rows {
+        let pipeline = ctx.pipeline("gguf_dual_gemv_iq3xxs_iq3s_f16")?;
+        let rows_u32 = validate_u32("IQ3 dual rows", first_rows)?;
+        let first_row_bytes_u32 = validate_u32("IQ3 dual first row bytes", first_row_bytes)?;
+        let second_row_bytes_u32 = validate_u32("IQ3 dual second row bytes", second_row_bytes)?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&input.buffer), 0);
+        encoder.set_buffer(1, Some(first_blob), 0);
+        encoder.set_buffer(2, Some(second_blob), 0);
+        encoder.set_buffer(3, Some(&first_output.buffer), 0);
+        encoder.set_buffer(4, Some(&second_output.buffer), 0);
+        set_bytes(&encoder, 5, &columns_u32);
+        set_bytes(&encoder, 6, &rows_u32);
+        set_bytes(&encoder, 7, &first_row_bytes_u32);
+        set_bytes(&encoder, 8, &second_row_bytes_u32);
+        encoder.dispatch_thread_groups(MTLSize::new(first_rows.div_ceil(8) as u64, 1, 1), MTLSize::new(64, 1, 1));
+        encoder.end_encoding();
+        let shape = format!("input=[1,{columns}],rows={first_rows},types=18/21");
+        ctx.commit_and_wait_profiled(&command, "gguf_dual_gemv_iq3xxs_iq3s_f16", &shape, input.buffer.length() + first_blob.length() + second_blob.length(), first_output.buffer.length() + second_output.buffer.length());
+        return Ok((first_output, second_output));
+    }
+    for (blob, tensor_type, row_bytes, rows, output) in [(first_blob, first_type, first_row_bytes, first_rows, &first_output), (second_blob, second_type, second_row_bytes, second_rows, &second_output)] {
+        let pipeline = ctx.pipeline(pipeline_name(tensor_type)?)?;
+        let rows_u32 = validate_u32("IQ3 dual rows", rows)?;
+        let row_bytes_u32 = validate_u32("IQ3 dual row bytes", row_bytes)?;
+        encoder.set_compute_pipeline_state(&pipeline);
+        encoder.set_buffer(0, Some(&input.buffer), 0);
+        encoder.set_buffer(1, Some(blob), 0);
+        encoder.set_buffer(2, Some(&grid), 0);
+        encoder.set_buffer(3, Some(&output.buffer), 0);
+        set_bytes(&encoder, 4, &columns_u32);
+        set_bytes(&encoder, 5, &rows_u32);
+        set_bytes(&encoder, 6, &tensor_type);
+        set_bytes(&encoder, 7, &row_bytes_u32);
+        encoder.dispatch_thread_groups(MTLSize::new(rows.div_ceil(8) as u64, 1, 1), MTLSize::new(64, 1, 1));
+    }
+    encoder.end_encoding();
+    let shape = format!("input=[1,{columns}],first={first_rows}/t{first_type},second={second_rows}/t{second_type}");
+    ctx.commit_and_wait_profiled(&command, "gguf_dual_gemv_iq3_f16", &shape, input.buffer.length() + first_blob.length() + second_blob.length() + grid.length(), first_output.buffer.length() + second_output.buffer.length());
     Ok((first_output, second_output))
 }
 
@@ -779,7 +863,7 @@ pub fn gguf_gated_gemv_tensor_resident(
     let pipeline = ctx.pipeline(pipeline_name)?;
     let packed_rows = matches!(gate_type, 2 | 11 | 12 | 18 | 22) && gate_type == up_type;
     let iq_packed_rows = matches!(gate_type, 20 | 21 | 23) && gate_type == up_type;
-    let threads = if gate_type == 11 && up_type == 11 {
+    let threads = if matches!((gate_type, up_type), (11, 11) | (18, 18)) {
         64
     } else if gate_type == 2 && up_type == 2 {
         // q4_0 gated:16 K-lane x 2 行/simdgroup,4 simdgroups = 8 行/threadgroup

@@ -483,6 +483,24 @@ impl GgufReader {
         Ok(GgufMatrix { name: format!("{name}[{index}]"), rows, columns, tensor_type, file, offset, bytes_len: slice_bytes, bytes: Arc::new(OnceLock::new()) })
     }
 
+    /// 把 `[columns, rows, count]` 矩阵数组保持原始连续布局，视为
+    /// `[rows * count, columns]`。用于设备端按 expert id 计算的 packed 权重；
+    /// 不解码、不重排，也不制造第二份主机权重。
+    pub fn read_matrix_array(&self, name: &str) -> Result<GgufMatrix, String> {
+        let tensor = self.tensor(name).ok_or_else(|| format!("GGUF 无 tensor {name}"))?;
+        if tensor.dims.len() != 3 {
+            return Err(format!("GGUF tensor {name} shape={:?}，不是矩阵数组", tensor.dims));
+        }
+        let (columns, matrix_rows, count) = (tensor.dims[0], tensor.dims[1], tensor.dims[2]);
+        let rows = matrix_rows.checked_mul(count).ok_or_else(|| format!("GGUF tensor {name} 展平行数溢出"))?;
+        let expected = tensor.tensor_type.storage_bytes(rows.checked_mul(columns).ok_or_else(|| format!("GGUF tensor {name} 展平元素数溢出"))?)?;
+        if expected != tensor.bytes {
+            return Err(format!("GGUF tensor {name} 矩阵数组字节数 {}，期望 {expected}", tensor.bytes));
+        }
+        let (file, offset) = self.tensor_storage(name, 0, tensor.bytes)?;
+        Ok(GgufMatrix { name: name.to_owned(), rows, columns, tensor_type: tensor.tensor_type, file, offset, bytes_len: tensor.bytes, bytes: Arc::new(OnceLock::new()) })
+    }
+
     pub fn read_matrix_row_f32(&self, name: &str, row: usize) -> Result<Vec<f32>, String> {
         let tensor = self.tensor(name).ok_or_else(|| format!("GGUF 无 tensor {name}"))?;
         if tensor.dims.len() != 2 {

@@ -61,6 +61,10 @@ impl SamplingState {
 pub enum OutputNorm {
     Rms,
     GemmaRms,
+    /// K2-Horizon 的分组 RMSNorm:hidden 按组等分、组内独立归一化。
+    GroupedRms {
+        groups: usize,
+    },
 }
 
 /// 模型输出尾段(norm + lm_head + 取 token)的公共参数。
@@ -237,18 +241,28 @@ where
     token_output(backend, head, &hidden, plan)
 }
 
+/// 复用输出头的最终归一化；MTP 等需要 target hidden 的路径必须与 logits 输入一致。
+pub(crate) fn normalize_hidden<B>(backend: &B, head: &OutputHead<B::Weight>, hidden: &B::Tensor, plan: &OutputPlan) -> Result<B::Tensor, BackendError>
+where
+    B: Backend,
+{
+    Ok(match (plan.norm, head.norm_f32) {
+        (OutputNorm::Rms, false) => backend.rmsnorm(hidden, &head.norm, plan.eps)?,
+        (OutputNorm::GemmaRms, false) => backend.gemma_rmsnorm(hidden, &head.norm, plan.eps)?,
+        (OutputNorm::GroupedRms { groups }, false) => backend.grouped_rmsnorm(hidden, &head.norm, plan.eps, groups)?,
+        (OutputNorm::Rms, true) => backend.rmsnorm_f32(hidden, &head.norm, plan.eps)?,
+        (OutputNorm::GemmaRms, true) => backend.gemma_rmsnorm_f32(hidden, &head.norm, plan.eps)?,
+        (OutputNorm::GroupedRms { groups }, true) => backend.grouped_rmsnorm_f32(hidden, &head.norm, plan.eps, groups)?,
+    })
+}
+
 /// 输出尾段的公共前半程：按 plan 的 norm 语义归一化后过 LM head。
 /// token_output / token_ids / sampled_token_ids 共用，避免 4 路 match 逐字重复。
 pub(crate) fn norm_and_lm_head<B>(backend: &B, head: &OutputHead<B::Weight>, hidden: &B::Tensor, plan: &OutputPlan) -> Result<(B::Tensor, B::Tensor), BackendError>
 where
     B: Backend,
 {
-    let hidden = match (plan.norm, head.norm_f32) {
-        (OutputNorm::Rms, false) => backend.rmsnorm(hidden, &head.norm, plan.eps)?,
-        (OutputNorm::GemmaRms, false) => backend.gemma_rmsnorm(hidden, &head.norm, plan.eps)?,
-        (OutputNorm::Rms, true) => backend.rmsnorm_f32(hidden, &head.norm, plan.eps)?,
-        (OutputNorm::GemmaRms, true) => backend.gemma_rmsnorm_f32(hidden, &head.norm, plan.eps)?,
-    };
+    let hidden = normalize_hidden(backend, head, hidden, plan)?;
     let logits = backend.linear(&hidden, &head.lm_head)?;
     Ok((hidden, logits))
 }
@@ -378,6 +392,21 @@ mod tests {
         let normalized = normalized_token_ids(&backend, &head, &hidden, &excluded)?;
         let normalized_rows = (0..hidden.rows).map(|row| backend.slice_token_rows(&hidden, row, 1).and_then(|hidden| normalized_token_id(&backend, &head, &hidden, &excluded))).collect::<Result<Vec<_>, _>>()?;
         assert_eq!(normalized, normalized_rows);
+        Ok(())
+    }
+
+    #[test]
+    fn reusable_output_norm_matches_logits_input() -> Result<(), BackendError> {
+        let backend = CpuContext;
+        let head = prepare_output_head(&backend, &[1.0, 0.5, 2.0], LinearWeight::F32(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), 2, 3)?;
+        let hidden = CpuTensor { data: vec![4.0, 1.0, 2.0, -2.0, -1.0, -4.0], rows: 2, cols: 3 };
+        let plan = OutputPlan { eps: 1.0e-6, norm: OutputNorm::Rms, excluded_tokens: Vec::new() };
+        let normalized = normalize_hidden(&backend, &head, &hidden, &plan)?;
+        let output = token_output(&backend, &head, &hidden, &plan)?;
+
+        assert_eq!(normalized.rows, output.input.rows);
+        assert_eq!(normalized.cols, output.input.cols);
+        assert_eq!(normalized.data, output.input.data);
         Ok(())
     }
 

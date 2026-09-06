@@ -491,6 +491,26 @@ mod tests {
     }
 
     #[test]
+    fn rocm_greedy_rows_preserve_exclusion_nan_and_tie_break() {
+        let rows = 4;
+        let columns = 131_072;
+        let mut input = vec![-100.0_f32; rows * columns];
+        for row in 0..rows {
+            input[row * columns + 17] = f32::NAN;
+            input[row * columns + 129_001] = 1000.0;
+            input[row * columns + 73_003 + row] = 999.0;
+            input[row * columns + 81_007] = 999.0;
+        }
+        let sampling = [crate::backend::TokenSampling { temperature: 0.0, top_p: 1.0, random: 0.0 }; 4];
+        let device = DeviceBuffer::upload_f32(0, &input).unwrap();
+        let actual = try_sample_top_p_rows_excluding_resident_f32(0, &device, rows, columns, &sampling, &[129_001]).unwrap();
+        assert_eq!(actual, [73_003, 73_004, 73_005, 73_006]);
+        let mut invalid = sampling;
+        invalid[0].random = f32::NAN;
+        assert!(try_sample_top_p_rows_excluding_resident_f32(0, &device, rows, columns, &invalid, &[]).is_err());
+    }
+
+    #[test]
     fn rocm_large_vocab_top_p_matches_cpu_rows() {
         let rows = 3;
         let columns = 8192;

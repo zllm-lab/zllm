@@ -75,7 +75,7 @@ impl Cancellation {
     }
 }
 
-/// 进程内模型引擎。当前支持 Gemma4 / Qwen3.6-3.8 / Ornith / Mistral / MiniCPM5 的 Metal 组合，
+/// 进程内模型引擎。当前支持 Gemma4 / Qwen3.6-3.8 / Ornith / Mistral / K2-Horizon / MiniCPM5 的 Metal 组合，
 /// 后续模型按相同 runtime 边界接入。
 pub struct Engine {
     inner: EngineInner,
@@ -92,6 +92,12 @@ enum EngineInner {
     Ornith(Box<crate::runtime::ornith::node::OrnithEngine>),
     #[cfg(target_os = "macos")]
     Mistral(Box<crate::runtime::mistral::node::MistralEngine>),
+    #[cfg(target_os = "macos")]
+    K2Horizon(Box<crate::runtime::k2_horizon::node::K2Engine>),
+    /// 复用 runtime::node 的直装分发（CUDA/ROCm 组合）。这类 engine 走
+    /// NodeEngine 单请求接口；KV 驻留统计与 SSD snapshot 按 NodeEngine
+    /// 实际能力透传，不支持的字段以占位值返回。
+    Direct(Box<dyn crate::server::node::NodeEngine>),
 }
 
 impl Engine {
@@ -110,6 +116,23 @@ impl Engine {
         #[cfg(target_os = "macos")]
         let (runtime, compute_steps) = (Arc::new(Mutex::new(crate::runtime::session::RuntimeStatus::default())), Arc::new(crate::runtime::session::AtomicCounterU64::new(0)));
         match (model, backend) {
+            // CUDA/ROCm 组合复用 runtime::node 的直装分发:console、node 进程
+            // 与嵌入式入口共享同一批 XxxCudaEngine/OrnithRocmEngine,生成语义不分叉。
+            // 这些分支必须先于各模型的 Metal catch-all 匹配。
+            #[cfg(feature = "with-cuda")]
+            (model, backend @ NodeBackendConfig::Cuda(_)) => {
+                let engine = crate::runtime::node::load_direct_engine(model, backend, session.cache_directory, session.persist_kv_cache, session.resident_cache_entries).map_err(|error| error.to_string())?;
+                Ok(Self { inner: EngineInner::Direct(engine) })
+            }
+            #[cfg(not(feature = "with-cuda"))]
+            (_, NodeBackendConfig::Cuda(_)) => Err("CUDA 嵌入式引擎需要 --features with-cuda".to_owned()),
+            #[cfg(all(target_os = "linux", feature = "with-rocm"))]
+            (NodeModelConfig::Ornith(model), backend @ NodeBackendConfig::Rocm(_)) => {
+                let engine = crate::runtime::node::load_direct_engine(NodeModelConfig::Ornith(model), backend, session.cache_directory, session.persist_kv_cache, session.resident_cache_entries).map_err(|error| error.to_string())?;
+                Ok(Self { inner: EngineInner::Direct(engine) })
+            }
+            #[cfg(not(all(target_os = "linux", feature = "with-rocm")))]
+            (NodeModelConfig::Ornith(_), NodeBackendConfig::Rocm(_)) => Err("Ornith ROCm 嵌入式引擎需要 Linux + --features with-rocm".to_owned()),
             (NodeModelConfig::Gemma4(model), NodeBackendConfig::Metal(metal)) => {
                 #[cfg(target_os = "macos")]
                 {
@@ -134,7 +157,7 @@ impl Engine {
                     Err("Gemma4 Metal 嵌入式引擎只支持 macOS".to_owned())
                 }
             }
-            (NodeModelConfig::Gemma4(_), _) => Err("Gemma4 嵌入式引擎第一阶段只支持 Metal backend".to_owned()),
+            (NodeModelConfig::Gemma4(_), _) => Err("Gemma4 嵌入式引擎只支持 Metal(macOS)与 CUDA backend".to_owned()),
             (NodeModelConfig::Qwen36(model), NodeBackendConfig::Metal(metal)) => {
                 #[cfg(target_os = "macos")]
                 {
@@ -160,7 +183,7 @@ impl Engine {
                     Err("Qwen3.6/Qwen3.8 Metal 嵌入式引擎只支持 macOS".to_owned())
                 }
             }
-            (NodeModelConfig::Qwen36(_), _) => Err("Qwen3.6/Qwen3.8 嵌入式引擎第一阶段只支持 Metal backend".to_owned()),
+            (NodeModelConfig::Qwen36(_), _) => Err("Qwen3.6/Qwen3.8 嵌入式引擎只支持 Metal(macOS)与 CUDA backend".to_owned()),
             (NodeModelConfig::MiniCpm5(model), NodeBackendConfig::Metal(metal)) => {
                 #[cfg(target_os = "macos")]
                 {
@@ -185,7 +208,7 @@ impl Engine {
                     Err("MiniCPM5 Metal 嵌入式引擎只支持 macOS".to_owned())
                 }
             }
-            (NodeModelConfig::MiniCpm5(_), _) => Err("MiniCPM5 嵌入式引擎第一阶段只支持 Metal backend".to_owned()),
+            (NodeModelConfig::MiniCpm5(model), _) => Err(format!("MiniCPM5 嵌入式引擎只支持 Metal backend(macOS): {model:?}")),
             (NodeModelConfig::Ornith(model), NodeBackendConfig::Metal(metal)) => {
                 #[cfg(target_os = "macos")]
                 {
@@ -204,7 +227,7 @@ impl Engine {
                     Err("Ornith Metal 嵌入式引擎只支持 macOS".to_owned())
                 }
             }
-            (NodeModelConfig::Ornith(_), _) => Err("Ornith 嵌入式引擎当前只支持 Metal backend".to_owned()),
+            (NodeModelConfig::Ornith(_), _) => Err("Ornith 嵌入式引擎只支持 Metal(macOS)、CUDA 与 ROCm(Linux) backend".to_owned()),
             (NodeModelConfig::Mistral(model), NodeBackendConfig::Metal(metal)) => {
                 #[cfg(target_os = "macos")]
                 {
@@ -222,7 +245,33 @@ impl Engine {
                     Err("Mistral Metal 嵌入式引擎只支持 macOS".to_owned())
                 }
             }
-            (NodeModelConfig::Mistral(_), _) => Err("Mistral 嵌入式引擎当前只支持 Metal backend".to_owned()),
+            (NodeModelConfig::Mistral(_), _) => Err("Mistral 嵌入式引擎只支持 Metal(macOS)与 CUDA backend".to_owned()),
+            (NodeModelConfig::K2Horizon(model), NodeBackendConfig::Metal(metal)) => {
+                #[cfg(target_os = "macos")]
+                {
+                    if session.persist_kv_cache {
+                        return Err("K2-Horizon embedded 尚未实现 terminal cache，仅支持 persist_kv_cache=false".to_owned());
+                    }
+                    let engine = crate::runtime::k2_horizon::node::K2Engine::load(
+                        &model.weights_directory,
+                        model.max_sequence_length,
+                        model.execution.kv_cache_format == crate::config::KvCacheFormat::F16,
+                        metal.replay,
+                        model.execution.expert_cache_gib,
+                        model.lm_head_quantization,
+                        runtime,
+                        compute_steps,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    Ok(Self { inner: EngineInner::K2Horizon(Box::new(engine)) })
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = (model, metal, session);
+                    Err("K2-Horizon Metal 嵌入式引擎只支持 macOS".to_owned())
+                }
+            }
+            (NodeModelConfig::K2Horizon(_), _) => Err("K2-Horizon 嵌入式引擎当前只支持 Metal backend".to_owned()),
             (_, _) => Err("该模型尚未接入嵌入式引擎".to_owned()),
         }
     }
@@ -244,6 +293,10 @@ impl Engine {
             EngineInner::Ornith(engine) => engine.kv_residency(),
             #[cfg(target_os = "macos")]
             EngineInner::Mistral(engine) => engine.kv_residency(),
+            #[cfg(target_os = "macos")]
+            EngineInner::K2Horizon(engine) => engine.kv_residency(),
+            // NodeEngine 没有 KV 驻留统计;返回全零占位,/stats 仍能显示 engine 字段。
+            EngineInner::Direct(_) => crate::runtime::session::KvResidency { capacity_bytes: 0, active_bytes: 0, resident_bytes: 0, engine_resident_bytes: 0, session_resident_bytes: 0 },
         };
         KvResourceReport {
             engine_resident_bytes: residency.engine_resident_bytes,
@@ -286,6 +339,9 @@ impl Engine {
             }
             #[cfg(target_os = "macos")]
             EngineInner::Mistral(engine) => engine.generate("embedded", request, &cancellation.cancelled, &mut |token, text| on_token(token.unwrap_or(0), &text))?,
+            #[cfg(target_os = "macos")]
+            EngineInner::K2Horizon(engine) => engine.generate("embedded", request, &cancellation.cancelled, &mut |token, text| on_token(token.unwrap_or(0), &text))?,
+            EngineInner::Direct(engine) => engine.generate_one("embedded", request, &cancellation.cancelled, &mut |token, text| on_token(token, &text))?,
         };
         if repetition {
             summary.finish_reason = "repetition".to_owned();
@@ -324,6 +380,13 @@ impl Engine {
                 Some(token_id) => on_event(GenerationEvent::Token { token_id, text: &text }),
                 None => on_event(GenerationEvent::Text { text: &text }),
             })?,
+            #[cfg(target_os = "macos")]
+            EngineInner::K2Horizon(engine) => engine.generate("embedded", request, &cancellation.cancelled, &mut |token, text| match token {
+                Some(token_id) => on_event(GenerationEvent::Token { token_id, text: &text }),
+                None => on_event(GenerationEvent::Text { text: &text }),
+            })?,
+            // NodeEngine 的 token 回调没有 None(sentinel)形态,全部按词表 token 上报。
+            EngineInner::Direct(engine) => engine.generate_one("embedded", request, &cancellation.cancelled, &mut |token_id, text| on_event(GenerationEvent::Token { token_id, text: &text }))?,
         };
         Ok(GenerationResult { finish_reason: summary.finish_reason, prompt_tokens: summary.prompt_tokens, completion_tokens: summary.completion_tokens, cache_id: summary.cache.map(|cache| cache.cache_id), tool_calls: summary.tool_calls })
     }
@@ -342,6 +405,9 @@ impl Engine {
             EngineInner::Ornith(engine) => engine.shutdown(),
             #[cfg(target_os = "macos")]
             EngineInner::Mistral(engine) => engine.shutdown(),
+            #[cfg(target_os = "macos")]
+            EngineInner::K2Horizon(engine) => engine.shutdown(),
+            EngineInner::Direct(engine) => engine.shutdown(),
         }
     }
 }

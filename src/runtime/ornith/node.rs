@@ -134,6 +134,9 @@ impl NodeEngine for OrnithEngine {
     fn terminal_cache_infos(&self) -> Vec<CacheInfo> {
         self.terminal_states.infos()
     }
+    fn terminal_cache_pins(&self) -> Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>> {
+        Some(self.terminal_states.pin_handle())
+    }
     fn max_concurrency(&self) -> usize {
         1
     }

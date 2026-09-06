@@ -37,7 +37,16 @@ mod tests {
             *byte = ((index.wrapping_mul(37) + seed * 29 + index / 11) & 255) as u8;
         }
         for block in packed.chunks_exact_mut(block_bytes) {
-            block[..2].copy_from_slice(&half::f16::from_f32(0.001).to_le_bytes());
+            if tensor_type == 11 {
+                block[108..110].copy_from_slice(&half::f16::from_f32(0.001).to_le_bytes());
+            } else if tensor_type == 14 {
+                block[208..210].copy_from_slice(&half::f16::from_f32(0.001).to_le_bytes());
+            } else {
+                block[..2].copy_from_slice(&half::f16::from_f32(0.001).to_le_bytes());
+                if matches!(tensor_type, 12 | 13) {
+                    block[2..4].copy_from_slice(&half::f16::from_f32(0.0005).to_le_bytes());
+                }
+            }
         }
         packed
     }
@@ -523,9 +532,19 @@ mod tests {
         let route_weights = super::DeviceBuffer::upload(DEVICE, bytes(route_weights_host)).unwrap();
         let meta = super::GgufGroupedExpertMeta { gate: gate.device_pointer() as u64, up: up.device_pointer() as u64, down: down.device_pointer() as u64, gate_type: 21, up_type: 21, down_type: 23 };
         let metas = super::resident_gguf_grouped_metas(DEVICE, &vec![meta; expert_count]).unwrap();
-        let output = super::try_gguf_grouped_wmma_experts(DEVICE, &input, tokens, HIDDEN, INTERMEDIATE, top_k, &route_ids, &route_weights, tokens * top_k, &metas, expert_count).unwrap();
         let mut actual = vec![0.0_f32; tokens * HIDDEN];
-        output.copy_to_host(bytes_mut(&mut actual)).unwrap();
+        let mut first_bits = None;
+        let rounds = if top_k > 1 { 8 } else { 1 };
+        for round in 0..rounds {
+            let output = super::try_gguf_grouped_wmma_experts(DEVICE, &input, tokens, HIDDEN, INTERMEDIATE, top_k, &route_ids, &route_weights, tokens * top_k, &metas, expert_count).unwrap();
+            output.copy_to_host(bytes_mut(&mut actual)).unwrap();
+            let bits = actual.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+            if let Some(first_bits) = &first_bits {
+                assert_eq!(&bits, first_bits, "GGUF grouped down 第 {round} 轮结果非确定");
+            } else {
+                first_bits = Some(bits);
+            }
+        }
 
         let mut expected = vec![0.0_f32; tokens * HIDDEN];
         let mut activated = vec![0.0_f32; INTERMEDIATE];
@@ -562,13 +581,190 @@ mod tests {
         let routed_weights = (0..9).flat_map(|_| [0.25_f32, 0.5_f32]).collect::<Vec<_>>();
         assert_grouped_wmma_matches_cpu(9, 2, 2, &routed_ids, &routed_weights);
 
+        // 8 个 expert 同时贡献同一 token，覆盖旧浮点 atomicAdd 的竞争形态。
+        let routed_ids = (0..17).flat_map(|token| (0..8).map(move |slot| ((token * 3 + slot * 5) % 8) as u32)).collect::<Vec<_>>();
+        let routed_weights = (0..17).flat_map(|_| (1..=8).map(|slot| slot as f32 / 64.0)).collect::<Vec<_>>();
+        assert_grouped_wmma_matches_cpu(17, 8, 8, &routed_ids, &routed_weights);
+
         // 超过一个 128-row tile，覆盖 shared expert 的多 y block 路径。
         let shared_ids = vec![0_u32; 129];
         let shared_weights = vec![1.0_f32; 129];
         assert_grouped_wmma_matches_cpu(129, 1, 1, &shared_ids, &shared_weights);
     }
 
-    fn assert_fused_decode_matches_generic(types: [u32; 3]) {
+    fn assert_rows2_gate_up_matches_token_major(tensor_type: u32) {
+        use half::bf16;
+
+        const DEVICE: i32 = 0;
+        const HIDDEN: usize = 256;
+        const INTERMEDIATE: usize = 256;
+        const TOP_K: usize = 4;
+        const EXPERTS: usize = 6;
+        let input_bits = (0..2 * HIDDEN).map(|index| bf16::from_f32(((index * 17 % 47) as f32 - 23.0) / 128.0).to_bits()).collect::<Vec<_>>();
+        let input = super::DeviceBuffer::upload(DEVICE, bytes(&input_bits)).unwrap();
+        let mut metas_host = Vec::with_capacity(EXPERTS);
+        for expert in 0..EXPERTS {
+            let gate = super::DeviceBuffer::upload(DEVICE, &iq_rows(tensor_type, INTERMEDIATE, HIDDEN, 7 + expert)).unwrap();
+            let up = super::DeviceBuffer::upload(DEVICE, &iq_rows(tensor_type, INTERMEDIATE, HIDDEN, 37 + expert)).unwrap();
+            metas_host.push(super::GgufGroupedExpertMeta { gate: gate.device_pointer() as u64, up: up.device_pointer() as u64, down: gate.device_pointer() as u64, gate_type: tensor_type, up_type: tensor_type, down_type: tensor_type });
+            std::mem::forget((gate, up));
+        }
+        let metas = super::resident_gguf_grouped_metas(DEVICE, &metas_host).unwrap();
+        let route_ids = super::DeviceBuffer::upload(DEVICE, bytes(&[0_u32, 1, 2, 3, 4, 1, 5, 3])).unwrap();
+        let token_major = super::DeviceBuffer::allocate(DEVICE, 2 * TOP_K * INTERMEDIATE * 2).unwrap();
+        let shared = super::DeviceBuffer::allocate(DEVICE, 2 * TOP_K * INTERMEDIATE * 2).unwrap();
+        let functions = super::super::ct_quantized_functions(DEVICE).unwrap();
+        let (token_major_function, shared_function) =
+            if tensor_type == 21 { (functions.gguf_fused_gate_up_iq3s_wide, functions.gguf_fused_gate_up_iq3s_wide_rows2) } else { (functions.gguf_fused_gate_up_iq4xs, functions.gguf_fused_gate_up_iq4xs_rows2) };
+        let launch = |function: usize, output: &super::DeviceBuffer| {
+            let mut input_pointer = input.pointer;
+            let mut metas_pointer = metas.buffer.pointer;
+            let mut route_ids_pointer = route_ids.pointer;
+            let mut output_pointer = output.pointer as usize;
+            let mut assignments = (2 * TOP_K) as u32;
+            let mut top_k = TOP_K as u32;
+            let mut hidden = HIDDEN as u32;
+            let mut intermediate = INTERMEDIATE as u32;
+            let mut input_is_bf16 = 1_u32;
+            let mut arguments = [
+                (&mut input_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut metas_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut route_ids_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut route_ids_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut output_pointer as *mut usize).cast(),
+                (&mut assignments as *mut u32).cast(),
+                (&mut top_k as *mut u32).cast(),
+                (&mut hidden as *mut u32).cast(),
+                (&mut intermediate as *mut u32).cast(),
+                (&mut input_is_bf16 as *mut u32).cast(),
+            ];
+            let status = unsafe {
+                crate::kernel::rocm::hip::kernel_launch_trampoline(
+                    function as *mut std::ffi::c_void,
+                    (INTERMEDIATE / 32) as u32,
+                    (2 * TOP_K) as u32,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    crate::kernel::rocm::hip::active_compute_stream(),
+                    arguments.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, crate::kernel::rocm::hip::HIP_SUCCESS);
+        };
+        launch(token_major_function, &token_major);
+        launch(shared_function, &shared);
+        super::super::synchronize_device(DEVICE, "GGUF rows2 gate/up 共享 oracle").unwrap();
+        let mut token_major_host = vec![0_u16; 2 * TOP_K * INTERMEDIATE];
+        let mut shared_host = vec![0_u16; 2 * TOP_K * INTERMEDIATE];
+        token_major.copy_to_host(bytes_mut(&mut token_major_host)).unwrap();
+        shared.copy_to_host(bytes_mut(&mut shared_host)).unwrap();
+        assert_eq!(shared_host, token_major_host, "tensor_type={tensor_type} rows2 共享权重改变 activation");
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn glm53_rows2_gate_up_weight_sharing_matches_token_major() {
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+        assert_rows2_gate_up_matches_token_major(21);
+        assert_rows2_gate_up_matches_token_major(23);
+    }
+
+    fn assert_rowsn_gate_up_matches_token_major(tensor_type: u32) {
+        use half::bf16;
+
+        const DEVICE: i32 = 0;
+        const HIDDEN: usize = 256;
+        const INTERMEDIATE: usize = 256;
+        const TOP_K: usize = 4;
+        const ROWS: usize = 6;
+        const EXPERTS: usize = 6;
+        let input_bits = (0..ROWS * HIDDEN).map(|index| bf16::from_f32(((index * 17 % 47) as f32 - 23.0) / 128.0).to_bits()).collect::<Vec<_>>();
+        let input = super::DeviceBuffer::upload(DEVICE, bytes(&input_bits)).unwrap();
+        let mut metas_host = Vec::with_capacity(EXPERTS);
+        for expert in 0..EXPERTS {
+            let gate = super::DeviceBuffer::upload(DEVICE, &iq_rows(tensor_type, INTERMEDIATE, HIDDEN, 7 + expert)).unwrap();
+            let up = super::DeviceBuffer::upload(DEVICE, &iq_rows(tensor_type, INTERMEDIATE, HIDDEN, 37 + expert)).unwrap();
+            metas_host.push(super::GgufGroupedExpertMeta { gate: gate.device_pointer() as u64, up: up.device_pointer() as u64, down: gate.device_pointer() as u64, gate_type: tensor_type, up_type: tensor_type, down_type: tensor_type });
+            std::mem::forget((gate, up));
+        }
+        let metas = super::resident_gguf_grouped_metas(DEVICE, &metas_host).unwrap();
+        // 每行 4 个互异专家,跨行刻意重叠:expert 0/1/3 各成 4 成员组,4/5 各 3 成员。
+        let routes: [u32; ROWS * TOP_K] = [
+            0, 1, 2, 3, //
+            4, 1, 5, 3, //
+            0, 2, 4, 1, //
+            3, 5, 0, 2, //
+            1, 4, 3, 0, //
+            2, 5, 1, 4, //
+        ];
+        let route_ids = super::DeviceBuffer::upload(DEVICE, bytes(&routes)).unwrap();
+        let token_major = super::DeviceBuffer::allocate(DEVICE, ROWS * TOP_K * INTERMEDIATE * 2).unwrap();
+        let shared = super::DeviceBuffer::allocate(DEVICE, ROWS * TOP_K * INTERMEDIATE * 2).unwrap();
+        let functions = super::super::ct_quantized_functions(DEVICE).unwrap();
+        let (token_major_function, shared_function) =
+            if tensor_type == 21 { (functions.gguf_fused_gate_up_iq3s_wide, functions.gguf_fused_gate_up_iq3s_wide_rowsn) } else { (functions.gguf_fused_gate_up_iq4xs, functions.gguf_fused_gate_up_iq4xs_rowsn) };
+        let launch = |function: usize, output: &super::DeviceBuffer| {
+            let mut input_pointer = input.pointer;
+            let mut metas_pointer = metas.buffer.pointer;
+            let mut route_ids_pointer = route_ids.pointer;
+            let mut output_pointer = output.pointer as usize;
+            let mut assignments = (ROWS * TOP_K) as u32;
+            let mut top_k = TOP_K as u32;
+            let mut hidden = HIDDEN as u32;
+            let mut intermediate = INTERMEDIATE as u32;
+            let mut input_is_bf16 = 1_u32;
+            let mut arguments = [
+                (&mut input_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut metas_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut route_ids_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut route_ids_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut output_pointer as *mut usize).cast(),
+                (&mut assignments as *mut u32).cast(),
+                (&mut top_k as *mut u32).cast(),
+                (&mut hidden as *mut u32).cast(),
+                (&mut intermediate as *mut u32).cast(),
+                (&mut input_is_bf16 as *mut u32).cast(),
+            ];
+            let status = unsafe {
+                crate::kernel::rocm::hip::kernel_launch_trampoline(
+                    function as *mut std::ffi::c_void,
+                    (INTERMEDIATE / 32) as u32,
+                    (ROWS * TOP_K) as u32,
+                    1,
+                    256,
+                    1,
+                    1,
+                    0,
+                    crate::kernel::rocm::hip::active_compute_stream(),
+                    arguments.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, crate::kernel::rocm::hip::HIP_SUCCESS);
+        };
+        launch(token_major_function, &token_major);
+        launch(shared_function, &shared);
+        super::super::synchronize_device(DEVICE, "GGUF rowsN gate/up 共享 oracle").unwrap();
+        let mut token_major_host = vec![0_u16; ROWS * TOP_K * INTERMEDIATE];
+        let mut shared_host = vec![0_u16; ROWS * TOP_K * INTERMEDIATE];
+        token_major.copy_to_host(bytes_mut(&mut token_major_host)).unwrap();
+        shared.copy_to_host(bytes_mut(&mut shared_host)).unwrap();
+        assert_eq!(shared_host, token_major_host, "tensor_type={tensor_type} rowsN 共享权重改变 activation");
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn glm53_rowsn_gate_up_weight_sharing_matches_token_major() {
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+        assert_rowsn_gate_up_matches_token_major(21);
+        assert_rowsn_gate_up_matches_token_major(23);
+    }
+
+    fn assert_fused_decode_matches_generic(types: [u32; 3], bitwise: bool) {
         use half::bf16;
 
         const DEVICE: i32 = 0;
@@ -578,6 +774,10 @@ mod tests {
         let gate_host = iq_rows(types[0], INTERMEDIATE, HIDDEN, 7);
         let up_host = iq_rows(types[1], INTERMEDIATE, HIDDEN, 11);
         let down_host = iq_rows(types[2], HIDDEN, INTERMEDIATE, 13);
+        let input_values = input_bits.iter().map(|&bits| bf16::from_bits(bits).to_f32()).collect::<Vec<_>>();
+        let gate_values = crate::weight::codec::ggml::dequantize(types[0], &gate_host, INTERMEDIATE * HIDDEN).unwrap();
+        let up_values = crate::weight::codec::ggml::dequantize(types[1], &up_host, INTERMEDIATE * HIDDEN).unwrap();
+        let down_values = crate::weight::codec::ggml::dequantize(types[2], &down_host, HIDDEN * INTERMEDIATE).unwrap();
         let input = super::DeviceBuffer::upload(DEVICE, bytes(&input_bits)).unwrap();
         let gate = super::DeviceBuffer::upload(DEVICE, &gate_host).unwrap();
         let up = super::DeviceBuffer::upload(DEVICE, &up_host).unwrap();
@@ -594,29 +794,98 @@ mod tests {
         let mut packed_host = vec![0.0_f32; HIDDEN];
         generic.copy_to_host(bytes_mut(&mut generic_host)).unwrap();
         packed.copy_to_host(bytes_mut(&mut packed_host)).unwrap();
+        let mut activated = vec![0.0_f32; INTERMEDIATE];
+        for row in 0..INTERMEDIATE {
+            let gate = gate_values[row * HIDDEN..(row + 1) * HIDDEN].iter().zip(&input_values).map(|(weight, input)| bf16::from_f32(*weight).to_f32() * input).sum::<f32>();
+            let up = up_values[row * HIDDEN..(row + 1) * HIDDEN].iter().zip(&input_values).map(|(weight, input)| bf16::from_f32(*weight).to_f32() * input).sum::<f32>();
+            activated[row] = bf16::from_f32(gate / (1.0 + (-gate).exp()) * up).to_f32();
+        }
+        let expected = (0..HIDDEN).map(|row| down_values[row * INTERMEDIATE..(row + 1) * INTERMEDIATE].iter().zip(&activated).map(|(weight, value)| bf16::from_f32(*weight).to_f32() * value).sum::<f32>() * 0.75).collect::<Vec<_>>();
+        let mut cpu_max_abs = 0.0_f32;
         for (index, (&generic, &packed)) in generic_host.iter().zip(&packed_host).enumerate() {
             assert!(generic.is_finite() && packed.is_finite(), "index={index} generic={generic} packed={packed}");
+            if bitwise {
+                assert_eq!(packed.to_bits(), generic.to_bits(), "types={types:?} index={index} 专用 kernel 改变结果位模式");
+            }
             let tolerance = 0.02 * generic.abs().max(1.0);
             assert!((generic - packed).abs() <= tolerance, "index={index} generic={generic} packed={packed} tolerance={tolerance}");
+            let cpu_difference = (packed - expected[index]).abs();
+            cpu_max_abs = cpu_max_abs.max(cpu_difference);
+            let cpu_tolerance = 0.03 * expected[index].abs().max(1.0);
+            assert!(cpu_difference <= cpu_tolerance, "types={types:?} index={index} packed={packed} expected={} difference={cpu_difference} tolerance={cpu_tolerance}", expected[index]);
         }
+        eprintln!("[glm53-fused-decode-oracle] types={types:?} cpu_max_abs={cpu_max_abs:.6e}");
     }
 
     #[test]
     #[ignore = "需要 ROCm GPU"]
     fn glm53_iq4xs_fused_decode_matches_generic() {
-        assert_fused_decode_matches_generic([23, 23, 23]);
+        assert_fused_decode_matches_generic([23, 23, 23], false);
     }
 
     #[test]
     #[ignore = "需要 ROCm GPU"]
     fn glm53_iq3s_iq4xs_fused_decode_matches_generic() {
-        assert_fused_decode_matches_generic([21, 21, 23]);
+        assert_fused_decode_matches_generic([21, 21, 23], false);
+    }
+
+    #[test]
+    fn q8_single_expert_rows2_matches_single_rows() {
+        use half::bf16;
+        const DEVICE: i32 = 0;
+        const HIDDEN: usize = 512;
+        for intermediate in [256, 1024, 2048] {
+            let bits = (0..2 * HIDDEN).map(|i| bf16::from_f32(((i * 17 % 47) as f32 - 23.0) / 128.0).to_bits()).collect::<Vec<_>>();
+            let gate = super::DeviceBuffer::upload(DEVICE, &iq_rows(8, intermediate, HIDDEN, 7)).unwrap();
+            let up = super::DeviceBuffer::upload(DEVICE, &iq_rows(8, intermediate, HIDDEN, 37)).unwrap();
+            let down = super::DeviceBuffer::upload(DEVICE, &iq_rows(8, HIDDEN, intermediate, 67)).unwrap();
+            let meta = super::GgufGroupedExpertMeta { gate: gate.device_pointer() as u64, up: up.device_pointer() as u64, down: down.device_pointer() as u64, gate_type: 8, up_type: 8, down_type: 8 };
+            let metas = super::resident_gguf_grouped_metas(DEVICE, &[meta]).unwrap();
+            let input = super::DeviceBuffer::upload(DEVICE, bytes(&bits)).unwrap();
+            let ids = super::DeviceBuffer::upload(DEVICE, bytes(&[0_u32, 0])).unwrap();
+            let weights = super::DeviceBuffer::upload(DEVICE, bytes(&[0.37_f32, 0.81])).unwrap();
+            let output = super::DeviceBuffer::allocate(DEVICE, 2 * HIDDEN * 4).unwrap();
+            super::try_gguf_fused_decode_experts(DEVICE, &input, 2, HIDDEN, intermediate, 1, &ids, &weights, 2, &metas, &output).unwrap();
+            let mut actual = vec![0.0_f32; 2 * HIDDEN];
+            output.copy_to_host(bytes_mut(&mut actual)).unwrap();
+            for row in 0..2 {
+                let input = super::DeviceBuffer::upload(DEVICE, bytes(&bits[row * HIDDEN..(row + 1) * HIDDEN])).unwrap();
+                let ids = super::DeviceBuffer::upload(DEVICE, bytes(&[0_u32])).unwrap();
+                let weights = super::DeviceBuffer::upload(DEVICE, bytes(&[if row == 0 { 0.37_f32 } else { 0.81 }])).unwrap();
+                let output = super::DeviceBuffer::allocate(DEVICE, HIDDEN * 4).unwrap();
+                super::try_gguf_fused_decode_experts(DEVICE, &input, 1, HIDDEN, intermediate, 1, &ids, &weights, 1, &metas, &output).unwrap();
+                let mut expected = vec![0.0_f32; HIDDEN];
+                output.copy_to_host(bytes_mut(&mut expected)).unwrap();
+                for (col, value) in expected.iter().enumerate() {
+                    assert!(value.is_finite());
+                    assert_eq!(actual[row * HIDDEN + col].to_bits(), value.to_bits(), "intermediate={intermediate} row={row} col={col}");
+                }
+            }
+        }
     }
 
     #[test]
     #[ignore = "需要 ROCm GPU"]
     fn glm53_q8_0_fused_decode_matches_generic() {
-        assert_fused_decode_matches_generic([8, 8, 8]);
+        assert_fused_decode_matches_generic([8, 8, 8], false);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn glm53_iq4xs_q5k_fused_decode_matches_generic() {
+        assert_fused_decode_matches_generic([23, 23, 13], false);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn glm53_iq3s_q6k_fused_decode_matches_generic() {
+        assert_fused_decode_matches_generic([21, 21, 14], false);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn glm53_q3k_q4k_fused_decode_matches_generic_bits() {
+        assert_fused_decode_matches_generic([11, 11, 12], true);
     }
 }
 
@@ -635,6 +904,25 @@ fn try_gguf_fused_decode_experts_impl(
     output: &DeviceBuffer,
     uniform_types: Option<[u32; 3]>,
 ) -> Result<(), String> {
+    try_gguf_fused_decode_experts_with_workspace(device_id, input, input_rows, hidden_size, intermediate_size, top_k, route_ids, route_weights, route_count, metas, output, uniform_types, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_gguf_fused_decode_experts_with_workspace(
+    device_id: i32,
+    input: &DeviceBuffer,
+    input_rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    top_k: usize,
+    route_ids: &DeviceBuffer,
+    route_weights: &DeviceBuffer,
+    route_count: usize,
+    metas: &DeviceBuffer,
+    output: &DeviceBuffer,
+    uniform_types: Option<[u32; 3]>,
+    activated_workspace: Option<&DeviceBuffer>,
+) -> Result<(), String> {
     if input_rows == 0 || route_count != input_rows.checked_mul(top_k).ok_or("GGUF fused route 数溢出")? || route_count > 64 {
         return Err("GGUF fused decode 参数无效".to_owned());
     }
@@ -649,9 +937,15 @@ fn try_gguf_fused_decode_experts_impl(
     let input_is_bf16 = input.bytes == input_bytes_bf16;
     let iq3s_gate_up = input_is_bf16 && matches!(uniform_types, Some([21, 21, _]));
     let iq4xs_gate_up = input_is_bf16 && matches!(uniform_types, Some([23, 23, _]));
+    let q3_k_gate_up = input_is_bf16 && matches!(uniform_types, Some([11, 11, _]));
     let q8_0_gate_up = input_is_bf16 && matches!(uniform_types, Some([8, 8, _]));
     let iq4xs_down = intermediate_size.is_multiple_of(256) && matches!(uniform_types, Some([_, _, 23]));
     let q8_0_down = intermediate_size.is_multiple_of(256) && matches!(uniform_types, Some([_, _, 8]));
+    // 只有一个 metadata 条目时，两行才确定使用同一专家；routed top-1 不满足此前提。
+    let single_expert_rows2 = input_rows == 2 && top_k == 1 && metas.bytes() == std::mem::size_of::<GgufGroupedExpertMeta>();
+    let q4_k_down = intermediate_size.is_multiple_of(256) && matches!(uniform_types, Some([_, _, 12]));
+    let q5_k_down = intermediate_size.is_multiple_of(256) && matches!(uniform_types, Some([_, _, 13]));
+    let q6_k_down = intermediate_size.is_multiple_of(256) && matches!(uniform_types, Some([_, _, 14]));
     if route_ids.device_id != device_id || route_weights.device_id != device_id || route_ids.bytes < route_count * 4 || route_weights.bytes < route_count * 4 {
         return Err("GGUF fused decode 路由 device 不一致".to_owned());
     }
@@ -666,16 +960,24 @@ fn try_gguf_fused_decode_experts_impl(
         return Err("GGUF fused decode 输出 buffer 尺寸不匹配".to_owned());
     }
     let output_pointer = output.device_pointer();
-    // activated 常驻 workspace：只增不减，跨调用零分配。
     let activated_bytes = route_count.checked_mul(intermediate_size).and_then(|n| n.checked_mul(2)).ok_or("GGUF fused activated 溢出")?;
-    let activated_pointer = GGUF_FUSED_WORKSPACES.with(|workspaces| {
-        let mut workspaces = workspaces.borrow_mut();
-        let workspace = workspaces.entry(crate::kernel::rocm::hip::compute_workspace_key(device_id)).or_default();
-        if workspace.activated.as_ref().is_none_or(|buffer| buffer.bytes() < activated_bytes) {
-            workspace.activated = Some(DeviceBuffer::allocate(device_id, activated_bytes)?);
+    let activated_pointer = if let Some(workspace) = activated_workspace {
+        if workspace.device_id() != device_id || workspace.bytes() < activated_bytes {
+            return Err(format!("GGUF fused activated workspace 不匹配: device={}/{} bytes={}/{}", workspace.device_id(), device_id, workspace.bytes(), activated_bytes,));
         }
-        Ok::<usize, String>(workspace.activated.as_ref().expect("GGUF fused activated 已初始化").device_pointer())
-    })?;
+        workspace.device_pointer()
+    } else {
+        // eager 路径继续复用按 device+stream 的常驻 workspace；graph 必须由
+        // 调用方持有私有 buffer，否则后续多行 prefill 扩容会使固化指针悬垂。
+        GGUF_FUSED_WORKSPACES.with(|workspaces| {
+            let mut workspaces = workspaces.borrow_mut();
+            let workspace = workspaces.entry(crate::kernel::rocm::hip::compute_workspace_key(device_id)).or_default();
+            if workspace.activated.as_ref().is_none_or(|buffer| buffer.bytes() < activated_bytes) {
+                workspace.activated = Some(DeviceBuffer::allocate(device_id, activated_bytes)?);
+            }
+            Ok::<usize, String>(workspace.activated.as_ref().expect("GGUF fused activated 已初始化").device_pointer())
+        })?
+    };
 
     let mut assignments = u32::try_from(route_count).map_err(|_| "GGUF fused route 数超过 u32".to_owned())?;
     let mut tokens = u32::try_from(input_rows).map_err(|_| "GGUF fused tokens 超过 u32".to_owned())?;
@@ -683,6 +985,7 @@ fn try_gguf_fused_decode_experts_impl(
     let mut hidden = u32::try_from(hidden_size).map_err(|_| "GGUF fused hidden 超过 u32".to_owned())?;
     let mut intermediate = u32::try_from(intermediate_size).map_err(|_| "GGUF fused intermediate 超过 u32".to_owned())?;
     let mut is_bf16 = u32::from(input_is_bf16);
+    let gate_started = options().kernel_profile.then(std::time::Instant::now);
     {
         let mut input_pointer = input.pointer;
         let mut metas_pointer = d_metas.pointer;
@@ -700,25 +1003,58 @@ fn try_gguf_fused_decode_experts_impl(
             (&mut intermediate as *mut u32).cast(),
             (&mut is_bf16 as *mut u32).cast(),
         ];
-        let outputs_per_block = if iq3s_gate_up || iq4xs_gate_up { 32 } else { 16 };
+        let outputs_per_block = if iq3s_gate_up || iq4xs_gate_up || q3_k_gate_up { 32 } else { 16 };
         let grid_x = u32::try_from(intermediate_size.div_ceil(outputs_per_block)).map_err(|_| "GGUF fused grid 超过 u32".to_owned())?;
         let grid_y = u32::try_from(route_count).map_err(|_| "GGUF fused grid 超过 u32".to_owned())?;
         let function = if iq3s_gate_up {
             // wide-lite：同一布局的 u16 宽读版，逐位一致（iq3s_wave32_probe_bench 位级验证），
             // 生产实测 gate_up -8%。原 kernel 保留在模块内作对照。
-            functions.gguf_fused_gate_up_iq3s_wide
+            if input_rows == 2 {
+                functions.gguf_fused_gate_up_iq3s_wide_rows2
+            } else if input_rows > 2 {
+                // MTP verify 多行:同专家 assignment 由 leader 块一次读权重逐成员复用,
+                // 与 token-major 输出逐位一致(oracle 断言)。
+                functions.gguf_fused_gate_up_iq3s_wide_rowsn
+            } else {
+                functions.gguf_fused_gate_up_iq3s_wide
+            }
         } else if iq4xs_gate_up {
-            functions.gguf_fused_gate_up_iq4xs
+            if input_rows == 2 {
+                functions.gguf_fused_gate_up_iq4xs_rows2
+            } else if input_rows > 2 {
+                functions.gguf_fused_gate_up_iq4xs_rowsn
+            } else {
+                functions.gguf_fused_gate_up_iq4xs
+            }
+        } else if q3_k_gate_up {
+            functions.gguf_fused_gate_up_q3_k
+        } else if q8_0_gate_up && single_expert_rows2 {
+            functions.gguf_fused_gate_up_q8_0_rows2
         } else if q8_0_gate_up {
             functions.gguf_fused_gate_up_q8_0
         } else {
             functions.gguf_fused_gate_up
         };
-        let status = unsafe { module_launch(function as *mut c_void, grid_x, grid_y, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
+        let status = unsafe {
+            module_launch(function as *mut c_void, grid_x, if q8_0_gate_up && single_expert_rows2 { 1 } else { grid_y }, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut())
+        };
         if status != HIP_SUCCESS {
             return Err(runtime.hip_error(status, "hipModuleLaunchKernel GGUF fused gate_up"));
         }
     }
+    if let Some(started) = gate_started {
+        synchronize_device(device_id, "GGUF fused gate/up profile")?;
+        eprintln!("[rocm-kernel] gguf-fused-gate-up device={device_id} input_rows={input_rows} routes={route_count} top_k={top_k} types={uniform_types:?} wall={:.6}s", started.elapsed().as_secs_f64(),);
+        if input_rows > 1 && top_k > 1 {
+            let mut routes = vec![0_u32; route_count];
+            route_ids.copy_to_host(unsafe { std::slice::from_raw_parts_mut(routes.as_mut_ptr().cast(), route_count * std::mem::size_of::<u32>()) })?;
+            let top_k = top_k as usize;
+            let overlap = routes[..top_k].iter().filter(|expert| routes[top_k..].contains(expert)).count();
+            let unique = routes.iter().enumerate().filter(|(index, expert)| !routes[..*index].contains(expert)).count();
+            eprintln!("[rocm-kernel] gguf-route-overlap device={device_id} rows={input_rows} types={uniform_types:?} overlap={overlap} unique={unique} routes={routes:?}");
+        }
+    }
+    let down_started = options().kernel_profile.then(std::time::Instant::now);
     {
         let mut activated_pointer = activated_pointer;
         let mut metas_pointer = d_metas.pointer;
@@ -737,19 +1073,32 @@ fn try_gguf_fused_decode_experts_impl(
             (&mut hidden as *mut u32).cast(),
             (&mut intermediate as *mut u32).cast(),
         ];
-        let outputs_per_block = if iq4xs_down { 32 } else { 16 };
+        let outputs_per_block = if iq4xs_down || q4_k_down { 32 } else { 16 };
         let grid_x = u32::try_from(hidden_size.div_ceil(outputs_per_block)).map_err(|_| "GGUF fused grid 超过 u32".to_owned())?;
         let function = if iq4xs_down {
             functions.gguf_fused_down_iq4xs
+        } else if q8_0_down && single_expert_rows2 {
+            functions.gguf_fused_down_q8_0_rows2
         } else if q8_0_down {
             functions.gguf_fused_down_q8_0
+        } else if q4_k_down {
+            functions.gguf_fused_down_q4_k
+        } else if q5_k_down {
+            functions.gguf_fused_down_q5_k
+        } else if q6_k_down {
+            functions.gguf_fused_down_q6_k
         } else {
             functions.gguf_fused_down
         };
-        let status = unsafe { module_launch(function as *mut c_void, grid_x, tokens, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
+        let status =
+            unsafe { module_launch(function as *mut c_void, grid_x, if q8_0_down && single_expert_rows2 { 1 } else { tokens }, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
         if status != HIP_SUCCESS {
             return Err(runtime.hip_error(status, "hipModuleLaunchKernel GGUF fused down"));
         }
+    }
+    if let Some(started) = down_started {
+        synchronize_device(device_id, "GGUF fused down profile")?;
+        eprintln!("[rocm-kernel] gguf-fused-down device={device_id} input_rows={input_rows} routes={route_count} top_k={top_k} types={uniform_types:?} wall={:.6}s", started.elapsed().as_secs_f64(),);
     }
     Ok(())
 }
@@ -788,6 +1137,27 @@ pub(crate) fn try_gguf_fused_decode_experts_typed(
     uniform_types: Option<[u32; 3]>,
 ) -> Result<(), String> {
     try_gguf_fused_decode_experts_impl(device_id, input, input_rows, hidden_size, intermediate_size, top_k, route_ids, route_weights, route_count, metas, output, uniform_types)
+}
+
+/// Graph 录制专用：activated 地址必须由 graph 本身持有，不能引用 eager 的
+/// device+stream workspace；后者会在下一次更大 prefill 时扩容并释放旧地址。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_gguf_fused_decode_experts_typed_with_workspace(
+    device_id: i32,
+    input: &DeviceBuffer,
+    input_rows: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    top_k: usize,
+    route_ids: &DeviceBuffer,
+    route_weights: &DeviceBuffer,
+    route_count: usize,
+    metas: &DeviceBuffer,
+    output: &DeviceBuffer,
+    uniform_types: Option<[u32; 3]>,
+    activated_workspace: &DeviceBuffer,
+) -> Result<(), String> {
+    try_gguf_fused_decode_experts_with_workspace(device_id, input, input_rows, hidden_size, intermediate_size, top_k, route_ids, route_weights, route_count, metas, output, uniform_types, Some(activated_workspace))
 }
 
 /// IQ3_S 110B 块内重排为 112B：[d f16][pad 2B][scales 4B][qs 64B][qh 8B][signs 32B]。

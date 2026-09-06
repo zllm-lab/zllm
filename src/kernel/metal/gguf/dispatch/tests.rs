@@ -622,6 +622,27 @@ mod gguf_quant_tests {
     }
 
     #[test]
+    fn iq3_dual_gemv_matches_separate_dispatches() {
+        let ctx = MetalContext::new_default().unwrap();
+        let columns = 256usize;
+        let first_rows = 13usize;
+        let second_rows = 13usize;
+        let first_row = block(18);
+        let second_row = block(21);
+        let first_bytes = (0..first_rows).flat_map(|_| first_row.iter().copied()).collect::<Vec<_>>();
+        let second_bytes = (0..second_rows).flat_map(|_| second_row.iter().copied()).collect::<Vec<_>>();
+        let first_blob = ctx.resident_byte_weight_buffer(&first_bytes);
+        let second_blob = ctx.resident_byte_weight_buffer(&second_bytes);
+        let input_values = (0..columns).map(|index| ((index as f32) * 0.03125).sin()).collect::<Vec<_>>();
+        let input = ctx.tensor_from_f32(&input_values, 1, columns).unwrap();
+        let expected_first = gguf_matmul_tensor_resident(&ctx, &input, &first_blob, 18, first_row.len(), first_rows, columns).unwrap();
+        let expected_second = gguf_matmul_tensor_resident(&ctx, &input, &second_blob, 21, second_row.len(), second_rows, columns).unwrap();
+        let (actual_first, actual_second) = gguf_dual_gemv_iq3_tensor(&ctx, &input, &first_blob, 18, first_row.len(), first_rows, &second_blob, 21, second_row.len(), second_rows, columns).unwrap();
+        assert_eq!(ctx.tensor_to_f32(&actual_first), ctx.tensor_to_f32(&expected_first));
+        assert_eq!(ctx.tensor_to_f32(&actual_second), ctx.tensor_to_f32(&expected_second));
+    }
+
+    #[test]
     fn gguf_bf16和mxfp4_matvec_matches_cpu() {
         if metal::Device::system_default().is_none() {
             return;

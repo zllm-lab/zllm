@@ -2,7 +2,7 @@
 ///
 /// 共用 helper 见 [`super::preamble`]。`mod.rs` 的 `kernels_source()`
 /// 把 `preamble::SHADERS` 与各模块的 `SHADERS` 拼成完整字符串。
-// kernels: sample_top_p_f16, argmax_f16_bf16, argmax_f32, moe_router_sigmoid_topk_f16_bias_f16, moe_router_bias_topk_f32_weight, moe_router_sqrt_softplus_selected_f32_weight, moe_router_softmax_topk_f16, moe_router_softmax_topk_f32_weight, moe_router_logits_parallel_f32_input_weight, moe_router_softmax_topk_f32_input_weight, moe_router_softmax_topk_logits_f32, gather_rows_f16, gather_rows_f32, gather_rows_f32_to_f16, scatter_add_rows_weighted_f32, moe_sort_topk_by_id
+// kernels: sample_top_p_f16, argmax_f16_bf16, argmax_f32, moe_router_sigmoid_topk_f16_bias_f16, moe_router_bias_topk_f32_weight, moe_router_sqrt_softplus_selected_f32_weight, moe_router_softmax_topk_f16, moe_router_softmax_topk_f32_weight, moe_router_logits_parallel_f32_input_weight, moe_router_logits_parallel_f16_input_f32_weight, moe_router_softmax_topk_f32_input_weight, moe_router_softmax_topk_logits_f32, moe_router_sigmoid_bias_topk_logits_f32, gather_rows_f16, gather_rows_f32, gather_rows_f32_to_f16, scatter_add_rows_weighted_f32, moe_sort_topk_by_id
 // private helpers: threadgroup_sum_64
 pub const SHADERS: &str = r#"
 inline float threadgroup_sum_64(
@@ -596,6 +596,27 @@ kernel void moe_router_logits_parallel_f32_input_weight(
     const float total = threadgroup_sum_64(logit, partial, simd_group, simd_lane);
     if (lane == 0) logits[expert] = total;
 }
+kernel void moe_router_logits_parallel_f16_input_f32_weight(
+    device const half *input [[buffer(0)]],
+    device const float *weight [[buffer(1)]],
+    device float *logits [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant uint &expert_count [[buffer(4)]],
+    uint expert [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    if (expert >= expert_count) return;
+    const ulong weight_base = ulong(expert) * columns;
+    float logit = 0.0f;
+    for (uint column = lane; column < columns; column += 64) {
+        logit += float(input[column]) * weight[weight_base + column];
+    }
+    threadgroup float partial[2];
+    const float total = threadgroup_sum_64(logit, partial, simd_group, simd_lane);
+    if (lane == 0) logits[expert] = total;
+}
 kernel void moe_router_softmax_topk_f32_input_weight(
     device const float *input [[buffer(0)]],
     device const float *weight [[buffer(1)]],
@@ -667,6 +688,43 @@ kernel void moe_router_softmax_topk_logits_f32(
         const ulong output = ulong(row) * top_k + lane;
         output_ids[output] = expert_ids[lane];
         output_weights[output] = exp(logits[lane] - logits[0]) / denominator * scaling_factor;
+    }
+}
+kernel void moe_router_sigmoid_bias_topk_logits_f32(
+    device const float *input_logits [[buffer(0)]],
+    device const float *bias [[buffer(1)]],
+    device uint *output_ids [[buffer(2)]],
+    device float *output_weights [[buffer(3)]],
+    constant uint &expert_count [[buffer(4)]],
+    constant uint &top_k [[buffer(5)]],
+    constant float &scaling_factor [[buffer(6)]],
+    uint lane [[thread_index_in_threadgroup]],
+    uint width [[threads_per_threadgroup]])
+{
+    threadgroup float corrected_scores[256];
+    threadgroup float raw_scores[256];
+    threadgroup uint expert_ids[256];
+    threadgroup float top_sum;
+    float raw = -INFINITY;
+    float corrected = -INFINITY;
+    if (lane < expert_count) {
+        raw = 1.0f / (1.0f + exp(-input_logits[lane]));
+        corrected = raw + bias[lane];
+    }
+    corrected_scores[lane] = corrected;
+    raw_scores[lane] = raw;
+    expert_ids[lane] = lane;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    moe_bitonic_sort(corrected_scores, raw_scores, expert_ids, true, lane, width);
+    if (lane == 0) {
+        float sum = 0.0f;
+        for (uint index = 0; index < top_k; ++index) sum += raw_scores[index];
+        top_sum = max(sum, 1.0e-20f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane < top_k) {
+        output_ids[lane] = expert_ids[lane];
+        output_weights[lane] = raw_scores[lane] / top_sum * scaling_factor;
     }
 }
 kernel void gather_rows_f16(
@@ -846,6 +904,71 @@ pub fn moe_router_tensor_resident_f32(
     let expert_ids = unsafe { std::slice::from_raw_parts(output_ids.contents().cast::<u32>(), output_len) }.to_vec();
     let weights = unsafe { std::slice::from_raw_parts(output_weights.contents().cast::<f32>(), output_len) }.to_vec();
     Ok(MetalRouting { expert_ids, weights, rows: input.rows, top_k, expert_ids_buffer: output_ids, weights_buffer: output_weights })
+}
+
+/// 单 token sigmoid+bias 路由留在设备队列，供完整 resident expert archive
+/// 直接消费。logit 按 expert 展开成并行 threadgroup，避免单组串行扫描全部权重。
+#[allow(clippy::too_many_arguments)]
+pub fn moe_router_sigmoid_decode_resident_f32(
+    ctx: &MetalContext,
+    input: &MetalTensor,
+    weight: &metal::Buffer,
+    weight_len: usize,
+    bias: &metal::Buffer,
+    bias_len: usize,
+    expert_count: usize,
+    top_k: usize,
+    scaling_factor: f32,
+) -> Result<(metal::Buffer, metal::Buffer), String> {
+    if input.rows != 1 || weight_len != expert_count.checked_mul(input.cols).ok_or("resident sigmoid router weight 大小溢出")? || bias_len != expert_count {
+        return Err(format!("resident sigmoid router shape 异常: input=[{},{}] weight={weight_len} bias={bias_len} experts={expert_count}", input.rows, input.cols));
+    }
+    if expert_count == 0 || expert_count > 256 || top_k == 0 || top_k > expert_count || !scaling_factor.is_finite() || scaling_factor <= 0.0 {
+        return Err(format!("resident sigmoid router 参数非法: experts={expert_count} top_k={top_k} scale={scaling_factor}"));
+    }
+    let input = to_f16_tensor(ctx, input)?;
+    let sort_size = expert_count.next_power_of_two();
+    const LOGIT_THREADS: usize = 64;
+    let logits_pipeline = ctx.pipeline("moe_router_logits_parallel_f16_input_f32_weight")?;
+    let topk_pipeline = ctx.pipeline("moe_router_sigmoid_bias_topk_logits_f32")?;
+    if LOGIT_THREADS as u64 > logits_pipeline.max_total_threads_per_threadgroup() || sort_size as u64 > topk_pipeline.max_total_threads_per_threadgroup() {
+        return Err(format!("resident sigmoid router 需要 {sort_size} threads，设备最多支持 {}", topk_pipeline.max_total_threads_per_threadgroup()));
+    }
+    let (output_ids, output_weights) = ctx.routing_readback_buffers(top_k);
+    let logits = ctx.tensor_kernel_output_f32(1, expert_count);
+    let columns = validate_u32("columns", input.cols)?;
+    let experts = validate_u32("expert_count", expert_count)?;
+    let top_k_u32 = validate_u32("top_k", top_k)?;
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&logits_pipeline);
+    encoder.set_buffer(0, Some(&input.buffer), 0);
+    encoder.set_buffer(1, Some(weight), 0);
+    encoder.set_buffer(2, Some(&logits.buffer), 0);
+    set_bytes(&encoder, 3, &columns);
+    set_bytes(&encoder, 4, &experts);
+    encoder.dispatch_thread_groups(MTLSize::new(expert_count as u64, 1, 1), MTLSize::new(LOGIT_THREADS as u64, 1, 1));
+    encoder.end_encoding();
+
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&topk_pipeline);
+    encoder.set_buffer(0, Some(&logits.buffer), 0);
+    encoder.set_buffer(1, Some(bias), 0);
+    encoder.set_buffer(2, Some(&output_ids), 0);
+    encoder.set_buffer(3, Some(&output_weights), 0);
+    set_bytes(&encoder, 4, &experts);
+    set_bytes(&encoder, 5, &top_k_u32);
+    set_bytes(&encoder, 6, &scaling_factor);
+    encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(sort_size as u64, 1, 1));
+    encoder.end_encoding();
+    ctx.commit_and_wait_profiled(
+        &command,
+        "moe_router_sigmoid_topk_resident_f32",
+        &format!("rows=1,columns={columns},experts={experts},top_k={top_k_u32}"),
+        input.buffer.length() + weight.length() + bias.length() + logits.buffer.length(),
+        logits.buffer.length() + output_ids.length() + output_weights.length(),
+    );
+    Ok((output_ids, output_weights))
 }
 
 /// Token-hash 层只计算表中指定的专家；权重仍按原始 sqrt(softplus) 分数归一化。
@@ -1093,7 +1216,14 @@ pub fn moe_router_softmax_decode_resident_f32(
 }
 
 pub fn prewarm_resident_decode_router(ctx: &MetalContext) -> Result<(), String> {
-    for pipeline in ["moe_router_logits_parallel_f32_input_weight", "moe_router_softmax_topk_logits_f32", "moe_sort_topk_by_id"] {
+    for pipeline in [
+        "moe_router_logits_parallel_f32_input_weight",
+        "moe_router_logits_parallel_f16_input_f32_weight",
+        "moe_router_softmax_topk_logits_f32",
+        "moe_router_sigmoid_bias_topk_logits_f32",
+        "moe_router_bias_topk_f32_weight",
+        "moe_sort_topk_by_id",
+    ] {
         drop(ctx.pipeline(pipeline)?);
     }
     Ok(())
@@ -1529,6 +1659,25 @@ mod deepseek_router_tests {
     }
 
     #[test]
+    fn resident_sigmoid_router_matches_readback_path() {
+        let ctx = MetalContext::new_default().unwrap();
+        let input = ctx.tensor_from_f32_preserve(&[0.5, -1.0, 2.0, 0.25], 1, 4).unwrap();
+        let weights = [0.1, 0.2, 0.3, 0.4, -0.5, 0.6, 0.1, -0.2, 0.7, -0.1, 0.2, 0.3, 0.4, 0.5, -0.6, 0.1];
+        let biases = [0.05, -0.2, 0.1, 0.0];
+        let weight = f32_buffer(&ctx, &weights);
+        let bias = f32_buffer(&ctx, &biases);
+        let expected = moe_router_tensor_resident_f32(&ctx, &input, &weight, weights.len(), &bias, biases.len(), 4, 2, 2.5, 1).unwrap();
+        let (ids, values) = moe_router_sigmoid_decode_resident_f32(&ctx, &input, &weight, weights.len(), &bias, biases.len(), 4, 2, 2.5).unwrap();
+        ctx.synchronize();
+        let actual_ids = unsafe { std::slice::from_raw_parts(ids.contents().cast::<u32>(), 2) };
+        let actual_values = unsafe { std::slice::from_raw_parts(values.contents().cast::<f32>(), 2) };
+        assert_eq!(actual_ids, expected.expert_ids);
+        for (actual, expected) in actual_values.iter().zip(expected.weights) {
+            assert!((*actual - expected).abs() <= 1.0e-6, "actual={actual} expected={expected}");
+        }
+    }
+
+    #[test]
     fn shared_ordering_keeps_score_descending_and_id_ascending() {
         let ctx = MetalContext::new_default().unwrap();
         let input = ctx.tensor_from_f32(&[1.0, 0.0], 1, 2).unwrap();
@@ -1566,5 +1715,30 @@ mod deepseek_router_tests {
         assert_eq!(argmax_tensor(&ctx, &input, &excluded).unwrap(), 123);
         // 无排除时全局最大值(在第二个 partial 段尾部附近)
         assert_eq!(argmax_tensor(&ctx, &input, &[]).unwrap(), 7);
+    }
+
+    #[test]
+    fn sample_top_p大词表下与cpu参考逐点一致() {
+        // K2-Horizon 词表规模(250624)下的采样一致性:尖峰分布 + 长尾,nucleus
+        // 边界由头部 logit 决定,采样点扫过 [0,1) 各区间;内核若把核边界算宽,
+        // random→1 时会抽到长尾 token,与 CPU 参考立刻分叉。
+        if crate::backend::metal::api::Device::system_default().is_none() {
+            return;
+        }
+        let ctx = MetalContext::new_default().unwrap();
+        let vocab = 250_624usize;
+        let mut logits = vec![-12.0f32; vocab];
+        for (index, value) in [(7usize, 9.5f32), (1234, 9.0), (100_000, 8.6), (200_001, 8.2), (250_000, 7.9), (64, 7.5), (4096, 7.2), (99_999, 7.0)] {
+            logits[index] = value;
+        }
+        // 内核输入是 f16(tensor_from_f32 产出 F16);参考实现用同一批 f16 舍入值,
+        // 排除精度差干扰,只验证算法。
+        let logits: Vec<f32> = logits.iter().map(|&value| half::f16::from_f32(value).to_f32()).collect();
+        let input = ctx.tensor_from_f32(&logits, 1, vocab).unwrap();
+        for random in [0.0f32, 0.13, 0.42, 0.77, 0.93, 0.999] {
+            let metal = sample_top_p_tensor(&ctx, &input, 1.0, 0.95, random).unwrap();
+            let cpu = crate::kernel::cpu::sample_top_p(&logits, 1.0, 0.95, random).unwrap();
+            assert_eq!(metal, cpu, "random={random}: metal={metal} cpu={cpu} 采样不一致");
+        }
     }
 }

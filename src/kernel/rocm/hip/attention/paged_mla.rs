@@ -43,6 +43,7 @@ struct PagedMlaFunctions {
     dsa_score_native_wmma_i8: usize,
     dsa_score_wmma: usize,
     dsa_score_native_wmma: usize,
+    dsa_score_native_wmma_rows2: usize,
     dsa_score_native_wmma_decode: usize,
     dsa_score_native_wmma_kpool: usize,
     dsa_score_prefix_native_wmma: usize,
@@ -1603,6 +1604,7 @@ fn try_dsa_select_paged_q8_impl(
     let use_wmma = !hadamard_i8 && head_count.is_multiple_of(16) && head_dim.is_multiple_of(16);
     let use_native_wmma = use_wmma && functions.dense_wmma && options().native_dsa_wmma;
     let single_row_native_wmma = use_native_wmma && query_rows == 1;
+    let rows2_native_wmma = use_native_wmma && query_rows == 2;
     let use_native_i8 = hadamard_i8 && head_count.is_multiple_of(16) && functions.dense_wmma && options().native_dsa_wmma;
     let compact_select = top_k <= 4096;
     let compact_shard_scores = shard_parity <= 1 && query_rows == 1;
@@ -1624,6 +1626,8 @@ fn try_dsa_select_paged_q8_impl(
     let score_histogram_shared_bytes: u32 = if compact_select {
         if single_row_native_wmma {
             256 * 4
+        } else if rows2_native_wmma {
+            2 * 256 * 4
         } else if use_native_wmma || use_native_i8 {
             4 * 256 * 4
         } else {
@@ -1877,6 +1881,8 @@ fn try_dsa_select_paged_q8_impl(
                     functions.dsa_score_prefix_native_wmma
                 } else if single_row_native_wmma {
                     functions.dsa_score_native_wmma_decode
+                } else if rows2_native_wmma {
+                    functions.dsa_score_native_wmma_rows2
                 } else {
                     functions.dsa_score_native_wmma
                 }
@@ -1886,7 +1892,15 @@ fn try_dsa_select_paged_q8_impl(
                 functions.dsa_score
             },
             u32::try_from(batch_tile_count).map_err(|_| "DSA tile grid 超过 u32")?,
-            if use_native_wmma || use_native_i8 { current_rows_u32.div_ceil(4) } else { current_rows_u32 },
+            if single_row_native_wmma {
+                current_rows_u32
+            } else if rows2_native_wmma {
+                current_rows_u32.div_ceil(2)
+            } else if use_native_wmma || use_native_i8 {
+                current_rows_u32.div_ceil(4)
+            } else {
+                current_rows_u32
+            },
             if single_row_native_wmma {
                 256
             } else if use_native_wmma || use_native_i8 {
@@ -1911,6 +1925,8 @@ fn try_dsa_select_paged_q8_impl(
                     "HIP DSA score prefix native WMMA"
                 } else if single_row_native_wmma {
                     "HIP DSA score decode native WMMA"
+                } else if rows2_native_wmma {
+                    "HIP DSA score rows2 native WMMA"
                 } else {
                     "HIP DSA score native WMMA"
                 }
@@ -2763,9 +2779,9 @@ fn try_paged_mla_attention_ct_inner(
         (&mut scale_u32 as *mut u32).cast(),
         (&mut bits_u32 as *mut u32).cast(),
     ];
-    let absorb_wmma = query_rows > 1 && options().mla_absorb_wmma;
+    let absorb_wmma = query_rows > 2 && options().mla_absorb_wmma;
     // decode W8G32 向量化臂按 64 latent 列/block 发射（kernel 内同条件门控）。
-    let absorb_w8v = query_rows == 1 && weight.bits == 8 && weight.group_size == 32 && latent_dim.is_multiple_of(64) && q_head_dim > rope_dim && (q_head_dim - rope_dim).is_multiple_of(16) && q_head_dim - rope_dim <= 1024;
+    let absorb_w8v = query_rows <= 2 && weight.bits == 8 && weight.group_size == 32 && latent_dim.is_multiple_of(64) && q_head_dim > rope_dim && (q_head_dim - rope_dim).is_multiple_of(16) && q_head_dim - rope_dim <= 1024;
     let absorb_tile = if absorb_wmma {
         128
     } else if absorb_w8v {
@@ -2894,13 +2910,14 @@ fn try_paged_mla_attention_ct_inner(
     };
     // gfx11 每个 workgroup 最多使用 64 KiB LDS；超限形态保留原标量路径。
     let selected_wmma_q8 = selected_wmma_shared.is_some_and(|bytes| bytes <= WMMA_MAX_SHARED_BYTES);
+    let batch_split_decode = query_rows > 1 && query_rows <= 8 && split_decode && shard.is_none() && selection.is_some() && selected_wmma_q8;
     // 区分 dense / sparse / decode 路径的 profile 标签，仅用于 [mla-profile] 归因。
     let mut attention_kind = "decode_split";
-    if query_rows == 1 && split_decode {
+    if query_rows == 1 && split_decode || batch_split_decode {
         // selected decode 的 latent 预重排：一次散读把 top-k 行收集到连续
         // workspace，scan 各 head-group 不再对同一批行做冗余散读。仅非分片路径
         // （分片下 gathered 行序与 parity compact 行号不一致，不适用）。
-        if selected_wmma_q8 && shard.is_none() && selection.is_some() && latent_scales.is_some() && latent_group_size != 0 && top_k >= 1024 {
+        if query_rows == 1 && selected_wmma_q8 && shard.is_none() && selection.is_some() && latent_scales.is_some() && latent_group_size != 0 && top_k >= 1024 {
             let visible_rows = query_start.checked_add(1).ok_or("paged MLA decode visible rows 溢出")?.min(context_rows);
             let gather_rows = visible_rows.min(top_k);
             let selection = selection.expect("selected 已检查");
@@ -2917,7 +2934,7 @@ fn try_paged_mla_attention_ct_inner(
             d_selection = identity.pointer;
         }
         let requested_tile_size = options().mla_decode_tile_size;
-        let visible_rows = query_start.checked_add(1).ok_or("paged MLA decode visible rows 溢出")?.min(context_rows);
+        let visible_rows = query_start.checked_add(query_rows).ok_or("paged MLA decode visible rows 溢出")?.min(context_rows);
         // DSA selection 按逻辑候选区间拆分，tile 内再映射到真实分页位置。
         let decode_rows = if selection.is_some() { visible_rows.min(top_k) } else { visible_rows };
         // WMMA kernel 已按 shard_parity 把全局 token 映射到本卡紧凑物理行；
@@ -2938,8 +2955,8 @@ fn try_paged_mla_attention_ct_inner(
         if tile_count == 0 || tile_count > DECODE_MAX_TILES {
             return Err(format!("paged MLA decode tile_count={tile_count} 非法"));
         }
-        let partial_elements = tile_count.checked_mul(head_count).and_then(|elements| elements.checked_mul(latent_dim)).ok_or("paged MLA decode partial 元素数溢出")?;
-        let stats_elements = tile_count.checked_mul(head_count).and_then(|elements| elements.checked_mul(2)).ok_or("paged MLA decode stats 元素数溢出")?;
+        let partial_elements = query_rows.checked_mul(tile_count).and_then(|elements| elements.checked_mul(head_count)).and_then(|elements| elements.checked_mul(latent_dim)).ok_or("paged MLA decode partial 元素数溢出")?;
+        let stats_elements = query_rows.checked_mul(tile_count).and_then(|elements| elements.checked_mul(head_count)).and_then(|elements| elements.checked_mul(2)).ok_or("paged MLA decode stats 元素数溢出")?;
         let partial_bytes = partial_elements.checked_mul(std::mem::size_of::<f32>()).ok_or("paged MLA decode partial 字节数溢出")?;
         let stats_bytes = stats_elements.checked_mul(std::mem::size_of::<f32>()).ok_or("paged MLA decode stats 字节数溢出")?;
         let (partial, stats) = PAGED_MLA_SPLIT_WORKSPACES.with(|workspaces| -> Result<_, String> {
@@ -2952,6 +2969,7 @@ fn try_paged_mla_attention_ct_inner(
         let mut d_stats = stats.pointer;
         let mut tile_size_u32 = u32::try_from(decode_tile_size).map_err(|_| "paged MLA decode tile_size 超过 u32")?;
         let mut tile_count_u32 = u32::try_from(tile_count).map_err(|_| "paged MLA decode tile_count 超过 u32")?;
+        let mut split_tile_count_u32 = tile_count_u32;
         let mut stage_chunk_u32 = 0_u32;
         let mut partial_args = [
             (&mut d_query as *mut *mut c_void).cast(),
@@ -3054,9 +3072,11 @@ fn try_paged_mla_attention_ct_inner(
                 (&mut block_u32 as *mut u32).cast(),
                 (&mut selected_u32 as *mut u32).cast(),
                 (&mut tile_size_u32 as *mut u32).cast(),
+                (&mut split_tile_count_u32 as *mut u32).cast(),
                 (&mut shard_u32 as *mut u32).cast(),
             ];
-            launch_moe_kernel(launch_function, heads_u32.div_ceil(WMMA_HEADS_PER_BLOCK as u32), tile_count_u32, 256, launch_shared, &mut wmma_args, "HIP paged MLA decode partial Q8 WMMA")?;
+            let grid_y = tile_count_u32.checked_mul(query_rows_u32).ok_or("paged MLA decode grid y 溢出")?;
+            launch_moe_kernel(launch_function, heads_u32.div_ceil(WMMA_HEADS_PER_BLOCK as u32), grid_y, 256, launch_shared, &mut wmma_args, "HIP paged MLA decode partial Q8 WMMA")?;
         } else {
             launch_moe_kernel(functions.decode_partial, heads_u32.div_ceil(4), tile_count_u32, 256, decode_shared_u32, &mut partial_args, "HIP paged MLA decode partial")?;
         }
@@ -3069,7 +3089,7 @@ fn try_paged_mla_attention_ct_inner(
             (&mut tile_count_u32 as *mut u32).cast(),
             (&mut d_merged_stats as *mut *mut c_void).cast(),
         ];
-        launch_moe_kernel(functions.split_merge_pl, heads_u32 * latent_u32.div_ceil(128), 1, 128, 0, &mut merge_args, "HIP paged MLA decode merge")?;
+        launch_moe_kernel(functions.split_merge_pl, heads_u32 * latent_u32.div_ceil(128), query_rows_u32, 128, 0, &mut merge_args, "HIP paged MLA decode merge")?;
     } else {
         let dense_prefill =
             functions.dense_wmma && (selection.is_none() || force_dense_prefill) && query_rows > 1 && latent_dim.is_multiple_of(16) && rope_dim.is_multiple_of(16) && (latent_group_size == 0 || latent_group_size.is_multiple_of(16));
@@ -3139,6 +3159,7 @@ fn try_paged_mla_attention_ct_inner(
         if sparse_prefill_wmma {
             d_direct_weighted = d_weighted;
             let mut direct_tile_size_u32 = topk_u32;
+            let mut direct_split_tile_count_u32 = 1u32;
             let mut direct_args = [
                 (&mut d_query as *mut *mut c_void).cast(),
                 (&mut d_absorbed as *mut *mut c_void).cast(),
@@ -3162,6 +3183,7 @@ fn try_paged_mla_attention_ct_inner(
                 (&mut block_u32 as *mut u32).cast(),
                 (&mut selected_u32 as *mut u32).cast(),
                 (&mut direct_tile_size_u32 as *mut u32).cast(),
+                (&mut direct_split_tile_count_u32 as *mut u32).cast(),
                 (&mut shard_u32 as *mut u32).cast(),
             ];
             launch_moe_kernel(
@@ -3262,12 +3284,22 @@ fn try_paged_mla_attention_ct_inner(
         (&mut bits_u32 as *mut u32).cast(),
     ];
     let value_dim = kv_head_dim.checked_sub(q_head_dim - rope_dim).ok_or("paged MLA value_dim 下溢")?;
-    let project_wmma = query_rows > 1;
+    let project_wmma = query_rows > 2;
+    // W8G32 单行 decode 走 perm 直读臂(kv_b 权重 W8A16 直读省一次发散常量查表,
+    // 真机 oracle 已过);perm kernel 仅支持该形态,形状或行数不满足时必须回落原
+    // kernel——kernel 内部对不满足的形态是直接返回不写输出,host 侧不门控会静默产错。
+    let project_perm = !project_wmma && query_rows == 1 && bits_u32 == 8 && group_u32 == 32 && latent_u32 % 128 == 0;
     let project_tile = if project_wmma { 128 } else { 16 };
     let project_tiles = head_count.checked_mul(value_dim.div_ceil(project_tile)).ok_or("paged MLA project grid x 溢出")?;
     let project_started = profile_mla.then(std::time::Instant::now);
     launch_moe_kernel(
-        if project_wmma { functions.project_value_wmma } else { functions.project_value },
+        if project_wmma {
+            functions.project_value_wmma
+        } else if project_perm {
+            functions.project_value_perm
+        } else {
+            functions.project_value
+        },
         u32::try_from(project_tiles).map_err(|_| "paged MLA project grid x 超过 u32")?,
         u32::try_from(query_rows.div_ceil(project_tile)).map_err(|_| "paged MLA project grid y 超过 u32")?,
         if project_wmma { functions.wavefront_size * 8 } else { 256 },
@@ -3833,6 +3865,65 @@ mod tests {
                 let mismatch = specialized_scores[..context_rows].iter().zip(&legacy_score_host[..context_rows]).position(|(specialized, legacy)| specialized != legacy).unwrap();
                 return Err(format!("DSA decode score bitwise oracle 不一致: context={context_rows} token={mismatch} specialized={} legacy={}", specialized_scores[mismatch], legacy_score_host[mismatch]));
             }
+        } else if use_native_wmma && query_rows == 2 {
+            let mut specialized_scores = vec![0_u32; query_rows * score_stride];
+            scores.copy_to_host(as_bytes_mut(&mut specialized_scores))?;
+            let legacy_scores = DeviceBuffer::allocate(DEVICE_ID, query_rows * score_stride * 4)?;
+            let legacy_histograms = DeviceBuffer::allocate(DEVICE_ID, query_rows * 256 * 4)?;
+            let mut d_histograms = legacy_histograms.pointer;
+            let mut histogram_elements = (query_rows * 256) as u32;
+            let mut clear_args = [(&mut d_histograms as *mut *mut c_void).cast(), (&mut histogram_elements as *mut u32).cast()];
+            launch_tensor_kernel(functions.dsa_clear, histogram_elements.div_ceil(256), 256, &mut clear_args, "HIP DSA rows2 legacy histogram oracle")?;
+
+            let mut d_keys = keys.pointer;
+            let mut d_scales = scales.pointer;
+            let mut d_table = block_table.pointer;
+            let mut d_query = query.pointer;
+            let mut d_weights = head_weights.pointer;
+            let mut d_legacy_scores = legacy_scores.pointer;
+            let mut rows = query_rows as u32;
+            let mut context = context_rows as u32;
+            let mut start = query_start as u32;
+            let mut heads = HEAD_COUNT as u32;
+            let mut dim = HEAD_DIM as u32;
+            let mut group = KEY_GROUP_SIZE as u32;
+            let mut block = BLOCK_SIZE as u32;
+            let mut tile = tile_rows as u32;
+            let mut stride = score_stride as u32;
+            let mut parity = 2_u32;
+            let mut legacy_args = [
+                (&mut d_keys as *mut *mut c_void).cast(),
+                (&mut d_scales as *mut *mut c_void).cast(),
+                (&mut d_table as *mut *mut c_void).cast(),
+                (&mut d_query as *mut *mut c_void).cast(),
+                (&mut d_weights as *mut *mut c_void).cast(),
+                (&mut d_legacy_scores as *mut *mut c_void).cast(),
+                (&mut d_histograms as *mut *mut c_void).cast(),
+                (&mut rows as *mut u32).cast(),
+                (&mut context as *mut u32).cast(),
+                (&mut start as *mut u32).cast(),
+                (&mut heads as *mut u32).cast(),
+                (&mut dim as *mut u32).cast(),
+                (&mut group as *mut u32).cast(),
+                (&mut block as *mut u32).cast(),
+                (&mut tile as *mut u32).cast(),
+                (&mut stride as *mut u32).cast(),
+                (&mut parity as *mut u32).cast(),
+            ];
+            launch_moe_kernel(functions.dsa_score_native_wmma, context.div_ceil(tile), rows.div_ceil(4), 512, 4 * 256 * 4, &mut legacy_args, "HIP DSA rows2 score legacy bitwise oracle")?;
+            super::super::synchronize_device(DEVICE_ID, "HIP DSA rows2 score bitwise oracle")?;
+            let mut legacy_score_host = vec![0_u32; query_rows * score_stride];
+            legacy_scores.copy_to_host(as_bytes_mut(&mut legacy_score_host))?;
+            for row in 0..query_rows {
+                let visible = query_start + row + 1;
+                let start = row * score_stride;
+                let specialized = &specialized_scores[start..start + visible];
+                let legacy = &legacy_score_host[start..start + visible];
+                if specialized != legacy {
+                    let token = specialized.iter().zip(legacy).position(|(specialized, legacy)| specialized != legacy).unwrap();
+                    return Err(format!("DSA rows2 score bitwise oracle 不一致: context={context_rows} row={row} token={token} specialized={} legacy={}", specialized[token], legacy[token]));
+                }
+            }
         }
         if use_native_wmma && query_rows >= 8 && context_rows >= 128 * 1024 {
             let mut d_keys = keys.pointer;
@@ -4015,6 +4106,12 @@ mod tests {
         compare_score_pipeline(131_073, 8, true).unwrap();
         compare_score_pipeline(1025, 3, false).unwrap();
         compare_score_pipeline(32_774, 1, false).unwrap();
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm gfx11+ GPU"]
+    fn dsa_rows2_native_wmma_matches_legacy_bits() {
+        compare_score_pipeline(46_160, 2, false).unwrap();
     }
 
     #[test]
@@ -4607,12 +4704,12 @@ mod tests {
             let half_output_bytes = output_bytes / 2;
             let owner_half = DeviceBuffer::allocate(DEVICE_ID, half_output_bytes).unwrap();
             let peer_half = DeviceBuffer::allocate(DEVICE_ID, half_output_bytes).unwrap();
+            let merged_full = DeviceBuffer::allocate(DEVICE_ID, output_bytes).unwrap();
+            let merged_full_reverse = DeviceBuffer::allocate(DEVICE_ID, output_bytes).unwrap();
             try_paged_mla_shard_merge_project_heads_ct(DEVICE_ID, &owner.weighted, &peer.weighted, &owner.stats, &peer.stats, weight_ref(), query_rows, q_projection, HEADS, 0, HEADS / 2, ROPE, &owner_half).unwrap();
             try_paged_mla_shard_merge_project_heads_ct(DEVICE_ID, &peer.weighted, &owner.weighted, &peer.stats, &owner.stats, weight_ref(), query_rows, q_projection, HEADS, HEADS / 2, HEADS / 2, ROPE, &peer_half).unwrap();
-            // decode 的单次汇合路径由 owner 直接物化全部 heads；同一个 kernel
-            // 必须在 head_count=HEADS 时仍与未分片 attention 一致。
-            let merged_full = DeviceBuffer::allocate(DEVICE_ID, output_bytes).unwrap();
             try_paged_mla_shard_merge_project_heads_ct(DEVICE_ID, &owner.weighted, &peer.weighted, &owner.stats, &peer.stats, weight_ref(), query_rows, q_projection, HEADS, 0, HEADS, ROPE, &merged_full).unwrap();
+            try_paged_mla_shard_merge_project_heads_ct(DEVICE_ID, &peer.weighted, &owner.weighted, &peer.stats, &owner.stats, weight_ref(), query_rows, q_projection, HEADS, 0, HEADS, ROPE, &merged_full_reverse).unwrap();
             super::super::synchronize_device(DEVICE_ID, "HIP MLA parity shard oracle").unwrap();
             let decode = |buffer: &DeviceBuffer| {
                 if query_rows == 1 {
@@ -4633,7 +4730,6 @@ mod tests {
             assert!(max_abs <= if query_rows == 1 { 2.0e-2 } else { 5.0e-2 }, "rows={query_rows} max_abs={max_abs}");
             let owner_half = decode(&owner_half);
             let peer_half = decode(&peer_half);
-            let merged_full = decode(&merged_full);
             let half_columns = q_projection / 2;
             let head_reduce_scatter_max_abs = (0..query_rows)
                 .flat_map(|row| {
@@ -4644,9 +4740,12 @@ mod tests {
                 .fold(0.0_f32, f32::max);
             println!("[mla-head-reduce-scatter-oracle] rows={query_rows} context={CONTEXT_ROWS} max_abs={head_reduce_scatter_max_abs:.6e}");
             assert!(head_reduce_scatter_max_abs <= if query_rows == 1 { 2.0e-2 } else { 5.0e-2 }, "rows={query_rows} head reduce-scatter max_abs={head_reduce_scatter_max_abs}");
+            let merged_full = decode(&merged_full);
+            let merged_full_reverse = decode(&merged_full_reverse);
             let full_merge_max_abs = merged_full.iter().zip(&full).map(|(actual, expected)| (actual - expected).abs()).fold(0.0_f32, f32::max);
-            println!("[mla-head-full-merge-oracle] rows={query_rows} context={CONTEXT_ROWS} max_abs={full_merge_max_abs:.6e}");
-            assert!(full_merge_max_abs <= if query_rows == 1 { 2.0e-2 } else { 5.0e-2 }, "rows={query_rows} full head merge max_abs={full_merge_max_abs}");
+            println!("[mla-full-head-merge-oracle] rows={query_rows} context={CONTEXT_ROWS} max_abs={full_merge_max_abs:.6e}");
+            assert!(full_merge_max_abs <= if query_rows == 1 { 2.0e-2 } else { 5.0e-2 }, "rows={query_rows} full-head merge max_abs={full_merge_max_abs}");
+            assert!(merged_full.iter().zip(&merged_full_reverse).all(|(owner_first, peer_first)| owner_first.to_bits() == peer_first.to_bits()), "rows={query_rows} 交换 shard 顺序后 full-head merge 必须逐位一致");
         }
 
         // prefill 的全局候选表先按 parity 紧凑拆分；pair 两半的 WMMA
@@ -5153,6 +5252,141 @@ mod tests {
         assert!(max_abs <= 1.0e-3, "max_abs={max_abs} index={max_index}");
     }
 
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn mla_w8g32_rows2_edges_match_independent_rows1() {
+        const DEVICE_ID: i32 = 0;
+        const QUERY_ROWS: usize = 2;
+        const HEAD_COUNT: usize = 64;
+        const Q_HEAD_DIM: usize = 256;
+        const KV_HEAD_DIM: usize = 448;
+        const LATENT_DIM: usize = 512;
+        const ROPE_DIM: usize = 64;
+        const GROUP_SIZE: usize = 32;
+        const REPEATS: usize = 100;
+
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        let query_row_elements = HEAD_COUNT * Q_HEAD_DIM;
+        let query_host = (0..QUERY_ROWS * query_row_elements).map(|index| ((index * 29 % 257) as f32 - 128.0) * (1.0 / 512.0)).collect::<Vec<_>>();
+        let weight_rows = HEAD_COUNT * KV_HEAD_DIM;
+        let packed = (0..weight_rows * LATENT_DIM)
+            .map(|index| {
+                let row = index / LATENT_DIM;
+                let column = index % LATENT_DIM;
+                ((row * 17 + column * 13) % 255) as u8
+            })
+            .collect::<Vec<_>>();
+        let groups = LATENT_DIM / GROUP_SIZE;
+        let scale_bits = (0..weight_rows * groups).map(|index| half::f16::from_f32(((index * 7 % 5 + 1) as f32) * (1.0 / 512.0)).to_bits()).collect::<Vec<_>>();
+        let query_pair = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query_host)).unwrap();
+        let query_rows = [DeviceBuffer::upload(DEVICE_ID, as_bytes(&query_host[..query_row_elements])).unwrap(), DeviceBuffer::upload(DEVICE_ID, as_bytes(&query_host[query_row_elements..])).unwrap()];
+        let packed = DeviceBuffer::upload(DEVICE_ID, &packed).unwrap();
+        let scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&scale_bits)).unwrap();
+        let absorbed_pair = DeviceBuffer::allocate(DEVICE_ID, QUERY_ROWS * HEAD_COUNT * LATENT_DIM * 2).unwrap();
+        let absorbed_rows = [DeviceBuffer::allocate(DEVICE_ID, HEAD_COUNT * LATENT_DIM * 2).unwrap(), DeviceBuffer::allocate(DEVICE_ID, HEAD_COUNT * LATENT_DIM * 2).unwrap()];
+        let functions = paged_mla_functions(DEVICE_ID).unwrap();
+        let launch_absorb = |query: &DeviceBuffer, rows: u32, output: &DeviceBuffer| {
+            let mut d_query = query.pointer;
+            let mut d_packed = packed.pointer;
+            let mut d_scales = scales.pointer;
+            let mut d_output = output.pointer;
+            let mut rows = rows;
+            let mut heads = HEAD_COUNT as u32;
+            let mut q_head = Q_HEAD_DIM as u32;
+            let mut kv_head = KV_HEAD_DIM as u32;
+            let mut latent = LATENT_DIM as u32;
+            let mut rope = ROPE_DIM as u32;
+            let mut group = GROUP_SIZE as u32;
+            let mut scale_dtype = 1u32;
+            let mut bits = 8u32;
+            let mut args = [
+                (&mut d_query as *mut *mut c_void).cast(),
+                (&mut d_packed as *mut *mut c_void).cast(),
+                (&mut d_scales as *mut *mut c_void).cast(),
+                (&mut d_output as *mut *mut c_void).cast(),
+                (&mut rows as *mut u32).cast(),
+                (&mut heads as *mut u32).cast(),
+                (&mut q_head as *mut u32).cast(),
+                (&mut kv_head as *mut u32).cast(),
+                (&mut latent as *mut u32).cast(),
+                (&mut rope as *mut u32).cast(),
+                (&mut group as *mut u32).cast(),
+                (&mut scale_dtype as *mut u32).cast(),
+                (&mut bits as *mut u32).cast(),
+            ];
+            launch_moe_kernel(functions.absorb_query, (HEAD_COUNT * (LATENT_DIM / 64)) as u32, 1, 256, 0, &mut args, "HIP MLA W8G32 rows2 absorb oracle").unwrap();
+        };
+        launch_absorb(&query_pair, 2, &absorbed_pair);
+        launch_absorb(&query_rows[0], 1, &absorbed_rows[0]);
+        launch_absorb(&query_rows[1], 1, &absorbed_rows[1]);
+        super::super::synchronize_device(DEVICE_ID, "HIP MLA W8G32 rows2 absorb oracle").unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..REPEATS {
+            launch_absorb(&query_pair, 2, &absorbed_pair);
+        }
+        super::super::synchronize_device(DEVICE_ID, "HIP MLA W8G32 rows2 absorb bench").unwrap();
+        let absorb_us = started.elapsed().as_secs_f64() * 1e6 / REPEATS as f64;
+        let pair_absorbed = absorbed_pair.download_u16(QUERY_ROWS * HEAD_COUNT * LATENT_DIM).unwrap();
+        for row in 0..QUERY_ROWS {
+            let reference = absorbed_rows[row].download_u16(HEAD_COUNT * LATENT_DIM).unwrap();
+            assert_eq!(&pair_absorbed[row * reference.len()..(row + 1) * reference.len()], reference, "absorb row={row}");
+        }
+
+        let output_pair = DeviceBuffer::allocate(DEVICE_ID, QUERY_ROWS * query_row_elements * 2).unwrap();
+        let output_rows = [DeviceBuffer::allocate(DEVICE_ID, query_row_elements * 4).unwrap(), DeviceBuffer::allocate(DEVICE_ID, query_row_elements * 4).unwrap()];
+        let launch_project = |input: &DeviceBuffer, rows: u32, output: &DeviceBuffer| {
+            let mut d_input = input.pointer;
+            let mut d_packed = packed.pointer;
+            let mut d_scales = scales.pointer;
+            let mut d_output = output.pointer;
+            let mut rows = rows;
+            let mut heads = HEAD_COUNT as u32;
+            let mut weight_head_start = 0u32;
+            let mut q_head = Q_HEAD_DIM as u32;
+            let mut kv_head = KV_HEAD_DIM as u32;
+            let mut latent = LATENT_DIM as u32;
+            let mut rope = ROPE_DIM as u32;
+            let mut group = GROUP_SIZE as u32;
+            let mut scale_dtype = 1u32;
+            let mut bits = 8u32;
+            let mut args = [
+                (&mut d_input as *mut *mut c_void).cast(),
+                (&mut d_packed as *mut *mut c_void).cast(),
+                (&mut d_scales as *mut *mut c_void).cast(),
+                (&mut d_output as *mut *mut c_void).cast(),
+                (&mut rows as *mut u32).cast(),
+                (&mut heads as *mut u32).cast(),
+                (&mut weight_head_start as *mut u32).cast(),
+                (&mut q_head as *mut u32).cast(),
+                (&mut kv_head as *mut u32).cast(),
+                (&mut latent as *mut u32).cast(),
+                (&mut rope as *mut u32).cast(),
+                (&mut group as *mut u32).cast(),
+                (&mut scale_dtype as *mut u32).cast(),
+                (&mut bits as *mut u32).cast(),
+            ];
+            let value_dim = KV_HEAD_DIM - (Q_HEAD_DIM - ROPE_DIM);
+            launch_moe_kernel(functions.project_value, (HEAD_COUNT * value_dim.div_ceil(16)) as u32, 1, 256, 0, &mut args, "HIP MLA W8G32 rows2 project oracle").unwrap();
+        };
+        launch_project(&absorbed_pair, 2, &output_pair);
+        launch_project(&absorbed_rows[0], 1, &output_rows[0]);
+        launch_project(&absorbed_rows[1], 1, &output_rows[1]);
+        super::super::synchronize_device(DEVICE_ID, "HIP MLA W8G32 rows2 project oracle").unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..REPEATS {
+            launch_project(&absorbed_pair, 2, &output_pair);
+        }
+        super::super::synchronize_device(DEVICE_ID, "HIP MLA W8G32 rows2 project bench").unwrap();
+        let project_us = started.elapsed().as_secs_f64() * 1e6 / REPEATS as f64;
+        let pair_output = output_pair.download_u16(QUERY_ROWS * query_row_elements).unwrap();
+        for row in 0..QUERY_ROWS {
+            let reference = output_rows[row].download_f32(query_row_elements).unwrap();
+            let reference = reference.into_iter().map(|value| half::bf16::from_f32(value).to_bits()).collect::<Vec<_>>();
+            assert_eq!(&pair_output[row * query_row_elements..(row + 1) * query_row_elements], reference, "project row={row}");
+        }
+        eprintln!("[mla-rows2-edge-oracle] absorb_us={absorb_us:.1} project_us={project_us:.1}");
+    }
+
     /// PV perm 直读臂 oracle：zllm_w8_perm_f16 构造 f16(1024+u) +
     /// zllm_f16x2_dot2 累加，-1152·Σx_g 修偏置。与 W8G32 标量臂同 CPU 参考，
     /// bf16 容差族（Mac 端 numpy 仿真 max_abs≈6e-5），门槛沿用 1e-3。
@@ -5464,6 +5698,101 @@ mod tests {
         }
         TEST_MLA_DECODE_WMMA.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn mla_rows2_decode_split_matches_sparse_wmma_and_reports_latency() {
+        const DEVICE_ID: i32 = 0;
+        const QUERY_ROWS: usize = 2;
+        const CONTEXT_ROWS: usize = 4_096;
+        const TOP_K: usize = 2_048;
+        const HEAD_COUNT: usize = 64;
+        const Q_HEAD_DIM: usize = 256;
+        const Q_PROJECTION: usize = HEAD_COUNT * Q_HEAD_DIM;
+        const LATENT_DIM: usize = 512;
+        const KV_HEAD_DIM: usize = 448;
+        const KV_PROJECTION: usize = HEAD_COUNT * KV_HEAD_DIM;
+        const ROPE_DIM: usize = 64;
+        const LATENT_GROUP: usize = 64;
+        const WEIGHT_GROUP: usize = 32;
+        const BLOCK_SIZE: usize = 128;
+
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        TEST_MLA_DECODE_WMMA.store(true, std::sync::atomic::Ordering::Relaxed);
+        TEST_SPARSE_PREFILL_WMMA.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let query = (0..QUERY_ROWS * Q_PROJECTION).map(|index| ((index % 257) as f32 - 128.0) * (1.0 / 256.0)).collect::<Vec<_>>();
+        let latent = (0..CONTEXT_ROWS * LATENT_DIM).map(|index| (((index * 29 + index / LATENT_DIM * 7) % 127) as i16 - 63) as i8 as u8).collect::<Vec<_>>();
+        let latent_scales = vec![0x3b80_u16; CONTEXT_ROWS * (LATENT_DIM / LATENT_GROUP)];
+        let rope = (0..CONTEXT_ROWS * ROPE_DIM).map(|index| (((index * 13) % 127) as f32 - 63.0) * (1.0 / 128.0)).map(|value| (value.to_bits() >> 16) as u16).collect::<Vec<_>>();
+        let table = (0..CONTEXT_ROWS.div_ceil(BLOCK_SIZE) as u32).collect::<Vec<_>>();
+        let query_start = CONTEXT_ROWS - QUERY_ROWS;
+        let selection = (0..QUERY_ROWS)
+            .flat_map(|row| {
+                let visible = query_start + row + 1;
+                (0..TOP_K).map(move |index| ((index * 251 + row * 17) % visible) as u32)
+            })
+            .collect::<Vec<_>>();
+        let weight = (0..KV_PROJECTION * LATENT_DIM).map(|index| (121 + (index * 17 + index / 7) % 15) as u8).collect::<Vec<_>>();
+        let weight_scales = vec![half::f16::from_f32(0.02).to_bits(); KV_PROJECTION * (LATENT_DIM / WEIGHT_GROUP)];
+        let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query)).unwrap();
+        let latent = DeviceBuffer::upload(DEVICE_ID, &latent).unwrap();
+        let latent_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&latent_scales)).unwrap();
+        let rope = DeviceBuffer::upload(DEVICE_ID, as_bytes(&rope)).unwrap();
+        let table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&table)).unwrap();
+        let selection = DeviceBuffer::upload(DEVICE_ID, as_bytes(&selection)).unwrap();
+        let weight = DeviceBuffer::upload(DEVICE_ID, &weight).unwrap();
+        let weight_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&weight_scales)).unwrap();
+        let serial = DeviceBuffer::allocate(DEVICE_ID, QUERY_ROWS * Q_PROJECTION * 2).unwrap();
+        let split = DeviceBuffer::allocate(DEVICE_ID, QUERY_ROWS * Q_PROJECTION * 2).unwrap();
+
+        let run = |output: &DeviceBuffer, split_decode| {
+            let started = std::time::Instant::now();
+            try_paged_mla_attention_ct_into(
+                DEVICE_ID,
+                &query,
+                &latent,
+                Some(&latent_scales),
+                LATENT_GROUP,
+                &rope,
+                &table,
+                Some(&selection),
+                CtMlaWeightRef { packed: &weight, scales: &weight_scales, rows: KV_PROJECTION, cols: LATENT_DIM, group_size: WEIGHT_GROUP, scale_dtype: 1, bits: 8 },
+                QUERY_ROWS,
+                CONTEXT_ROWS,
+                query_start,
+                Q_PROJECTION,
+                HEAD_COUNT,
+                ROPE_DIM,
+                TOP_K,
+                BLOCK_SIZE,
+                output,
+                Some(split_decode),
+            )
+            .unwrap();
+            super::super::synchronize_device(DEVICE_ID, "HIP MLA rows2 split oracle").unwrap();
+            started.elapsed().as_secs_f64() * 1e3
+        };
+        run(&serial, false);
+        run(&split, true);
+        let serial_ms = (0..3).map(|_| run(&serial, false)).sum::<f64>() / 3.0;
+        let split_ms = (0..3).map(|_| run(&split, true)).sum::<f64>() / 3.0;
+        let serial = serial.download_u16(QUERY_ROWS * Q_PROJECTION).unwrap();
+        let split = split.download_u16(QUERY_ROWS * Q_PROJECTION).unwrap();
+        let mut max_abs = 0.0_f32;
+        let mut squared = 0.0_f64;
+        for (index, (&reference, &candidate)) in serial.iter().zip(&split).enumerate() {
+            let reference = f32::from_bits(u32::from(reference) << 16);
+            let candidate = f32::from_bits(u32::from(candidate) << 16);
+            assert!(reference.is_finite() && candidate.is_finite(), "index={index} serial={reference} split={candidate}");
+            let error = (reference - candidate).abs();
+            max_abs = max_abs.max(error);
+            squared += f64::from(error) * f64::from(error);
+        }
+        let rmse = (squared / serial.len() as f64).sqrt();
+        eprintln!("[mla-rows2-split-oracle] serial_ms={serial_ms:.3} split_ms={split_ms:.3} speedup={:.3} max_abs={max_abs:.6e} rmse={rmse:.6e}", serial_ms / split_ms);
+        assert!(max_abs <= 2.0e-2, "max_abs={max_abs}");
+    }
 }
 
 #[cfg(test)]
@@ -5732,6 +6061,7 @@ mod decode_scan_bench {
             let mut block = BLOCK_SIZE as u32;
             let mut selected = 1_u32;
             let mut tile_u32 = tile_size as u32;
+            let mut split_tiles = tile_count as u32;
             let mut shard = 2_u32;
             let mut args = [
                 (&mut d_query as *mut *mut c_void).cast(),
@@ -5756,6 +6086,7 @@ mod decode_scan_bench {
                 (&mut block as *mut u32).cast(),
                 (&mut selected as *mut u32).cast(),
                 (&mut tile_u32 as *mut u32).cast(),
+                (&mut split_tiles as *mut u32).cast(),
                 (&mut shard as *mut u32).cast(),
             ];
             let shared = if kernel != functions.decode_partial_wmma_q8 { colpar_shared } else { baseline_shared } as u32;
@@ -5913,6 +6244,7 @@ mod decode_scan_bench {
             let mut block = BLOCK_SIZE as u32;
             let mut selected = 1_u32;
             let mut tile_u32 = TILE as u32;
+            let mut split_tiles = tile_count as u32;
             let mut shard = 2_u32;
             let mut mask_u32 = 15_u32;
             let mut args = [
@@ -5938,6 +6270,7 @@ mod decode_scan_bench {
                 (&mut block as *mut u32).cast(),
                 (&mut selected as *mut u32).cast(),
                 (&mut tile_u32 as *mut u32).cast(),
+                (&mut split_tiles as *mut u32).cast(),
                 (&mut shard as *mut u32).cast(),
                 (&mut mask_u32 as *mut u32).cast(),
             ];

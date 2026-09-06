@@ -126,6 +126,48 @@ kernel void gqa_kv_quantize_q8(
         codes[base + index] = char(clamp(rint(element * inverse_scale), -127.0f, 127.0f));
     }
 }
+// Replay 单行量化：输入始终是一行，cache 写入行由 state[0] 动态指定。
+kernel void gqa_kv_quantize_q8_position(
+    device const ushort *key [[buffer(0)]],
+    device const ushort *value [[buffer(1)]],
+    device char *key_codes [[buffer(2)]],
+    device half *key_scales [[buffer(3)]],
+    device char *value_codes [[buffer(4)]],
+    device half *value_scales [[buffer(5)]],
+    constant uint *decode_state [[buffer(6)]],
+    constant uint &kv_head_count [[buffer(7)]],
+    constant uint &head_dim [[buffer(8)]],
+    constant uint &group_size [[buffer(9)]],
+    constant uint &groups_per_head [[buffer(10)]],
+    constant uint &bf16 [[buffer(11)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint groups_per_row = kv_head_count * groups_per_head;
+    if (gid >= groups_per_row * 2 || group_size == 0) return;
+    const bool is_value = gid >= groups_per_row;
+    const uint group = gid - (is_value ? groups_per_row : 0);
+    const uint group_in_head = group % groups_per_head;
+    const ulong input_base = ulong(group) * group_size;
+    const ulong output_group = ulong(decode_state[0]) * groups_per_row + group;
+    const ulong output_base = output_group / groups_per_head * head_dim + group_in_head * group_size;
+    device const ushort *input = is_value ? value : key;
+    device char *codes = is_value ? value_codes : key_codes;
+    device half *scales = is_value ? value_scales : key_scales;
+    float maximum = 0.0f;
+    for (uint index = 0; index < group_size; ++index) {
+        const ushort bits = input[input_base + index];
+        const float element = bf16 != 0 ? zllm_bf16_to_f32(bits) : float(as_type<half>(bits));
+        maximum = max(maximum, abs(element));
+    }
+    const float scale = maximum > 0.0f ? maximum / 127.0f : 1.0f;
+    scales[output_group] = half(scale);
+    const float inverse_scale = 1.0f / scale;
+    for (uint index = 0; index < group_size; ++index) {
+        const ushort bits = input[input_base + index];
+        const float element = bf16 != 0 ? zllm_bf16_to_f32(bits) : float(as_type<half>(bits));
+        codes[output_base + index] = char(clamp(rint(element * inverse_scale), -127.0f, 127.0f));
+    }
+}
 kernel void gqa_kv_dequantize_q8(
     device const char *key_codes [[buffer(0)]],
     device const half *key_scales [[buffer(1)]],
@@ -600,7 +642,7 @@ kernel void gqa_decode_split_kv(
     device const ushort *value [[buffer(2)]],
     device float *statistics [[buffer(3)]],
     device float *partial_values [[buffer(4)]],
-    constant uint &source_rows [[buffer(5)]],
+    constant uint *decode_state [[buffer(5)]],
     constant uint &head_count [[buffer(6)]],
     constant uint &kv_head_count [[buffer(7)]],
     constant uint &head_dim [[buffer(8)]],
@@ -608,7 +650,6 @@ kernel void gqa_decode_split_kv(
     constant uint &block_count [[buffer(10)]],
     constant float &score_scale [[buffer(11)]],
     constant uint &bf16 [[buffer(12)]],
-    constant uint &first_visible [[buffer(13)]],
     constant uint &kv_capacity [[buffer(14)]],
     device const half *key_scales [[buffer(15)]],
     device const half *value_scales [[buffer(16)]],
@@ -624,6 +665,9 @@ kernel void gqa_decode_split_kv(
     constexpr uint heads_per_group = 4;
     constexpr uint max_head_dim = 512;
     constexpr uint max_block_tokens = 256;
+    const uint kv_rows = decode_state[1];
+    const uint first_visible = decode_state[2];
+    const uint source_rows = kv_rows - first_visible;
     if (kv_head_count == 0 || head_count % kv_head_count != 0) return;
     const uint heads_per_kv = head_count / kv_head_count;
     if (heads_per_kv == 0) return;
@@ -633,8 +677,25 @@ kernel void gqa_decode_split_kv(
     const uint head_group = group.y - kv_head * head_groups_per_kv;
     const uint first_head_offset = head_group * heads_per_group;
     const uint active_heads = min(heads_per_group, heads_per_kv - first_head_offset);
+    const uint first_query_head = kv_head * heads_per_kv + first_head_offset;
     if (block >= block_count || kv_head >= kv_head_count || head_dim > max_head_dim
         || block_tokens == 0 || block_tokens > max_block_tokens) return;
+
+    const uint active_block_count = (source_rows + block_tokens - 1) / block_tokens;
+    if (block >= active_block_count) {
+        for (uint query_head = 0; query_head < active_heads; ++query_head) {
+            const uint global_head = first_query_head + query_head;
+            const ulong statistic = (ulong(global_head) * block_count + block) * 2;
+            if (thread_index == 0) {
+                statistics[statistic] = -INFINITY;
+                statistics[statistic + 1] = 0.0f;
+            }
+            for (uint dimension = thread_index; dimension < head_dim; dimension += max_block_tokens) {
+                partial_values[(ulong(global_head) * block_count + block) * head_dim + dimension] = 0.0f;
+            }
+        }
+        return;
+    }
 
     const uint row_begin = block * block_tokens;
     const uint rows = min(block_tokens, source_rows - row_begin);
@@ -644,9 +705,11 @@ kernel void gqa_decode_split_kv(
     threadgroup float reduction[256];
     threadgroup half key_scale_tile[2048];
     threadgroup half value_scale_tile[2048];
+    // head_dim<=128 时按 token 拆给多个线程分区；总槽位恒为
+    // heads_per_group*256，不随实际维度增长。
+    threadgroup float value_partials[heads_per_group * 256];
 
     const uint query_elements = active_heads * head_dim;
-    const uint first_query_head = kv_head * heads_per_kv + first_head_offset;
     for (uint index = thread_index; index < query_elements; index += max_block_tokens) {
         const ushort bits = query[ulong(first_query_head) * head_dim + index];
         query_tile[index] = half(bf16 != 0 ? zllm_bf16_to_f32(bits) : float(as_type<half>(bits)));
@@ -718,7 +781,6 @@ kernel void gqa_decode_split_kv(
             : 0.0f;
         if (thread_index < rows) weights[weight_base + thread_index] = weight;
         const float simd_denominator = simd_sum(weight);
-        // 所有 SIMD group 读完广播的 maximum 后，group 0 才能复用 reduction[0]。
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (simd_lane == 0) reduction[simd_group] = simd_denominator;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -736,7 +798,50 @@ kernel void gqa_decode_split_kv(
         }
     }
 
-    for (uint dimension = thread_index; dimension < head_dim; dimension += max_block_tokens) {
+    if (head_dim <= 128) {
+        const uint value_parts = min(256u / head_dim, 8u);
+        const uint value_part = thread_index / head_dim;
+        const uint dimension = thread_index - value_part * head_dim;
+        if (value_part < value_parts) {
+            float accumulated[heads_per_group];
+            for (uint query_head = 0; query_head < active_heads; ++query_head) accumulated[query_head] = 0.0f;
+            for (uint token = value_part; token < rows; token += value_parts) {
+                const uint source = first_visible + row_begin + token;
+                const uint slot = kv_capacity == 0 ? source : source % kv_capacity;
+                const ulong value_index = ((ulong(slot) * kv_head_count + kv_head) * head_dim) + dimension;
+                float value_element;
+                if (q8 != 0) {
+                    const device char *codes = reinterpret_cast<device const char *>(value);
+                    const ulong scale = (ulong(slot) * kv_head_count + kv_head) * groups_per_head + dimension / group_size;
+                    const half quant_scale = tiled_q8_scales
+                        ? value_scale_tile[token * groups_per_head + dimension / group_size]
+                        : value_scales[scale];
+                    value_element = float(codes[value_index]) * float(quant_scale);
+                } else {
+                    const ushort bits = value[value_index];
+                    value_element = bf16 != 0 ? zllm_bf16_to_f32(bits) : float(as_type<half>(bits));
+                }
+                for (uint query_head = 0; query_head < active_heads; ++query_head) {
+                    accumulated[query_head] += weights[query_head * max_block_tokens + token] * value_element;
+                }
+            }
+            for (uint query_head = 0; query_head < active_heads; ++query_head) {
+                value_partials[(query_head * value_parts + value_part) * head_dim + dimension] = accumulated[query_head];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_index < head_dim) {
+            for (uint query_head = 0; query_head < active_heads; ++query_head) {
+                float accumulated = 0.0f;
+                for (uint part = 0; part < value_parts; ++part) {
+                    accumulated += value_partials[(query_head * value_parts + part) * head_dim + thread_index];
+                }
+                const uint global_head = first_query_head + query_head;
+                const ulong partial = (ulong(global_head) * block_count + block) * head_dim + thread_index;
+                partial_values[partial] = accumulated;
+            }
+        }
+    } else for (uint dimension = thread_index; dimension < head_dim; dimension += max_block_tokens) {
         float accumulated[heads_per_group];
         for (uint query_head = 0; query_head < active_heads; ++query_head) accumulated[query_head] = 0.0f;
         for (uint token = 0; token < rows; ++token) {
@@ -992,13 +1097,12 @@ kernel void gqa_decode_direct_q8_append(
     device half *value_scales [[buffer(5)]],
     device const ushort *new_key [[buffer(6)]],
     device const ushort *new_value [[buffer(7)]],
-    constant uint &source_rows [[buffer(8)]],
+    constant uint *decode_state [[buffer(8)]],
     constant uint &head_count [[buffer(9)]],
     constant uint &kv_head_count [[buffer(10)]],
     constant uint &head_dim [[buffer(11)]],
     constant float &score_scale [[buffer(12)]],
     constant uint &bf16 [[buffer(13)]],
-    constant uint &first_visible [[buffer(14)]],
     constant uint &group_size [[buffer(15)]],
     constant uint &groups_per_head [[buffer(16)]],
     uint group [[threadgroup_position_in_grid]],
@@ -1007,10 +1111,13 @@ kernel void gqa_decode_direct_q8_append(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_groups [[simdgroups_per_threadgroup]])
 {
-    constexpr uint heads_per_group = 2;   // heads_per_kv=8 时 8 个 threadgroup,延迟链减半
+    constexpr uint heads_per_group = 2;
     constexpr uint max_rows = 512;
     constexpr uint max_head_dim = 128;
-    constexpr uint max_kv_columns = 512;
+    constexpr uint max_kv_columns = 1024;
+    const uint kv_rows = decode_state[1];
+    const uint first_visible = decode_state[2];
+    const uint source_rows = kv_rows - first_visible;
     if (kv_head_count == 0 || head_count % kv_head_count != 0) return;
     const uint heads_per_kv = head_count / kv_head_count;
     if (heads_per_kv == 0) return;
@@ -1031,8 +1138,8 @@ kernel void gqa_decode_direct_q8_append(
     // 当前行(最后一行)的量化副本:全 threadgroup 共享,注意力与 group 0 回写都用它。
     threadgroup char new_key_codes[max_kv_columns];
     threadgroup char new_value_codes[max_kv_columns];
-    threadgroup half new_key_scales[8];
-    threadgroup half new_value_scales[8];
+    threadgroup half new_key_scales[16];
+    threadgroup half new_value_scales[16];
 
     // 量化当前行:每个 64 元素 group 一个 SIMD group(K/V 合计 group 数 = 2*kv*groups_per_head)。
     {
@@ -1065,7 +1172,7 @@ kernel void gqa_decode_direct_q8_append(
     // group 0 回写 cache(当前行 = source_rows - 1;scales 的 threadgroup 数组布局
     // 与设备布局相同:group 索引 = kv_head * groups_per_head + group_in_head)。
     if (group == 0) {
-        const uint row = source_rows - 1;
+        const uint row = kv_rows - 1;
         for (uint index = thread_index; index < kv_columns; index += 256) {
             key_codes[row * kv_columns + index] = new_key_codes[index];
             value_codes[row * kv_columns + index] = new_value_codes[index];
@@ -3482,6 +3589,230 @@ pub(crate) fn gqa_decode_attention_append_direct_q8_tensor(ctx: &MetalContext, q
         spec.score_scale,
         view.group_size,
     )
+}
+
+/// Q8 replay 的小上下文 decode：KV 行数与写入位置从
+/// `[position, kv_rows, first_visible]` state 槽读取，dispatch 形状保持静态。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gqa_decode_attention_append_direct_q8_position_tensor(
+    ctx: &MetalContext,
+    query: &MetalTensor,
+    new_key: &MetalTensor,
+    new_value: &MetalTensor,
+    view: &MetalGqaCacheView,
+    spec: &GqaSpec,
+    decode_state: &metal::Buffer,
+    state_offset: u64,
+) -> Result<MetalTensor, String> {
+    const THREADS: usize = 256;
+    let key_scale_offset = view.key_scale_offset.ok_or("GQA replay direct-append 缺少 K scales")?;
+    let value_scale_offset = view.value_scale_offset.ok_or("GQA replay direct-append 缺少 V scales")?;
+    if view.format != MetalKvCacheFormat::Int8
+        || spec.window != CausalWindow::Full
+        || spec.num_kv_heads == 0
+        || !spec.num_heads.is_multiple_of(spec.num_kv_heads)
+        || spec.head_dim > 128
+        || !spec.head_dim.is_multiple_of(32)
+        || !spec.head_dim.is_multiple_of(view.group_size)
+        || !view.group_size.is_multiple_of(4)
+        || spec.num_kv_heads * spec.head_dim > 1024
+        || spec.num_kv_heads * (spec.head_dim / view.group_size) > 16
+    {
+        return Err(format!("GQA replay direct-append 维度不符: format={:?}, heads={}, kv_heads={}, head_dim={}, group={}", view.format, spec.num_heads, spec.num_kv_heads, spec.head_dim, view.group_size));
+    }
+    if query.rows != 1 || new_key.rows != 1 || new_value.rows != 1 || new_key.cols != spec.num_kv_heads * spec.head_dim || new_value.cols != spec.num_kv_heads * spec.head_dim {
+        return Err(format!("GQA replay direct-append shape 不符: Q=[{},{}] K=[{},{}] V=[{},{}]", query.rows, query.cols, new_key.rows, new_key.cols, new_value.rows, new_value.cols));
+    }
+    let output = if query.dtype == MetalTensorDType::Bf16 { ctx.tensor_kernel_output_bf16(1, query.cols) } else { ctx.tensor_kernel_output(1, query.cols) };
+    let pipeline = ctx.pipeline("gqa_decode_direct_q8_append")?;
+    if THREADS as u64 > pipeline.max_total_threads_per_threadgroup() {
+        return Err("GQA replay direct-append 需要 256 threads，超过 Metal pipeline 上限".to_owned());
+    }
+    let heads = validate_u32("GQA replay direct-append heads", spec.num_heads)?;
+    let kv_heads = validate_u32("GQA replay direct-append KV heads", spec.num_kv_heads)?;
+    let dimension = validate_u32("GQA replay direct-append head dim", spec.head_dim)?;
+    let bf16 = u32::from(query.dtype == MetalTensorDType::Bf16);
+    let group_size = validate_u32("GQA replay direct-append group size", view.group_size)?;
+    let groups_per_head = validate_u32("GQA replay direct-append groups per head", spec.head_dim / view.group_size)?;
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(&query.buffer), 0);
+    encoder.set_buffer(1, Some(&view.buffer), view.key_offset);
+    encoder.set_buffer(2, Some(&view.buffer), view.value_offset);
+    encoder.set_buffer(3, Some(&output.buffer), 0);
+    encoder.set_buffer(4, Some(&view.buffer), key_scale_offset);
+    encoder.set_buffer(5, Some(&view.buffer), value_scale_offset);
+    encoder.set_buffer(6, Some(&new_key.buffer), 0);
+    encoder.set_buffer(7, Some(&new_value.buffer), 0);
+    encoder.set_buffer(8, Some(decode_state), state_offset);
+    set_bytes(&encoder, 9, &heads);
+    set_bytes(&encoder, 10, &kv_heads);
+    set_bytes(&encoder, 11, &dimension);
+    set_bytes(&encoder, 12, &spec.score_scale);
+    set_bytes(&encoder, 13, &bf16);
+    set_bytes(&encoder, 15, &group_size);
+    set_bytes(&encoder, 16, &groups_per_head);
+    let head_groups = spec.num_kv_heads * (spec.num_heads / spec.num_kv_heads).div_ceil(2);
+    encoder.dispatch_thread_groups(MTLSize::new(head_groups as u64, 1, 1), MTLSize::new(THREADS as u64, 1, 1));
+    encoder.end_encoding();
+    ctx.commit_and_wait_profiled(
+        &command,
+        "gqa_decode_attention_direct_q8_append_position",
+        &format!("q=[1,{}],heads={},kv_heads={},head_dim={}", query.cols, spec.num_heads, spec.num_kv_heads, spec.head_dim),
+        query.buffer.length() + view.buffer.length(),
+        output.buffer.length(),
+    );
+    Ok(output)
+}
+
+/// Q8 replay 的分块 attention。当前行先按 state[0] 写入 cache，随后以固定
+/// 四个 128-token block 录制；超出当前 kv_rows 的 block 在设备端写中性 partial。
+#[allow(clippy::too_many_arguments)]
+fn gqa_decode_attention_append_split_q8_position_into(
+    ctx: &MetalContext,
+    query: &MetalTensor,
+    new_key: &MetalTensor,
+    new_value: &MetalTensor,
+    view: &MetalGqaCacheView,
+    spec: &GqaSpec,
+    decode_state: &metal::Buffer,
+    state_offset: u64,
+    output: &MetalTensor,
+) -> Result<(), String> {
+    const THREADS: usize = 256;
+    const BLOCK_TOKENS: usize = 128;
+    const BLOCK_COUNT: usize = 4;
+    let key_scale_offset = view.key_scale_offset.ok_or("GQA replay split 缺少 K scales")?;
+    let value_scale_offset = view.value_scale_offset.ok_or("GQA replay split 缺少 V scales")?;
+    if view.format != MetalKvCacheFormat::Int8
+        || spec.window != CausalWindow::Full
+        || spec.num_kv_heads == 0
+        || !spec.num_heads.is_multiple_of(spec.num_kv_heads)
+        || !spec.head_dim.is_multiple_of(view.group_size)
+        || query.rows != 1
+        || new_key.rows != 1
+        || new_value.rows != 1
+        || new_key.cols != spec.num_kv_heads * spec.head_dim
+        || new_value.cols != spec.num_kv_heads * spec.head_dim
+    {
+        return Err(format!("GQA replay split shape 不符: Q=[{},{}] K=[{},{}] V=[{},{}]", query.rows, query.cols, new_key.rows, new_key.cols, new_value.rows, new_value.cols));
+    }
+    let heads = validate_u32("GQA replay split heads", spec.num_heads)?;
+    let kv_heads = validate_u32("GQA replay split KV heads", spec.num_kv_heads)?;
+    let dimension = validate_u32("GQA replay split head dim", spec.head_dim)?;
+    let group_size = validate_u32("GQA replay split group size", view.group_size)?;
+    let groups_per_head = validate_u32("GQA replay split groups per head", spec.head_dim / view.group_size)?;
+    let bf16 = u32::from(query.dtype == MetalTensorDType::Bf16);
+
+    let quantize = ctx.pipeline("gqa_kv_quantize_q8_position")?;
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&quantize);
+    encoder.set_buffer(0, Some(&new_key.buffer), 0);
+    encoder.set_buffer(1, Some(&new_value.buffer), 0);
+    encoder.set_buffer(2, Some(&view.buffer), view.key_offset);
+    encoder.set_buffer(3, Some(&view.buffer), key_scale_offset);
+    encoder.set_buffer(4, Some(&view.buffer), view.value_offset);
+    encoder.set_buffer(5, Some(&view.buffer), value_scale_offset);
+    encoder.set_buffer(6, Some(decode_state), state_offset);
+    set_bytes(&encoder, 7, &kv_heads);
+    set_bytes(&encoder, 8, &dimension);
+    set_bytes(&encoder, 9, &group_size);
+    set_bytes(&encoder, 10, &groups_per_head);
+    set_bytes(&encoder, 11, &bf16);
+    let total_groups = spec.num_kv_heads * (spec.head_dim / view.group_size) * 2;
+    encoder.dispatch_threads(MTLSize::new(total_groups as u64, 1, 1), MTLSize::new(quantize.max_total_threads_per_threadgroup().clamp(1, THREADS as u64), 1, 1));
+    encoder.end_encoding();
+    ctx.commit_and_wait_profiled(&command, "gqa_kv_quantize_q8_position", "rows=1", new_key.buffer.length() + new_value.buffer.length(), (new_key.cols * 2) as u64);
+
+    let statistics = ctx.tensor_pooled_f32("gqa_replay_q8_statistics", 1, spec.num_heads * BLOCK_COUNT * 2);
+    let partial = ctx.tensor_pooled_f32("gqa_replay_q8_partial", 1, spec.num_heads * BLOCK_COUNT * spec.head_dim);
+    let split = ctx.pipeline("gqa_decode_split_kv")?;
+    let merge = ctx.pipeline("gqa_decode_split_kv_merge")?;
+    if split.max_total_threads_per_threadgroup() < THREADS as u64 || merge.max_total_threads_per_threadgroup() < THREADS as u64 {
+        return Err("GQA replay split 需要 256 threads，超过 Metal pipeline 上限".to_owned());
+    }
+    let block_tokens = BLOCK_TOKENS as u32;
+    let block_count = BLOCK_COUNT as u32;
+    let capacity = 0u32;
+    let q8 = 1u32;
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&split);
+    encoder.set_buffer(0, Some(&query.buffer), 0);
+    encoder.set_buffer(1, Some(&view.buffer), view.key_offset);
+    encoder.set_buffer(2, Some(&view.buffer), view.value_offset);
+    encoder.set_buffer(3, Some(&statistics.buffer), 0);
+    encoder.set_buffer(4, Some(&partial.buffer), 0);
+    encoder.set_buffer(5, Some(decode_state), state_offset);
+    set_bytes(&encoder, 6, &heads);
+    set_bytes(&encoder, 7, &kv_heads);
+    set_bytes(&encoder, 8, &dimension);
+    set_bytes(&encoder, 9, &block_tokens);
+    set_bytes(&encoder, 10, &block_count);
+    set_bytes(&encoder, 11, &spec.score_scale);
+    set_bytes(&encoder, 12, &bf16);
+    set_bytes(&encoder, 14, &capacity);
+    encoder.set_buffer(15, Some(&view.buffer), key_scale_offset);
+    encoder.set_buffer(16, Some(&view.buffer), value_scale_offset);
+    set_bytes(&encoder, 17, &group_size);
+    set_bytes(&encoder, 18, &groups_per_head);
+    set_bytes(&encoder, 19, &q8);
+    let split_height = spec.num_kv_heads * (spec.num_heads / spec.num_kv_heads).div_ceil(4);
+    encoder.dispatch_thread_groups(MTLSize::new(BLOCK_COUNT as u64, split_height as u64, 1), MTLSize::new(THREADS as u64, 1, 1));
+    encoder.end_encoding();
+    ctx.commit_and_wait_profiled(&command, "gqa_decode_attention_split_kv_q8_position", "max_rows=512", query.buffer.length() + view.buffer.length(), statistics.buffer.length() + partial.buffer.length());
+
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&merge);
+    encoder.set_buffer(0, Some(&statistics.buffer), 0);
+    encoder.set_buffer(1, Some(&partial.buffer), 0);
+    encoder.set_buffer(2, Some(&output.buffer), 0);
+    set_bytes(&encoder, 3, &block_count);
+    set_bytes(&encoder, 4, &heads);
+    set_bytes(&encoder, 5, &dimension);
+    set_bytes(&encoder, 6, &bf16);
+    encoder.dispatch_thread_groups(MTLSize::new(spec.num_heads as u64, 1, 1), MTLSize::new(THREADS as u64, 1, 1));
+    encoder.end_encoding();
+    ctx.commit_and_wait_profiled(&command, "gqa_decode_attention_split_kv_merge_q8_position", "blocks=4", statistics.buffer.length() + partial.buffer.length(), output.buffer.length());
+    Ok(())
+}
+
+/// Q8 replay 同时录制短上下文直通与长上下文分块算子，两条路径写同一输出。
+/// 提交时必须用 [`Q8PositionReplayPipelines::accepts`] 过滤掉另一条路径。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gqa_decode_attention_append_adaptive_q8_position_tensor(
+    ctx: &MetalContext,
+    query: &MetalTensor,
+    new_key: &MetalTensor,
+    new_value: &MetalTensor,
+    view: &MetalGqaCacheView,
+    spec: &GqaSpec,
+    decode_state: &metal::Buffer,
+    state_offset: u64,
+) -> Result<MetalTensor, String> {
+    let output = gqa_decode_attention_append_direct_q8_position_tensor(ctx, query, new_key, new_value, view, spec, decode_state, state_offset)?;
+    gqa_decode_attention_append_split_q8_position_into(ctx, query, new_key, new_value, view, spec, decode_state, state_offset, &output)?;
+    Ok(output)
+}
+
+pub(crate) struct Q8PositionReplayPipelines {
+    direct: metal::ComputePipelineState,
+    quantize: metal::ComputePipelineState,
+    split: metal::ComputePipelineState,
+    merge: metal::ComputePipelineState,
+}
+
+impl Q8PositionReplayPipelines {
+    pub(crate) fn new(ctx: &MetalContext) -> Result<Self, String> {
+        Ok(Self { direct: ctx.pipeline("gqa_decode_direct_q8_append")?, quantize: ctx.pipeline("gqa_kv_quantize_q8_position")?, split: ctx.pipeline("gqa_decode_split_kv")?, merge: ctx.pipeline("gqa_decode_split_kv_merge")? })
+    }
+
+    pub(crate) fn accepts(&self, op: &metal::RecordedComputeOp, split: bool) -> bool {
+        if split { !op.pipeline.same_handle(&self.direct) } else { !op.pipeline.same_handle(&self.quantize) && !op.pipeline.same_handle(&self.split) && !op.pipeline.same_handle(&self.merge) }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1045,7 +1045,7 @@ extern "C" __global__ void dsa_score_tiles_q8(
 // Prefill 索引器以 16×16 BF16 WMMA 计算逐 head QK，ReLU 后再用 F32 head weight 归约。
 // 每个 block 复用同一 query，并把 128 个分页 K 分给各 wave，避免标量路径重复读取 K。
 // gfx11+ 原生 WMMA：每个 block 同时处理四行 query，共享 128 行 K。
-template <bool PrefixOnly>
+template <bool PrefixOnly, bool Rows2 = false>
 __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
     const signed char* keys,
     const unsigned short* key_scales,
@@ -1071,7 +1071,8 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
     using DsaWmmaFloat8 = float __attribute__((ext_vector_type(8)));
 
     const unsigned int tile = blockIdx.x;
-    const unsigned int query_base = blockIdx.y * 4u;
+    const unsigned int queries_per_block = Rows2 ? 2u : 4u;
+    const unsigned int query_base = blockIdx.y * queries_per_block;
     const unsigned int wave = threadIdx.x >> 5;
     const unsigned int lane = threadIdx.x & 31u;
     const unsigned int query_offset = wave >> 3;
@@ -1086,7 +1087,8 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
     __shared__ float key_row_scales[256];
     extern __shared__ unsigned int coarse_histogram[];
     if (collect_histogram) {
-        for (unsigned int flat = threadIdx.x; flat < 4u * 256u; flat += blockDim.x) {
+        for (unsigned int flat = threadIdx.x;
+             flat < queries_per_block * 256u; flat += blockDim.x) {
             coarse_histogram[flat] = 0u;
         }
         __syncthreads();
@@ -1143,7 +1145,9 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
                 }
                 for (unsigned int head_group = 0; head_group < 2u; ++head_group) {
                     const unsigned int head_base = head_batch + head_group * 16u;
-                    for (unsigned int flat = threadIdx.x; flat < 4u * 16u * 16u; flat += blockDim.x) {
+                    for (unsigned int flat = threadIdx.x;
+                         flat < queries_per_block * 16u * 16u;
+                         flat += blockDim.x) {
                         const unsigned int target_query = flat / (16u * 16u);
                         const unsigned int element = flat % (16u * 16u);
                         const unsigned int head = head_base + element / 16u;
@@ -1159,16 +1163,19 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
                     const DsaWmmaShort16 query_fragment0
                         = *reinterpret_cast<const DsaWmmaShort16*>(
                             query_tiles[query_offset] + (lane & 15u) * 16u);
-                    const DsaWmmaShort16 query_fragment1
-                        = *reinterpret_cast<const DsaWmmaShort16*>(
-                            query_tiles[query_offset + 2u] + (lane & 15u) * 16u);
                     const DsaWmmaShort16 key_fragment
                         = *reinterpret_cast<const DsaWmmaShort16*>(
                             key_tiles[key_wave] + (lane & 15u) * 16u);
                     sums0[head_group] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
                         query_fragment0, key_fragment, sums0[head_group]);
-                    sums1[head_group] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
-                        query_fragment1, key_fragment, sums1[head_group]);
+                    if constexpr (!Rows2) {
+                        const DsaWmmaShort16 query_fragment1
+                            = *reinterpret_cast<const DsaWmmaShort16*>(
+                                query_tiles[query_offset + 2u]
+                                    + (lane & 15u) * 16u);
+                        sums1[head_group] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(
+                            query_fragment1, key_fragment, sums1[head_group]);
+                    }
                     __syncthreads();
                 }
             }
@@ -1187,17 +1194,23 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
                             (unsigned long long)query_row * head_count + head]
                             * fmaxf(sums0[head_group][index], 0.0f);
                     }
-                    if (query_row1 < query_rows && head < head_count) {
-                        partial1 += head_weights[
-                            (unsigned long long)query_row1 * head_count + head]
-                            * fmaxf(sums1[head_group][index], 0.0f);
+                    if constexpr (!Rows2) {
+                        if (query_row1 < query_rows && head < head_count) {
+                            partial1 += head_weights[
+                                (unsigned long long)query_row1 * head_count + head]
+                                * fmaxf(sums1[head_group][index], 0.0f);
+                        }
                     }
                 }
                 partial0 += __shfl_down(partial0, 16u, 32u);
-                partial1 += __shfl_down(partial1, 16u, 32u);
+                if constexpr (!Rows2) {
+                    partial1 += __shfl_down(partial1, 16u, 32u);
+                }
                 if (lane < 16u) {
                     score0 += partial0;
-                    score1 += partial1;
+                    if constexpr (!Rows2) {
+                        score1 += partial1;
+                    }
                 }
             }
         }
@@ -1223,18 +1236,20 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
                         atomicAdd(&coarse_histogram[query_offset * 256u + (key >> 24)], 1u);
                     }
                 }
-                if (query_row1 < query_rows && token < (query_start + query_row1 + 1u) / visibility_divisor) {
-                    const unsigned int key = dsa_ordered_score(score1);
-                    if constexpr (PrefixOnly) {
-                        ((unsigned char*)score_output)[
-                            (unsigned long long)query_row1 * stride + token]
-                            = (unsigned char)(key >> 24);
-                    } else {
-                        ((unsigned int*)score_output)[
-                            (unsigned long long)query_row1 * stride + token] = key;
-                    }
-                    if (collect_histogram) {
-                        atomicAdd(&coarse_histogram[(query_offset + 2u) * 256u + (key >> 24)], 1u);
+                if constexpr (!Rows2) {
+                    if (query_row1 < query_rows && token < (query_start + query_row1 + 1u) / visibility_divisor) {
+                        const unsigned int key = dsa_ordered_score(score1);
+                        if constexpr (PrefixOnly) {
+                            ((unsigned char*)score_output)[
+                                (unsigned long long)query_row1 * stride + token]
+                                = (unsigned char)(key >> 24);
+                        } else {
+                            ((unsigned int*)score_output)[
+                                (unsigned long long)query_row1 * stride + token] = key;
+                        }
+                        if (collect_histogram) {
+                            atomicAdd(&coarse_histogram[(query_offset + 2u) * 256u + (key >> 24)], 1u);
+                        }
                     }
                 }
             }
@@ -1242,7 +1257,8 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
         __syncthreads();
     }
     if (collect_histogram) {
-        for (unsigned int flat = threadIdx.x; flat < 4u * 256u; flat += blockDim.x) {
+        for (unsigned int flat = threadIdx.x;
+             flat < queries_per_block * 256u; flat += blockDim.x) {
             const unsigned int local_query = flat / 256u;
             const unsigned int query = query_base + local_query;
             const unsigned int count = coarse_histogram[flat];
@@ -1271,6 +1287,34 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
     (void)score_stride;
     (void)shard_parity;
 #endif
+}
+
+// Verify 两行沿用通用核的 sums0 累加顺序，但不再构造永远越界的 row+2
+// accumulator。16 个 wave 仍共同复用同一 256-token K tile。
+extern "C" __global__ void dsa_score_tiles_native_wmma_q8_rows2(
+    const signed char* keys,
+    const unsigned short* key_scales,
+    const unsigned int* block_table,
+    const float* query,
+    const float* head_weights,
+    unsigned int* score_keys,
+    unsigned int* coarse_histograms,
+    unsigned int query_rows,
+    unsigned int context_rows,
+    unsigned int query_start,
+    unsigned int head_count,
+    unsigned int head_dim,
+    unsigned int key_group_size,
+    unsigned int block_size,
+    unsigned int tile_rows,
+    unsigned int score_stride,
+    unsigned int shard_parity)
+{
+    dsa_score_tiles_native_wmma_q8_impl<false, true>(
+        keys, key_scales, block_table, query, head_weights, score_keys,
+        coarse_histograms, query_rows, context_rows, query_start, 1u,
+        head_count, head_dim, key_group_size, block_size, tile_rows,
+        score_stride, shard_parity);
 }
 
 extern "C" __global__ void dsa_score_tiles_native_wmma_q8(
@@ -3175,6 +3219,109 @@ extern "C" __global__ void mla_absorb_query_ct(
     unsigned int scale_dtype,
     unsigned int bits)
 {
+    if (query_rows == 2u && bits == 8u && group_size == 32u) {
+        const unsigned int nope_dim = q_head_dim - rope_dim;
+        if ((latent_dim & 63u) == 0u && (nope_dim & 15u) == 0u
+            && nope_dim <= 1024u) {
+            const unsigned int latent_quads = latent_dim / 64u;
+            const unsigned int head = blockIdx.x / latent_quads;
+            const unsigned int quad = blockIdx.x % latent_quads;
+            if (head >= head_count) return;
+            const unsigned int group_lane = threadIdx.x >> 4u;
+            const unsigned int lane = threadIdx.x & 15u;
+            const unsigned int col0 = quad * 64u + group_lane * 4u;
+            const unsigned int groups_per_row = latent_dim >> 5u;
+            const unsigned int row_words = latent_dim >> 2u;
+            __shared__ float query_tile[2][1024];
+            for (unsigned int index = threadIdx.x;
+                 index < 2u * nope_dim;
+                 index += blockDim.x) {
+                const unsigned int query_row = index / nope_dim;
+                const unsigned int column = index - query_row * nope_dim;
+                query_tile[query_row][column] = query[
+                    ((unsigned long long)query_row * head_count + head)
+                        * q_head_dim + column];
+            }
+            __syncthreads();
+            float acc[2][4] = {};
+            unsigned int row = lane;
+            for (; row + 48u < nope_dim; row += 64u) {
+                const unsigned long long weight_row0 =
+                    (unsigned long long)head * kv_head_dim + row;
+                const unsigned int words[4] = {
+                    packed[weight_row0 * row_words + (col0 >> 2u)],
+                    packed[(weight_row0 + 16u) * row_words + (col0 >> 2u)],
+                    packed[(weight_row0 + 32u) * row_words + (col0 >> 2u)],
+                    packed[(weight_row0 + 48u) * row_words + (col0 >> 2u)]
+                };
+                const float row_scales[4] = {
+                    zllm_scale(scales, weight_row0 * groups_per_row + (col0 >> 5u), scale_dtype),
+                    zllm_scale(scales, (weight_row0 + 16u) * groups_per_row + (col0 >> 5u), scale_dtype),
+                    zllm_scale(scales, (weight_row0 + 32u) * groups_per_row + (col0 >> 5u), scale_dtype),
+                    zllm_scale(scales, (weight_row0 + 48u) * groups_per_row + (col0 >> 5u), scale_dtype)
+                };
+                #pragma unroll
+                for (unsigned int source = 0u; source < 4u; ++source) {
+                    const float weights[4] = {
+                        (float)((int)(words[source] & 255u) - 128) * row_scales[source],
+                        (float)((int)((words[source] >> 8u) & 255u) - 128) * row_scales[source],
+                        (float)((int)((words[source] >> 16u) & 255u) - 128) * row_scales[source],
+                        (float)((int)(words[source] >> 24u) - 128) * row_scales[source]
+                    };
+                    #pragma unroll
+                    for (unsigned int query_row = 0u; query_row < 2u; ++query_row) {
+                        const float value = query_tile[query_row][row + source * 16u];
+                        #pragma unroll
+                        for (unsigned int output = 0u; output < 4u; ++output)
+                            acc[query_row][output] += value * weights[output];
+                    }
+                }
+            }
+            for (; row < nope_dim; row += 16u) {
+                const unsigned long long weight_row =
+                    (unsigned long long)head * kv_head_dim + row;
+                const unsigned int word =
+                    packed[weight_row * row_words + (col0 >> 2u)];
+                const float scale = zllm_scale(
+                    scales, weight_row * groups_per_row + (col0 >> 5u), scale_dtype);
+                const float weights[4] = {
+                    (float)((int)(word & 255u) - 128) * scale,
+                    (float)((int)((word >> 8u) & 255u) - 128) * scale,
+                    (float)((int)((word >> 16u) & 255u) - 128) * scale,
+                    (float)((int)(word >> 24u) - 128) * scale
+                };
+                #pragma unroll
+                for (unsigned int query_row = 0u; query_row < 2u; ++query_row) {
+                    const float value = query_tile[query_row][row];
+                    #pragma unroll
+                    for (unsigned int output = 0u; output < 4u; ++output)
+                        acc[query_row][output] += value * weights[output];
+                }
+            }
+            #pragma unroll
+            for (unsigned int query_row = 0u; query_row < 2u; ++query_row) {
+                #pragma unroll
+                for (unsigned int output = 0u; output < 4u; ++output) {
+                    for (unsigned int offset = 8u; offset > 0u; offset >>= 1u)
+                        acc[query_row][output] += __shfl_down(
+                            acc[query_row][output], offset, 16);
+                }
+            }
+            if (lane == 0u) {
+                #pragma unroll
+                for (unsigned int query_row = 0u; query_row < 2u; ++query_row) {
+                    const unsigned long long out_base =
+                        ((unsigned long long)query_row * head_count + head)
+                            * latent_dim + col0;
+                    #pragma unroll
+                    for (unsigned int output = 0u; output < 4u; ++output)
+                        absorbed[out_base + output]
+                            = zllm_f32_to_bf16(acc[query_row][output]);
+                }
+            }
+            return;
+        }
+    }
     // Decode 只有一行，16-lane/output 避免执行 15 行无效 tile FMA。
     if (query_rows == 1u) {
         const unsigned int nope_dim = q_head_dim - rope_dim;
@@ -4943,6 +5090,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8
     unsigned int block_size,
     unsigned int selected,
     unsigned int tile_size,
+    unsigned int split_tile_count,
     unsigned int shard_parity)
 {
     const unsigned int lane = threadIdx.x;
@@ -4967,18 +5115,19 @@ extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8
         || rope_dim % 16 != 0) return;
 
     const bool direct_output = weighted_latent != nullptr;
-    const unsigned int query_row = direct_output ? blockIdx.y : 0u;
+    if (!direct_output && split_tile_count == 0u) return;
+    const unsigned int query_row = direct_output ? blockIdx.y : blockIdx.y / split_tile_count;
     const unsigned int dense_visible = query_start + query_row + 1 < context_rows
         ? query_start + query_row + 1 : context_rows;
     const bool use_selection = selected && top_k < dense_visible;
     const unsigned int visible = use_selection
         ? (selection_counts == nullptr ? top_k : selection_counts[query_row])
         : dense_visible;
-    const unsigned int tile = direct_output ? 0u : blockIdx.y;
+    const unsigned int tile = direct_output ? 0u : blockIdx.y % split_tile_count;
     const unsigned int tile_start = tile * tile_size;
     if (tile_start >= visible) {
         const unsigned long long output_head_base
-            = (unsigned long long)(direct_output ? query_row : tile) * head_count
+            = (unsigned long long)(direct_output ? query_row : query_row * split_tile_count + tile) * head_count
                 + head_start;
         if (stats != nullptr) {
             for (unsigned int head = lane; head < block_head_count; head += blockDim.x) {
@@ -5282,7 +5431,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8
         __syncthreads();
     }
     const unsigned long long tile_head_base
-        = (unsigned long long)(direct_output ? query_row : tile) * head_count;
+        = (unsigned long long)(direct_output ? query_row : query_row * split_tile_count + tile) * head_count;
     if (stats != nullptr && wave < query_waves && row_column == 0) {
         #pragma unroll
         for (unsigned int index = 0; index < 8; ++index) {
@@ -5351,6 +5500,7 @@ __device__ __forceinline__ void mla_decode_partial_q8_wmma_colpar_impl(
     unsigned int block_size,
     unsigned int selected,
     unsigned int tile_size,
+    unsigned int split_tile_count,
     unsigned int shard_parity,
     unsigned int phase_mask)
 {
@@ -5379,18 +5529,19 @@ __device__ __forceinline__ void mla_decode_partial_q8_wmma_colpar_impl(
         || rope_dim == 0 || rope_dim % 16 != 0 || rope_slices > 8) return;
 
     const bool direct_output = weighted_latent != nullptr;
-    const unsigned int query_row = direct_output ? blockIdx.y : 0u;
+    if (!direct_output && split_tile_count == 0u) return;
+    const unsigned int query_row = direct_output ? blockIdx.y : blockIdx.y / split_tile_count;
     const unsigned int dense_visible = query_start + query_row + 1 < context_rows
         ? query_start + query_row + 1 : context_rows;
     const bool use_selection = selected && top_k < dense_visible;
     const unsigned int visible = use_selection
         ? (selection_counts == nullptr ? top_k : selection_counts[query_row])
         : dense_visible;
-    const unsigned int tile = direct_output ? 0u : blockIdx.y;
+    const unsigned int tile = direct_output ? 0u : blockIdx.y % split_tile_count;
     const unsigned int tile_start = tile * tile_size;
     if (tile_start >= visible) {
         const unsigned long long output_head_base
-            = (unsigned long long)(direct_output ? query_row : tile) * head_count
+            = (unsigned long long)(direct_output ? query_row : query_row * split_tile_count + tile) * head_count
                 + head_start;
         if (stats != nullptr) {
             for (unsigned int head = lane; head < block_head_count; head += blockDim.x) {
@@ -5717,7 +5868,7 @@ __device__ __forceinline__ void mla_decode_partial_q8_wmma_colpar_impl(
         __syncthreads();
     }
     const unsigned long long tile_head_base
-        = (unsigned long long)(direct_output ? query_row : tile) * head_count;
+        = (unsigned long long)(direct_output ? query_row : query_row * split_tile_count + tile) * head_count;
     if (stats != nullptr && wave < 1 && row_column == 0) {
         #pragma unroll
         for (unsigned int index = 0; index < 8; ++index) {
@@ -5777,13 +5928,15 @@ extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8
     unsigned int block_size,
     unsigned int selected,
     unsigned int tile_size,
+    unsigned int split_tile_count,
     unsigned int shard_parity)
 {
     mla_decode_partial_q8_wmma_colpar_impl<0, 0, 0, 0>(
         query, absorbed, latent_cache, latent_scales, rope_cache, block_table,
         selection, selection_counts, partial, stats, weighted_latent,
         context_rows, query_start, head_count, q_head_dim, latent_dim,
-        latent_group_size, rope_dim, top_k, block_size, selected, tile_size, shard_parity, 15u);
+        latent_group_size, rope_dim, top_k, block_size, selected, tile_size,
+        split_tile_count, shard_parity, 15u);
 }
 
 // GLM-5.3 生产形状特化（latent 512 / rope 64 / Q8G64）：
@@ -5813,6 +5966,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8
     unsigned int block_size,
     unsigned int selected,
     unsigned int tile_size,
+    unsigned int split_tile_count,
     unsigned int shard_parity)
 {
     if (latent_dim != 512 || latent_group_size != 64 || rope_dim != 64) return;
@@ -5820,7 +5974,8 @@ extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8
         query, absorbed, latent_cache, latent_scales, rope_cache, block_table,
         selection, selection_counts, partial, stats, weighted_latent,
         context_rows, query_start, head_count, q_head_dim, latent_dim,
-        latent_group_size, rope_dim, top_k, block_size, selected, tile_size, shard_parity, 15u);
+        latent_group_size, rope_dim, top_k, block_size, selected, tile_size,
+        split_tile_count, shard_parity, 15u);
 }
 
 // 消融专用：phase_mask 逐位开关 gather(1)/QK(2)/softmax(4)/PV(8)，仅用于计时分解，
@@ -5848,6 +6003,7 @@ extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8
     unsigned int block_size,
     unsigned int selected,
     unsigned int tile_size,
+    unsigned int split_tile_count,
     unsigned int shard_parity,
     unsigned int phase_mask)
 {
@@ -5856,7 +6012,8 @@ extern "C" __global__ __launch_bounds__(256, 1) void mla_paged_decode_partial_q8
         query, absorbed, latent_cache, latent_scales, rope_cache, block_table,
         selection, selection_counts, partial, stats, weighted_latent,
         context_rows, query_start, head_count, q_head_dim, latent_dim,
-        latent_group_size, rope_dim, top_k, block_size, selected, tile_size, shard_parity, phase_mask);
+        latent_group_size, rope_dim, top_k, block_size, selected, tile_size,
+        split_tile_count, shard_parity, phase_mask);
 }
 #endif
 
@@ -6665,6 +6822,103 @@ extern "C" __global__ void mla_project_value_ct(
     unsigned int scale_dtype,
     unsigned int bits)
 {
+    if (query_rows == 2u && bits == 8u && group_size == 32u
+        && (latent_dim & 127u) == 0u) {
+        const unsigned int nope_dim = q_head_dim - rope_dim;
+        const unsigned int value_dim = kv_head_dim - nope_dim;
+        const unsigned int value_tiles = (value_dim + 15u) / 16u;
+        const unsigned int head = blockIdx.x / value_tiles;
+        const unsigned int value =
+            (blockIdx.x % value_tiles) * 16u + (threadIdx.x >> 4u);
+        const unsigned int lane = threadIdx.x & 15u;
+        if (value < value_dim) {
+            float sums[2] = {};
+            const unsigned int weight_row =
+                (weight_head_start + head) * kv_head_dim + nope_dim + value;
+            const unsigned int groups = latent_dim >> 5u;
+            const unsigned char* weight_bytes =
+                reinterpret_cast<const unsigned char*>(packed)
+                    + (unsigned long long)weight_row * latent_dim;
+            for (unsigned int col0 = lane * 8u;
+                 col0 < latent_dim;
+                 col0 += 128u) {
+                const int2 pack8 =
+                    *reinterpret_cast<const int2*>(weight_bytes + col0);
+                const float scale = zllm_scale(
+                    scales,
+                    (unsigned long long)weight_row * groups + (col0 >> 5u),
+                    scale_dtype);
+                const uint4 input0 = *reinterpret_cast<const uint4*>(
+                    weighted_latent
+                        + (unsigned long long)head * latent_dim + col0);
+                const uint4 input1 = *reinterpret_cast<const uint4*>(
+                    weighted_latent
+                        + ((unsigned long long)head_count + head) * latent_dim
+                        + col0);
+                const unsigned int* input_words[2] = {
+                    reinterpret_cast<const unsigned int*>(&input0),
+                    reinterpret_cast<const unsigned int*>(&input1)
+                };
+                const unsigned int pack_words[2] = {
+                    (unsigned int)pack8.x, (unsigned int)pack8.y
+                };
+                #pragma unroll
+                for (unsigned int half = 0u; half < 2u; ++half) {
+                    #pragma unroll
+                    for (unsigned int element = 0u; element < 4u; ++element) {
+                        const int code = (int)((pack_words[half]
+                            >> (element * 8u)) & 255u) - 128;
+                        const float weight = (float)code * scale;
+                        #pragma unroll
+                        for (unsigned int query_row = 0u;
+                             query_row < 2u;
+                             ++query_row) {
+                            const unsigned int input_pair = input_words[query_row]
+                                [half * 2u + element / 2u];
+                            const unsigned short input_bits = (unsigned short)(
+                                input_pair >> ((element & 1u) * 16u));
+                            sums[query_row] +=
+                                zllm_bf16_to_f32(input_bits) * weight;
+                        }
+                    }
+                }
+            }
+            #pragma unroll
+            for (unsigned int query_row = 0u; query_row < 2u; ++query_row) {
+                for (unsigned int offset = 8u; offset > 0u; offset >>= 1u)
+                    sums[query_row] += __shfl_down(
+                        sums[query_row], offset, 16);
+            }
+            if (lane == 0u) {
+                unsigned short* output_bf16 =
+                    reinterpret_cast<unsigned short*>(output);
+                #pragma unroll
+                for (unsigned int query_row = 0u;
+                     query_row < 2u;
+                     ++query_row) {
+                    output_bf16[
+                        ((unsigned long long)query_row * head_count + head)
+                            * q_head_dim + value]
+                        = zllm_f32_to_bf16(sums[query_row]);
+                }
+            }
+        }
+        const unsigned int tail_dim = q_head_dim - value_dim;
+        if (blockIdx.x % value_tiles == 0u) {
+            unsigned short* output_bf16 =
+                reinterpret_cast<unsigned short*>(output);
+            for (unsigned int index = threadIdx.x;
+                 index < 2u * tail_dim;
+                 index += blockDim.x) {
+                const unsigned int query_row = index / tail_dim;
+                const unsigned int tail_column = index - query_row * tail_dim;
+                output_bf16[
+                    ((unsigned long long)query_row * head_count + head)
+                        * q_head_dim + value_dim + tail_column] = 0u;
+            }
+        }
+        return;
+    }
     // Decode 复用压缩权重，但不再为不存在的另外 15 行做矩阵乘。
     if (query_rows == 1u) {
         const unsigned int nope_dim = q_head_dim - rope_dim;

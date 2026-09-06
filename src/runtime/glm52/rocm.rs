@@ -17,7 +17,7 @@ use crate::{
     attention::rope::RopeTable,
     attention::{AttentionSpec, mla::MlaSpec},
     backend::rocm::{RocmContext, RocmDsaSelection, RocmDsaState, RocmKvCache, RocmPrefillExperts, RocmTensor, RocmWeight},
-    backend::{Backend, BackendResources, DecodeBackend, LinearWeight, SegmentedTensorBackend, StageExecutionBackend},
+    backend::{Backend, BackendResources, DecodeBackend, ExpertPrefillBackend, LinearWeight, SegmentedTensorBackend, StageExecutionBackend},
     config::{BackendConfig, Glm52StageDiagnosticsConfig, KvCacheFormat, RuntimeProcessConfig, StageModelConfig, StageTransportConfig},
     moe::{
         UncachedMoeState,
@@ -30,15 +30,15 @@ use crate::{
     runtime::{
         expert_pipeline::ExpertDecodePipeline,
         generation_guard::{GenerationGuard, TokenFenceProgram},
-        glm52::dspark_rocm::attach_dspark_projections,
+        glm52::dspark_rocm::{attach_dspark_projections, attach_dspark_projections_reusing},
         glm52::stage::{
             Glm52PrefillLayer as RuntimeGlm52PrefillLayer, Glm52StageState as RuntimeGlm52StageState, build_glm52_stage_states, build_pp_prefill_chunks, drive_glm52_stream_stage_pipeline_stateful, last_token_row as last_bf16_row,
-            prepare_prefill_layers, run_glm52_stage_pipeline_stateful,
+            prepare_prefill_layer, prepare_prefill_layers, run_glm52_stage_pipeline_stateful, run_glm52_stream_stage_pipeline_stateful,
         },
         glm52::tool::Glm52ToolFence,
         glm52::{
             Glm52DecodeLayer, Glm52Mtp, Glm52OutputHead, Glm52PrefillSegment, glm52_decode_layers, glm52_dense_prefill_layer, glm52_moe_prefill_layer, glm52_mtp_cache_segmented, glm52_mtp_decode, glm52_mtp_prefill_segmented,
-            glm52_mtp_token_ids_fenced, glm52_mtp_token_output, glm52_prefill_stage, glm52_token_output, prepare_glm52_decode_layers, prepare_glm52_mtp_ct, prepare_glm52_mtp_gguf, prepare_glm52_output_head,
+            glm52_mtp_token_ids_fenced, glm52_mtp_token_output, glm52_normalize_target_hidden, glm52_prefill_stage, glm52_token_output, prepare_glm52_decode_layers, prepare_glm52_mtp_ct, prepare_glm52_mtp_gguf, prepare_glm52_output_head,
             prepare_glm52_output_head_quantized, print_expert_cache, print_token,
         },
         output::{DraftHead, SamplingConfig, SamplingState, load_draft_vocabulary, normalized_draft_token_ids_fenced, prepare_draft_head},
@@ -68,6 +68,83 @@ pub(super) fn prepare_glm52_rope_resident(contexts: &[RocmContext], rope: &RopeT
     Ok(())
 }
 
+/// 从当前 GGUF 单卡 resident 权重派生双卡 head 工作域。普通路径的完整权重
+/// 保持不变，operator pair 仅在显式执行分支读取这些 shard。
+pub(super) fn prepare_operator_mla_layer_gguf(
+    owner: &RocmContext,
+    peer: &RocmContext,
+    experts: &mut RocmPrefillExperts,
+    cfg: &Glm52Config,
+    mla: &MlaSpec,
+    layer: usize,
+    weights: crate::weight::model::glm52::GgufMoeLayer,
+    owner_weights: (&RocmWeight, &RocmWeight),
+) -> Result<(), String> {
+    let crate::weight::model::glm52::GgufMoeLayer { q_b_proj, kv_b_w8, o_proj, post_attn_norm, router_weight, router_bias, .. } = weights;
+    prepare_operator_mla_weights_gguf(owner, peer, experts, cfg, mla, layer, q_b_proj, kv_b_w8, o_proj, owner_weights)?;
+    peer.activate().map_err(|error| format!("激活 ROCm peer device {}: {error}", peer.device_id()))?;
+    let post_attn_norm = peer.prepare_f32(&post_attn_norm, 1, cfg.hidden_size).map_err(|error| format!("L{layer} operator peer post_attn_norm: {error:?}"))?;
+    let router = peer.prepare_f32(&router_weight, cfg.expert_count, cfg.hidden_size).map_err(|error| format!("L{layer} operator peer router: {error:?}"))?;
+    let bias = peer.prepare_f32(&router_bias, 1, cfg.expert_count).map_err(|error| format!("L{layer} operator peer router bias: {error:?}"))?;
+    experts.set_operator_moe_layer(layer, post_attn_norm, router, bias).map_err(|error| format!("L{layer} 注册 operator peer MoE: {error:?}"))
+}
+
+pub(super) fn prepare_operator_mla_dense_layer_gguf(
+    owner: &RocmContext,
+    peer: &RocmContext,
+    experts: &mut RocmPrefillExperts,
+    cfg: &Glm52Config,
+    mla: &MlaSpec,
+    layer: usize,
+    weights: crate::weight::model::glm52::GgufDenseLayer,
+    owner_weights: (&RocmWeight, &RocmWeight),
+) -> Result<(), String> {
+    let crate::weight::model::glm52::GgufDenseLayer { q_b_proj, kv_b_w8, o_proj, post_attn_norm, gate_proj, up_proj, down_proj, .. } = weights;
+    prepare_operator_mla_weights_gguf(owner, peer, experts, cfg, mla, layer, q_b_proj, kv_b_w8, o_proj, owner_weights)?;
+    experts.prepare_operator_dense_layer_gguf(owner, peer, layer, &post_attn_norm, gate_proj, up_proj, down_proj).map_err(|error| format!("L{layer} 准备 operator dense MLP: {error:?}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_operator_mla_weights_gguf(
+    owner: &RocmContext,
+    peer: &RocmContext,
+    experts: &mut RocmPrefillExperts,
+    _cfg: &Glm52Config,
+    mla: &MlaSpec,
+    layer: usize,
+    q_b_proj: crate::weight::container::gguf::GgufMatrix,
+    kv_b_proj: crate::weight::format::quantization::W8A16Matrix,
+    o_proj: crate::weight::container::gguf::GgufMatrix,
+    owner_weights: (&RocmWeight, &RocmWeight),
+) -> Result<(), String> {
+    if owner.device_id() == peer.device_id() {
+        return Err(format!("L{layer} GGUF operator MLA owner/peer 不能是同一设备"));
+    }
+    if !mla.num_heads.is_multiple_of(2) || !mla.q_projection_size.is_multiple_of(mla.num_heads) || !mla.kv_projection_size.is_multiple_of(mla.num_heads) {
+        return Err(format!("L{layer} GGUF operator MLA 要求 attention head/q/kv 投影可按 head 分片"));
+    }
+    if o_proj.tensor_type.0 != 8 {
+        return Err(format!("L{layer} GGUF operator MLA 当前要求 Q8_0 o_proj，实际 type={}", o_proj.tensor_type.0));
+    }
+    // 最新 decode scan 每个 WMMA block 处理 16 heads；64 heads 只有 32/32
+    // 能让两卡都保持完整 block。24/40 会落入标量路径且暴露异步越界，
+    // 因此 attention 保持等分，负载差异改由 MoE intermediate 分片吸收。
+    let owner_heads = mla.num_heads / 2;
+    let owner_q = mla.q_projection_size / mla.num_heads * owner_heads;
+    let owner_kv = mla.kv_projection_size / mla.num_heads * owner_heads;
+    let owner_q_b = owner_weights.0.w8_row_view(0..owner_q).map_err(|error| format!("L{layer} GGUF operator q_b owner row view: {error:?}"))?.ok_or_else(|| format!("L{layer} GGUF operator q_b owner 不是 W8 resident"))?;
+    let owner_kv_b = owner_weights.1.w8_row_view(0..owner_kv).map_err(|error| format!("L{layer} GGUF operator kv_b owner row view: {error:?}"))?.ok_or_else(|| format!("L{layer} GGUF operator kv_b owner 不是 W8 resident"))?;
+    owner.activate().map_err(|error| format!("激活 ROCm owner device {}: {error}", owner.device_id()))?;
+    let owner_o = owner.prepare_gguf_q8_column_shard(&o_proj, 0..owner_q).map_err(|error| format!("L{layer} GGUF operator o_proj owner device={}: {error:?}", owner.device_id()))?;
+
+    peer.activate().map_err(|error| format!("激活 ROCm peer device {}: {error}", peer.device_id()))?;
+    let peer_q_b = peer.prepare_gguf_q8_row_shard(&q_b_proj, owner_q..mla.q_projection_size).map_err(|error| format!("L{layer} GGUF operator q_b peer device={}: {error:?}", peer.device_id()))?;
+    let peer_kv_b_source = kv_b_proj.slice_rows(owner_kv..mla.kv_projection_size).map_err(|error| format!("L{layer} GGUF operator kv_b peer row shard: {error}"))?;
+    let peer_kv_b = peer.prepare_mla_kv_b(LinearWeight::w8a16(&peer_kv_b_source), mla.kv_projection_size - owner_kv, mla.kv_lora_rank).map_err(|error| format!("L{layer} GGUF operator kv_b peer device={}: {error:?}", peer.device_id()))?;
+    let peer_o = peer.prepare_gguf_q8_column_shard(&o_proj, owner_q..mla.q_projection_size).map_err(|error| format!("L{layer} GGUF operator o_proj peer device={}: {error:?}", peer.device_id()))?;
+    experts.set_operator_mla_layer(layer, owner_q_b, peer_q_b, owner_kv_b, peer_kv_b, owner_o, peer_o).map_err(|error| format!("L{layer} 注册 GGUF operator MLA: {error:?}"))
+}
+
 /// 为一层 sequence-parallel attention 在两卡驻留 q_b/kv_b，并把 cooperative
 /// 路径的 o_proj 输入列按 head 对半分片。owner 另保留完整 o_proj，供普通路径使用。
 pub(super) fn prepare_cooperative_mla_layer_ct(
@@ -80,8 +157,15 @@ pub(super) fn prepare_cooperative_mla_layer_ct(
     weights: crate::weight::model::glm52::CtMoeLayer,
     owner_weights: (&RocmWeight, &RocmWeight),
 ) -> Result<RocmWeight, String> {
-    let crate::weight::model::glm52::CtMoeLayer { indexer, q_b_proj, kv_b_proj, o_proj, .. } = weights;
+    let crate::weight::model::glm52::CtMoeLayer { indexer, q_b_proj, kv_b_proj, o_proj, post_attn_norm, router_weight, router_bias, .. } = weights;
     let owner_o = prepare_cooperative_mla_weights_ct(owner, peer, experts, cfg, mla, layer, q_b_proj, kv_b_proj, o_proj, owner_weights)?;
+    if ops::hip::options().cooperative_mla_decode_replicated {
+        peer.activate().map_err(|error| format!("激活 ROCm MoE peer device {}: {error}", peer.device_id()))?;
+        let post_attn_norm = peer.prepare_f32(&post_attn_norm, 1, cfg.hidden_size).map_err(|error| format!("L{layer} peer post-attention norm: {error:?}"))?;
+        let router = peer.prepare_f32(&router_weight, cfg.expert_count, cfg.hidden_size).map_err(|error| format!("L{layer} peer router: {error:?}"))?;
+        let bias = peer.prepare_f32(&router_bias, 1, cfg.expert_count).map_err(|error| format!("L{layer} peer router bias: {error:?}"))?;
+        experts.set_cooperative_moe_replica_layer(layer, post_attn_norm, router, bias).map_err(|error| format!("L{layer} 注册 cooperative MoE 副本: {error:?}"))?;
+    }
     prepare_cooperative_dsa_wq_b_ct(peer, experts, cfg, layer, indexer)?;
     Ok(owner_o)
 }
@@ -135,7 +219,11 @@ fn prepare_cooperative_mla_weights_ct(
     let peer_q_b = super::prepare_ct_linear(peer, &q_b_proj, mla.q_projection_size, mla.q_lora_rank).map_err(|error| format!("L{layer} q_b full device={}: {error:?}", peer.device_id()))?;
     let peer_kv_b = super::prepare_ct_linear(peer, &kv_b_proj, mla.kv_projection_size, mla.kv_lora_rank).map_err(|error| format!("L{layer} kv_b full device={}: {error:?}", peer.device_id()))?;
     let peer_o_head = super::prepare_ct_linear(peer, &peer_o_head_source, cfg.hidden_size, o_head_columns).map_err(|error| format!("L{layer} o_proj peer head device={}: {error:?}", peer.device_id()))?;
-    experts.set_cooperative_mla_layer(layer, owner_weights.0.clone(), peer_q_b, owner_weights.1.clone(), peer_kv_b, owner_o.clone(), owner_o_head, peer_o_head).map_err(|error| format!("L{layer} 注册 cooperative MLA: {error:?}"))?;
+    let full_output = ops::hip::options().cooperative_mla_decode_replicated || ops::hip::options().cooperative_mla_prefill_row_output;
+    let peer_o_full = full_output.then(|| super::prepare_ct_linear(peer, &o_proj, cfg.hidden_size, mla.q_projection_size)).transpose().map_err(|error| format!("L{layer} o_proj peer full device={}: {error:?}", peer.device_id()))?;
+    experts
+        .set_cooperative_mla_layer(layer, owner_weights.0.clone(), peer_q_b, owner_weights.1.clone(), peer_kv_b, owner_o.clone(), owner_o_head, peer_o_head, peer_o_full)
+        .map_err(|error| format!("L{layer} 注册 cooperative MLA: {error:?}"))?;
     Ok(owner_o)
 }
 
@@ -149,8 +237,15 @@ pub(super) fn prepare_cooperative_mla_layer_gguf(
     weights: crate::weight::model::glm52::GgufMoeLayer,
     owner_weights: (&RocmWeight, &RocmWeight),
 ) -> Result<RocmWeight, String> {
-    let crate::weight::model::glm52::GgufMoeLayer { indexer, q_b_proj, kv_b_w8, o_proj, .. } = weights;
+    let crate::weight::model::glm52::GgufMoeLayer { indexer, q_b_proj, kv_b_w8, o_proj, post_attn_norm, router_weight, router_bias, .. } = weights;
     let owner_o = prepare_cooperative_mla_weights_gguf(owner, peer, experts, cfg, mla, layer, q_b_proj, kv_b_w8, o_proj, owner_weights)?;
+    if ops::hip::options().cooperative_mla_decode_replicated {
+        peer.activate().map_err(|error| format!("激活 ROCm MoE peer device {}: {error}", peer.device_id()))?;
+        let post_attn_norm = peer.prepare_f32(&post_attn_norm, 1, cfg.hidden_size).map_err(|error| format!("L{layer} GGUF peer post-attention norm: {error:?}"))?;
+        let router = peer.prepare_f32(&router_weight, cfg.expert_count, cfg.hidden_size).map_err(|error| format!("L{layer} GGUF peer router: {error:?}"))?;
+        let bias = peer.prepare_f32(&router_bias, 1, cfg.expert_count).map_err(|error| format!("L{layer} GGUF peer router bias: {error:?}"))?;
+        experts.set_cooperative_moe_replica_layer(layer, post_attn_norm, router, bias).map_err(|error| format!("L{layer} 注册 GGUF cooperative MoE 副本: {error:?}"))?;
+    }
     prepare_cooperative_dsa_wq_b_gguf(peer, experts, cfg, layer, indexer)?;
     Ok(owner_o)
 }
@@ -208,7 +303,17 @@ fn prepare_cooperative_mla_weights_gguf(
     } else {
         peer.prepare_weight(LinearWeight::gguf(&o_proj), cfg.hidden_size, mla.q_projection_size).map_err(|error| format!("L{layer} GGUF o_proj full device={}: {error:?}", peer.device_id()))?
     };
-    experts.set_cooperative_mla_layer(layer, owner_weights.0.clone(), peer_q_b, owner_weights.1.clone(), peer_kv_b, owner_o.clone(), owner_o_head, peer_o).map_err(|error| format!("L{layer} 注册 GGUF cooperative MLA: {error:?}"))?;
+    let full_output = ops::hip::options().cooperative_mla_decode_replicated || ops::hip::options().cooperative_mla_prefill_row_output;
+    let peer_o_full = if !full_output {
+        None
+    } else if o_proj.tensor_type.0 == 8 {
+        Some(peer.prepare_weight(LinearWeight::gguf(&o_proj), cfg.hidden_size, mla.q_projection_size).map_err(|error| format!("L{layer} GGUF o_proj peer full device={}: {error:?}", peer.device_id()))?)
+    } else {
+        Some(peer_o.clone())
+    };
+    experts
+        .set_cooperative_mla_layer(layer, owner_weights.0.clone(), peer_q_b, owner_weights.1.clone(), peer_kv_b, owner_o.clone(), owner_o_head, peer_o, peer_o_full)
+        .map_err(|error| format!("L{layer} 注册 GGUF cooperative MLA: {error:?}"))?;
     Ok(owner_o)
 }
 
@@ -218,6 +323,9 @@ pub(super) struct RocmMtpRuntime {
     pub(super) experts: RocmPrefillExperts,
     pub(super) draft_head: Option<DraftHead<RocmWeight>>,
     pub(super) embedding: Option<std::sync::Arc<ops::hip::DeviceBuffer>>,
+    /// MTP 不经过通用 stage scheduler；保留上一轮 completion，到下一次
+    /// L78 提交前再退休，避免在 token head 的天然同步点之外增加阻塞。
+    pub(super) pending_pair_completion: Option<crate::backend::rocm::RocmStageCompletion>,
 }
 
 pub(super) struct RocmMtpSession {
@@ -337,6 +445,7 @@ struct RocmEntry {
     pipeline_chunk_size: usize,
     preload_experts: bool,
     cooperative_expert_pairs: bool,
+    parallel_operator_pairs: bool,
     preload_layers_per_device: Option<usize>,
     max_concurrency: usize,
     diagnostics: Glm52StageDiagnosticsConfig,
@@ -345,6 +454,7 @@ struct RocmEntry {
     dspark_directory: Option<PathBuf>,
     dspark_weight_quantization: ResidentWeightQuantization,
     scheduling: crate::config::Glm52SchedulingConfig,
+    alternate_layer_ends: Vec<Vec<usize>>,
 }
 
 impl RocmEntry {
@@ -362,6 +472,7 @@ impl RocmEntry {
                     StageTransportConfig::Connect { ticket, iroh } => StageLink::Connect { ticket, iroh: iroh.runtime()? },
                 };
                 let execution = model.execution;
+                let alternate_layer_ends = model.layers.alternate_device_layer_ends;
                 let args = Args {
                     model_dir: model.weights_directory,
                     tokenizer_path: model.tokenizer.expect("配置加载已补全 tokenizer"),
@@ -392,6 +503,7 @@ impl RocmEntry {
                         pipeline_chunk_size: execution.prefill_chunk_size,
                         preload_experts: execution.preload_experts,
                         cooperative_expert_pairs: execution.cooperative_expert_pairs,
+                        parallel_operator_pairs: execution.parallel_operator_pairs,
                         preload_layers_per_device: execution.preload_layers_per_device,
                         max_concurrency: execution.max_concurrency,
                         diagnostics: execution.diagnostics,
@@ -400,6 +512,7 @@ impl RocmEntry {
                         dspark_directory: execution.dspark_directory,
                         dspark_weight_quantization: execution.dspark_weight_quantization,
                         scheduling: execution.scheduling,
+                        alternate_layer_ends,
                     },
                 ))
             }
@@ -421,6 +534,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         pipeline_chunk_size,
         preload_experts,
         cooperative_expert_pairs,
+        parallel_operator_pairs,
         preload_layers_per_device,
         max_concurrency,
         diagnostics,
@@ -429,6 +543,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         dspark_directory,
         dspark_weight_quantization,
         scheduling,
+        alternate_layer_ends,
         ..
     } = entry;
     let args = parsed;
@@ -503,8 +618,9 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
     if let Some(path) = diagnostics.input_artifact.as_deref() {
         return run_glm52_stage_input(backend, &args, &cfg, &mla, &weights, &tokenizer_path, path);
     }
+    let paired_operators = cooperative_expert_pairs || parallel_operator_pairs;
     let (prefill_contexts, cooperative_peer_contexts, prefill_layer_ends) = match (&args.prefill_devices, &args.prefill_layer_ends) {
-        (None, None) if cooperative_expert_pairs => return Err("cooperative_expert_pairs 要求显式配置物理 devices 和每个双卡组的 layer_ends".into()),
+        (None, None) if paired_operators => return Err("双卡算子要求显式配置物理 devices 和每个双卡组的 layer_ends".into()),
         (None, None) => (vec![*ctx], Vec::new(), vec![stage_end - 1]),
         (Some(devices), Some(ends)) => {
             if ends.last().copied() != Some(stage_end - 1) {
@@ -516,9 +632,9 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
             if ends.first().is_some_and(|end| *end < stage_start) {
                 return Err("--prefill-layer-ends 的首个边界早于当前 stage_start".into());
             }
-            if cooperative_expert_pairs {
+            if paired_operators {
                 if devices.len() < 2 || devices.len() % 2 != 0 || ends.len() != devices.len() / 2 {
-                    return Err(format!("cooperative_expert_pairs 要求每两张物理卡对应一个 layer_ends：devices={} layer_ends={}", devices.len(), ends.len()).into());
+                    return Err(format!("双卡算子要求每两张物理卡对应一个 layer_ends：devices={} layer_ends={}", devices.len(), ends.len()).into());
                 }
                 let owners = devices.iter().step_by(2).map(|&device| ctx.for_device(device).map_err(|error| format!("ROCm owner device {device} 初始化失败: {error}"))).collect::<Result<Vec<_>, _>>()?;
                 let peers = devices.iter().skip(1).step_by(2).map(|&device| ctx.for_device(device).map_err(|error| format!("ROCm cooperative peer device {device} 初始化失败: {error}"))).collect::<Result<Vec<_>, _>>()?;
@@ -536,6 +652,10 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
     for pair in prefill_contexts.windows(2) {
         pair[1].enable_peer_access_from(pair[0].device_id()).map_err(|error| format!("初始化 ROCm P2P {} -> {} 失败: {error}", pair[0].device_id(), pair[1].device_id()))?;
     }
+    for (owner, peer) in prefill_contexts.iter().zip(&cooperative_peer_contexts) {
+        owner.enable_peer_access_from(peer.device_id()).map_err(|error| format!("初始化 ROCm pair P2P {} -> {} 失败: {error}", peer.device_id(), owner.device_id()))?;
+        peer.enable_peer_access_from(owner.device_id()).map_err(|error| format!("初始化 ROCm pair P2P {} -> {} 失败: {error}", owner.device_id(), peer.device_id()))?;
+    }
     if distributed && pipeline_chunk_size == 0 {
         return Err("distributed stage 的 model.execution.prefill_chunk_size 必须大于 0".into());
     }
@@ -545,7 +665,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         Some(StageLink::Listen(iroh)) => Some(StageTransport::bind(iroh.clone()).map_err(|error| format!("启动 stage listener: {error}"))?),
         _ => None,
     };
-    if cooperative_expert_pairs {
+    if paired_operators {
         // pair prefill 的 owner/peer 在同一 stage 内同时保活 attention 与 MoE
         // 中间量；默认 3 GiB 软池装不下稳定工作集，会在长 prompt 中反复
         // hipMalloc/trim。这里只提高可驱逐软水位，OOM 路径仍会主动回收。
@@ -555,9 +675,31 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
     let resident_started = Instant::now();
     let mut prefill_layers =
         prepare_prefill_layers(&prefill_contexts, &prefill_layer_ends, stage_start, stage_end, &cfg, &mla, &weights, crate::kernel::rocm::hip::options().prefill_attention_cpu).map_err(|error| format!("准备 prefill layers: {error:?}"))?;
+    if paired_operators && !alternate_layer_ends.is_empty() {
+        return Err("双卡算子当前不支持 alternate_device_layer_ends；备用 placement 还没有对应的 peer 权重装配".into());
+    }
+    let placement_plans = std::iter::once(prefill_layer_ends.clone()).chain(alternate_layer_ends.iter().cloned()).collect::<Vec<_>>();
+    let mut resident_layers = (0..prefill_contexts.len()).map(|_| HashMap::<usize, PrefillLayer>::new()).collect::<Vec<_>>();
+    for (offset, layer) in prefill_layers.iter().cloned().enumerate() {
+        let absolute = stage_start + offset;
+        let device = prefill_layer_ends.iter().position(|&end| absolute <= end).ok_or_else(|| format!("L{absolute} 没有基础 placement"))?;
+        resident_layers[device].insert(absolute, layer);
+    }
+    for plan in placement_plans.iter().skip(1) {
+        for layer in stage_start..stage_end {
+            let device = plan.iter().position(|&end| layer <= end).ok_or_else(|| format!("L{layer} 没有备用 placement"))?;
+            if resident_layers[device].contains_key(&layer) {
+                continue;
+            }
+            let resident =
+                prepare_prefill_layer(&prefill_contexts[device], &cfg, &mla, &weights, layer, crate::kernel::rocm::hip::options().prefill_attention_cpu).map_err(|error| format!("准备备用 placement device={device} L{layer}: {error:?}"))?;
+            resident_layers[device].insert(layer, resident);
+        }
+    }
     eprintln!("[prefill-resident] layers={} wall={:.3}s", prefill_layers.len(), resident_started.elapsed().as_secs_f64(),);
     let rope = RopeTable::precompute(args.max_seq_len, mla.qk_rope_head_dim, mla.rope_theta);
-    prepare_glm52_rope_resident(&prefill_contexts, &rope)?;
+    let rope_contexts = prefill_contexts.iter().chain(&cooperative_peer_contexts).copied().collect::<Vec<_>>();
+    prepare_glm52_rope_resident(&rope_contexts, &rope)?;
     let new_prefill_experts = || -> Result<RocmPrefillExperts, Box<dyn std::error::Error>> {
         Ok(if let Some(source) = &nvfp4_source {
             RocmPrefillExperts::nvfp4(source.clone())
@@ -571,6 +713,40 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
     };
     let expert_state_count = if pipeline_enabled || distributed { prefill_contexts.len() } else { 1 };
     let mut prefill_experts = (0..expert_state_count).map(|_| new_prefill_experts()).collect::<Result<Vec<_>, _>>()?;
+    if parallel_operator_pairs {
+        if !distributed || !preload_experts || preload_layers_per_device.is_some() || !weights.source_is_gguf() || prefill_contexts.len() != cooperative_peer_contexts.len() {
+            return Err("parallel_operator_pairs 当前要求 distributed GGUF stage、preload_experts=true、完整预载且每个逻辑 stage 有一张 peer 卡".into());
+        }
+        for (stage, (experts, &peer)) in prefill_experts.iter_mut().zip(&cooperative_peer_contexts).enumerate() {
+            experts.enable_operator_peer(peer).map_err(|error| format!("配置 ROCm operator pair stage={stage}: {error:?}"))?;
+        }
+        let mla_started = Instant::now();
+        for (layer_offset, resident) in prefill_layers.iter().enumerate() {
+            let layer = stage_start + layer_offset;
+            let placement = prefill_layer_ends.iter().position(|&end| layer <= end).ok_or_else(|| format!("L{layer} 没有 operator MLA device"))?;
+            let owner_weights = match resident {
+                PrefillLayer::Dense(weights) => (&weights.q_b_proj, &weights.kv_b_proj),
+                PrefillLayer::Moe(weights) => (&weights.q_b_proj, &weights.kv_b_proj),
+            };
+            match resident {
+                PrefillLayer::Dense(_) => {
+                    let raw = weights.load_dense_layer_gguf(layer).map_err(|error| format!("加载 L{layer} dense GGUF operator MLA 权重: {error}"))?;
+                    prepare_operator_mla_dense_layer_gguf(&prefill_contexts[placement], &cooperative_peer_contexts[placement], &mut prefill_experts[placement], &cfg, &mla, layer, raw, owner_weights)?;
+                }
+                PrefillLayer::Moe(_) => {
+                    let raw = weights.load_moe_layer_gguf(layer).map_err(|error| format!("加载 L{layer} MoE GGUF operator MLA 权重: {error}"))?;
+                    prepare_operator_mla_layer_gguf(&prefill_contexts[placement], &cooperative_peer_contexts[placement], &mut prefill_experts[placement], &cfg, &mla, layer, raw, owner_weights)?;
+                }
+            }
+        }
+        eprintln!(
+            "[glm52-operator-pairs] physical_devices={} pairs={} logical_stages={} mode=current-fused-operators partition=attention-head+expert-intermediate independent-host-submit",
+            prefill_contexts.len() + cooperative_peer_contexts.len(),
+            prefill_contexts.len(),
+            prefill_contexts.len(),
+        );
+        eprintln!("[glm52-operator-mla-resident] layers={} wall={:.3}s", prefill_layers.len(), mla_started.elapsed().as_secs_f64());
+    }
     if cooperative_expert_pairs {
         if !distributed || !preload_experts || preload_layers_per_device.is_some() || !(weights.source_is_ct() || weights.source_is_gguf()) || prefill_contexts.len() != cooperative_peer_contexts.len() {
             return Err("cooperative_expert_pairs 要求 distributed CT/GGUF stage、preload_experts=true、完整预载且每个逻辑 stage 有一张 peer 卡".into());
@@ -640,24 +816,23 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         let started = Instant::now();
         let layers_per_device = preload_layers_per_device.unwrap_or(usize::MAX);
         let mut device_layers = vec![0_usize; prefill_contexts.len()];
-        let mut resident_layers = 0;
-        for (layer_offset, resident) in prefill_layers.iter().enumerate() {
-            let layer = stage_start + layer_offset;
-            if !matches!(resident, PrefillLayer::Moe(_)) {
-                continue;
+        let mut resident_expert_layers = 0;
+        for (placement, layers) in resident_layers.iter().enumerate() {
+            let mut layers = layers.iter().collect::<Vec<_>>();
+            layers.sort_unstable_by_key(|(layer, _)| **layer);
+            for (&layer, resident) in layers {
+                if !matches!(resident, PrefillLayer::Moe(_)) || device_layers[placement] >= layers_per_device {
+                    continue;
+                }
+                let layer_backend = &prefill_contexts[placement];
+                layer_backend.activate()?;
+                let expert_state = if pipeline_enabled || distributed { placement } else { 0 };
+                prefill_experts[expert_state].preload_layer(layer_backend, layer, cfg.expert_count).map_err(|error| format!("预加载 ROCm device={placement} L{layer} experts 失败: {error:?}"))?;
+                device_layers[placement] += 1;
+                resident_expert_layers += 1;
             }
-            let placement = prefill_layer_ends.iter().position(|&end| layer <= end).ok_or_else(|| format!("L{layer} 没有 prefill expert device"))?;
-            if device_layers[placement] >= layers_per_device {
-                continue;
-            }
-            let layer_backend = &prefill_contexts[placement];
-            layer_backend.activate()?;
-            let expert_state = if pipeline_enabled || distributed { placement } else { 0 };
-            prefill_experts[expert_state].preload_layer(layer_backend, layer, cfg.expert_count).map_err(|error| format!("预加载 ROCm L{layer} experts 失败: {error:?}"))?;
-            device_layers[placement] += 1;
-            resident_layers += 1;
         }
-        eprintln!("[prefill-expert-resident] layers={resident_layers} experts={} wall={:.3}s", cfg.expert_count, started.elapsed().as_secs_f64(),);
+        eprintln!("[prefill-expert-resident] layers={resident_expert_layers} experts={} wall={:.3}s", cfg.expert_count, started.elapsed().as_secs_f64(),);
     }
     if distributed {
         let mut states = build_glm52_stage_states(&prefill_contexts, &prefill_layer_ends, stage_start, &cfg, prefill_layers, prefill_experts, args.max_seq_len).map_err(|error| format!("构造 GLM stage states: {error:?}"))?;
@@ -758,26 +933,51 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
             return Ok(());
         }
 
+        let mut templates = vec![states];
+        for (plan_index, plan) in placement_plans.iter().enumerate().skip(1) {
+            let mut next_layer = stage_start;
+            let mut alternate = Vec::with_capacity(prefill_contexts.len());
+            for (device, (&layer_end, backend)) in plan.iter().zip(&prefill_contexts).enumerate() {
+                let mut state = templates[0][device].fresh_session(&cfg, args.max_seq_len).map_err(|error| format!("创建备用 placement stage={device}: {error:?}"))?;
+                state.layer_start = next_layer;
+                state.layers =
+                    Arc::new((next_layer..=layer_end).map(|layer| resident_layers[device].get(&layer).cloned().ok_or_else(|| format!("备用 placement={plan_index} device={device} 缺少 L{layer} resident"))).collect::<Result<Vec<_>, _>>()?);
+                state.backend = *backend;
+                state.hidden_projectors.clear();
+                next_layer = layer_end + 1;
+                alternate.push(state);
+            }
+            if let Some(root) = dspark_directory.as_deref() {
+                attach_dspark_projections_reusing(&mut alternate, &templates[0], root, cfg.layer_count, dspark_weight_quantization).map_err(|error| format!("加载备用 placement DSpark projections: {error:?}"))?;
+            }
+            eprintln!("[glm52-session-placement] plan={plan_index} layer_ends={plan:?}");
+            templates.push(alternate);
+        }
+
         let input_context = prefill_contexts[0];
         let output_context = *prefill_contexts.last().ok_or("tail stage 没有输出 device")?;
         crate::kernel::rocm::hip::enable_device_buffer_reuse();
-        // LM head、采样与 MTP 全部驻留 head 首卡 A0;tail 只回传 hidden,
-        // 不再装载任何输出侧权重。
-        let mut device_start = stage_start;
-        let device_memory = prefill_contexts
-            .iter()
-            .zip(&prefill_layer_ends)
-            .map(|(context, &layer_end)| {
-                let model_units = layer_end + 1 - device_start;
-                device_start = layer_end + 1;
-                Ok(StageDeviceMemory {
+        // LM head、采样与 MTP runtime 由 head 持有；operator pair 时 L78
+        // 还会使用 head A1。tail 只回传 hidden,不再装载输出侧权重。
+        let mut device_memory = Vec::with_capacity(prefill_contexts.len() + cooperative_peer_contexts.len());
+        for (index, context) in prefill_contexts.iter().enumerate() {
+            let model_units = placement_plans
+                .iter()
+                .map(|plan| {
+                    let start = if index == 0 { stage_start } else { plan[index - 1] + 1 };
+                    plan[index] + 1 - start
+                })
+                .max()
+                .unwrap_or(0);
+            for context in std::iter::once(context).chain(cooperative_peer_contexts.get(index)) {
+                device_memory.push(StageDeviceMemory {
                     device: context.device_id(),
                     model_units,
                     available_bytes: u64::try_from(context.stage_available_bytes().map_err(|error| format!("查询 tail ROCm device {} 可用显存: {error:?}", context.device_id()))?).map_err(|_| "stage available bytes 超过 u64".to_owned())?,
                     total_bytes: u64::try_from(context.stage_total_bytes().map_err(|error| format!("查询 tail ROCm device {} 总显存: {error:?}", context.device_id()))?).map_err(|_| "stage total bytes 超过 u64".to_owned())?,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+                });
+            }
+        }
         let cache_dir = args.cache_dir.as_ref().ok_or("GLM decode 后继必须设置 model.cache_directory")?;
         let cache_identity = Glm52CacheIdentity::new(&weights, kv_cache_format, stage_start, stage_end, false, args.max_seq_len, dspark_directory.as_deref());
         let swap = Arc::new(Glm52SwapStore::open(cache_dir.join("glm52").join(format!("stage-{stage_start}-{stage_end}")), &cache_identity)?);
@@ -789,7 +989,6 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
             return Err("distributed stage 缺少 transport".into());
         };
         link.send_device_memory(&device_memory, Some(max_concurrency))?;
-        let templates = states;
         let mut active = HashMap::<RequestId, TailSession>::new();
         let mut resident = HashMap::<RequestId, TailResident>::new();
         let mut pending_opens = Vec::<TailPendingOpen>::new();

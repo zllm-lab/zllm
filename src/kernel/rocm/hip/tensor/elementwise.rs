@@ -804,6 +804,10 @@ pub fn try_sample_top_p_rows_excluding_resident_f32(device_id: i32, input: &Devi
             return Err(format!("HIP sample rows 参数非法: {sample:?}"));
         }
     }
+    // greedy 不使用概率和随机参数，复用分片 argmax，避免每行一个 CTA 扫完整词表。
+    if sampling.iter().all(|sample| sample.temperature == 0.0) {
+        return try_argmax_rows_excluding_resident_f32(device_id, input, rows, columns, excluded);
+    }
     let elements = rows.checked_mul(columns).ok_or("HIP sample rows 输入大小溢出")?;
     validate_resident(input, device_id, elements.checked_mul(4).ok_or("HIP sample rows 输入大小溢出")?, "sample rows input")?;
     set_device(device_id)?;

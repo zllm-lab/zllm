@@ -12,6 +12,7 @@ mod gated_delta_net;
 mod hyper_connection;
 mod kda;
 mod kv_cache;
+mod pair_worker;
 mod tensor;
 mod vae;
 mod vision;
@@ -56,6 +57,7 @@ pub use expert::RocmPrefillExperts;
 pub use gated_delta_net::RocmGatedDeltaNetStorage;
 pub use kda::RocmKdaStorage;
 pub use kv_cache::{MlaLayerSerde, RocmKvCache, RocmKvOwnership};
+pub(crate) use pair_worker::RocmPairWorker;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RocmTensorDType {
@@ -85,6 +87,13 @@ pub enum RocmTensorLayout {
 /// 也依赖它。若设备间有 NVLink/xGMI 直连,卡间迁移可设备直传,不需要 shadow;
 /// 单机统一内存后端(Metal)无 host/device 之分,同样不需要常驻 shadow。
 #[derive(Debug, Clone)]
+pub(crate) struct RocmTensorReplica {
+    pub(crate) device_id: i32,
+    pub(crate) dtype: RocmTensorDType,
+    pub(crate) device: Arc<ops::hip::DeviceBuffer>,
+}
+
+#[derive(Debug, Clone)]
 pub struct RocmTensor {
     pub data: Vec<f32>,
     pub rows: usize,
@@ -92,9 +101,15 @@ pub struct RocmTensor {
     pub dtype: RocmTensorDType,
     pub layout: RocmTensorLayout,
     pub device: Option<Arc<ops::hip::DeviceBuffer>>,
+    /// 同一逻辑值在 operator peer 上的 resident 副本。普通算子不会传播；
+    /// 只有明确支持 pair 后继消费的融合边界会设置或读取。
+    pub(crate) replica: Option<RocmTensorReplica>,
 }
 
-pub struct RocmStageCompletion(ops::hip::DeviceCompletion);
+pub struct RocmStageCompletion {
+    owner: ops::hip::DeviceCompletion,
+    peers: Vec<pair_worker::RocmPairStageCompletion>,
+}
 
 /// 量化权重的设备 resident 形态。`linear()` 时 in-kernel dequant,不展开 F32。
 #[derive(Debug, Clone)]
@@ -423,7 +438,7 @@ impl RocmContext {
         }
         let bytes = std::mem::size_of_val(data.as_slice());
         let device = ops::hip::DeviceBuffer::upload(self.device_id, unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), bytes) })?;
-        Ok(RocmTensor { data, rows, cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: Some(Arc::new(device)) })
+        Ok(RocmTensor { data, rows, cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: Some(Arc::new(device)), replica: None })
     }
 
     /// 接收/调度线程上传的输入已 ready，不与当前 compute stream 建立全流同步。
@@ -433,7 +448,7 @@ impl RocmContext {
         }
         let bytes = std::mem::size_of_val(data.as_slice());
         let device = ops::hip::DeviceBuffer::upload_independent(self.device_id, unsafe { std::slice::from_raw_parts(data.as_ptr().cast(), bytes) })?;
-        Ok(RocmTensor { data, rows, cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: Some(Arc::new(device)) })
+        Ok(RocmTensor { data, rows, cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: Some(Arc::new(device)), replica: None })
     }
 
     /// 从 fused QKV 中抽取连续 head 区间，输出仍按 `[Q|K|V]` 排列。
@@ -698,12 +713,12 @@ fn device_tensor_with_dtype(buffer: ops::hip::DeviceBuffer, rows: usize, cols: u
     // 空张量允许 4 字节占位 buffer:DeviceBuffer 不接受 0 字节分配,
     // 空窗口路径(compressor 等)统一按 max(bytes, 4) 分配输出。
     debug_assert!(buffer.bytes() == rows.saturating_mul(cols).saturating_mul(dtype.element_bytes()) || (rows == 0 || cols == 0) && buffer.bytes() == 4);
-    RocmTensor { data: Vec::new(), rows, cols, dtype, layout: RocmTensorLayout::RowMajor, device: Some(Arc::new(buffer)) }
+    RocmTensor { data: Vec::new(), rows, cols, dtype, layout: RocmTensorLayout::RowMajor, device: Some(Arc::new(buffer)), replica: None }
 }
 
 fn device_tensor_with_arc(buffer: Arc<ops::hip::DeviceBuffer>, rows: usize, cols: usize, dtype: RocmTensorDType) -> RocmTensor {
     debug_assert_eq!(buffer.bytes(), rows.saturating_mul(cols).saturating_mul(dtype.element_bytes()));
-    RocmTensor { data: Vec::new(), rows, cols, dtype, layout: RocmTensorLayout::RowMajor, device: Some(buffer) }
+    RocmTensor { data: Vec::new(), rows, cols, dtype, layout: RocmTensorLayout::RowMajor, device: Some(buffer), replica: None }
 }
 
 fn device_tensor_f32(buffer: ops::hip::DeviceBuffer, rows: usize, cols: usize) -> RocmTensor {

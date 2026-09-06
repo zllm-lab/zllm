@@ -3,7 +3,7 @@
 use rayon::prelude::*;
 
 use crate::{
-    attention::gated_delta_net::{GatedDeltaNetHeadLayout, GatedDeltaNetInputs, GatedDeltaNetKernel, GatedDeltaNetSpec, GatedDeltaNetStorage, GatedDeltaNetWeightsRef},
+    attention::gated_delta_net::{GatedDeltaNetHeadLayout, GatedDeltaNetInputs, GatedDeltaNetKernel, GatedDeltaNetSpec, GatedDeltaNetStorage, GatedDeltaNetWeightsRef, GdnOutputGate},
     backend::cpu::{CpuContext, CpuWeight},
     backend::{BackendError, compute_error as compute},
     kernel::cpu::{CpuTensor, sigmoid, softplus},
@@ -164,8 +164,18 @@ impl GatedDeltaNetKernel for CpuContext {
             core_chunks_read.into_par_iter().zip(output_chunks.into_par_iter()).enumerate().for_each(|(head, (core_chunk, out_chunk))| {
                 let variance = core_chunk.iter().map(|value| value * value).sum::<f32>() / value_head_dim as f32;
                 let inv_rms = 1.0 / (variance + spec.rms_eps).sqrt();
-                for column in 0..value_head_dim {
-                    out_chunk[column] = core_chunk[column] * inv_rms * norm_ref[column] * z_ref[head * value_head_dim + column] * sigmoid(z_ref[head * value_head_dim + column]);
+                match spec.output_gate {
+                    GdnOutputGate::Silu => {
+                        for column in 0..value_head_dim {
+                            let z = z_ref[head * value_head_dim + column];
+                            out_chunk[column] = core_chunk[column] * inv_rms * norm_ref[column] * z * sigmoid(z);
+                        }
+                    }
+                    GdnOutputGate::Sigmoid => {
+                        for column in 0..value_head_dim {
+                            out_chunk[column] = core_chunk[column] * inv_rms * norm_ref[column] * sigmoid(z_ref[head * value_head_dim + column]);
+                        }
+                    }
                 }
             });
         }
@@ -208,7 +218,7 @@ mod tests {
     #[test]
     fn fused_kernel_obeys_head_layout() {
         let backend = CpuContext;
-        let spec = GatedDeltaNetSpec { key_heads: 2, value_heads: 4, key_head_dim: 2, value_head_dim: 1, conv_kernel: 1, rms_eps: 1e-6 };
+        let spec = GatedDeltaNetSpec { key_heads: 2, value_heads: 4, key_head_dim: 2, value_head_dim: 1, conv_kernel: 1, rms_eps: 1e-6, output_gate: GdnOutputGate::Silu };
         // value head 1 在 grouped/tiled 下分别读取 key head 0/1；两组 Q/K
         // 分别平行和正交，确保数值结果能锁定映射，而不只测试 helper。
         let qkv = CpuTensor { data: vec![1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0], rows: 1, cols: spec.conv_dim() };

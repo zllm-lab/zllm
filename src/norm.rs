@@ -5,6 +5,8 @@
 pub enum NormSpec {
     /// 标准 Llama 形式:`out = x_normed * weight`(GLM-5.2、Llama)。
     Rms { eps: f32 },
+    /// hidden 按组等分，各组独立计算均方根，再乘全长度权重。
+    GroupedRms { eps: f32, groups: usize },
     /// Gemma 形式:`out = x_normed * (1 + weight)`,权重是零中心 gamma(MiniMax-M3)。
     GemmaRms { eps: f32 },
     /// AdaLN 形式（Diffusion Transformer 专用）:`out = x_normed * (1 + scale) + shift`，

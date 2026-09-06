@@ -296,6 +296,17 @@ extern "C" __global__ void copy_f32(const float *input, float *output, unsigned 
     if (id >= count) return;
     output[id] = input[id];
 }
+// greedy token 的 softmax 概率,用于在验证前截断低置信度草稿。
+extern "C" __global__ void token_probability_f16(const __half *input, float *output, unsigned int columns, unsigned int token) {
+    __shared__ float sums[256];
+    const unsigned int lane = threadIdx.x;
+    const float maximum = __half2float(input[token]);
+    float sum = 0.0f;
+    for (unsigned int c = lane; c < columns; c += blockDim.x) sum += expf(__half2float(input[c]) - maximum);
+    sums[lane] = sum; __syncthreads();
+    for (unsigned int stride = 128; stride; stride >>= 1) { if (lane < stride) sums[lane] += sums[lane + stride]; __syncthreads(); }
+    if (lane == 0) output[0] = 1.0f / sums[0];
+}
 extern "C" __global__ void argmax_f16(
     const __half * __restrict__ input,
     unsigned int * __restrict__ output,
@@ -685,8 +696,12 @@ fn apply_rope_f16(ctx: &CudaContext, input: &CudaTensor, head_count: usize, rota
     let half_dim = rotary_dim / 2;
     let table_begin = position_offset.checked_mul(half_dim).ok_or_else(|| format!("CUDA {name} table offset 溢出"))?;
     let table_end = position_offset.checked_add(input.rows).and_then(|rows| rows.checked_mul(half_dim)).ok_or_else(|| format!("CUDA {name} table end 溢出"))?;
-    let cos = cos.get(table_begin..table_end).ok_or_else(|| format!("CUDA {name} cos={}，需要 {table_begin}..{table_end}", cos.len()))?;
-    let sin = sin.get(table_begin..table_end).ok_or_else(|| format!("CUDA {name} sin={}，需要 {table_begin}..{table_end}", sin.len()))?;
+    let cos_window = cos.get(table_begin..table_end).ok_or_else(|| format!("CUDA {name} cos={}，需要 {table_begin}..{table_end}", cos.len()))?;
+    let sin_window = sin.get(table_begin..table_end).ok_or_else(|| format!("CUDA {name} sin={}，需要 {table_begin}..{table_end}", sin.len()))?;
+    // 小表整体驻留,防止每个位置产生长期存活的小分配,阻碍专家大块内存复用。
+    // 长上下文仍按窗口上传,不把未使用的完整大表强制放进显存。
+    let whole_table = cos.len().max(sin.len()) <= 512 * 1024;
+    let (cos, sin, device_begin) = if whole_table { (cos, sin, table_begin) } else { (cos_window, sin_window, 0) };
     let output = ctx.tensor_alloc(input.rows, input.cols)?;
     let pipeline = if prefix { "apply_rope_prefix_f16" } else { "apply_rope_partial_f16" };
     let func = ctx.function(pipeline)?;
@@ -698,6 +713,8 @@ fn apply_rope_f16(ctx: &CudaContext, input: &CudaTensor, head_count: usize, rota
     // 表窗口设备驻留缓存:同一窗口跨层复用,避免逐层 pageable 上传的重型负载 stall。
     let cos_gpu = ctx.rope_window_f16(cos).map_err(|e| format!("{name} cos 窗口上传失败: {e}"))?;
     let sin_gpu = ctx.rope_window_f16(sin).map_err(|e| format!("{name} sin 窗口上传失败: {e}"))?;
+    let cos_view = cos_gpu.slice(device_begin..device_begin + table_end - table_begin);
+    let sin_view = sin_gpu.slice(device_begin..device_begin + table_end - table_begin);
     unsafe {
         ctx.stream()
             .launch_builder(&func)
@@ -708,8 +725,8 @@ fn apply_rope_f16(ctx: &CudaContext, input: &CudaTensor, head_count: usize, rota
             .arg(&hc)
             .arg(&rd)
             .arg(&pos)
-            .arg(&*cos_gpu)
-            .arg(&*sin_gpu)
+            .arg(&cos_view)
+            .arg(&sin_view)
             .launch(grid_1d(input.rows * input.cols))
             .map_err(|e| format!("launch {pipeline} 失败: {e:?}"))?;
     }
@@ -770,4 +787,45 @@ pub fn argmax_f16(ctx: &CudaContext, input: &CudaTensor) -> Result<u32, String> 
 /// image/video 等特殊 token 时由 runtime 传入。
 pub fn argmax_excluding_f16(ctx: &CudaContext, input: &CudaTensor, excluded: &[u32]) -> Result<u32, String> {
     argmax_impl(ctx, input, excluded)
+}
+
+/// 调用者传入 greedy token,稳定地计算它在整词表上的概率。
+pub fn token_probability_f16(ctx: &CudaContext, input: &CudaTensor, token: u32) -> Result<f32, String> {
+    if input.rows != 1 || input.slice_f32.is_some() || token as usize >= input.cols {
+        return Err("token probability shape/token 非法".into());
+    }
+    let output = ctx.buffer_uninit::<f32>(1)?;
+    let function = ctx.function("token_probability_f16")?;
+    unsafe {
+        ctx.stream()
+            .launch_builder(&function)
+            .arg(&input.slice)
+            .arg(&output)
+            .arg(&(input.cols as u32))
+            .arg(&token)
+            .launch(LaunchConfig { grid_dim: (1, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 })
+            .map_err(|e| format!("token probability: {e:?}"))?;
+    }
+    let value = ctx.stream().clone_dtoh(&output).map_err(|e| format!("token probability 回读: {e:?}"))?[0];
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(format!("token probability 非法: {value}"));
+    }
+    Ok(value)
+}
+
+#[cfg(all(test, target_os = "linux", feature = "with-cuda"))]
+mod probability_tests {
+    use super::*;
+    #[test]
+    fn greedy_probability_matches_host_softmax() {
+        let ctx = CudaContext::new_default().unwrap();
+        for columns in [3usize, 1109] {
+            let values: Vec<f32> = (0..columns).map(|i| ((i * 13 % 41) as f32 - 20.0) / 4.0).collect();
+            let input = ctx.tensor_from_f32(&values, 1, columns).unwrap();
+            let token = argmax_f16(&ctx, &input).unwrap();
+            let expected = 1.0 / values.iter().map(|v| (v - values[token as usize]).exp()).sum::<f32>();
+            let actual = token_probability_f16(&ctx, &input, token).unwrap();
+            assert!((actual - expected).abs() < 1e-6, "probability={actual} expected={expected}");
+        }
+    }
 }

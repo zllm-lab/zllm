@@ -7,7 +7,7 @@ use crate::{
     kernel::cpu::{
         CpuTensor, ggml_quant,
         matmul::matmul,
-        rmsnorm::rmsnorm_with_weight_offset,
+        rmsnorm::{grouped_rmsnorm, rmsnorm_with_weight_offset},
         silu::{gelu_tanh_mul, silu_mul, situ_mul, swiglu_oai_mul},
         w4a16::{W8A8VnniMatrix, matmul_w4a16_matrix, matmul_w8a16_matrix, matvec_w4a16_matrix, matvec_w8a16_matrix},
     },
@@ -284,6 +284,20 @@ impl Backend for CpuContext {
 
     fn rmsnorm(&self, input: &CpuTensor, weight: &CpuWeight, eps: f32) -> Result<CpuTensor, BackendError> {
         apply_rmsnorm(input, weight, eps, 0.0, "RMSNorm")
+    }
+
+    fn grouped_rmsnorm(&self, input: &CpuTensor, weight: &CpuWeight, eps: f32, groups: usize) -> Result<CpuTensor, BackendError> {
+        if weight.data.len() != input.cols {
+            return Err(compute(format!("CPU GroupedRMSNorm weight={}，input cols={}", weight.data.len(), input.cols)));
+        }
+        if groups == 0 || !input.cols.is_multiple_of(groups) {
+            return Err(compute(format!("CPU GroupedRMSNorm groups={groups} 无法整除 cols={}", input.cols)));
+        }
+        let mut output = CpuTensor { data: vec![0.0; input.data.len()], rows: input.rows, cols: input.cols };
+        for row in 0..input.rows {
+            grouped_rmsnorm(input.row(row), &weight.data, eps, groups, output.row_mut(row));
+        }
+        Ok(output)
     }
 
     fn gemma_rmsnorm(&self, input: &CpuTensor, weight: &CpuWeight, eps: f32) -> Result<CpuTensor, BackendError> {

@@ -21,12 +21,13 @@ __device__ __forceinline__ void q4_k_scale_min(
 }
 __device__ __forceinline__ unsigned int gguf_kq_block_bytes(const unsigned int tensor_type)
 {
-    return tensor_type == 2 ? 18u : (tensor_type == 8 ? 34u : (tensor_type == 12 ? 144u : (tensor_type == 13 ? 176u : 210u)));
+    return tensor_type == 2 || tensor_type == 20 ? 18u : (tensor_type == 6 ? 22u : (tensor_type == 7 ? 24u : (tensor_type == 8 ? 34u : (tensor_type == 12 ? 144u : (tensor_type == 13 ? 176u : 210u)))));
 }
 __device__ __forceinline__ unsigned int gguf_kq_block_elements(const unsigned int tensor_type)
 {
-    return tensor_type == 8 || tensor_type == 2 ? 32u : 256u;
+    return tensor_type == 8 || tensor_type == 2 || tensor_type == 6 || tensor_type == 7 || tensor_type == 20 ? 32u : 256u;
 }
+__device__ __constant__ signed char gguf_iq4nl_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 __device__ __forceinline__ float gguf_kq_value(
     const unsigned char *row,
     const unsigned int tensor_type,
@@ -38,13 +39,28 @@ __device__ __forceinline__ float gguf_kq_value(
     if (tensor_type == 8) {
         return __half2float(*reinterpret_cast<const __half *>(block)) * float((signed char)block[2 + (column & 31)]);
     }
+    if (tensor_type == 6) {
+        const unsigned int local = column & 31u;
+        const unsigned int packed = block[6u + (local & 15u)];
+        const unsigned int low = local < 16u ? packed & 15u : packed >> 4;
+        const unsigned int high = (block[2u + local / 8u] >> (local & 7u)) & 1u;
+        return __half2float(*reinterpret_cast<const __half *>(block)) * float(int(low | (high << 4)) - 16);
+    }
+    if (tensor_type == 7) {
+        const unsigned int local = column & 31;
+        const unsigned int packed = block[8 + (local & 15)];
+        const unsigned int low = local < 16 ? packed & 15u : packed >> 4;
+        const unsigned int high = (block[4 + local / 8] >> (local & 7)) & 1u;
+        return __half2float(*reinterpret_cast<const __half *>(block)) * float(low | (high << 4))
+             + __half2float(*reinterpret_cast<const __half *>(block + 2));
+    }
     // Q4_0:32 元素块 = f16 scale + 16 字节 nibble。字节 j 低 nibble 是第 j 个
     // 元素、高 nibble 是第 j+16 个元素(与 weight/codec/ggml.rs 的 decode_q4_0 一致)。
-    if (tensor_type == 2) {
+    if (tensor_type == 2 || tensor_type == 20) {
         const unsigned int local = column & 31;
         const unsigned char packed = block[2 + (local & 15)];
         const unsigned int nibble = local < 16 ? (packed & 15u) : (packed >> 4);
-        return __half2float(*reinterpret_cast<const __half *>(block)) * float(int(nibble) - 8);
+        return __half2float(*reinterpret_cast<const __half *>(block)) * float(tensor_type == 20 ? int(gguf_iq4nl_values[nibble]) : int(nibble) - 8);
     }
     const unsigned int local = column & 255;
     if (tensor_type == 14) {
@@ -69,6 +85,11 @@ __device__ __forceinline__ float gguf_kq_value(
     if (tensor_type == 13 && (block[16 + index] & (1u << group)) != 0) quant += 16;
     return __half2float(*reinterpret_cast<const __half *>(block)) * float(scale * quant)
          - __half2float(*reinterpret_cast<const __half *>(block + 2)) * float(minimum);
+}
+// gather 后的少量压缩行在设备上生成 activation,不物化完整 embedding 表。
+extern "C" __global__ void gguf_rows_f16(const unsigned char *packed, __half *output, unsigned int elements, unsigned int tensor_type) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < elements) output[i] = __float2half(gguf_kq_value(packed, tensor_type, i));
 }
 extern "C" __global__ void gguf_kq_matmul_f16(
     const __half * __restrict__ input,
@@ -141,6 +162,105 @@ extern "C" __global__ void gguf_kq_gemv_f16(
     }
     if (lane == 0) output[output_row] = __float2half(partial[0]);
 }
+// 32 元素块的 GEMV:每 warp 一行,同一 block 的 8 行共享输入。
+// 避免为每个输出行启动 256 线程和 8 次整块同步,同时保持 F32 点积累加。
+__device__ __forceinline__ float gguf_block32_dot(const __half *shared_input, const unsigned char *row, unsigned int columns, unsigned int tensor_type, unsigned int lane) {
+    float sum = 0.0f;
+    if (tensor_type == 8u) {
+        // 8 lane 合作处理一个 Q8_0 块,每 lane 读取 4 个码,每轮覆盖 4 块。
+        // 块长 34 字节仅保证 2 字节对齐,用两个 u16 读取避免未对齐 u32。
+        const unsigned int local = (lane & 7u) * 4u;
+        for (unsigned int b = lane >> 3; b < columns / 32u; b += 4u) {
+            const unsigned char *block = row + (unsigned long long)b * 34u;
+            const float d = __half2float(*reinterpret_cast<const __half *>(block));
+            const unsigned short lo = *reinterpret_cast<const unsigned short *>(block + 2u + local);
+            const unsigned short hi = *reinterpret_cast<const unsigned short *>(block + 4u + local);
+            const unsigned int c = b * 32u + local;
+            float dot = __half2float(shared_input[c]) * float((signed char)(lo & 255u));
+            dot += __half2float(shared_input[c + 1u]) * float((signed char)(lo >> 8));
+            dot += __half2float(shared_input[c + 2u]) * float((signed char)(hi & 255u));
+            dot += __half2float(shared_input[c + 3u]) * float((signed char)(hi >> 8));
+            sum += d * dot;
+        }
+    } else {
+        for (unsigned int c = lane; c < columns; c += 32u) sum += __half2float(shared_input[c]) * gguf_kq_value(row, tensor_type, c);
+    }
+    for (unsigned int offset = 16; offset; offset >>= 1) sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    return sum;
+}
+extern "C" __global__ void gguf_block32_gemv_f16(
+    const __half *input, const unsigned char *weight, __half *output,
+    const unsigned int columns, const unsigned int output_rows, const unsigned int tensor_type)
+{
+    extern __shared__ __half shared_input[];
+    for (unsigned int c = threadIdx.x; c < columns; c += blockDim.x) shared_input[c] = input[c];
+    __syncthreads();
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int row_index = blockIdx.x * (blockDim.x / 32u) + threadIdx.x / 32u;
+    if (row_index >= output_rows) return;
+    const unsigned char *row = weight + (unsigned long long)row_index * (columns / 32u) * gguf_kq_block_bytes(tensor_type);
+    float sum = gguf_block32_dot(shared_input, row, columns, tensor_type, lane);
+    if (lane == 0) output[row_index] = __float2half(sum);
+}
+// 小批次验证复用同一 packed 权重,每 warp 同时计算最多 8 行激活。
+template<unsigned int ROWS, unsigned int TYPE>
+__device__ __forceinline__ void gguf_block32_rows_impl(const __half *input, const unsigned char *weight, __half *output, unsigned int runtime_rows, unsigned int columns, unsigned int output_rows, unsigned int runtime_type, unsigned int use_shared) {
+    const unsigned int rows = ROWS ? ROWS : runtime_rows;
+    const unsigned int tensor_type = TYPE ? TYPE : runtime_type;
+    extern __shared__ __half shared_rows[];
+    if (use_shared) for (unsigned int i = threadIdx.x; i < rows * columns; i += blockDim.x) shared_rows[i] = input[i];
+    __syncthreads();
+    const __half *x = use_shared ? shared_rows : input;
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int out = blockIdx.x * (blockDim.x / 32u) + threadIdx.x / 32u;
+    if (out >= output_rows) return;
+    const unsigned char *w = weight + (unsigned long long)out * (columns / 32u) * gguf_kq_block_bytes(tensor_type);
+    float sum[8] = {0};
+    if (tensor_type == 8u) {
+        const unsigned int local = (lane & 7u) * 4u;
+        for (unsigned int b = lane >> 3; b < columns / 32u; b += 4u) {
+            const unsigned char *block = w + (unsigned long long)b * 34u;
+            const float d = __half2float(*reinterpret_cast<const __half *>(block));
+            const unsigned short lo = *reinterpret_cast<const unsigned short *>(block + 2u + local);
+            const unsigned short hi = *reinterpret_cast<const unsigned short *>(block + 4u + local);
+            const unsigned int c = b * 32u + local;
+            #pragma unroll
+            for (unsigned int row = 0; row < 8; ++row) if (row < rows) {
+                const __half *v = x + (unsigned long long)row * columns + c;
+                float dot = __half2float(v[0]) * float((signed char)(lo & 255u));
+                dot += __half2float(v[1]) * float((signed char)(lo >> 8));
+                dot += __half2float(v[2]) * float((signed char)(hi & 255u));
+                dot += __half2float(v[3]) * float((signed char)(hi >> 8));
+                sum[row] += d * dot;
+            }
+        }
+    } else {
+        for (unsigned int c = lane; c < columns; c += 32u) {
+            const float value = gguf_kq_value(w, tensor_type, c);
+            #pragma unroll
+            for (unsigned int row = 0; row < 8; ++row) if (row < rows) sum[row] += __half2float(x[(unsigned long long)row * columns + c]) * value;
+        }
+    }
+    #pragma unroll
+    for (unsigned int row = 0; row < 8; ++row) if (row < rows) {
+        for (unsigned int offset = 16; offset; offset >>= 1) sum[row] += __shfl_down_sync(0xffffffffu, sum[row], offset);
+        if (lane == 0) output[(unsigned long long)row * output_rows + out] = __float2half(sum[row]);
+    }
+}
+// 行数和编码在编译期确定,消除每个量化块内的八路动态分支及数组局部内存。
+#define BLOCK32_ROWS_KERNEL(NAME, ROWS, TYPE) \
+extern "C" __global__ void NAME(const __half *input, const unsigned char *weight, __half *output, unsigned int rows, unsigned int columns, unsigned int output_rows, unsigned int tensor_type, unsigned int use_shared) { \
+    gguf_block32_rows_impl<ROWS, TYPE>(input, weight, output, rows, columns, output_rows, tensor_type, use_shared); \
+}
+BLOCK32_ROWS_KERNEL(gguf_block32_rows_f16, 0, 0)
+BLOCK32_ROWS_KERNEL(gguf_q8_rows2_f16, 2, 8)
+BLOCK32_ROWS_KERNEL(gguf_q8_rows3_f16, 3, 8)
+BLOCK32_ROWS_KERNEL(gguf_q8_rows4_f16, 4, 8)
+BLOCK32_ROWS_KERNEL(gguf_q8_rows5_f16, 5, 8)
+BLOCK32_ROWS_KERNEL(gguf_q8_rows6_f16, 6, 8)
+BLOCK32_ROWS_KERNEL(gguf_q8_rows7_f16, 7, 8)
+BLOCK32_ROWS_KERNEL(gguf_q8_rows8_f16, 8, 8)
+#undef BLOCK32_ROWS_KERNEL
 // Q4_0 专用单行 GEMV:每 warp 独占一个输出行,lane 固定覆盖 32 元素块的 1 列,
 // scale 每块解码一次;输入向量经 smem 广播(LM head 262144 行共享同一份 x)。
 // 替代通用 gguf_kq_gemv 的逐元素解码(26 万行 × 逐元素 f16 scale 重读,~6% 带宽)。
@@ -676,17 +796,15 @@ __device__ __forceinline__ float q6_k_row_dot(
     }
     return sum;
 }
-extern "C" __global__ void gated_linear_q4_k_silu_f16(
+__device__ __forceinline__ void gated_q4k_row(
     const __half * __restrict__ input,
     const unsigned char * __restrict__ gate,
     const unsigned char * __restrict__ up,
     __half * __restrict__ output,
     const unsigned int in_cols,
     const unsigned int out_cols,
-    const unsigned int blocks_per_row)
+    const unsigned int blocks_per_row, const unsigned int col, const unsigned int row)
 {
-    const unsigned int col = blockIdx.x;
-    const unsigned int row = blockIdx.y;
     if (col >= out_cols) return;
     const unsigned int lane = threadIdx.x & 31;
     const unsigned int warp = threadIdx.x >> 5;
@@ -728,6 +846,36 @@ extern "C" __global__ void gated_linear_q4_k_silu_f16(
             output[(unsigned long long)row * out_cols + col] = __float2half((gate_sum / (1.0f + expf(-gate_sum))) * up_sum);
         }
     }
+}
+extern "C" __global__ void gated_linear_q4_k_silu_f16(const __half *input, const unsigned char *gate, const unsigned char *up, __half *output, unsigned int in_cols, unsigned int out_cols, unsigned int blocks_per_row) {
+    gated_q4k_row(input, gate, up, output, in_cols, out_cols, blocks_per_row, blockIdx.x, blockIdx.y);
+}
+// 所有已选择专家一次提交,地址表只引用仍由 backend 持有的 packed 权重。
+extern "C" __global__ void moe_q4k_gate_up_f16(const __half *input, const unsigned long long *experts, __half *output, unsigned int columns, unsigned int intermediate, unsigned int top_k) {
+    const unsigned int expert = blockIdx.y;
+    const unsigned char *gate = reinterpret_cast<const unsigned char *>(experts[expert * 4u]);
+    const unsigned char *up = reinterpret_cast<const unsigned char *>(experts[expert * 4u + 1u]);
+    gated_q4k_row(input + (unsigned long long)(expert / top_k) * columns, gate, up, output + (unsigned long long)expert * intermediate, columns, intermediate, columns / 256u, blockIdx.x, 0);
+}
+extern "C" __global__ void moe_block32_down_sum_f32(const __half *input, const unsigned long long *experts, const float *route_weights, float *output, unsigned int count, unsigned int columns, unsigned int output_rows, unsigned int tensor_type, const float *previous) {
+    extern __shared__ __half activations[];
+    input += (unsigned long long)blockIdx.y * count * columns;
+    experts += (unsigned long long)blockIdx.y * count * 4u;
+    output += (unsigned long long)blockIdx.y * output_rows;
+    for (unsigned int i = threadIdx.x; i < count * columns; i += blockDim.x) activations[i] = input[i];
+    __syncthreads();
+    const unsigned int lane = threadIdx.x & 31u;
+    const unsigned int row_index = blockIdx.x * (blockDim.x / 32u) + threadIdx.x / 32u;
+    if (row_index >= output_rows) return;
+    float result = previous && lane == 0 ? previous[(unsigned long long)blockIdx.y * output_rows + row_index] : 0.0f;
+    for (unsigned int expert = 0; expert < count; ++expert) {
+        const unsigned char *weight = reinterpret_cast<const unsigned char *>(experts[expert * 4u + 2u]);
+        const unsigned char *row = weight + (unsigned long long)row_index * (columns / 32u) * gguf_kq_block_bytes(tensor_type);
+        const float sum = gguf_block32_dot(activations + expert * columns, row, columns, tensor_type, lane);
+        // 保持独立 down GEMV 的 F16 交付语义,再按原专家顺序累加 F32。
+        if (lane == 0) result += __half2float(__float2half(sum)) * route_weights[experts[expert * 4u + 3u]];
+    }
+    if (lane == 0) output[row_index] = result;
 }
 extern "C" __global__ void gated_linear_q4_k_silu_rows8_f16(
     const __half * __restrict__ input,
@@ -1251,13 +1399,15 @@ pub fn cublas_matmul_f32(ctx: &CudaContext, input: &CudaTensor, weight: &CudaSli
 fn gguf_kq_layout(rows: usize, cols: usize, tensor_type: u32) -> Result<(usize, usize), String> {
     let block_bytes = match tensor_type {
         2 => 18,
+        6 => 22,
+        7 => 24,
         8 => 34,
         12 => 144,
         13 => 176,
         14 => 210,
         other => return Err(format!("CUDA GGUF K-quant 不支持 type={other}")),
     };
-    let block_elements = if tensor_type == 8 || tensor_type == 2 { 32 } else { 256 };
+    let block_elements = if matches!(tensor_type, 2 | 6 | 7 | 8) { 32 } else { 256 };
     if rows == 0 || cols == 0 || !cols.is_multiple_of(block_elements) {
         return Err(format!("CUDA GGUF K-quant shape [{rows},{cols}] 非法"));
     }
@@ -1266,11 +1416,53 @@ fn gguf_kq_layout(rows: usize, cols: usize, tensor_type: u32) -> Result<(usize, 
     Ok((elements, bytes))
 }
 
+/// CPU 只搬运被选中的 packed 行,其数值转换在 GPU 形成 activation。
+pub fn gguf_rows_f16(ctx: &CudaContext, packed: &[u8], rows: usize, columns: usize, tensor_type: u32) -> Result<CudaTensor, String> {
+    let block_bytes = match tensor_type {
+        8 => 34,
+        20 => 18,
+        _ => return Err(format!("CUDA gather rows 不支持 GGUF type={tensor_type}")),
+    };
+    let elements = rows.checked_mul(columns).ok_or("CUDA gather rows 元素数溢出")?;
+    if rows == 0 || columns == 0 || !columns.is_multiple_of(32) || packed.len() != elements / 32 * block_bytes {
+        return Err(format!("CUDA gather rows shape=[{rows},{columns}] packed={} type={tensor_type}", packed.len()));
+    }
+    let data = ctx.stream().clone_htod(packed).map_err(|error| format!("CUDA gather 上传: {error:?}"))?;
+    let output = ctx.tensor_alloc(rows, columns)?;
+    let function = ctx.function("gguf_rows_f16")?;
+    unsafe {
+        ctx.stream().launch_builder(&function).arg(&data).arg(&output.slice).arg(&(elements as u32)).arg(&tensor_type).launch(grid_1d(elements)).map_err(|error| format!("CUDA gather decode: {error:?}"))?;
+    }
+    Ok(output)
+}
+
 /// prefill/decode 都直接从 GGUF K-quant block 计算；同一行权重一次处理最多 8 个 token。
 pub fn gguf_kq_matmul_f16(ctx: &CudaContext, input: &CudaTensor, weight: &cudarc::driver::safe::CudaSlice<u8>, out_rows: usize, tensor_type: u32) -> Result<CudaTensor, String> {
     let (_, expected) = gguf_kq_layout(out_rows, input.cols, tensor_type)?;
     if weight.len() != expected {
         return Err(format!("CUDA GGUF type={tensor_type} weight={}，期望 {expected}", weight.len()));
+    }
+    if matches!(tensor_type, 6 | 7 | 8) && (2..=8).contains(&input.rows) {
+        let output = ctx.tensor_uninit(input.rows, out_rows)?;
+        let shared = input.rows * input.cols * 2;
+        let use_shared = shared <= 48 * 1024;
+        let name = if tensor_type == 8 { format!("gguf_q8_rows{}_f16", input.rows) } else { "gguf_block32_rows_f16".to_owned() };
+        let function = ctx.function(&name)?;
+        unsafe {
+            ctx.stream()
+                .launch_builder(&function)
+                .arg(&input.slice)
+                .arg(weight)
+                .arg(&output.slice)
+                .arg(&(input.rows as u32))
+                .arg(&(input.cols as u32))
+                .arg(&(out_rows as u32))
+                .arg(&tensor_type)
+                .arg(&u32::from(use_shared))
+                .launch(LaunchConfig { grid_dim: (out_rows.div_ceil(8) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: if use_shared { shared as u32 } else { 0 } })
+                .map_err(|e| format!("launch gguf_block32_rows_f16: {e:?}"))?;
+        }
+        return Ok(output);
     }
     if tensor_type == 2 && (2..=8).contains(&input.rows) {
         // Q4_0 × Q8_1 MMVQ(llama.cpp 同款):2..8 行前向(MTP verify),权重只读
@@ -1296,6 +1488,22 @@ pub fn gguf_kq_matmul_f16(ctx: &CudaContext, input: &CudaTensor, weight: &cudarc
                     .arg(&(blocks_per_row as u32))
                     .launch(LaunchConfig { grid_dim: ((out_rows.div_ceil((THREADS / 32) as usize)) as u32, 1, 1), block_dim: (THREADS, 1, 1), shared_mem_bytes: (input.cols * std::mem::size_of::<half::f16>()) as u32 })
                     .map_err(|error| format!("launch linear_q4_0_gemv_f16 失败: {error:?}"))?;
+            }
+            return Ok(output);
+        }
+        if matches!(tensor_type, 6 | 7 | 8) && input.cols * std::mem::size_of::<half::f16>() <= 48 * 1024 {
+            let func = ctx.function("gguf_block32_gemv_f16")?;
+            unsafe {
+                ctx.stream()
+                    .launch_builder(&func)
+                    .arg(&input.slice)
+                    .arg(weight)
+                    .arg(&output.slice)
+                    .arg(&cols_u32)
+                    .arg(&out_rows_u32)
+                    .arg(&tensor_type)
+                    .launch(LaunchConfig { grid_dim: (out_rows.div_ceil((THREADS / 32) as usize) as u32, 1, 1), block_dim: (THREADS, 1, 1), shared_mem_bytes: (input.cols * std::mem::size_of::<half::f16>()) as u32 })
+                    .map_err(|error| format!("launch gguf_block32_gemv_f16 失败: {error:?}"))?;
             }
             return Ok(output);
         }
@@ -1520,6 +1728,94 @@ pub fn gated_linear_q4_k_silu_f16(ctx: &CudaContext, input: &CudaTensor, gate: &
             .map_err(|error| format!("launch gated_linear_q4_k_silu_f16 失败: {error:?}"))?;
     }
     Ok(output)
+}
+
+/// Q4_K gate/up 与 Q5_1/Q8_0 down 的多个已驻留专家,整个 token 批次两次 kernel 提交。
+/// references 的顺序就是 F32 路由累加顺序,不得按设备执行顺序重排。
+pub fn moe_q4k_block32(
+    ctx: &CudaContext,
+    input: &CudaTensor,
+    references: &[(&cudarc::driver::safe::CudaSlice<u8>, &cudarc::driver::safe::CudaSlice<u8>, &cudarc::driver::safe::CudaSlice<u8>, usize)],
+    intermediate: usize,
+    output_columns: usize,
+    down_type: u32,
+    route_weights: &cudarc::driver::safe::CudaSlice<f32>,
+) -> Result<CudaTensor, String> {
+    moe_q4k_block32_accumulate(ctx, input, references, intermediate, output_columns, down_type, route_weights, None)
+}
+
+pub(crate) fn moe_q4k_block32_accumulate(
+    ctx: &CudaContext,
+    input: &CudaTensor,
+    references: &[(&cudarc::driver::safe::CudaSlice<u8>, &cudarc::driver::safe::CudaSlice<u8>, &cudarc::driver::safe::CudaSlice<u8>, usize)],
+    intermediate: usize,
+    output_columns: usize,
+    down_type: u32,
+    route_weights: &cudarc::driver::safe::CudaSlice<f32>,
+    previous: Option<&CudaTensor>,
+) -> Result<CudaTensor, String> {
+    use cudarc::driver::safe::DevicePtr;
+    let top_k = references.len().checked_div(input.rows).ok_or("MoE 输入行数为零")?;
+    let shared_bytes = top_k.checked_mul(intermediate).and_then(|v| v.checked_mul(2)).ok_or("MoE decode activation 大小溢出")?;
+    if !references.len().is_multiple_of(input.rows)
+        || input.slice_f32.is_some()
+        || input.cols == 0
+        || !input.cols.is_multiple_of(256)
+        || intermediate == 0
+        || !intermediate.is_multiple_of(32)
+        || references.is_empty()
+        || !matches!(down_type, 7 | 8)
+        || shared_bytes > 48 * 1024
+    {
+        return Err(format!("CUDA packed MoE decode shape 不支持: input=[{},{}] experts={} intermediate={intermediate} down_type={down_type}", input.rows, input.cols, references.len()));
+    }
+    if previous.is_some_and(|value| value.rows != input.rows || value.cols != output_columns || value.slice_f32.is_none()) {
+        return Err("CUDA packed MoE 累加前缀 shape/dtype 不匹配".into());
+    }
+    let previous_pointer = previous.map_or(0u64, |value| value.slice_f32.as_ref().unwrap().device_ptr(ctx.stream()).0);
+    let gate_bytes = intermediate * (input.cols / 256) * 144;
+    let down_bytes = output_columns * (intermediate / 32) * if down_type == 7 { 24 } else { 34 };
+    let mut pointers = Vec::with_capacity(references.len() * 32);
+    for &(gate, up, down, route) in references {
+        if gate.len() != gate_bytes || up.len() != gate_bytes || down.len() != down_bytes || route >= route_weights.len() {
+            return Err(format!("CUDA packed MoE decode weight/route 不匹配: gate={} up={} expected={gate_bytes}, down={} expected={down_bytes}, route={route}/{}", gate.len(), up.len(), down.len(), route_weights.len()));
+        }
+        for address in [gate.device_ptr(ctx.stream()).0, up.device_ptr(ctx.stream()).0, down.device_ptr(ctx.stream()).0, route as u64] {
+            pointers.extend_from_slice(&address.to_le_bytes());
+        }
+    }
+    let mut table = ctx.buffer_uninit::<u8>(pointers.len())?;
+    ctx.upload_u8_pinned(&pointers, &mut table)?;
+    let activated = ctx.tensor_uninit(references.len(), intermediate)?;
+    let output = ctx.buffer_uninit::<f32>(input.rows * output_columns)?;
+    let gate_up = ctx.function("moe_q4k_gate_up_f16")?;
+    let down = ctx.function("moe_block32_down_sum_f32")?;
+    unsafe {
+        ctx.stream()
+            .launch_builder(&gate_up)
+            .arg(&input.slice)
+            .arg(&table)
+            .arg(&activated.slice)
+            .arg(&(input.cols as u32))
+            .arg(&(intermediate as u32))
+            .arg(&(top_k as u32))
+            .launch(LaunchConfig { grid_dim: (intermediate as u32, references.len() as u32, 1), block_dim: (THREADS, 1, 1), shared_mem_bytes: 2 * (THREADS / 32) * 4 })
+            .map_err(|e| format!("launch moe_q4k_gate_up_f16: {e:?}"))?;
+        ctx.stream()
+            .launch_builder(&down)
+            .arg(&activated.slice)
+            .arg(&table)
+            .arg(route_weights)
+            .arg(&output)
+            .arg(&(top_k as u32))
+            .arg(&(intermediate as u32))
+            .arg(&(output_columns as u32))
+            .arg(&down_type)
+            .arg(&previous_pointer)
+            .launch(LaunchConfig { grid_dim: (output_columns.div_ceil(8) as u32, input.rows as u32, 1), block_dim: (256, 1, 1), shared_mem_bytes: shared_bytes as u32 })
+            .map_err(|e| format!("launch moe_block32_down_sum_f32: {e:?}"))?;
+    }
+    Ok(CudaTensor::new_f32_residual(output, ctx.placeholder_f16()?, input.rows, output_columns))
 }
 
 /// Q4_0 gate/up 直接计算并融合 SiLU;块为 32 元素 / 18 字节,结构对称
@@ -1813,13 +2109,15 @@ mod tests {
     fn packed_blocks(tensor_type: u32, rows: usize) -> Vec<u8> {
         let block_bytes = match tensor_type {
             2 => 18,
+            6 => 22,
+            7 => 24,
             8 => 34,
             12 => 144,
             13 => 176,
             14 => 210,
             _ => unreachable!(),
         };
-        let blocks_per_row = if tensor_type == 8 || tensor_type == 2 { 8 } else { 1 };
+        let blocks_per_row = if matches!(tensor_type, 2 | 6 | 7 | 8) { 8 } else { 1 };
         let mut bytes = vec![0u8; rows * blocks_per_row * block_bytes];
         for block_index in 0..rows * blocks_per_row {
             let row = block_index / blocks_per_row;
@@ -1855,15 +2153,35 @@ mod tests {
     }
 
     #[test]
+    fn selected_quantized_rows_match_cpu() {
+        let ctx = CudaContext::new_default().unwrap();
+        for tensor_type in [8, 20] {
+            let block_bytes = if tensor_type == 8 { 34 } else { 18 };
+            let mut packed = vec![0u8; 15 * block_bytes];
+            for (index, block) in packed.chunks_exact_mut(block_bytes).enumerate() {
+                block[..2].copy_from_slice(&f16::from_f32(0.03125 * (index + 1) as f32).to_le_bytes());
+                for (i, byte) in block[2..].iter_mut().enumerate() {
+                    *byte = (i * 31 + index * 17) as u8;
+                }
+            }
+            let expected = crate::weight::codec::ggml::dequantize(tensor_type, &packed, 480).unwrap();
+            let actual = gguf_rows_f16(&ctx, &packed, 3, 160, tensor_type).and_then(|tensor| ctx.tensor_to_f32(&tensor)).unwrap();
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(*actual, f16::from_f32(expected).to_f32());
+            }
+        }
+    }
+
+    #[test]
     fn gguf_kq_matmul_matches_cpu_decode() {
         let ctx = CudaContext::new_default().expect("初始化 CUDA");
         let input_rows = 9;
         let columns = 256;
-        let output_rows = 2;
+        let output_rows = 11;
         let input = (0..input_rows * columns).map(|index| f16::from_f32(((index * 17 % 101) as f32 - 50.0) / 64.0)).collect::<Vec<_>>();
         let input_device = ctx.stream().clone_htod(&input).expect("上传 input");
         let input_tensor = CudaTensor::new(input_device, input_rows, columns);
-        for tensor_type in [2, 8, 12, 13, 14] {
+        for tensor_type in [2, 6, 7, 8, 12, 13, 14] {
             let packed = packed_blocks(tensor_type, output_rows);
             let decoded = crate::weight::codec::ggml::dequantize(tensor_type, &packed, output_rows * columns).expect("CPU decode");
             let weight = ctx.stream().clone_htod(&packed).expect("上传 packed weight");
@@ -1883,6 +2201,114 @@ mod tests {
                 let expected = (0..columns).map(|column| input[column].to_f32() * decoded[output_row * columns + column]).sum::<f32>();
                 let tolerance = 0.05 + expected.abs() * 0.002;
                 assert!((decode_actual[output_row] - expected).abs() <= tolerance, "GEMV type={tensor_type} output={output_row}: CUDA={} CPU={expected}", decode_actual[output_row]);
+            }
+        }
+    }
+
+    #[test]
+    fn q8_vector_loads_match_cpu_at_block_boundaries() {
+        let ctx = CudaContext::new_default().unwrap();
+        for columns in [32usize, 1056, 2560, 10240] {
+            let rows = 11;
+            let input: Vec<f16> = (0..columns).map(|i| f16::from_f32(((i * 19 % 97) as f32 - 48.0) / 64.0)).collect();
+            let mut packed = vec![0u8; rows * (columns / 32) * 34];
+            for (b, block) in packed.chunks_exact_mut(34).enumerate() {
+                block[..2].copy_from_slice(&f16::from_f32((b % 5 + 1) as f32 / 256.0).to_le_bytes());
+                for (j, byte) in block[2..].iter_mut().enumerate() {
+                    *byte = (b * 29 + j * 31) as u8;
+                }
+            }
+            let decoded = crate::weight::codec::ggml::dequantize(8, &packed, rows * columns).unwrap();
+            let tensor = CudaTensor::new(ctx.stream().clone_htod(&input).unwrap(), 1, columns);
+            let weight = ctx.stream().clone_htod(&packed).unwrap();
+            let actual = gguf_kq_matmul_f16(&ctx, &tensor, &weight, rows, 8).and_then(|t| ctx.tensor_to_f32(&t)).unwrap();
+            for row in 0..rows {
+                let expected: f32 = input.iter().enumerate().map(|(c, x)| x.to_f32() * decoded[row * columns + c]).sum();
+                assert!((actual[row] - expected).abs() <= 1e-3 + 1e-3 * expected.abs(), "Q8 columns={columns} row={row}: {} != {expected}", actual[row]);
+            }
+        }
+    }
+
+    #[test]
+    fn small_batch_block32_matches_cpu_including_large_input() {
+        let ctx = CudaContext::new_default().unwrap();
+        for (rows, columns) in [(2usize, 320usize), (3, 2560), (4, 32), (5, 10240), (6, 320), (7, 1024), (8, 1056)] {
+            let output_rows = 11;
+            let input: Vec<f16> = (0..rows * columns).map(|i| f16::from_f32(((i * 19 % 97) as f32 - 48.0) / 256.0)).collect();
+            let tensor = CudaTensor::new(ctx.stream().clone_htod(&input).unwrap(), rows, columns);
+            for tensor_type in [6u32, 7, 8] {
+                let mut packed = packed_blocks(tensor_type, (output_rows * columns).div_ceil(256));
+                packed.truncate(
+                    output_rows
+                        * (columns / 32)
+                        * match tensor_type {
+                            6 => 22,
+                            7 => 24,
+                            _ => 34,
+                        },
+                );
+                let decoded = crate::weight::codec::ggml::dequantize(tensor_type, &packed, output_rows * columns).unwrap();
+                let weight = ctx.stream().clone_htod(&packed).unwrap();
+                let actual = gguf_kq_matmul_f16(&ctx, &tensor, &weight, output_rows, tensor_type).and_then(|t| ctx.tensor_to_f32(&t)).unwrap();
+                for row in 0..rows {
+                    for out in 0..output_rows {
+                        let expected: f32 = (0..columns).map(|c| input[row * columns + c].to_f32() * decoded[out * columns + c]).sum();
+                        assert!((actual[row * output_rows + out] - expected).abs() <= 0.002 + 0.002 * expected.abs(), "type={tensor_type} rows={rows} columns={columns} row={row} out={out}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_packed_experts_match_separate_native_kernels() {
+        let ctx = CudaContext::new_default().unwrap();
+        for rows in [1usize, 3, 8] {
+            let (hidden, intermediate, output_columns) = (512usize, 640usize, 37usize);
+            let input: Vec<f16> = (0..rows * hidden).map(|i| f16::from_f32(((i * 19 % 97) as f32 - 48.0) / 256.0)).collect();
+            let tensor = CudaTensor::new(ctx.stream().clone_htod(&input).unwrap(), rows, hidden);
+            let route_weights = ctx.stream().clone_htod(&(0..rows * 3).map(|index| [0.2f32, 0.5, 0.3, 0.1, 0.2, 0.7, 0.5, 0.25, 0.25][index % 9]).collect::<Vec<_>>()).unwrap();
+            for down_type in [7u32, 8u32] {
+                let mut owned = Vec::new();
+                for expert in 0..3 {
+                    let mut gate = packed_blocks(12, intermediate * hidden / 256);
+                    let mut up = gate.clone();
+                    // 同一形状的专家拥有不同码,避免地址表错位被相同权重掩盖。
+                    for block in gate.chunks_exact_mut(144) {
+                        block[16] ^= expert * 23;
+                    }
+                    for block in up.chunks_exact_mut(144) {
+                        block[17] ^= expert * 37;
+                    }
+                    let mut down = packed_blocks(down_type, (output_columns * intermediate).div_ceil(256));
+                    down.truncate(output_columns * (intermediate / 32) * if down_type == 7 { 24 } else { 34 });
+                    owned.push((ctx.stream().clone_htod(&gate).unwrap(), ctx.stream().clone_htod(&up).unwrap(), ctx.stream().clone_htod(&down).unwrap()));
+                }
+                let references: Vec<_> = (0..rows).flat_map(|row| owned.iter().zip([2usize, 0, 1]).map(move |((g, u, d), route)| (g, u, d, row * 3 + route))).collect();
+                let actual = moe_q4k_block32(&ctx, &tensor, &references, intermediate, output_columns, down_type, &route_weights).and_then(|t| ctx.tensor_to_f32(&t)).unwrap();
+                for group in [1usize, 2] {
+                    let mut partial = None;
+                    for start in (0..3).step_by(group) {
+                        let end = (start + group).min(3);
+                        let subset: Vec<_> = references.chunks_exact(3).flat_map(|row| row[start..end].iter().copied()).collect();
+                        partial = Some(moe_q4k_block32_accumulate(&ctx, &tensor, &subset, intermediate, output_columns, down_type, &route_weights, partial.as_ref()).unwrap());
+                    }
+                    assert_eq!(ctx.tensor_to_f32(partial.as_ref().unwrap()).unwrap(), actual, "分组累加必须保持逐位相同");
+                }
+                let mut expected = Vec::new();
+                for row in 0..rows {
+                    let one = CudaTensor::new(ctx.stream().clone_htod(&input[row * hidden..(row + 1) * hidden]).unwrap(), 1, hidden);
+                    let sum = ctx.stream().alloc_zeros::<f32>(output_columns).unwrap();
+                    for &(gate, up, down, route) in &references[row * 3..(row + 1) * 3] {
+                        let activated = gated_linear_q4_k_silu_f16(&ctx, &one, gate, up, intermediate).unwrap();
+                        let output = gguf_kq_matmul_f16(&ctx, &activated, down, output_columns, down_type).unwrap();
+                        crate::kernel::cuda::routing::scatter_add_route_f32(&ctx, &sum, &output, &route_weights, route).unwrap();
+                    }
+                    expected.extend(ctx.stream().clone_dtoh(&sum).unwrap());
+                }
+                for (a, e) in actual.iter().zip(expected) {
+                    assert_eq!(*a, e, "批量专家必须保持逐专家原生计算结果: down_type={down_type}");
+                }
             }
         }
     }

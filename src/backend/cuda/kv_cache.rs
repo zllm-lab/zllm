@@ -11,19 +11,19 @@ use crate::{
 };
 
 /// Q8G64(symmetric INT8 + per-64 组 scale)存储,布局镜像 Metal 的 Ornith Q8G64。
-struct CudaKvLayerQ8 {
-    key_codes: CudaSlice<i8>,
-    key_scales: CudaSlice<f32>,
-    value_codes: CudaSlice<i8>,
-    value_scales: CudaSlice<f32>,
+pub struct CudaKvLayerQ8 {
+    pub key_codes: CudaSlice<i8>,
+    pub key_scales: CudaSlice<f32>,
+    pub value_codes: CudaSlice<i8>,
+    pub value_scales: CudaSlice<f32>,
 }
 
-struct CudaKvLayer {
-    key: CudaSlice<f16>,
-    value: CudaSlice<f16>,
-    q8: Option<CudaKvLayerQ8>,
-    rows: usize,
-    columns: usize,
+pub struct CudaKvLayer {
+    pub key: CudaSlice<f16>,
+    pub value: CudaSlice<f16>,
+    pub q8: Option<CudaKvLayerQ8>,
+    pub rows: usize,
+    pub columns: usize,
     /// 该层存储容量(行数):sliding-window 层 = 窗口大小,按 ring 寻址。
     capacity: usize,
 }
@@ -65,6 +65,11 @@ impl CudaKvCache {
         Ok(Self { layers: (0..layer_count).map(|_| None).collect(), max_seq_len, columns, q8g64: true, capacities: Vec::new() })
     }
 
+    /// QSA 掩码注意力等直接消费方需要 KV 层句柄(码/scale 或 F16)。
+    pub fn layer(&self, layer: usize) -> Result<&CudaKvLayer, crate::backend::BackendError> {
+        self.layers.get(layer).ok_or(crate::backend::BackendError::UnsupportedLayer { layer })?.as_ref().ok_or(crate::backend::BackendError::Compute { msg: format!("CUDA KV layer {layer} 尚未初始化") })
+    }
+
     pub fn format(&self) -> &'static str {
         if self.q8g64 { "q8g64" } else { "f16" }
     }
@@ -96,7 +101,7 @@ impl CudaKvCache {
         (0..self.layers.len()).map(move |layer| self.layer_capacity(layer))
     }
 
-    fn append<'a>(&'a mut self, ctx: &CudaContext, layer: usize, position: usize, key: &CudaTensor, value: &CudaTensor) -> Result<&'a CudaKvLayer, BackendError> {
+    pub fn append<'a>(&'a mut self, ctx: &CudaContext, layer: usize, position: usize, key: &CudaTensor, value: &CudaTensor) -> Result<&'a CudaKvLayer, BackendError> {
         if key.rows != value.rows || key.cols != value.cols || (self.columns != 0 && key.cols != self.columns) {
             return Err(BackendError::Compute { msg: format!("CUDA GQA KV shape 异常: key=[{},{}], value=[{},{}], columns={}", key.rows, key.cols, value.rows, value.cols, self.columns) });
         }

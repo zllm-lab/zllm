@@ -205,9 +205,98 @@ pub enum NodeModelConfig {
     Glm52(Glm52NodeModelConfig),
     Glm53Flash(Glm53FlashNodeModelConfig),
     MinimaxH3(H3NodeModelConfig),
-    #[serde(alias = "k2_horizon")]
+    K2Horizon(K2HorizonNodeModelConfig),
     Mistral(MistralNodeModelConfig),
     MiniCpm5(MiniCpm5NodeModelConfig),
+    Qwen4Exp(Qwen4ExpNodeModelConfig),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qwen4ExpNodeModelConfig {
+    pub weights_directory: PathBuf,
+    /// 稠密 QSA 路径上限为 indexer top_k(2048);QSA 稀疏索引器 CUDA 落地后放开。
+    #[serde(default = "default_qwen4exp_max_sequence_length")]
+    pub max_sequence_length: usize,
+    #[serde(default)]
+    pub execution: Qwen4ExpNodeExecutionConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Qwen4ExpNodeExecutionConfig {
+    #[serde(default = "default_qwen4exp_prefill_chunk_size")]
+    pub prefill_chunk_size: usize,
+    /// 显存专家 LRU 预算(GiB)。KV 惰性逐层分配(仅 12 个 QSA 全注意力层),
+    /// 128K Q8G64 约 1.7GiB(F16 3.0GiB)——预算要让位 KV,默认 4GiB。
+    #[serde(default = "default_qwen4exp_expert_cache_gib")]
+    pub expert_cache_gib: usize,
+    #[serde(default)]
+    pub kv_cache_format: KvCacheFormat,
+    #[serde(default = "default_qwen4exp_expert_prefetch_count")]
+    pub expert_prefetch_count: usize,
+    /// 主存专家锁页注册(节点路径要求锁定,与 bench 入口同口径)。
+    #[serde(default = "default_true")]
+    pub pin_experts: bool,
+    #[serde(default = "default_true")]
+    pub frequency_cache: bool,
+    #[serde(default)]
+    pub expert_transfer_group: usize,
+    /// shared MTP 草稿 GGUF(单层);启用后 node 解码走草稿/验证循环。
+    #[serde(default)]
+    pub mtp_weights: Option<PathBuf>,
+    #[serde(default = "default_qwen4exp_mtp_steps")]
+    pub mtp_steps: usize,
+    #[serde(default = "default_qwen4exp_mtp_cache_gib")]
+    pub mtp_cache_gib: usize,
+    #[serde(default = "default_qwen4exp_mtp_min_confidence")]
+    pub mtp_min_confidence: f32,
+}
+
+impl Default for Qwen4ExpNodeExecutionConfig {
+    fn default() -> Self {
+        Self {
+            prefill_chunk_size: default_qwen4exp_prefill_chunk_size(),
+            expert_cache_gib: default_qwen4exp_expert_cache_gib(),
+            expert_prefetch_count: default_qwen4exp_expert_prefetch_count(),
+            pin_experts: true,
+            frequency_cache: true,
+            expert_transfer_group: 0,
+            mtp_weights: None,
+            mtp_steps: default_qwen4exp_mtp_steps(),
+            mtp_cache_gib: default_qwen4exp_mtp_cache_gib(),
+            mtp_min_confidence: default_qwen4exp_mtp_min_confidence(),
+            kv_cache_format: KvCacheFormat::Q8g64,
+        }
+    }
+}
+
+fn default_qwen4exp_mtp_steps() -> usize {
+    2
+}
+
+fn default_qwen4exp_mtp_cache_gib() -> usize {
+    1
+}
+
+fn default_qwen4exp_mtp_min_confidence() -> f32 {
+    0.5
+}
+
+fn default_qwen4exp_max_sequence_length() -> usize {
+    2048
+}
+
+fn default_qwen4exp_prefill_chunk_size() -> usize {
+    256
+}
+
+fn default_qwen4exp_expert_cache_gib() -> usize {
+    4
+}
+
+fn default_qwen4exp_expert_prefetch_count() -> usize {
+    4
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -369,6 +458,33 @@ pub struct MistralNodeModelConfig {
     pub max_sequence_length: usize,
     #[serde(default)]
     pub execution: MistralNodeExecutionConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct K2HorizonNodeModelConfig {
+    pub weights_directory: PathBuf,
+    #[serde(default)]
+    pub lm_head_quantization: LmHeadQuantization,
+    #[serde(default = "default_max_sequence_length")]
+    pub max_sequence_length: usize,
+    #[serde(default)]
+    pub execution: K2HorizonNodeExecutionConfig,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct K2HorizonNodeExecutionConfig {
+    #[serde(default)]
+    pub kv_cache_format: KvCacheFormat,
+    #[serde(default = "default_expert_cache_gib")]
+    pub expert_cache_gib: usize,
+}
+
+impl Default for K2HorizonNodeExecutionConfig {
+    fn default() -> Self {
+        Self { kv_cache_format: KvCacheFormat::Q8g64, expert_cache_gib: default_expert_cache_gib() }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -656,6 +772,10 @@ pub struct Glm52NodeExecutionConfig {
     /// 同机相邻卡共享 routed expert 计算；当前只用于单行 decode 实验。
     #[serde(default)]
     pub cooperative_expert_pairs: bool,
+    /// 以当前单卡融合算子为基线，把 Attention/MoE 工作域拆到相邻两卡；
+    /// 两卡各有独立 host 提交线程，不进入旧 cooperative 执行协议。
+    #[serde(default)]
+    pub parallel_operator_pairs: bool,
     #[serde(default)]
     pub preload_layers_per_device: Option<usize>,
     #[serde(default = "default_memory_reserve_bytes")]
@@ -688,6 +808,9 @@ pub struct Glm52NodeExecutionConfig {
     pub dspark_verify_group_rows: usize,
     #[serde(default = "default_mtp_draft_tokens")]
     pub mtp_draft_tokens: usize,
+    /// 带模型与完整词表元数据的 FR-Spec draft vocabulary JSON。
+    #[serde(default)]
+    pub mtp_draft_vocabulary: Option<PathBuf>,
     #[serde(default)]
     pub reasoning_effort: Glm52ReasoningEffort,
     #[serde(default)]
@@ -708,6 +831,7 @@ impl Default for Glm52NodeExecutionConfig {
             preload_experts: true,
             output_backend: Glm52OutputBackend::default(),
             cooperative_expert_pairs: false,
+            parallel_operator_pairs: false,
             preload_layers_per_device: None,
             memory_reserve_bytes: default_memory_reserve_bytes(),
             kv_admission_layers_per_device: 0,
@@ -720,6 +844,7 @@ impl Default for Glm52NodeExecutionConfig {
             dspark_weight_quantization: ResidentWeightQuantization::Native,
             dspark_verify_group_rows: default_dspark_verify_group_rows(),
             mtp_draft_tokens: default_mtp_draft_tokens(),
+            mtp_draft_vocabulary: None,
             reasoning_effort: Glm52ReasoningEffort::default(),
             thinking_token_budget: None,
             scheduling: Glm52SchedulingConfig::default(),
@@ -957,6 +1082,10 @@ pub struct Glm52StageLayersConfig {
     pub start: usize,
     pub end: usize,
     pub device_layer_ends: Vec<usize>,
+    /// 新 session 可选的卡内层边界；权重按所有方案的并集驻留，KV/DSA 只跟随
+    /// session 选中的单一方案。基础方案始终是 `device_layer_ends`。
+    #[serde(default)]
+    pub alternate_device_layer_ends: Vec<Vec<usize>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -971,6 +1100,9 @@ pub struct Glm52StageExecutionConfig {
     /// 同机相邻卡共享 routed expert 计算；当前只用于单行 decode 实验。
     #[serde(default)]
     pub cooperative_expert_pairs: bool,
+    /// 以当前单卡融合算子为基线，把 Attention/MoE 工作域拆到相邻两卡。
+    #[serde(default)]
+    pub parallel_operator_pairs: bool,
     #[serde(default)]
     pub preload_layers_per_device: Option<usize>,
     #[serde(default = "default_stage_max_concurrency")]
@@ -1001,6 +1133,7 @@ impl Default for Glm52StageExecutionConfig {
             kv_cache_format: KvCacheFormat::Q8g64,
             preload_experts: true,
             cooperative_expert_pairs: false,
+            parallel_operator_pairs: false,
             preload_layers_per_device: None,
             max_concurrency: default_stage_max_concurrency(),
             mtp: false,
@@ -1371,6 +1504,14 @@ pub struct RocmBackendConfig {
     /// cooperative decode 用序列拆分（两卡全头各扫半段 + LSE 合并）替代半头拆分。
     #[serde(default)]
     pub cooperative_mla_sequence_split: bool,
+    /// cooperative decode 在两卡复制完整 attention 输出，使后续 norm/router
+    /// 无需等待 hidden partial 回到 owner。默认关闭，供同二进制 A/B。
+    #[serde(default)]
+    pub cooperative_mla_decode_replicated: bool,
+    /// cooperative prefill 按 query 行归属执行完整 o_proj，避免两卡都为全部
+    /// token 生成半 hidden partial。默认关闭，供同二进制 A/B。
+    #[serde(default)]
+    pub cooperative_mla_prefill_row_output: bool,
     /// cooperative decode 在 owner 合并两侧 sequence shard 并执行完整 o_proj，
     /// 跳过 attention 尾部的 hidden partial P2P 与归约；用于同二进制 A/B。
     #[serde(default)]
@@ -1384,7 +1525,8 @@ pub struct RocmBackendConfig {
     /// 仅 kernel_profile 下对每个 DSA 层采样多少行 HISA block 粗排；不改变 exact selection。
     #[serde(default)]
     pub dsa_hisa_shadow_samples: usize,
-    /// 单行 decode 由 CPU 全历史 DSA 产生候选，GPU 精确重排；MLA cache 仍由 GPU 本地读取。
+    /// 单行 decode 用 CPU BF16 scorer 扫描主存中的完整 DSA 历史并选 Top-K；
+    /// 可配合 mla_cpu_hot_rows，让 GPU 只保留所选 MLA hot rows。
     #[serde(default)]
     pub dsa_cpu_select: bool,
     /// CPU 保存全量 MLA，GPU 每层只保留固定行数的精确 hot cache；0 表示关闭。
@@ -1516,6 +1658,10 @@ fn resolve_node_model_backend(base: &Path, model: &mut NodeModelConfig, backend:
             resolve_optional_path(base, &mut model.execution.dspark_directory);
         }
         NodeModelConfig::DeepseekV4(model) => resolve_path(base, &mut model.weights_directory),
+        NodeModelConfig::Qwen4Exp(model) => {
+            resolve_path(base, &mut model.weights_directory);
+            resolve_optional_path(base, &mut model.execution.mtp_weights);
+        }
         NodeModelConfig::Glm53Flash(model) => {
             resolve_path(base, &mut model.weights_directory);
             resolve_path(base, &mut model.tokenizer);
@@ -1525,6 +1671,7 @@ fn resolve_node_model_backend(base: &Path, model: &mut NodeModelConfig, backend:
             resolve_optional_path(base, &mut model.compressed_tensors_directory);
             resolve_optional_path(base, &mut model.nvfp4_directory);
             resolve_optional_path(base, &mut model.gguf_directory);
+            resolve_optional_path(base, &mut model.execution.mtp_draft_vocabulary);
             resolve_optional_path(base, &mut model.execution.dspark_directory);
             if let Some(tokenizer) = &mut model.tokenizer {
                 resolve_path(base, tokenizer);
@@ -1538,6 +1685,7 @@ fn resolve_node_model_backend(base: &Path, model: &mut NodeModelConfig, backend:
             resolve_optional_path(base, &mut model.qwen_tokenizer_directory);
         }
         NodeModelConfig::Mistral(model) => resolve_path(base, &mut model.weights_directory),
+        NodeModelConfig::K2Horizon(model) => resolve_path(base, &mut model.weights_directory),
         NodeModelConfig::MiniCpm5(model) => resolve_path(base, &mut model.weights_directory),
     }
     match backend {
@@ -1555,6 +1703,8 @@ fn validate_node_model_backend(model: &NodeModelConfig, backend: &NodeBackendCon
         (NodeModelConfig::Ornith(model), NodeBackendConfig::Metal(_)) => validate_ornith(model),
         (NodeModelConfig::Ornith(model), NodeBackendConfig::Cuda(_)) => validate_ornith(model),
         (NodeModelConfig::Laguna(model), NodeBackendConfig::Cuda(_)) => validate_laguna(model),
+        (NodeModelConfig::Qwen4Exp(model), NodeBackendConfig::Cuda(_)) => validate_qwen4exp(model),
+        (NodeModelConfig::Qwen4Exp(_), _) => Err(ConfigError::Invalid("Qwen4-Exp Node 当前只支持 CUDA backend".to_owned())),
         (NodeModelConfig::Laguna(_), _) => Err(ConfigError::Invalid("Laguna Node 当前支持 CUDA backend".to_owned())),
         // Ornith 只使用 full-attention cached GQA，ROCm 已有设备 prefill/decode 实现。
         (NodeModelConfig::Ornith(model), NodeBackendConfig::Rocm(backend)) => validate_ornith_rocm(model, backend),
@@ -1584,6 +1734,8 @@ fn validate_node_model_backend(model: &NodeModelConfig, backend: &NodeBackendCon
         (NodeModelConfig::MinimaxH3(_), _) => Err(ConfigError::Invalid("MiniMax-H3 Node 当前只支持 ROCm backend".to_owned())),
         (NodeModelConfig::Mistral(model), NodeBackendConfig::Metal(_) | NodeBackendConfig::Cuda(_)) => validate_mistral(model),
         (NodeModelConfig::Mistral(_), _) => Err(ConfigError::Invalid("Mistral Node 当前支持 Metal/CUDA backend".to_owned())),
+        (NodeModelConfig::K2Horizon(model), NodeBackendConfig::Metal(_)) => validate_k2_horizon(model),
+        (NodeModelConfig::K2Horizon(_), _) => Err(ConfigError::Invalid("K2-Horizon Node 当前只支持 Metal backend".to_owned())),
         (NodeModelConfig::MiniCpm5(model), NodeBackendConfig::Metal(_) | NodeBackendConfig::Cpu(_)) => validate_minicpm5(model),
         (NodeModelConfig::MiniCpm5(_), _) => Err(ConfigError::Invalid("MiniCPM5 Node 当前支持 Metal/CPU backend".to_owned())),
     }
@@ -1800,6 +1952,22 @@ fn validate_laguna(model: &LagunaNodeModelConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_qwen4exp(model: &Qwen4ExpNodeModelConfig) -> Result<(), ConfigError> {
+    if model.max_sequence_length == 0 || model.execution.prefill_chunk_size == 0 || model.execution.expert_cache_gib == 0 {
+        return Err(ConfigError::Invalid("Qwen4-Exp max_sequence_length / prefill_chunk_size / expert_cache_gib 必须大于 0".to_owned()));
+    }
+    if model.max_sequence_length > 262_144 {
+        return Err(ConfigError::Invalid("Qwen4-Exp max_sequence_length 超过 max_position_embeddings(262144)".to_owned()));
+    }
+    if let Some(mtp) = &model.execution.mtp_weights {
+        let _ = mtp;
+        if model.execution.mtp_steps == 0 || model.execution.mtp_steps > 8 || !(0.0..=1.0).contains(&model.execution.mtp_min_confidence) || model.execution.mtp_cache_gib == 0 {
+            return Err(ConfigError::Invalid("Qwen4-Exp MTP 要求 steps 1..=8、confidence 0..=1、cache_gib > 0".to_owned()));
+        }
+    }
+    Ok(())
+}
+
 fn validate_ornith(model: &OrnithNodeModelConfig) -> Result<(), ConfigError> {
     if model.max_sequence_length == 0 {
         return Err(ConfigError::Invalid("model.max_sequence_length 必须大于 0".to_owned()));
@@ -1810,6 +1978,13 @@ fn validate_ornith(model: &OrnithNodeModelConfig) -> Result<(), ConfigError> {
 fn validate_mistral(model: &MistralNodeModelConfig) -> Result<(), ConfigError> {
     if model.max_sequence_length == 0 {
         return Err(ConfigError::Invalid("model.max_sequence_length 必须大于 0".to_owned()));
+    }
+    Ok(())
+}
+
+fn validate_k2_horizon(model: &K2HorizonNodeModelConfig) -> Result<(), ConfigError> {
+    if model.max_sequence_length == 0 || model.execution.expert_cache_gib == 0 {
+        return Err(ConfigError::Invalid("K2-Horizon max_sequence_length 与 expert_cache_gib 必须大于 0".to_owned()));
     }
     Ok(())
 }
@@ -1986,6 +2161,12 @@ fn validate_glm52(model: &Glm52NodeModelConfig, backend: &RocmBackendConfig) -> 
     if model.execution.mtp && model.execution.dspark_directory.is_some() {
         return Err(ConfigError::Invalid("GLM-5.2 MTP 与 DSpark 不能同时启用".to_owned()));
     }
+    if model.execution.mtp_draft_vocabulary.is_some() && !model.execution.mtp {
+        return Err(ConfigError::Invalid("GLM-5.2 mtp_draft_vocabulary 必须与 mtp 一起启用".to_owned()));
+    }
+    if model.execution.cooperative_expert_pairs && model.execution.parallel_operator_pairs {
+        return Err(ConfigError::Invalid("GLM-5.2 cooperative_expert_pairs 与 parallel_operator_pairs 不能同时启用".to_owned()));
+    }
     if backend.mla_decode_split_threshold == 0 {
         return Err(ConfigError::Invalid("ROCm MLA decode split 阈值必须大于 0".to_owned()));
     }
@@ -1996,19 +2177,20 @@ fn validate_glm52(model: &Glm52NodeModelConfig, backend: &RocmBackendConfig) -> 
     if !single_process && model.head.downstream.ticket.trim().is_empty() {
         return Err(ConfigError::Invalid("model.head.downstream.ticket 不能为空".to_owned()));
     }
-    if single_process && (model.execution.mtp || model.execution.dspark_directory.is_some() || model.execution.cooperative_expert_pairs) {
-        return Err(ConfigError::Invalid("GLM-5.2 单进程完整层链当前要求关闭 MTP、DSpark 与 cooperative experts".to_owned()));
+    if single_process && (model.execution.mtp || model.execution.dspark_directory.is_some() || model.execution.cooperative_expert_pairs || model.execution.parallel_operator_pairs) {
+        return Err(ConfigError::Invalid("GLM-5.2 单进程完整层链当前要求关闭 MTP、DSpark 与双卡算子".to_owned()));
     }
-    let logical_stage_count = if model.execution.cooperative_expert_pairs {
+    let paired = model.execution.cooperative_expert_pairs || model.execution.parallel_operator_pairs;
+    let logical_stage_count = if paired {
         if backend.devices.len() % 2 != 0 {
-            return Err(ConfigError::Invalid("GLM-5.2 cooperative_expert_pairs 要求偶数张设备".to_owned()));
+            return Err(ConfigError::Invalid("GLM-5.2 双卡算子要求偶数张设备".to_owned()));
         }
         backend.devices.len() / 2
     } else {
         backend.devices.len()
     };
     if model.head.layer_ends.len() != logical_stage_count || model.head.layer_ends.last().copied() != Some(model.head.stage_end - 1) || model.head.layer_ends.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(ConfigError::Invalid("GLM-5.2 head.layer_ends 必须与逻辑 stage 一一对应、严格递增，最后等于 stage_end-1；cooperative 模式每两张设备为一个 stage".to_owned()));
+        return Err(ConfigError::Invalid("GLM-5.2 head.layer_ends 必须与逻辑 stage 一一对应、严格递增，最后等于 stage_end-1；双卡模式每两张设备为一个 stage".to_owned()));
     }
     Ok(())
 }
@@ -2061,9 +2243,13 @@ fn validate_stage_glm52(model: &Glm52StageModelConfig, backend: &RocmBackendConf
     if layers.start >= layers.end || layers.end > GLM52_LAYER_COUNT {
         return Err(ConfigError::Invalid(format!("Stage layers 必须满足 0 <= start < end <= {GLM52_LAYER_COUNT}")));
     }
-    let logical_stage_count = if model.execution.cooperative_expert_pairs {
+    if model.execution.cooperative_expert_pairs && model.execution.parallel_operator_pairs {
+        return Err(ConfigError::Invalid("GLM-5.2 stage cooperative_expert_pairs 与 parallel_operator_pairs 不能同时启用".to_owned()));
+    }
+    let paired = model.execution.cooperative_expert_pairs || model.execution.parallel_operator_pairs;
+    let logical_stage_count = if paired {
         if backend.devices.len() % 2 != 0 {
-            return Err(ConfigError::Invalid("GLM-5.2 cooperative_expert_pairs 要求偶数张设备".to_owned()));
+            return Err(ConfigError::Invalid("GLM-5.2 stage 双卡算子要求偶数张设备".to_owned()));
         }
         backend.devices.len() / 2
     } else {
@@ -2074,7 +2260,51 @@ fn validate_stage_glm52(model: &Glm52StageModelConfig, backend: &RocmBackendConf
         || layers.device_layer_ends.windows(2).any(|pair| pair[0] >= pair[1])
         || layers.device_layer_ends.first().is_some_and(|end| *end < layers.start)
     {
-        return Err(ConfigError::Invalid("Stage device_layer_ends 必须与逻辑 stage 一一对应并覆盖完整层区间；cooperative 模式每两张设备为一个 stage".to_owned()));
+        return Err(ConfigError::Invalid("Stage device_layer_ends 必须与逻辑 stage 一一对应并覆盖完整层区间；双卡模式每两张设备为一个 stage".to_owned()));
+    }
+    let layer_counts = |ends: &[usize]| {
+        let mut start = layers.start;
+        ends.iter()
+            .map(|&end| {
+                let count = end + 1 - start;
+                start = end + 1;
+                count
+            })
+            .collect::<Vec<_>>()
+    };
+    const MAX_PLACEMENT_LAYERS_PER_DEVICE: usize = 6;
+    let base_max_layers = layer_counts(&layers.device_layer_ends).into_iter().max().unwrap_or(0);
+    if !layers.alternate_device_layer_ends.is_empty() && base_max_layers > MAX_PLACEMENT_LAYERS_PER_DEVICE {
+        return Err(ConfigError::Invalid(format!("Stage 多 placement 的基础方案单设备不能超过 {MAX_PLACEMENT_LAYERS_PER_DEVICE} 层")));
+    }
+    for alternate in &layers.alternate_device_layer_ends {
+        if alternate.len() != backend.devices.len() || alternate.last().copied() != Some(layers.end - 1) || alternate.windows(2).any(|pair| pair[0] >= pair[1]) || alternate.first().is_some_and(|end| *end < layers.start) {
+            return Err(ConfigError::Invalid("Stage alternate_device_layer_ends 必须与 backend.devices 一一对应并覆盖完整层区间".to_owned()));
+        }
+        if alternate == &layers.device_layer_ends || layer_counts(alternate).into_iter().max().unwrap_or(0) > MAX_PLACEMENT_LAYERS_PER_DEVICE {
+            return Err(ConfigError::Invalid(format!("Stage alternate_device_layer_ends 不能重复基础方案或产生超过 {MAX_PLACEMENT_LAYERS_PER_DEVICE} 层的设备")));
+        }
+    }
+    if !layers.alternate_device_layer_ends.is_empty() {
+        let mut resident_layers = vec![vec![false; layers.end - layers.start]; backend.devices.len()];
+        for plan in std::iter::once(&layers.device_layer_ends).chain(&layers.alternate_device_layer_ends) {
+            let mut start = layers.start;
+            for (device, &end) in plan.iter().enumerate() {
+                for layer in start..=end {
+                    resident_layers[device][layer - layers.start] = true;
+                }
+                start = end + 1;
+            }
+        }
+        if resident_layers.iter().any(|device| device.iter().filter(|&&resident| resident).count() > MAX_PLACEMENT_LAYERS_PER_DEVICE) {
+            return Err(ConfigError::Invalid(format!("Stage 多 placement 的常驻权重并集单设备不能超过 {MAX_PLACEMENT_LAYERS_PER_DEVICE} 层")));
+        }
+    }
+    if !layers.alternate_device_layer_ends.is_empty() && (model.execution.scheduling.decode_batch_limit != 1 || model.execution.scheduling.prefill_batch_limit != 1) {
+        return Err(ConfigError::Invalid("Stage 多 placement 当前要求 decode_batch_limit=1 且 prefill_batch_limit=1".to_owned()));
+    }
+    if layers.start == 0 && !layers.alternate_device_layer_ends.is_empty() {
+        return Err(ConfigError::Invalid("Stage 多 placement 当前只支持同机 tail，不能改变跨机边界".to_owned()));
     }
     if model.max_sequence_length == 0 {
         return Err(ConfigError::Invalid("Stage max_sequence_length 必须大于 0".to_owned()));
@@ -2401,6 +2631,42 @@ mod tests {
     }
 
     #[test]
+    fn glm52_tail_alternate_placement_never_exceeds_base_layer_count() {
+        let RuntimeProcessConfig::Stage(tail) = RuntimeProcessConfig::load(Path::new("config/stage-glm52-tail.yaml")).unwrap() else { unreachable!() };
+        let StageModelConfig::Glm52(mut model) = tail.model else { unreachable!() };
+        let BackendConfig::Rocm(backend) = tail.backend else { unreachable!() };
+        model.execution.scheduling.decode_batch_limit = 1;
+        model.execution.scheduling.prefill_batch_limit = 1;
+        model.layers.device_layer_ends = vec![43, 49, 54, 59, 64, 69, 73, 77];
+        model.layers.alternate_device_layer_ends = vec![vec![43, 48, 54, 59, 64, 69, 73, 77]];
+        assert!(validate_stage_glm52(&model, &backend).is_ok());
+
+        // 基础示例最多 6 层；备用方案不能把任一设备扩成 7 层。
+        model.layers.alternate_device_layer_ends = vec![vec![42, 49, 53, 57, 62, 67, 73, 77]];
+        assert!(validate_stage_glm52(&model, &backend).is_err());
+
+        // 单个方案虽然都不超过 6 层，跨方案的常驻权重并集也不能让 B1 变成 7 层卡。
+        model.layers.alternate_device_layer_ends = vec![vec![42, 48, 54, 59, 64, 69, 73, 77]];
+        assert!(validate_stage_glm52(&model, &backend).is_err());
+
+        // 即使备用方案本身不超过 6 层，基础方案也不能留下 7 层卡。
+        model.layers.device_layer_ends = vec![44, 50, 55, 60, 65, 70, 74, 77];
+        model.layers.alternate_device_layer_ends = vec![vec![43, 48, 54, 59, 64, 69, 73, 77]];
+        assert!(validate_stage_glm52(&model, &backend).is_err());
+    }
+
+    #[test]
+    fn glm52_paired_tail_without_alternate_placement_allows_ten_layers_per_pair() {
+        let RuntimeProcessConfig::Stage(tail) = RuntimeProcessConfig::load(Path::new("config/stage-glm52-tail.yaml")).unwrap() else { unreachable!() };
+        let StageModelConfig::Glm52(mut model) = tail.model else { unreachable!() };
+        let BackendConfig::Rocm(backend) = tail.backend else { unreachable!() };
+        model.execution.parallel_operator_pairs = true;
+        model.layers.device_layer_ends = vec![47, 57, 67, 77];
+        model.layers.alternate_device_layer_ends.clear();
+        assert!(validate_stage_glm52(&model, &backend).is_ok());
+    }
+
+    #[test]
     fn scheduling_rejects_zero_values() {
         let mut scheduling = Glm52SchedulingConfig { execution_slots: 0, ..Glm52SchedulingConfig::default() };
         assert!(validate_scheduling(&scheduling).is_err());
@@ -2449,6 +2715,7 @@ mod tests {
         assert_eq!(execution.dspark_cpu_affinity, None);
         assert_eq!(execution.dspark_weight_quantization, ResidentWeightQuantization::Native);
         assert_eq!(execution.dspark_confidence_threshold, None);
+        assert_eq!(execution.mtp_draft_vocabulary, None);
         let execution: Glm52NodeExecutionConfig = serde_yaml::from_str("dspark_weight_quantization: q8g128\n").unwrap();
         assert_eq!(execution.dspark_weight_quantization, ResidentWeightQuantization::Q8g128);
         let execution: Glm52NodeExecutionConfig = serde_yaml::from_str("dspark_backend: cpu\n").unwrap();
@@ -2551,6 +2818,8 @@ mod tests {
             mla_decode_tile_size: 32,
             mla_decode_wmma: true,
             cooperative_mla_sequence_split: false,
+            cooperative_mla_decode_replicated: false,
+            cooperative_mla_prefill_row_output: false,
             cooperative_mla_decode_full_merge: false,
             dsa_hadamard_i8: false,
             dsa_hadamard_shadow_samples: 0,
@@ -2610,12 +2879,28 @@ mod tests {
     }
 
     #[test]
+    fn glm52_operator_pairs_use_one_logical_stage_per_device_pair() {
+        let head = Glm52HeadConfig { stage_end: 38, layer_ends: vec![9, 19, 29, 37], downstream: StagePeerConfig { ticket: "t".into(), iroh: IrohPeerConfig::default() } };
+        let (mut model, backend) = glm52_node_fixture(head, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        model.execution.parallel_operator_pairs = true;
+        validate_glm52(&model, &backend).expect("8 张物理卡应组成 4 个 operator pair stage");
+
+        model.execution.cooperative_expert_pairs = true;
+        let error = validate_glm52(&model, &backend).unwrap_err();
+        assert!(error.to_string().contains("不能同时启用"));
+    }
+
+    #[test]
     fn glm52_node_head_mtp_without_tail_sampling() {
         // tail 采样路径已移除:LM head 与 L78 固定驻留 head 首卡 A0,
         // mtp=true 不再需要任何配套开关,单独配置即合法。
         let head = Glm52HeadConfig { stage_end: 38, layer_ends: vec![37], downstream: StagePeerConfig { ticket: "t".into(), iroh: IrohPeerConfig::default() } };
         let (mut model, backend) = glm52_node_fixture(head, vec![0]);
         model.execution.mtp = true;
+        model.execution.mtp_draft_vocabulary = Some(PathBuf::from("/tmp/glm52-fr-spec.json"));
         validate_glm52(&model, &backend).expect("MTP 单独配置应合法");
+        model.execution.mtp = false;
+        let error = validate_glm52(&model, &backend).unwrap_err();
+        assert!(error.to_string().contains("mtp_draft_vocabulary"));
     }
 }

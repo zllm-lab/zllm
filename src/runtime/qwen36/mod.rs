@@ -311,6 +311,7 @@ impl Qwen36Config {
             value_head_dim: self.linear_value_head_dim,
             conv_kernel: self.linear_conv_kernel_size,
             rms_eps: self.rms_norm_eps,
+            output_gate: crate::attention::gated_delta_net::GdnOutputGate::Silu,
         }
     }
 }

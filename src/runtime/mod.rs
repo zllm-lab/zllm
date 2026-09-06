@@ -17,6 +17,7 @@ pub mod glm53_flash;
 pub mod h3;
 #[cfg(any(test, all(target_os = "linux", feature = "with-rocm")))]
 pub(crate) mod json_fence;
+pub mod k2_horizon;
 pub mod kimi_k3;
 #[cfg(target_os = "macos")]
 pub(crate) mod metal_node;
@@ -40,6 +41,7 @@ mod prefill_admission;
 mod prefill_scheduler;
 pub mod qwen36;
 pub mod qwen3_vl;
+pub mod qwen4exp;
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
 pub mod rocm_chain;
 pub mod session;
@@ -56,6 +58,24 @@ pub fn validate_max_sequence_length(model: &str, configured: usize, supported: u
         return Err(format!("{model} max_sequence_length={configured} 超出模型范围 1..={supported}"));
     }
     Ok(())
+}
+
+/// 各模型官方推荐的采样参数(模型卡口径,按模型固定不变)。
+/// console 与引擎的缺省采样都查这里,保持单一来源;请求显式指定
+/// `temperature > 0` 时以请求为准,`temperature == 0` 表示贪心。
+/// 未列入的模型缺省贪心(保持各引擎已验证行为)。
+pub fn official_sampling(model_key: &str) -> Option<(f32, f32)> {
+    match model_key {
+        // K2-Horizon 模型卡:temperature=1.0、top_p=0.95,配合 always-high 思考档
+        "k2-horizon" => Some((1.0, 0.95)),
+        // Gemma4 模型卡:temperature=1.0、top_p=0.95
+        "gemma4" => Some((1.0, 0.95)),
+        // Qwen3 官方(thinking 档):0.6/0.95;非 thinking 档 0.7/0.8,由调用方显式指定
+        "qwen36" | "qwen38" => Some((0.6, 0.95)),
+        // MiniCPM5:纯贪心会复读循环(node.rs 实测),温和采样
+        "minicpm5" => Some((0.7, 0.8)),
+        _ => None,
+    }
 }
 
 use crate::attention::AttentionSpec;
@@ -267,6 +287,7 @@ pub fn mtp_project<B: Backend>(
     }
     let (eps, is_gemma) = match norm {
         NormSpec::Rms { eps } => (eps, false),
+        NormSpec::GroupedRms { .. } => return Err(compute_error("MTP 不支持 grouped RMSNorm")),
         NormSpec::GemmaRms { eps } => (eps, true),
         NormSpec::AdaLn { .. } => return Err(compute_error("MTP 不支持 AdaLn 归一化")),
     };

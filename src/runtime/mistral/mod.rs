@@ -19,10 +19,7 @@ use crate::{
         rope::{RopeSpec, RopeTable, RotaryLayout},
     },
     backend::{Backend, BackendError, GqaPrefillBackend, LinearWeight},
-    moe::{
-        Activation,
-        dense_mlp::{DenseMlpSpec, DenseMlpWeightsRef, decode as mlp_decode},
-    },
+    moe::Activation,
     weight::model::mistral::{MistralConfig, MistralLayerWeights, MistralWeights},
 };
 
@@ -159,6 +156,11 @@ pub fn mistral_decode_round<B: GqaPrefillBackend>(
 pub const MISTRAL_BOS_TOKEN_ID: u32 = 1;
 pub const MISTRAL_EOS_TOKEN_ID: u32 = 2;
 
+/// 输出尾段 norm 语义:groups=1 是标准 RMSNorm,K2-Horizon 为分组变体。
+fn output_norm(config: &MistralConfig) -> super::output::OutputNorm {
+    if config.norm_groups == 1 { super::output::OutputNorm::Rms } else { super::output::OutputNorm::GroupedRms { groups: config.norm_groups } }
+}
+
 /// 构造 Mistral-Small-3.2 instruct 标准 prompt（不依赖 tokenizer chat template 解析，纯字面拼接）。
 ///
 /// Mistral-3.2 标准模板：`<s>[SYSTEM_PROMPT]<s>[INST] {prompt} [/INST]`
@@ -196,12 +198,12 @@ pub fn mistral_request_prompt(request: &serde_json::Value) -> Result<String, Str
 
 /// Prefill 后取最后一个 token 位置（prompt 末位）作为首个输出。
 pub fn mistral_last_token_output<B: Backend>(backend: &B, config: &MistralConfig, head: &MistralOutputHead<B::Weight>, hidden: &B::Tensor) -> Result<super::output::OutputResult<B::Tensor>, BackendError> {
-    super::output::last_token_output(backend, head, hidden, backend.token_rows(hidden) - 1, &super::output::OutputPlan { eps: config.rms_eps, norm: super::output::OutputNorm::Rms, excluded_tokens: Vec::new() })
+    super::output::last_token_output(backend, head, hidden, backend.token_rows(hidden) - 1, &super::output::OutputPlan { eps: config.rms_eps, norm: output_norm(config), excluded_tokens: Vec::new() })
 }
 
 /// decode 轮末尾取 hidden 第 0 行作为输出。
 pub fn mistral_token_output<B: Backend>(backend: &B, config: &MistralConfig, head: &MistralOutputHead<B::Weight>, hidden: &B::Tensor) -> Result<super::output::OutputResult<B::Tensor>, BackendError> {
-    super::output::token_output(backend, head, hidden, &super::output::OutputPlan { eps: config.rms_eps, norm: super::output::OutputNorm::Rms, excluded_tokens: Vec::new() })
+    super::output::token_output(backend, head, hidden, &super::output::OutputPlan { eps: config.rms_eps, norm: output_norm(config), excluded_tokens: Vec::new() })
 }
 
 /// Mistral 单层 forward（Llama 风格，无 QK-norm）。
@@ -221,8 +223,11 @@ fn mistral_layer<B: GqaPrefillBackend>(
     } else {
         backend.begin_batch();
     }
-    // 1. pre-norm + QKV projections
-    let normed = backend.rmsnorm(hidden, &weights.input_norm, config.rms_eps)?;
+    // 1. pre-norm + QKV projections(K2-Horizon 为分组 RMSNorm,groups=1 时保持原路径)
+    let normed = match config.norm_groups {
+        1 => backend.rmsnorm(hidden, &weights.input_norm, config.rms_eps)?,
+        groups => backend.grouped_rmsnorm(hidden, &weights.input_norm, config.rms_eps, groups)?,
+    };
     let (query, key, value) = backend.triple_linear(&normed, &weights.query, &weights.key, &weights.value)?;
     // 2. RoPE on Q/K (SplitHalf layout, full head_dim as rotary dim)
     let query = backend.rope_prefix(&query, config.num_heads, config.head_dim, RotaryLayout::SplitHalf, position, &rope.cos, &rope.sin)?;
@@ -245,11 +250,13 @@ fn mistral_layer<B: GqaPrefillBackend>(
     };
     // 4. output projection + residual
     let attention_residual = backend.linear_add(&attention, &weights.output, hidden)?;
-    // 5. pre-norm + SwiGLU
-    let normed = backend.rmsnorm(&attention_residual, &weights.post_attention_norm, config.rms_eps)?;
-    let mlp = mlp_decode(backend, &DenseMlpSpec { intermediate_size: config.intermediate_size, activation: Activation::Silu }, DenseMlpWeightsRef { gate: &weights.gate, up: &weights.up, down: &weights.down }, &normed)?;
-    // 6. residual
-    backend.add(&attention_residual, &mlp)
+    // 5. pre-norm + SwiGLU + 残差:走 gated_mlp_add_residual 能力,支持 fused
+    //    epilogue 的 backend 把残差加法融进 down 投影,省一次独立 dispatch。
+    let normed = match config.norm_groups {
+        1 => backend.rmsnorm(&attention_residual, &weights.post_attention_norm, config.rms_eps)?,
+        groups => backend.grouped_rmsnorm(&attention_residual, &weights.post_attention_norm, config.rms_eps, groups)?,
+    };
+    backend.gated_mlp_add_residual(&normed, &weights.gate, &weights.up, &weights.down, &Activation::Silu, &attention_residual)
 }
 
 // ── 向后兼容 alias ───────────────────────────────────────────────────────
@@ -303,6 +310,8 @@ mod tests {
             rope_theta: 10_000.0,
             rope_scaling: None,
             rms_eps: 1e-5,
+            norm_groups: 1,
+            eos_token_id: 2,
         };
         assert!(crate::runtime::validate_max_sequence_length("Mistral", 128, config.max_position_embeddings).is_ok());
         assert!(crate::runtime::validate_max_sequence_length("Mistral", 0, config.max_position_embeddings).is_err());

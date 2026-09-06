@@ -274,8 +274,13 @@ impl GqaPrefillBackend for MetalContext {
                 crate::attention::gqa::CausalWindow::Full => view.start,
                 crate::attention::gqa::CausalWindow::Sliding { size } => view.start.max((position + 1).saturating_sub(size)),
             };
-            let supported =
-                view.capacity == 0 && view.rows == position && position + 1 - first_visible <= 512 && spec.head_dim <= 128 && spec.head_dim.is_multiple_of(32) && view.group_size.is_multiple_of(4) && spec.num_kv_heads * spec.head_dim <= 512;
+            let supported = view.capacity == 0
+                && view.rows == position
+                && position + 1 - first_visible <= 512
+                && spec.head_dim <= 128
+                && spec.head_dim.is_multiple_of(32)
+                && view.group_size.is_multiple_of(4)
+                && spec.num_kv_heads * spec.head_dim <= 1024;
             if supported {
                 cache.reserve_layer_gqa_row(layer, position).map_err(|msg| BackendError::Compute { msg })?;
                 return ops::attention::gqa_decode_attention_append_direct_q8_tensor(self, query, key, value, &view, position, spec).map_err(|msg| BackendError::Compute { msg });

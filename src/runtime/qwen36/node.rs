@@ -1,7 +1,9 @@
 //! Qwen3.6 / Qwen3.8 节点适配器。只负责节点装载、批请求转发与状态上报。
 
 #[cfg(target_os = "macos")]
-use std::sync::Arc;
+use std::collections::HashSet;
+#[cfg(target_os = "macos")]
+use std::sync::{Arc, Mutex};
 
 #[cfg(not(target_os = "macos"))]
 use crate::{config::Qwen36NodeModelConfig, server::node::DynError};
@@ -49,6 +51,10 @@ impl NodeEngine for Qwen36Engine {
 
     fn terminal_cache_infos(&self) -> Vec<CacheInfo> {
         Qwen36Engine::terminal_cache_infos(self)
+    }
+
+    fn terminal_cache_pins(&self) -> Option<Arc<Mutex<HashSet<String>>>> {
+        Some(Qwen36Engine::terminal_cache_pins(self))
     }
 
     fn max_concurrency(&self) -> usize {

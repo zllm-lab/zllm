@@ -1,9 +1,14 @@
 //! Llama 风格 dense GQA GGUF loader。
 //!
-//! 当前已验证：Mistral-Small-3.2-24B-Instruct-2506。
+//! 当前已验证：Mistral-Small-3.2-24B-Instruct-2506、K2-Horizon-7B(dense 档)。
 //! 兼容任何 llama.cpp 风格 GGUF dense decoder（hidden_size / num_heads / num_kv_heads /
 //! head_dim / vocab_size / rope_theta 任意数值，仅硬约束：head_dim==value_dim、
 //! hidden_size % num_heads == 0、num_heads % num_kv_heads == 0、tensor 命名对齐）。
+//!
+//! K2-Horizon(`general.architecture = "k2-horizon"`)的 dense 档复用本 loader;
+//! 差异仅两处由 metadata 驱动:`attention.group_norm_groups` → 分组 RMSNorm
+//! (7B 为 4 组,组内独立归一化),`tokenizer.ggml.eos_token_id` 停止 token。
+//! MoE / MoVA 档(36B-A4B、375B-A23B)不在此 loader 范围。
 //!
 //! 架构（典型 Mistral-Small-3.2-24B）：
 //! - hidden_size=5120, intermediate_size=32768 (SwiGLU 合并宽度), num_hidden_layers=40
@@ -54,6 +59,10 @@ pub struct MistralConfig {
     pub rope_theta: f32,
     pub rope_scaling: Option<YarnRopeScaling>,
     pub rms_eps: f32,
+    /// K2-Horizon 分组 RMSNorm 的组数(`attention.group_norm_groups`,llama 架构恒为 1)。
+    pub norm_groups: usize,
+    /// 停止 token(`tokenizer.ggml.eos_token_id`;llama 架构 Mistral 惯例为 2,K2-Horizon 为 1)。
+    pub eos_token_id: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -127,14 +136,23 @@ impl MistralConfig {
             Some(kind) => return Err(format!("dense GQA loader 不支持 rope.scaling.type={kind}")),
         };
         let rms_eps = reader.metadata(&key("attention.layer_norm_rms_epsilon")).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(1e-5);
+        // 分组 RMSNorm:K2-Horizon 写 `attention.group_norm_groups`(layernorm_num_groups),
+        // llama 架构无此键,恒为 1(等价标准 RMSNorm)。
+        let norm_groups = reader.metadata(&key("attention.group_norm_groups")).and_then(GgufValue::as_u64).unwrap_or(1) as usize;
         if architecture == DenseGqaArchitecture::K2Horizon {
             let experts = reader.metadata(&key("expert_count")).and_then(GgufValue::as_u64).unwrap_or(0);
-            let norm_groups = reader.metadata(&key("attention.group_norm_groups")).and_then(GgufValue::as_u64).unwrap_or(1);
-            if experts != 0 || norm_groups != 1 {
-                return Err(format!("K2 Horizon dense runtime 仅支持 expert_count=0、group_norm_groups=1，实际 {experts}、{norm_groups}"));
+            if experts != 0 {
+                return Err(format!("K2 Horizon dense runtime 仅支持 expert_count=0(dense 档),实际 {experts};MoE/MoVA 档未接入"));
             }
         }
-        Ok(Self { architecture, layer_count, hidden_size, intermediate_size, num_heads, num_kv_heads, head_dim, vocab_size, max_position_embeddings, rope_theta, rope_scaling, rms_eps })
+        if hidden_size % norm_groups != 0 {
+            return Err(format!("分组 RMSNorm groups={norm_groups} 无法整除 hidden_size={hidden_size}"));
+        }
+        let eos_token_id = reader.metadata("tokenizer.ggml.eos_token_id").and_then(GgufValue::as_u64).map(|value| value as u32).unwrap_or(match architecture {
+            DenseGqaArchitecture::Mistral => 2,
+            DenseGqaArchitecture::K2Horizon => 1,
+        });
+        Ok(Self { architecture, layer_count, hidden_size, intermediate_size, num_heads, num_kv_heads, head_dim, vocab_size, max_position_embeddings, rope_theta, rope_scaling, rms_eps, norm_groups, eos_token_id })
     }
 
     /// query 投影列数（attention output dim）。
@@ -156,6 +174,9 @@ impl MistralConfig {
         }
         if !self.num_heads.is_multiple_of(self.num_kv_heads) {
             return Err(format!("Mistral num_heads={} 不是 num_kv_heads={} 的整数倍", self.num_heads, self.num_kv_heads));
+        }
+        if self.norm_groups == 0 || self.hidden_size % self.norm_groups != 0 {
+            return Err(format!("Mistral norm_groups={} 无法整除 hidden_size={}", self.norm_groups, self.hidden_size));
         }
         Ok(())
     }

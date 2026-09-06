@@ -960,6 +960,25 @@ kernel void gated_delta_norm_gate_f16(
         output[begin + lane] = finite_f16(value * inv_rms * weight[lane] * silu_gate);
     }
 }
+kernel void softplus_gate_scaled_f16(
+    device const half *input [[buffer(0)]],
+    device const half *gate [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant uint &columns [[buffer(3)]],
+    constant uint &gate_columns [[buffer(4)]],
+    constant uint &count [[buffer(5)]],
+    constant float &gate_scale [[buffer(6)]],
+    constant float &output_scale [[buffer(7)]],
+    uint index [[thread_position_in_grid]])
+{
+    if (index >= count) return;
+    const uint column = index % columns;
+    const uint gate_column = column / (columns / gate_columns);
+    const uint gate_index = (index / columns) * gate_columns + gate_column;
+    const float value = float(gate[gate_index]) * gate_scale;
+    const float softplus = value > 20.0f ? value : (value < -20.0f ? exp(value) : log(1.0f + exp(value)));
+    output[index] = finite_f16(float(input[index]) * softplus * output_scale);
+}
 "#;
 
 use crate::backend::metal::api as metal;
@@ -1094,6 +1113,123 @@ pub(crate) fn rmsnorm_f16_in_f32_weight_tensor_resident(ctx: &MetalContext, inpu
     Ok(output)
 }
 
+/// K2-Horizon 分组 RMSNorm:F16 输入直读 F32 权重,输出 F16(层 norm 主路径)。
+/// 单 simdgroup 逐行内核,组内 simd_sum 归约。
+pub(crate) fn grouped_rmsnorm_f16_in_f32_weight_tensor_resident(ctx: &MetalContext, input: &MetalTensor, weight: &metal::Buffer, weight_len: usize, eps: f32, groups: usize) -> Result<MetalTensor, String> {
+    if input.dtype != MetalTensorDType::F16 || weight_len != input.cols {
+        return Err(format!("grouped RMSNorm shape 不兼容: input=[{},{},{:?}] weight={weight_len}", input.rows, input.cols, input.dtype));
+    }
+    if groups == 0 || !input.cols.is_multiple_of(groups) {
+        return Err(format!("grouped RMSNorm groups={groups} 无法整除 cols={}", input.cols));
+    }
+    let output = ctx.tensor_zeros(input.rows, input.cols);
+    let columns = validate_u32("cols", input.cols)?;
+    let groups = validate_u32("groups", groups)?;
+    let pipeline = ctx.pipeline("grouped_rms_norm_f16_in_f32_weight_f16_simd")?;
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(&input.buffer), 0);
+    encoder.set_buffer(1, Some(weight), 0);
+    encoder.set_buffer(2, Some(&output.buffer), 0);
+    set_bytes(&encoder, 3, &columns);
+    set_bytes(&encoder, 4, &eps);
+    set_bytes(&encoder, 5, &groups);
+    encoder.dispatch_thread_groups(MTLSize::new(input.rows as u64, 1, 1), MTLSize::new((groups * 32) as u64, 1, 1));
+    encoder.end_encoding();
+    let shape = format!("[{},{columns}]", input.rows);
+    ctx.commit_and_wait_profiled(&command, "grouped_rms_norm_f16_in_f32_weight_f16", &shape, input.buffer.length() + weight.length(), output.buffer.length());
+    Ok(output)
+}
+
+/// K2-Horizon F32 residual 直接输出 F16 grouped RMSNorm，省去独立 cast。
+pub(crate) fn grouped_rmsnorm_f32_in_f32_weight_to_f16_tensor_resident(ctx: &MetalContext, input: &MetalTensor, weight: &metal::Buffer, weight_len: usize, eps: f32, groups: usize) -> Result<MetalTensor, String> {
+    if input.dtype != MetalTensorDType::F32 || weight_len != input.cols {
+        return Err(format!("F32→F16 grouped RMSNorm shape 不兼容: input=[{},{},{:?}] weight={weight_len}", input.rows, input.cols, input.dtype));
+    }
+    if groups == 0 || !input.cols.is_multiple_of(groups) {
+        return Err(format!("grouped RMSNorm groups={groups} 无法整除 cols={}", input.cols));
+    }
+    let output = ctx.tensor_zeros(input.rows, input.cols);
+    let columns = validate_u32("cols", input.cols)?;
+    let groups = validate_u32("groups", groups)?;
+    let pipeline = ctx.pipeline("grouped_rms_norm_f32_in_f32_weight_f16_simd")?;
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(&input.buffer), 0);
+    encoder.set_buffer(1, Some(weight), 0);
+    encoder.set_buffer(2, Some(&output.buffer), 0);
+    set_bytes(&encoder, 3, &columns);
+    set_bytes(&encoder, 4, &eps);
+    set_bytes(&encoder, 5, &groups);
+    encoder.dispatch_thread_groups(MTLSize::new(input.rows as u64, 1, 1), MTLSize::new((groups * 32) as u64, 1, 1));
+    encoder.end_encoding();
+    let shape = format!("[{},{}]", input.rows, input.cols);
+    ctx.commit_and_wait_profiled(&command, "grouped_rms_norm_f32_in_f32_weight_f16", &shape, input.buffer.length() + weight.length(), output.buffer.length());
+    Ok(output)
+}
+
+/// F32 residual + F16 投影，并直接生成下一子层的 grouped RMSNorm 输入。
+pub fn add_f32_f16_grouped_rmsnorm_tensor_resident(ctx: &MetalContext, left: &MetalTensor, right: &MetalTensor, weight: &metal::Buffer, weight_len: usize, eps: f32, groups: usize) -> Result<(MetalTensor, MetalTensor), String> {
+    validate_tensor("grouped RMSNorm add rhs", right, left.rows, left.cols)?;
+    if left.dtype != MetalTensorDType::F32 || right.dtype != MetalTensorDType::F16 || weight_len != left.cols {
+        return Err(format!("grouped RMSNorm add shape 不兼容: left=[{},{},{:?}] right={:?} weight={weight_len}", left.rows, left.cols, left.dtype, right.dtype));
+    }
+    if groups == 0 || !left.cols.is_multiple_of(groups) {
+        return Err(format!("grouped RMSNorm add groups={groups} 无法整除 cols={}", left.cols));
+    }
+    let residual = ctx.tensor_zeros_f32(left.rows, left.cols);
+    let normalized = ctx.tensor_zeros(left.rows, left.cols);
+    let columns = validate_u32("cols", left.cols)?;
+    let groups = validate_u32("groups", groups)?;
+    let pipeline = ctx.pipeline("add_f32_f16_grouped_rms_norm_f32_weight_f16_simd")?;
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(&left.buffer), 0);
+    encoder.set_buffer(1, Some(&right.buffer), 0);
+    encoder.set_buffer(2, Some(weight), 0);
+    encoder.set_buffer(3, Some(&residual.buffer), 0);
+    encoder.set_buffer(4, Some(&normalized.buffer), 0);
+    set_bytes(&encoder, 5, &columns);
+    set_bytes(&encoder, 6, &eps);
+    set_bytes(&encoder, 7, &groups);
+    encoder.dispatch_thread_groups(MTLSize::new(left.rows as u64, 1, 1), MTLSize::new((groups * 32) as u64, 1, 1));
+    encoder.end_encoding();
+    let shape = format!("[{},{}]", left.rows, left.cols);
+    ctx.commit_and_wait_profiled(&command, "add_f32_f16_grouped_rms_norm_f16", &shape, left.buffer.length() + right.buffer.length() + weight.length(), residual.buffer.length() + normalized.buffer.length());
+    Ok((residual, normalized))
+}
+
+/// K2-Horizon 分组 RMSNorm 的 F32 路径(output head,norm_f32=true)。
+pub(crate) fn grouped_rmsnorm_f32_tensor_resident(ctx: &MetalContext, input: &MetalTensor, weight: &metal::Buffer, weight_len: usize, eps: f32, groups: usize) -> Result<MetalTensor, String> {
+    if input.dtype != MetalTensorDType::F32 || weight_len != input.cols {
+        return Err(format!("F32 grouped RMSNorm shape 不兼容: input=[{},{},{:?}] weight={weight_len}", input.rows, input.cols, input.dtype));
+    }
+    if groups == 0 || !input.cols.is_multiple_of(groups) {
+        return Err(format!("grouped RMSNorm groups={groups} 无法整除 cols={}", input.cols));
+    }
+    let output = ctx.tensor_zeros_f32(input.rows, input.cols);
+    let columns = validate_u32("cols", input.cols)?;
+    let groups = validate_u32("groups", groups)?;
+    let pipeline = ctx.pipeline("grouped_rms_norm_f32_in_f32_weight_f32")?;
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(&input.buffer), 0);
+    encoder.set_buffer(1, Some(weight), 0);
+    encoder.set_buffer(2, Some(&output.buffer), 0);
+    set_bytes(&encoder, 3, &columns);
+    set_bytes(&encoder, 4, &eps);
+    set_bytes(&encoder, 5, &groups);
+    encoder.dispatch_thread_groups(MTLSize::new(input.rows as u64, 1, 1), MTLSize::new((groups * 32) as u64, 1, 1));
+    encoder.end_encoding();
+    let shape = format!("[{},{columns}]", input.rows);
+    ctx.commit_and_wait_profiled(&command, "grouped_rms_norm_f32_in_f32_weight_f32", &shape, input.buffer.length() + weight.length(), output.buffer.length());
+    Ok(output)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn segmented_rmsnorm_add_scaled_tensor(ctx: &MetalContext, left: &MetalTensor, right: &MetalTensor, weight: &MetalTensor, segments: usize, segment_columns: usize, eps: f32, scale: f32) -> Result<MetalTensor, String> {
     let expected_columns = segments.checked_mul(segment_columns).ok_or("segmented RMSNorm 列数溢出")?;
@@ -1202,6 +1338,31 @@ pub fn sigmoid_gate_tensor(ctx: &MetalContext, input: &MetalTensor, gate: &Metal
         set_bytes(encoder, 3, &columns);
         set_bytes(encoder, 4, &gate_columns);
         set_bytes(encoder, 5, &count);
+    })?;
+    Ok(output)
+}
+
+pub fn softplus_gate_scaled_tensor(ctx: &MetalContext, input: &MetalTensor, gate: &MetalTensor, gate_scale: f32, output_scale: f32) -> Result<MetalTensor, String> {
+    if input.rows != gate.rows || gate.cols == 0 || !input.cols.is_multiple_of(gate.cols) {
+        return Err(format!("scaled softplus gate shape input=[{},{}], gate=[{},{}] 不兼容", input.rows, input.cols, gate.rows, gate.cols));
+    }
+    if input.dtype != MetalTensorDType::F16 || gate.dtype != MetalTensorDType::F16 || !gate_scale.is_finite() || !output_scale.is_finite() {
+        return Err(format!("scaled softplus gate 要求 F16 与有限缩放，input={:?} gate={:?} scales={gate_scale}/{output_scale}", input.dtype, gate.dtype));
+    }
+    let columns = validate_u32("scaled softplus columns", input.cols)?;
+    let gate_columns = validate_u32("scaled softplus gate columns", gate.cols)?;
+    let count = validate_u32("scaled softplus count", input.len())?;
+    let output = ctx.tensor_kernel_output(input.rows, input.cols);
+    let shape = format!("input=[{},{}],gate_cols={},scales={gate_scale}/{output_scale}", input.rows, input.cols, gate.cols);
+    launch_1d(ctx, "softplus_gate_scaled_f16", &shape, input.len(), input.buffer.length() + gate.buffer.length(), output.buffer.length(), |encoder| {
+        encoder.set_buffer(0, Some(&input.buffer), 0);
+        encoder.set_buffer(1, Some(&gate.buffer), 0);
+        encoder.set_buffer(2, Some(&output.buffer), 0);
+        set_bytes(encoder, 3, &columns);
+        set_bytes(encoder, 4, &gate_columns);
+        set_bytes(encoder, 5, &count);
+        set_bytes(encoder, 6, &gate_scale);
+        set_bytes(encoder, 7, &output_scale);
     })?;
     Ok(output)
 }
@@ -1703,8 +1864,8 @@ mod gdn_chunked_tests {
     #[test]
     fn gdn_chunked_matches_serial_simd8() {
         // 600 行 = 9 个整 chunk + 24 行尾 chunk;520 行 = 8 个整 chunk + 8 行尾。
-        run_chunked_consistency(GatedDeltaNetSpec { key_heads: 2, value_heads: 4, key_head_dim: 128, value_head_dim: 128, conv_kernel: 4, rms_eps: 1.0e-5 }, 600);
-        run_chunked_consistency(GatedDeltaNetSpec { key_heads: 2, value_heads: 6, key_head_dim: 96, value_head_dim: 72, conv_kernel: 4, rms_eps: 1.0e-5 }, 520);
+        run_chunked_consistency(GatedDeltaNetSpec { key_heads: 2, value_heads: 4, key_head_dim: 128, value_head_dim: 128, conv_kernel: 4, rms_eps: 1.0e-5, output_gate: crate::attention::gated_delta_net::GdnOutputGate::Silu }, 600);
+        run_chunked_consistency(GatedDeltaNetSpec { key_heads: 2, value_heads: 6, key_head_dim: 96, value_head_dim: 72, conv_kernel: 4, rms_eps: 1.0e-5, output_gate: crate::attention::gated_delta_net::GdnOutputGate::Silu }, 520);
     }
 
     /// decode 的逐 token 路径(rows kernel 或 legacy 回退)与 simd8 批量 oracle
@@ -1713,8 +1874,8 @@ mod gdn_chunked_tests {
     /// 128/128 走 rows kernel;96/72 走 legacy 回退(两条 decode kernel 都覆盖)。
     #[test]
     fn gdn_legacy_decode_matches_simd8() {
-        run_decode_consistency(GatedDeltaNetSpec { key_heads: 2, value_heads: 4, key_head_dim: 128, value_head_dim: 128, conv_kernel: 4, rms_eps: 1.0e-5 });
-        run_decode_consistency(GatedDeltaNetSpec { key_heads: 2, value_heads: 6, key_head_dim: 96, value_head_dim: 72, conv_kernel: 4, rms_eps: 1.0e-5 });
+        run_decode_consistency(GatedDeltaNetSpec { key_heads: 2, value_heads: 4, key_head_dim: 128, value_head_dim: 128, conv_kernel: 4, rms_eps: 1.0e-5, output_gate: crate::attention::gated_delta_net::GdnOutputGate::Silu });
+        run_decode_consistency(GatedDeltaNetSpec { key_heads: 2, value_heads: 6, key_head_dim: 96, value_head_dim: 72, conv_kernel: 4, rms_eps: 1.0e-5, output_gate: crate::attention::gated_delta_net::GdnOutputGate::Silu });
     }
 
     fn run_decode_consistency(spec: GatedDeltaNetSpec) {
@@ -1876,6 +2037,47 @@ mod f16_in_f32_weight_tests {
                 assert_eq!(want, got, "columns={columns} index={index}: cast 链={want} 直通={got}");
             }
         }
+    }
+
+    #[test]
+    fn f32_in_f32_weight_grouped_rmsnorm_to_f16_matches_cast_chain() {
+        if crate::backend::metal::api::Device::system_default().is_none() {
+            return;
+        }
+        let ctx = MetalContext::new_default().unwrap();
+        let columns = 2560usize;
+        let rows = 3usize;
+        let groups = 2usize;
+        let input_values = (0..rows * columns).map(|index| ((index as f32) * 0.013).sin() * 1.7).collect::<Vec<_>>();
+        let input = ctx.tensor_from_f32_preserve(&input_values, rows, columns).unwrap();
+        let weight = (0..columns).map(|index| 0.8 + 0.2 * ((index as f32) * 0.019).cos()).collect::<Vec<f32>>();
+        let weight_bytes = unsafe { std::slice::from_raw_parts(weight.as_ptr().cast::<u8>(), std::mem::size_of_val(weight.as_slice())) };
+        let weight_buffer = ctx.shared_buffer(weight_bytes);
+        let expected = grouped_rmsnorm_f32_tensor_resident(&ctx, &input, &weight_buffer, columns, 1.0e-6, groups).unwrap();
+        let expected = to_f16_tensor(&ctx, &expected).unwrap();
+        let actual = grouped_rmsnorm_f32_in_f32_weight_to_f16_tensor_resident(&ctx, &input, &weight_buffer, columns, 1.0e-6, groups).unwrap();
+        assert_eq!(ctx.tensor_to_f32(&actual), ctx.tensor_to_f32(&expected));
+    }
+
+    #[test]
+    fn fused_add_grouped_rmsnorm_matches_separate_path() {
+        if crate::backend::metal::api::Device::system_default().is_none() {
+            return;
+        }
+        let ctx = MetalContext::new_default().unwrap();
+        let columns = 2560usize;
+        let left_values = (0..columns).map(|index| ((index as f32) * 0.011).sin()).collect::<Vec<_>>();
+        let right_values = (0..columns).map(|index| ((index as f32) * 0.017).cos()).collect::<Vec<_>>();
+        let left = ctx.tensor_from_f32_preserve(&left_values, 1, columns).unwrap();
+        let right = ctx.tensor_from_f32(&right_values, 1, columns).unwrap();
+        let weight = (0..columns).map(|index| 0.9 + 0.1 * ((index as f32) * 0.023).sin()).collect::<Vec<f32>>();
+        let weight_bytes = unsafe { std::slice::from_raw_parts(weight.as_ptr().cast::<u8>(), std::mem::size_of_val(weight.as_slice())) };
+        let weight_buffer = ctx.shared_buffer(weight_bytes);
+        let expected_residual = add_tensor(&ctx, &left, &right).unwrap();
+        let expected_normalized = grouped_rmsnorm_f32_in_f32_weight_to_f16_tensor_resident(&ctx, &expected_residual, &weight_buffer, columns, 1.0e-6, 2).unwrap();
+        let (actual_residual, actual_normalized) = add_f32_f16_grouped_rmsnorm_tensor_resident(&ctx, &left, &right, &weight_buffer, columns, 1.0e-6, 2).unwrap();
+        assert_eq!(ctx.tensor_to_f32(&actual_residual), ctx.tensor_to_f32(&expected_residual));
+        assert_eq!(ctx.tensor_to_f32(&actual_normalized), ctx.tensor_to_f32(&expected_normalized));
     }
 }
 

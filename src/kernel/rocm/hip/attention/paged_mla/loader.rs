@@ -84,6 +84,7 @@ fn load(device_id: i32) -> Result<(usize, PagedMlaFunctions), String> {
             dsa_score_native_wmma_i8: function("dsa_score_tiles_native_wmma_i8")?,
             dsa_score_wmma: function("dsa_score_tiles_wmma_q8")?,
             dsa_score_native_wmma: function("dsa_score_tiles_native_wmma_q8")?,
+            dsa_score_native_wmma_rows2: function("dsa_score_tiles_native_wmma_q8_rows2")?,
             dsa_score_native_wmma_decode: function("dsa_score_tiles_native_wmma_q8_decode")?,
             dsa_score_native_wmma_kpool: function("dsa_score_tiles_native_wmma_q8_kpool")?,
             dsa_score_prefix_native_wmma: function("dsa_score_prefix_tiles_native_wmma_q8")?,

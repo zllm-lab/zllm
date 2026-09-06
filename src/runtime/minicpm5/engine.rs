@@ -133,6 +133,9 @@ impl MiniCpm5Engine {
     pub(crate) fn terminal_cache_infos(&self) -> Vec<CacheInfo> {
         self.terminal_states.infos()
     }
+    pub(crate) fn terminal_cache_pins(&self) -> std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> {
+        self.terminal_states.pin_handle()
+    }
 
     pub fn shutdown(&mut self) -> Result<(), String> {
         // 终点缓存是内存 LRU,无落盘;接口形状与 gemma4/qwen36 保持一致。

@@ -4,6 +4,7 @@ use super::*;
 
 pub(super) struct TailSession {
     pub(super) states: Vec<Glm52StageState>,
+    pub(super) placement: usize,
     pub(super) hidden: Option<RocmTensor>,
     pub(super) completed_hidden: Option<(usize, RocmTensor)>,
     pub(super) prompt_hidden: Option<RocmTensor>,
@@ -17,6 +18,7 @@ pub(super) struct TailSession {
 /// 输出与 MTP 驻留 head 首卡,tail 的 resident 只含 KV/DSA 与 terminal hidden。
 pub(super) struct TailResident {
     pub(super) states: Vec<Glm52StageState>,
+    pub(super) placement: usize,
     pub(super) hidden: RocmTensor,
     pub(super) position: usize,
 }
@@ -44,7 +46,7 @@ pub(super) fn begin_tail_stage_open(
     pending: &mut Vec<TailPendingOpen>,
     swap: &Arc<Glm52SwapStore>,
     output_context: &RocmContext,
-    templates: &[Glm52StageState],
+    templates: &[Vec<Glm52StageState>],
     cfg: &Glm52Config,
     max_seq_len: usize,
     request: TailOpenRequest,
@@ -81,7 +83,7 @@ pub(super) fn poll_tail_stage_opens(
     pending: &mut Vec<TailPendingOpen>,
     swap: &Glm52SwapStore,
     output_context: &RocmContext,
-    templates: &[Glm52StageState],
+    templates: &[Vec<Glm52StageState>],
     cfg: &Glm52Config,
     max_seq_len: usize,
 ) -> Result<bool, String> {
@@ -114,7 +116,7 @@ pub(super) fn tail_stage_open(
     resident: &mut HashMap<RequestId, TailResident>,
     swap: &Glm52SwapStore,
     output_context: &RocmContext,
-    templates: &[Glm52StageState],
+    templates: &[Vec<Glm52StageState>],
     cfg: &Glm52Config,
     max_seq_len: usize,
     request: TailOpenRequest,
@@ -124,7 +126,17 @@ pub(super) fn tail_stage_open(
     if active.contains_key(&request_id) {
         return Err(format!("后继重复 Open active request={request_id}"));
     }
-    let mut states = templates.iter().map(|state| state.fresh_session(cfg, max_seq_len)).collect::<Result<Vec<_>, _>>().map_err(|error| format!("创建 tail stage session: {error:?}"))?;
+    let fresh_states = |placement: usize| {
+        templates
+            .get(placement)
+            .ok_or_else(|| format!("tail placement={placement} 不存在"))?
+            .iter()
+            .map(|state| state.fresh_session(cfg, max_seq_len))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("创建 tail placement={placement} session: {error:?}"))
+    };
+    let mut placement = choose_tail_placement(active, templates)?;
+    let mut states = fresh_states(placement)?;
     let mut hidden = None;
     if cache_hit {
         let reserved_rows = if reserved_rows == 0 { cached_tokens } else { reserved_rows };
@@ -144,6 +156,7 @@ pub(super) fn tail_stage_open(
                 link.send_ready(request_id, 0)?;
                 return Ok(());
             }
+            placement = saved.placement;
             states = saved.states;
             hidden = Some(saved.hidden);
         } else {
@@ -162,6 +175,11 @@ pub(super) fn tail_stage_open(
                 link.send_ready(request_id, 0)?;
                 return Ok(());
             }
+            placement = templates
+                .iter()
+                .position(|template| template.len() == snapshot.stages.len() && template.iter().zip(&snapshot.stages).all(|(state, cached)| state.layer_start == cached.layer_start))
+                .ok_or_else(|| format!("tail SSD cache 的 placement 与当前 {} 个方案均不匹配", templates.len()))?;
+            states = fresh_states(placement)?;
             upload_glm52_session(&mut states, &snapshot.stages, cfg, max_seq_len, reserved_rows)?;
             hidden = Some(output_context.tensor_from_bf16_bits(snapshot.last_hidden, 1, cfg.hidden_size).map_err(|error| format!("恢复 tail terminal hidden: {error:?}"))?);
             eprintln!("[stage-swap-in] cache_id={request_id} tokens={cached_tokens}");
@@ -171,8 +189,40 @@ pub(super) fn tail_stage_open(
     }
     // 采样参数在 head 侧消费;这里只做一次合法性校验,坏参数在 Open 期暴露。
     SamplingState::new(sampling_config)?;
-    active.insert(request_id, TailSession { states, hidden, completed_hidden: None, prompt_hidden: None, prompt_position: None, position: cached_tokens, resumed: cache_hit, started: Instant::now() });
+    active.insert(request_id, TailSession { states, placement, hidden, completed_hidden: None, prompt_hidden: None, prompt_position: None, position: cached_tokens, resumed: cache_hit, started: Instant::now() });
+    eprintln!("[glm52-session-placement] request_id={request_id} plan={placement} cache_hit={cache_hit}");
     link.send_ready(request_id, cached_tokens)
+}
+
+fn choose_tail_placement(active: &HashMap<RequestId, TailSession>, templates: &[Vec<Glm52StageState>]) -> Result<usize, String> {
+    let first = templates.first().ok_or("tail 没有 placement template")?;
+    let mut active_layers = vec![0_usize; first.len()];
+    for session in active.values() {
+        let template = templates.get(session.placement).ok_or_else(|| format!("active placement={} 越界", session.placement))?;
+        if template.len() != active_layers.len() {
+            return Err("tail placement stage 数不一致".to_owned());
+        }
+        for (load, state) in active_layers.iter_mut().zip(template) {
+            *load = load.saturating_add(state.layers.len());
+        }
+    }
+    templates
+        .iter()
+        .enumerate()
+        .map(|(placement, template)| {
+            if template.len() != active_layers.len() {
+                return Err("tail placement stage 数不一致".to_owned());
+            }
+            let projected = active_layers.iter().zip(template).map(|(load, state)| load.saturating_add(state.layers.len())).collect::<Vec<_>>();
+            let peak = projected.iter().copied().max().unwrap_or(0);
+            let imbalance = projected.iter().map(|load| load.saturating_mul(*load)).sum::<usize>();
+            Ok((peak, imbalance, placement))
+        })
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .min()
+        .map(|(_, _, placement)| placement)
+        .ok_or_else(|| "tail 没有可用 placement".to_owned())
 }
 
 /// 把已结束的 session 截断到 tokens 后以 next_request_id 名义存入 resident 并 ACK。
@@ -211,7 +261,7 @@ pub(super) fn tail_stage_cache_commit(
         tail.position = tokens;
     }
     let hidden = tail.hidden.ok_or_else(|| "后继 Cache 缺少 terminal hidden".to_owned())?;
-    resident.insert(next_request_id, TailResident { states: tail.states, hidden, position: tokens });
+    resident.insert(next_request_id, TailResident { states: tail.states, placement: tail.placement, hidden, position: tokens });
     link.send_ready(request_id, tokens)?;
     Ok(())
 }
@@ -295,7 +345,7 @@ pub(in crate::runtime::glm52) fn gather_embedding_rows(context: &RocmContext, ta
     let ids_bytes = ids.len().checked_mul(std::mem::size_of::<u32>()).ok_or("embedding ids 字节溢出")?;
     let ids_buffer = ops::hip::DeviceBuffer::upload(device_id, unsafe { std::slice::from_raw_parts(ids.as_ptr().cast(), ids_bytes) }).map_err(|error| format!("上传 embedding ids: {error}"))?;
     let output = ops::hip::try_gather_bf16_rows_f32(device_id, table, &ids_buffer, ids.len(), hidden).map_err(|error| format!("embedding gather kernel: {error}"))?;
-    Ok(RocmTensor { data: Vec::new(), rows: ids.len(), cols: hidden, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: Some(std::sync::Arc::new(output)) })
+    Ok(RocmTensor { data: Vec::new(), rows: ids.len(), cols: hidden, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: Some(std::sync::Arc::new(output)), replica: None })
 }
 
 pub(crate) struct RocmMtpCatchUp<'a> {
@@ -330,15 +380,28 @@ mod mtp_catch_up_tests {
 
 /// 同一 ready cohort 的 MTP catch-up 合并为一次 L78 segmented prefill。
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn mtp_catch_up_batch(runtime: &mut RocmMtpRuntime, items: &mut [RocmMtpCatchUp<'_>], model_weights: &Glm52Weights, cfg: &Glm52Config, mla: &MlaSpec, rope: &RopeTable) -> Result<(), crate::backend::BackendError> {
+pub(crate) fn mtp_catch_up_batch(
+    runtime: &mut RocmMtpRuntime,
+    items: &mut [RocmMtpCatchUp<'_>],
+    model_weights: &Glm52Weights,
+    output_head: &Glm52OutputHead<RocmWeight>,
+    cfg: &Glm52Config,
+    mla: &MlaSpec,
+    rope: &RopeTable,
+) -> Result<(), crate::backend::BackendError> {
+    let paired = begin_mtp_pair_submission(runtime, cfg)?;
     let mut metadata = vec![None; items.len()];
     let mut embeddings = std::iter::repeat_with(|| None).take(items.len()).collect::<Vec<Option<RocmTensor>>>();
     let mut shifted = std::iter::repeat_with(|| None).take(items.len()).collect::<Vec<Option<RocmTensor>>>();
+    runtime.backend.activate().map_err(crate::backend::compute_error)?;
     for (index, item) in items.iter_mut().enumerate() {
         let rows = item.target_hidden.rows;
         if rows == 0 || rows != item.target_inputs.len() {
             return Err(crate::backend::BackendError::Compute { msg: format!("MTP batch catch-up shape 非法: tokens={} hidden=[{},{}]", item.target_inputs.len(), rows, item.target_hidden.cols) });
         }
+        // stage 返回的是最终层残差；NextN 训练输入是 target final norm 后的 hidden，
+        // 随后才再经过 MTP 自己的 hnorm。单进程路径也遵循同一顺序。
+        item.target_hidden = glm52_normalize_target_hidden(&runtime.backend, cfg, output_head, &item.target_hidden)?;
         let (tokens, hidden, position) = if item.target_position == 0 {
             if item.session.position != 0 || item.session.pending_hidden.is_some() {
                 return Err(crate::backend::BackendError::Compute { msg: "MTP batch fresh catch-up 状态非空".to_owned() });
@@ -371,7 +434,6 @@ pub(crate) fn mtp_catch_up_batch(runtime: &mut RocmMtpRuntime, items: &mut [Rocm
         shifted[index] = Some(hidden);
     }
     if metadata.iter().any(Option::is_some) {
-        runtime.backend.activate().map_err(crate::backend::compute_error)?;
         for group in mtp_catch_up_groups(&metadata) {
             if group.is_empty() {
                 continue;
@@ -392,7 +454,7 @@ pub(crate) fn mtp_catch_up_batch(runtime: &mut RocmMtpRuntime, items: &mut [Rocm
                     metadata[index].map(|(position, rows)| Glm52PrefillSegment { position, rows, cache: &mut item.session.cache, dsa: &mut item.session.dsa })
                 })
                 .collect::<Vec<_>>();
-            glm52_mtp_cache_segmented(&runtime.backend, cfg, mla, &runtime.weights, &embeddings, &shifted, rope, &mut segments)?;
+            glm52_mtp_cache_segmented(&runtime.backend, cfg, mla, &runtime.weights, &runtime.experts, &embeddings, &shifted, rope, &mut segments)?;
         }
     }
     for (index, item) in items.iter_mut().enumerate() {
@@ -401,6 +463,7 @@ pub(crate) fn mtp_catch_up_batch(runtime: &mut RocmMtpRuntime, items: &mut [Rocm
         }
         item.session.pending_hidden = Some(runtime.backend.slice_token_rows(&item.target_hidden, item.target_hidden.rows - 1, 1)?);
     }
+    finish_mtp_pair_submission(runtime, paired)?;
     Ok(())
 }
 
@@ -447,6 +510,7 @@ pub(crate) fn mtp_draft_batch(
         if embeddings.is_empty() {
             break;
         }
+        let paired = begin_mtp_pair_submission(runtime, cfg)?;
         let embedding_refs = embeddings.iter().collect::<Vec<_>>();
         let hidden_refs = hiddens.iter().collect::<Vec<_>>();
         let embeddings = runtime.backend.concat_token_rows(&embedding_refs)?;
@@ -462,7 +526,11 @@ pub(crate) fn mtp_draft_batch(
         }
         let prep_micros = prep_started.map_or(0, |started| started.elapsed().as_micros());
         let layer_started = profile.then(Instant::now);
-        let hidden = glm52_mtp_prefill_segmented(&runtime.backend, cfg, mla, &runtime.weights, &mut runtime.experts, &embeddings, &hiddens, rope, &mut segments)?;
+        // 短上下文还没有稀疏 selection，跨过 top-k 边界时也必须先计算一次。
+        // 仅连续且已准备好的 cohort 复用；其余走正常 indexer，补齐本轮 key。
+        let dsa_spec = crate::runtime::glm52::glm52_dsa_spec(cfg, mla);
+        let reuse_selection = depth > 0 && segments.iter().all(|segment| crate::backend::DsaPrefillBackend::supports_dsa_prefill_selection_reuse(&runtime.backend, &*segment.dsa, cfg.layer_count, segment.position, segment.rows, &dsa_spec));
+        let hidden = glm52_mtp_prefill_segmented(&runtime.backend, cfg, mla, &runtime.weights, &mut runtime.experts, &embeddings, &hiddens, rope, reuse_selection, &mut segments)?;
         if profile {
             runtime.backend.synchronize()?;
         }
@@ -511,6 +579,28 @@ pub(crate) fn mtp_draft_batch(
                 state_started.map_or(0, |started| started.elapsed().as_micros()) as f64 / 1000.0,
             );
         }
+        finish_mtp_pair_submission(runtime, paired)?;
+    }
+    Ok(())
+}
+
+fn begin_mtp_pair_submission(runtime: &mut RocmMtpRuntime, cfg: &Glm52Config) -> Result<bool, crate::backend::BackendError> {
+    let paired = runtime.backend.supports_parallel_mla_prefill(cfg.layer_count, &runtime.experts);
+    if !paired {
+        return Ok(false);
+    }
+    if let Some(completion) = runtime.pending_pair_completion.take() {
+        // 上一轮后面已经排入 output norm/head，并在取 token 时完成 owner
+        // 同步；这里通常只是无阻塞退休 peer 的尾部 event。
+        runtime.backend.wait_stage_completion(&completion)?;
+    }
+    runtime.backend.begin_stage_submission()?;
+    Ok(true)
+}
+
+fn finish_mtp_pair_submission(runtime: &mut RocmMtpRuntime, paired: bool) -> Result<(), crate::backend::BackendError> {
+    if paired {
+        runtime.pending_pair_completion = Some(runtime.backend.record_stage_completion()?);
     }
     Ok(())
 }
@@ -525,10 +615,12 @@ pub(in crate::runtime::glm52) fn load_resident_embedding(context: &RocmContext, 
     Ok(Some(std::sync::Arc::new(table)))
 }
 
-/// head 首卡(A0)的输出运行时:LM head + 采样常驻,以及可选的 MTP L78 与
-/// FR-Spec draft head。tail 采样路径移除后,这是唯一的输出侧装配入口。
+/// head 首卡(A0)拥有输出运行时:LM head + 采样常驻,以及可选的 MTP L78 与
+/// FR-Spec draft head。operator pair 下 L78 同时装配 A1；tail 采样路径移除后,
+/// 这是唯一的输出侧装配入口。
 pub(in crate::runtime::glm52) fn prepare_head_output_runtime(
     output_context: &RocmContext,
+    operator_peer: Option<&RocmContext>,
     weights: &Glm52Weights,
     cfg: &Glm52Config,
     mla: &MlaSpec,
@@ -555,6 +647,9 @@ pub(in crate::runtime::glm52) fn prepare_head_output_runtime(
     };
     let mtp_runtime = if mtp_enabled {
         if weights.source_is_ct() {
+            if operator_peer.is_some() {
+                return Err("ROCm MTP operator pair 当前要求 GGUF 权重".to_owned());
+            }
             let started = Instant::now();
             output_context.activate()?;
             let source = weights.ct_source()?;
@@ -563,16 +658,28 @@ pub(in crate::runtime::glm52) fn prepare_head_output_runtime(
             let mut experts = RocmPrefillExperts::ct(source);
             experts.preload_layer(output_context, cfg.layer_count, cfg.expert_count).map_err(|error| format!("常驻 ROCm MTP experts: {error:?}"))?;
             eprintln!("[glm52-mtp-resident] device={} layer={} drafts={} wall={:.3}s", output_context.device_id(), cfg.layer_count, mtp_draft_tokens, started.elapsed().as_secs_f64());
-            Some(RocmMtpRuntime { backend: *output_context, weights: mtp_weights, experts, draft_head, embedding: embedding_table })
+            Some(RocmMtpRuntime { backend: *output_context, weights: mtp_weights, experts, draft_head, embedding: embedding_table, pending_pair_completion: None })
         } else if weights.source_is_gguf() {
             let started = Instant::now();
             output_context.activate()?;
             let layer = weights.load_mtp_layer_gguf().map_err(|error| format!("加载 tail MTP L{}: {error}", cfg.layer_count))?;
             let mtp_weights = prepare_glm52_mtp_gguf(output_context, cfg, mla, &layer).map_err(|error| format!("准备 tail ROCm MTP: {error:?}"))?;
             let mut experts = RocmPrefillExperts::gguf(weights.gguf_source()?);
+            if let Some(peer) = operator_peer {
+                experts.enable_operator_peer(*peer).map_err(|error| format!("配置 ROCm MTP operator peer: {error:?}"))?;
+                super::prepare_operator_mla_layer_gguf(output_context, peer, &mut experts, cfg, mla, cfg.layer_count, layer.layer, (&mtp_weights.layer.q_b_proj, &mtp_weights.layer.kv_b_proj))?;
+            }
             experts.preload_layer(output_context, cfg.layer_count, cfg.expert_count).map_err(|error| format!("常驻 ROCm MTP experts: {error:?}"))?;
-            eprintln!("[glm52-mtp-resident] device={} layer={} drafts={} wall={:.3}s", output_context.device_id(), cfg.layer_count, mtp_draft_tokens, started.elapsed().as_secs_f64());
-            Some(RocmMtpRuntime { backend: *output_context, weights: mtp_weights, experts, draft_head, embedding: embedding_table })
+            eprintln!(
+                "[glm52-mtp-resident] device={} peer={} layer={} drafts={} operator_pair={} wall={:.3}s",
+                output_context.device_id(),
+                operator_peer.map_or(-1, RocmContext::device_id),
+                cfg.layer_count,
+                mtp_draft_tokens,
+                operator_peer.is_some(),
+                started.elapsed().as_secs_f64(),
+            );
+            Some(RocmMtpRuntime { backend: *output_context, weights: mtp_weights, experts, draft_head, embedding: embedding_table, pending_pair_completion: None })
         } else {
             return Err("GLM-5.2 distributed MTP 当前只支持 compressed-tensors/GGUF 权重".to_owned());
         }

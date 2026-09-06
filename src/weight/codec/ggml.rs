@@ -81,6 +81,8 @@ pub(crate) fn decode_block(tensor_type: u32, bytes: &[u8], output: &mut [f32]) -
         30 => output[0] = f32::from_bits((u16::from_le_bytes(bytes.try_into().expect("BF16 block")) as u32) << 16),
         39 => decode_mxfp4(bytes, output.try_into().expect("MXFP4 block")),
         2 => decode_q4_0(bytes, output.try_into().expect("Q4_0 block")),
+        6 => decode_q5_0(bytes, output.try_into().expect("Q5_0 block")),
+        7 => decode_q5_1(bytes, output.try_into().expect("Q5_1 block")),
         8 => decode_q8_0(bytes, output.try_into().expect("Q8_0 block")),
         11 => decode_q3_k(bytes, output.try_into().expect("Q3_K block")),
         12 => decode_q4_k(bytes, output.try_into().expect("Q4_K block")),
@@ -103,6 +105,27 @@ fn decode_q4_0(block: &[u8], output: &mut [f32; 32]) {
         let pair = block[2 + index];
         output[index] = ((pair & 0x0f) as i32 - 8) as f32 * scale;
         output[index + 16] = ((pair >> 4) as i32 - 8) as f32 * scale;
+    }
+}
+
+fn decode_q5_0(block: &[u8], output: &mut [f32; 32]) {
+    let scale = read_f16(block, 0);
+    let high = u32::from_le_bytes(block[2..6].try_into().expect("Q5_0 high bits"));
+    for index in 0..32 {
+        let packed = block[6 + index % 16];
+        let low = if index < 16 { packed & 15 } else { packed >> 4 };
+        output[index] = scale * (((low as u32 | (((high >> index) & 1) << 4)) as i32 - 16) as f32);
+    }
+}
+
+fn decode_q5_1(block: &[u8], output: &mut [f32; 32]) {
+    let scale = read_f16(block, 0);
+    let minimum = read_f16(block, 2);
+    let high = u32::from_le_bytes(block[4..8].try_into().expect("Q5_1 high bits"));
+    for index in 0..16 {
+        let low = block[8 + index];
+        output[index] = scale * ((low & 15) as u32 | (((high >> index) & 1) << 4)) as f32 + minimum;
+        output[index + 16] = scale * ((low >> 4) as u32 | (((high >> (index + 16)) & 1) << 4)) as f32 + minimum;
     }
 }
 
@@ -456,6 +479,36 @@ fn read_f16(bytes: &[u8], offset: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q5_0_preserves_signed_fifth_bit() {
+        let mut block = [0u8; 22];
+        block[..2].copy_from_slice(&half::f16::from_f32(0.5).to_le_bytes());
+        block[2..6].copy_from_slice(&0xffff0000u32.to_le_bytes());
+        for i in 0..16 {
+            block[6 + i] = i as u8 | ((15 - i) as u8) << 4;
+        }
+        let result = dequantize(6, &block, 32).unwrap();
+        for i in 0..16 {
+            assert_eq!(result[i], (i as f32 - 16.0) * 0.5);
+            assert_eq!(result[16 + i], (15 - i) as f32 * 0.5);
+        }
+    }
+
+    #[test]
+    fn q5_1_preserves_unsigned_fifth_bit_and_minimum() {
+        let mut block = [0u8; 24];
+        block[..2].copy_from_slice(&half::f16::from_f32(0.25).to_le_bytes());
+        block[2..4].copy_from_slice(&half::f16::from_f32(-3.0).to_le_bytes());
+        block[4..8].copy_from_slice(&0xffff0000u32.to_le_bytes());
+        for index in 0..16 {
+            block[8 + index] = (index | (index << 4)) as u8;
+        }
+        let values = dequantize(7, &block, 32).unwrap();
+        for (index, value) in values.iter().enumerate() {
+            assert_eq!(*value, index as f32 * 0.25 - 3.0);
+        }
+    }
 
     #[test]
     fn decodes_iq4_nl_block_layout() {

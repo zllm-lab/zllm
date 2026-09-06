@@ -582,6 +582,54 @@ inline float iq3xxs_dot32_f16(
     return sum;
 }
 
+inline float4 iq3xxs_dot32_4r_f16(
+    device const half *input,
+    device const uchar *weights,
+    uint row_bytes,
+    uint first_row,
+    uint output_rows,
+    uint block_index,
+    uint ib32,
+    threadgroup const uint *shared_grid,
+    threadgroup const uchar *shared_signs)
+{
+    float values[32];
+    #pragma unroll
+    for (uint index = 0; index < 32; ++index) {
+        values[index] = float(input[index]);
+    }
+    float4 sums = 0.0f;
+    #pragma unroll
+    for (uint offset = 0; offset < 4; ++offset) {
+        const uint row = first_row + offset;
+        if (row < output_rows) {
+            device const uchar *block = weights + ulong(row) * row_bytes + ulong(block_index) * 98;
+            const float d = float(load_f16(block));
+            device const uchar *qs = block + 2;
+            const uint scales_base = 64 + ib32 * 4;
+            const uint aux32 = uint(qs[scales_base]) | (uint(qs[scales_base + 1]) << 8) | (uint(qs[scales_base + 2]) << 16) | (uint(qs[scales_base + 3]) << 24);
+            const float db = d * (0.5f + float(aux32 >> 28)) * 0.5f;
+            const uint qs_base = ib32 * 8;
+            float sum = 0.0f;
+            #pragma unroll
+            for (uint lane = 0; lane < 4; ++lane) {
+                const uchar signs = shared_signs[(aux32 >> (7 * lane)) & 127];
+                const uint grid0 = shared_grid[qs[qs_base + 2 * lane]];
+                const uint grid1 = shared_grid[qs[qs_base + 2 * lane + 1]];
+                #pragma unroll
+                for (uint j = 0; j < 4; ++j) {
+                    const float sign0 = (signs & (1u << j)) == 0 ? 1.0f : -1.0f;
+                    const float sign1 = (signs & (1u << (4 + j))) == 0 ? 1.0f : -1.0f;
+                    sum += sign0 * float((grid0 >> (8 * j)) & 0xff) * values[lane * 8 + j];
+                    sum += sign1 * float((grid1 >> (8 * j)) & 0xff) * values[lane * 8 + 4 + j];
+                }
+            }
+            sums[offset] = db * sum;
+        }
+    }
+    return sums;
+}
+
 kernel void gguf_gemv_f16(
     device const half *input [[buffer(0)]],
     device const uchar *weight [[buffer(1)]],
@@ -890,10 +938,9 @@ kernel void gguf_gemv_q6k_f16(
     uint simd_group [[simdgroup_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]])
 {
-    const uint row = group_position.x * 2 + simd_group;
-    if (row >= output_rows) return;
+    const uint first_row = group_position.x * 8 + simd_group * 4;
+    if (first_row >= output_rows) return;
     device const half *input_row = input + ulong(group_position.y) * columns;
-    device const uchar *weight_row = weight + ulong(row) * row_bytes;
     constexpr uchar mask1 = 0x03;
     constexpr uchar mask2 = 0x0c;
     constexpr uchar mask3 = 0x30;
@@ -907,47 +954,52 @@ kernel void gguf_gemv_q6k_f16(
     const uint input_offset = 128 * half_index + local4;
     const uint low_offset = 64 * half_index + local4;
     const uint high_offset = 32 * half_index + local4;
-    float sum = 0.0f;
+    float4 sums = 0.0f;
     const uint block_count = (columns + 255) >> 8;
     for (uint block_index = block_parity; block_index < block_count; block_index += 2) {
-        device const uchar *block = weight_row + ulong(block_index) * 210;
-        const ushort d_bits = ushort(block[208]) | (ushort(block[209]) << 8);
-        const float d = float(as_type<half>(d_bits));
         const uint column_base = block_index * 256 + input_offset;
-        // 向量化装载:ql 两段与 qh 各 2 次 ushort(block 210B 仅 2B 对齐,uint 非法),
-        // 输入四次 half4;寄存器内字节提取,取代 12 次标量 uchar load。
-        const uint ql_first = uint(*(device const ushort *)(block + low_offset)) | (uint(*(device const ushort *)(block + low_offset + 2)) << 16);
-        const uint ql_second = uint(*(device const ushort *)(block + low_offset + 32)) | (uint(*(device const ushort *)(block + low_offset + 34)) << 16);
-        const uint qh4 = uint(*(device const ushort *)(block + 128 + high_offset)) | (uint(*(device const ushort *)(block + 130 + high_offset)) << 16);
-        const half4 in_first = *(device const half4 *)(input_row + column_base);
-        const half4 in_second = *(device const half4 *)(input_row + column_base + 32);
-        const half4 in_third = *(device const half4 *)(input_row + column_base + 64);
-        const half4 in_fourth = *(device const half4 *)(input_row + column_base + 96);
-        float4 quant_sums = 0.0f;
+        const float4 in_first = float4(*(device const half4 *)(input_row + column_base));
+        const float4 in_second = float4(*(device const half4 *)(input_row + column_base + 32));
+        const float4 in_third = float4(*(device const half4 *)(input_row + column_base + 64));
+        const float4 in_fourth = float4(*(device const half4 *)(input_row + column_base + 96));
         #pragma unroll
-        for (uint index = 0; index < 4; ++index) {
-            const uchar low_first = uchar(ql_first >> (8 * index));
-            const uchar low_second = uchar(ql_second >> (8 * index));
-            const uchar high = uchar(qh4 >> (8 * index));
-            quant_sums.x += float(in_first[index])
-                * float(int((low_first & 15) | ((high & mask1) << 4)) - 32);
-            quant_sums.y += float(in_second[index])
-                * float(int((low_second & 15) | ((high & mask2) << 2)) - 32);
-            quant_sums.z += float(in_third[index])
-                * float(int((low_first >> 4) | (high & mask3)) - 32);
-            quant_sums.w += float(in_fourth[index])
-                * float(int((low_second >> 4) | ((high & mask4) >> 2)) - 32);
+        for (uint row_offset = 0; row_offset < 4; ++row_offset) {
+            const uint row = first_row + row_offset;
+            if (row < output_rows) {
+                device const uchar *block = weight + ulong(row) * row_bytes + ulong(block_index) * 210;
+                const ushort d_bits = ushort(block[208]) | (ushort(block[209]) << 8);
+                const float d = float(as_type<half>(d_bits));
+                // 一个 SIMD 组连续算四行，四组输入只加载一次；每行仍由完整 32 lanes
+                // 沿 K 维归约，数值顺序与原单行 kernel 一致。
+                const uint ql_first = uint(*(device const ushort *)(block + low_offset)) | (uint(*(device const ushort *)(block + low_offset + 2)) << 16);
+                const uint ql_second = uint(*(device const ushort *)(block + low_offset + 32)) | (uint(*(device const ushort *)(block + low_offset + 34)) << 16);
+                const uint qh4 = uint(*(device const ushort *)(block + 128 + high_offset)) | (uint(*(device const ushort *)(block + 130 + high_offset)) << 16);
+                float4 quant_sums = 0.0f;
+                #pragma unroll
+                for (uint index = 0; index < 4; ++index) {
+                    const uchar low_first = uchar(ql_first >> (8 * index));
+                    const uchar low_second = uchar(ql_second >> (8 * index));
+                    const uchar high = uchar(qh4 >> (8 * index));
+                    quant_sums.x += in_first[index] * float(int((low_first & 15) | ((high & mask1) << 4)) - 32);
+                    quant_sums.y += in_second[index] * float(int((low_second & 15) | ((high & mask2) << 2)) - 32);
+                    quant_sums.z += in_third[index] * float(int((low_first >> 4) | (high & mask3)) - 32);
+                    quant_sums.w += in_fourth[index] * float(int((low_second >> 4) | ((high & mask4) >> 2)) - 32);
+                }
+                const int4 scales = int4(
+                    int(as_type<char>(block[192 + scale_offset])),
+                    int(as_type<char>(block[194 + scale_offset])),
+                    int(as_type<char>(block[196 + scale_offset])),
+                    int(as_type<char>(block[198 + scale_offset])));
+                sums[row_offset] += d * dot(quant_sums, float4(scales));
+            }
         }
-        const int4 scales = int4(
-            int(as_type<char>(block[192 + scale_offset])),
-            int(as_type<char>(block[194 + scale_offset])),
-            int(as_type<char>(block[196 + scale_offset])),
-            int(as_type<char>(block[198 + scale_offset])));
-        sum += d * dot(quant_sums, float4(scales));
     }
-    const float total = simd_sum(sum);
-    if (simd_lane == 0) {
-        output[ulong(group_position.y) * output_rows + row] = finite_f16(total);
+    #pragma unroll
+    for (uint row_offset = 0; row_offset < 4; ++row_offset) {
+        const float total = simd_sum(sums[row_offset]);
+        if (simd_lane == 0 && first_row + row_offset < output_rows) {
+            output[ulong(group_position.y) * output_rows + first_row + row_offset] = finite_f16(total);
+        }
     }
 }
 // gemv + 残差 epilogue(decode 单行),数值路径与 q6k gemv + add_f16 两步逐位一致。
@@ -1209,6 +1261,53 @@ inline float iq3s_row_sum_f16(
     return sum;
 }
 
+inline float4 iq3s_row_sum4_f16(
+    device const half *input_row,
+    device const uchar *weights,
+    uint row_bytes,
+    uint first_row,
+    uint output_rows,
+    uint block_count,
+    uint ib32,
+    uint tuple)
+{
+    float4 sums = 0.0f;
+    for (uint block_index = 0; block_index < block_count; ++block_index) {
+        device const half *source = input_row + block_index * 256 + ib32 * 32 + tuple * 8;
+        const float4 input0 = float4(*(device const half4 *)(source));
+        const float4 input1 = float4(*(device const half4 *)(source + 4));
+        #pragma unroll
+        for (uint offset = 0; offset < 4; ++offset) {
+            const uint row = first_row + offset;
+            if (row < output_rows) {
+                device const uchar *block = weights + ulong(row) * row_bytes + ulong(block_index) * 110;
+                const float d = float(load_f16(block));
+                const uchar scale_byte = block[106 + (ib32 >> 1)];
+                const uint nib = (ib32 & 1) != 0 ? scale_byte >> 4 : scale_byte & 0x0f;
+                const float db = d * (1.0f + 2.0f * float(nib));
+                const uint qh_val = block[66 + ib32];
+                device const uchar *qs = block + 2 + ib32 * 8 + tuple * 2;
+                const uchar signs_byte = block[74 + ib32 * 4 + tuple];
+                const uint index0 = uint(qs[0]) | ((qh_val << (8 - 2 * tuple)) & 256u);
+                const uint index1 = uint(qs[1]) | ((qh_val << (7 - 2 * tuple)) & 256u);
+                const uint grid0 = iq3s_grid[index0];
+                const uint grid1 = iq3s_grid[index1];
+                float acc = 0.0f;
+                #pragma unroll
+                for (uint j = 0; j < 4; ++j) {
+                    const float g0 = float((grid0 >> (8 * j)) & 0xff);
+                    const float g1 = float((grid1 >> (8 * j)) & 0xff);
+                    const float sign0 = (signs_byte & (1u << j)) == 0 ? 1.0f : -1.0f;
+                    const float sign1 = (signs_byte & (1u << (4 + j))) == 0 ? 1.0f : -1.0f;
+                    acc += g0 * sign0 * input0[j] + g1 * sign1 * input1[j];
+                }
+                sums[offset] += db * acc;
+            }
+        }
+    }
+    return sums;
+}
+
 kernel void gguf_gemv_iq4xs_f16(
     device const half *input [[buffer(0)]],
     device const uchar *weight [[buffer(1)]],
@@ -1298,12 +1397,19 @@ kernel void gguf_gemv_iq3s_f16(
     uint simd_group [[simdgroup_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]])
 {
-    const uint row = group_position.x * 4 + simd_group;
-    if (row >= output_rows) return;
+    const uint first_row = group_position.x * 8 + simd_group * 4;
+    if (first_row >= output_rows) return;
     device const half *input_row = input + ulong(group_position.y) * columns;
-    const float sum = iq3s_row_sum_f16(input_row, weight + ulong(row) * row_bytes, columns >> 8, simd_lane >> 2, simd_lane & 3);
-    const float total = simd_sum(sum);
-    if (simd_lane == 0) output[ulong(group_position.y) * output_rows + row] = finite_f16(total);
+    const float4 sums = iq3s_row_sum4_f16(
+        input_row, weight, row_bytes, first_row, output_rows,
+        columns >> 8, simd_lane >> 2, simd_lane & 3);
+    #pragma unroll
+    for (uint offset = 0; offset < 4; ++offset) {
+        const float total = simd_sum(sums[offset]);
+        if (simd_lane == 0 && first_row + offset < output_rows) {
+            output[ulong(group_position.y) * output_rows + first_row + offset] = finite_f16(total);
+        }
+    }
 }
 kernel void gguf_gated_gemv_iq4xs_f16(
     device const half *input [[buffer(0)]],
@@ -1561,24 +1667,86 @@ kernel void gguf_gemv_iq3xxs_f16(
     constant uint &row_bytes [[buffer(7)]],
     uint2 group_position [[threadgroup_position_in_grid]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]])
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint thread_index [[thread_index_in_threadgroup]])
 {
-    const uint row = group_position.x * 8 + simd_group;
-    if (row >= output_rows) return;
+    threadgroup uint shared_grid[256];
+    threadgroup uchar shared_signs[128];
+    #pragma unroll
+    for (uint index = 0; index < 4; ++index) shared_grid[thread_index * 4 + index] = iq3xxs_grid[thread_index * 4 + index];
+    #pragma unroll
+    for (uint index = 0; index < 2; ++index) shared_signs[thread_index * 2 + index] = ksigns_iq2xs[thread_index * 2 + index];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint first_row = group_position.x * 8 + simd_group * 4;
+    if (first_row >= output_rows) return;
     device const half *input_row = input + ulong(group_position.y) * columns;
-    device const uchar *weight_row = weight + ulong(row) * row_bytes;
-    float sum = 0.0f;
+    float4 sums = 0.0f;
     // columns 必须是 256 的倍数;每 block 有 8 个 ib32 组,每组 32 元素
     const uint ib32_count = columns >> 5; // columns / 32
     for (uint ib32 = simd_lane; ib32 < ib32_count; ib32 += 32) {
         const uint block_index = ib32 >> 3; // 每 block 8 个 ib32
-        sum += iq3xxs_dot32_f16(
+        sums += iq3xxs_dot32_4r_f16(
             input_row + ib32 * 32,
-            weight_row + ulong(block_index) * 98,
-            ib32 & 7);
+            weight,
+            row_bytes,
+            first_row,
+            output_rows,
+            block_index,
+            ib32 & 7,
+            shared_grid,
+            shared_signs);
     }
-    const float total = simd_sum(sum);
-    if (simd_lane == 0) output[ulong(group_position.y) * output_rows + row] = finite_f16(total);
+    #pragma unroll
+    for (uint offset = 0; offset < 4; ++offset) {
+        const float total = simd_sum(sums[offset]);
+        if (simd_lane == 0 && first_row + offset < output_rows) {
+            output[ulong(group_position.y) * output_rows + first_row + offset] = finite_f16(total);
+        }
+    }
+}
+kernel void gguf_dual_gemv_iq3xxs_iq3s_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *first_weight [[buffer(1)]],
+    device const uchar *second_weight [[buffer(2)]],
+    device half *first_output [[buffer(3)]],
+    device half *second_output [[buffer(4)]],
+    constant uint &columns [[buffer(5)]],
+    constant uint &output_rows [[buffer(6)]],
+    constant uint &first_row_bytes [[buffer(7)]],
+    constant uint &second_row_bytes [[buffer(8)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    threadgroup uint shared_grid[256];
+    threadgroup uchar shared_signs[128];
+    #pragma unroll
+    for (uint index = 0; index < 4; ++index) shared_grid[thread_index * 4 + index] = iq3xxs_grid[thread_index * 4 + index];
+    #pragma unroll
+    for (uint index = 0; index < 2; ++index) shared_signs[thread_index * 2 + index] = ksigns_iq2xs[thread_index * 2 + index];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint first_row = group * 8 + simd_group * 4;
+    if (first_row >= output_rows) return;
+    float4 first_sums = 0.0f;
+    const uint ib32_count = columns >> 5;
+    for (uint ib32 = simd_lane; ib32 < ib32_count; ib32 += 32) {
+        first_sums += iq3xxs_dot32_4r_f16(
+            input + ib32 * 32, first_weight, first_row_bytes, first_row,
+            output_rows, ib32 >> 3, ib32 & 7, shared_grid, shared_signs);
+    }
+    const float4 second_sums = iq3s_row_sum4_f16(
+        input, second_weight, second_row_bytes, first_row, output_rows,
+        columns >> 8, simd_lane >> 2, simd_lane & 3);
+    #pragma unroll
+    for (uint offset = 0; offset < 4; ++offset) {
+        const float first_total = simd_sum(first_sums[offset]);
+        const float second_total = simd_sum(second_sums[offset]);
+        if (simd_lane == 0 && first_row + offset < output_rows) {
+            first_output[first_row + offset] = finite_f16(first_total);
+            second_output[first_row + offset] = finite_f16(second_total);
+        }
+    }
 }
 kernel void gguf_gemv_iq2s_accumulate_f32(
     device const half *input [[buffer(0)]],
@@ -2847,25 +3015,39 @@ kernel void gguf_gated_gemv_iq3xxs_f16(
     constant float &limit [[buffer(13)]],
     uint group_row [[threadgroup_position_in_grid]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]])
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint thread_index [[thread_index_in_threadgroup]])
 {
-    const uint row = group_row * 8 + simd_group;
-    if (row >= output_rows) return;
-    device const uchar *gate_row = gate_weight + ulong(row) * gate_row_bytes;
-    device const uchar *up_row = up_weight + ulong(row) * up_row_bytes;
-    float gate_sum = 0.0f;
-    float up_sum = 0.0f;
+    threadgroup uint shared_grid[256];
+    threadgroup uchar shared_signs[128];
+    #pragma unroll
+    for (uint index = 0; index < 4; ++index) shared_grid[thread_index * 4 + index] = iq3xxs_grid[thread_index * 4 + index];
+    #pragma unroll
+    for (uint index = 0; index < 2; ++index) shared_signs[thread_index * 2 + index] = ksigns_iq2xs[thread_index * 2 + index];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint first_row = group_row * 8 + simd_group * 4;
+    if (first_row >= output_rows) return;
+    float4 gate_sums = 0.0f;
+    float4 up_sums = 0.0f;
     const uint ib32_count = columns >> 5;
     for (uint ib32 = simd_lane; ib32 < ib32_count; ib32 += 32) {
         const uint block_index = ib32 >> 3;
         device const half *input_block = input + ib32 * 32;
-        gate_sum += iq3xxs_dot32_f16(input_block, gate_row + ulong(block_index) * 98, ib32 & 7);
-        up_sum += iq3xxs_dot32_f16(input_block, up_row + ulong(block_index) * 98, ib32 & 7);
+        gate_sums += iq3xxs_dot32_4r_f16(
+            input_block, gate_weight, gate_row_bytes, first_row, output_rows,
+            block_index, ib32 & 7, shared_grid, shared_signs);
+        up_sums += iq3xxs_dot32_4r_f16(
+            input_block, up_weight, up_row_bytes, first_row, output_rows,
+            block_index, ib32 & 7, shared_grid, shared_signs);
     }
-    const float gate_total = simd_sum(gate_sum);
-    const float up_total = simd_sum(up_sum);
-    if (simd_lane == 0) {
-        output[row] = finite_f16(gated_activation_value(gate_total, up_total, activation_kind, alpha, limit));
+    #pragma unroll
+    for (uint offset = 0; offset < 4; ++offset) {
+        const float gate_total = simd_sum(gate_sums[offset]);
+        const float up_total = simd_sum(up_sums[offset]);
+        if (simd_lane == 0 && first_row + offset < output_rows) {
+            output[first_row + offset] = finite_f16(gated_activation_value(
+                gate_total, up_total, activation_kind, alpha, limit));
+        }
     }
 }
 kernel void prefetch_shared_pages(

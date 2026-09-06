@@ -219,9 +219,13 @@ impl MetalMoeDecodeState {
     /// Ornith 在模型加载期调用它，避免长 prompt prefill 完成后才发现某层 expert
     /// 使用了没有 Metal 算子的量化类型。
     pub fn validate_gguf_expert_formats(source: &dyn GgufExpertSource, layer_count: usize, expert_count: usize) -> Result<(), BackendError> {
+        Self::validate_gguf_expert_range(source, 0, layer_count, expert_count)
+    }
+
+    pub fn validate_gguf_expert_range(source: &dyn GgufExpertSource, first_layer: usize, layer_count: usize, expert_count: usize) -> Result<(), BackendError> {
         let hidden = source.hidden();
         let intermediate = source.intermediate();
-        for layer in 0..layer_count {
+        for layer in first_layer..layer_count {
             for expert in 0..expert_count {
                 let weights = source.load_expert_gguf(layer, expert).map_err(BackendError::ExpertLoad)?;
                 for (projection, matrix, rows, cols) in [("gate", &weights.gate, intermediate, hidden), ("up", &weights.up, intermediate, hidden), ("down", &weights.down, hidden, intermediate)] {
@@ -238,12 +242,19 @@ impl MetalMoeDecodeState {
     }
 
     pub fn preload_gguf_experts(&mut self, ctx: &MetalContext, source: &dyn GgufExpertSource, layer_count: usize, expert_count: usize) -> Result<(usize, usize), BackendError> {
-        for layer in 0..layer_count {
+        self.preload_gguf_expert_range(ctx, source, 0, layer_count, expert_count)
+    }
+
+    pub fn preload_gguf_expert_range(&mut self, ctx: &MetalContext, source: &dyn GgufExpertSource, first_layer: usize, layer_count: usize, expert_count: usize) -> Result<(usize, usize), BackendError> {
+        if first_layer >= layer_count {
+            return Err(BackendError::ExpertLoad(format!("GGUF expert layer range {first_layer}..{layer_count} 为空")));
+        }
+        for layer in first_layer..layer_count {
             for expert in 0..expert_count {
                 self.gguf_cache.ensure(ctx, source, layer, expert)?;
             }
         }
-        for layer in 0..layer_count {
+        for layer in first_layer..layer_count {
             self.gguf_cache.pack_layer(ctx, layer, expert_count)?;
         }
         ops::moe::prewarm_resident_decode_router(ctx).map_err(|msg| BackendError::Compute { msg })?;
@@ -261,8 +272,8 @@ impl MetalMoeDecodeState {
             let weight_bytes = unsafe { std::slice::from_raw_parts(warmup_weights.as_ptr().cast::<u8>(), std::mem::size_of_val(warmup_weights.as_slice())) };
             let id_buffer = ctx.shared_buffer(id_bytes);
             let weight_buffer = ctx.shared_buffer(weight_bytes);
-            let mut warmup_outputs = Vec::with_capacity(layer_count);
-            for weights in self.gguf_cache.layers.iter().flatten() {
+            let mut warmup_outputs = Vec::with_capacity(layer_count - first_layer);
+            for weights in self.gguf_cache.layers[first_layer..layer_count].iter().flatten() {
                 warmup_outputs.push(
                     ops::gguf::gguf_indexed_experts_tensor_resident(ctx, &warmup_input, &weights.gate, &weights.up, &weights.down, &id_buffer, &weight_buffer, warmup_top_k, &crate::backend::Activation::Silu)
                         .map_err(|msg| BackendError::Compute { msg })?,
@@ -271,7 +282,7 @@ impl MetalMoeDecodeState {
             ctx.synchronize();
             drop(warmup_outputs);
         }
-        self.gguf_cache.fully_resident = self.gguf_cache.len() == layer_count.saturating_mul(expert_count);
+        self.gguf_cache.fully_resident = self.gguf_cache.len() == (layer_count - first_layer).saturating_mul(expert_count);
         if self.gguf_cache.fully_resident {
             self.gguf_cache.lru.clear();
         }
@@ -546,20 +557,28 @@ impl ExpertDecodeBackend for MetalContext {
         inputs: crate::moe::topk_moe::RoutedMoeInputs<'_, MetalTensor>,
     ) -> Result<Option<(MetalTensor, Option<Vec<u16>>)>, BackendError> {
         let router_weight = weights.router;
+        let router_bias = weights.bias;
         let route_input = inputs.route;
         let expert_input = inputs.expert;
-        if !matches!(source, crate::weight::expert_source::ExpertSource::Gguf(_)) || route_input.rows != 1 || expert_input.rows != 1 || spec.scoring_func != ScoringFunc::Softmax {
+        if !matches!(source, crate::weight::expert_source::ExpertSource::Gguf(_)) || route_input.rows != 1 || expert_input.rows != 1 {
             return Ok(None);
         }
         let MetalWeight::F32 { buffer: router_weight, len: router_weight_len } = router_weight else {
             return Ok(None);
         };
-        let Some(weights) = state.gguf_cache.layer(layer) else {
+        let Some(expert_weights) = state.gguf_cache.layer(layer) else {
             return Ok(None);
         };
-        let (expert_ids, route_weights) = ops::moe::moe_router_softmax_decode_resident_f32(self, route_input, router_weight, *router_weight_len, spec.num_experts, spec.top_k, spec.routed_scaling_factor, spec.normalize_selected)
+        let (expert_ids, route_weights) = match (spec.scoring_func, router_bias) {
+            (ScoringFunc::Softmax, _) => ops::moe::moe_router_softmax_decode_resident_f32(self, route_input, router_weight, *router_weight_len, spec.num_experts, spec.top_k, spec.routed_scaling_factor, spec.normalize_selected),
+            (ScoringFunc::SigmoidBias, MetalWeight::F32 { buffer: bias, len: bias_len }) => {
+                ops::moe::moe_router_sigmoid_decode_resident_f32(self, route_input, router_weight, *router_weight_len, bias, *bias_len, spec.num_experts, spec.top_k, spec.routed_scaling_factor)
+            }
+            _ => return Ok(None),
+        }
+        .map_err(|msg| BackendError::Compute { msg })?;
+        let output = ops::gguf::gguf_indexed_experts_tensor_resident(self, expert_input, &expert_weights.gate, &expert_weights.up, &expert_weights.down, &expert_ids, &route_weights, spec.top_k, &spec.activation)
             .map_err(|msg| BackendError::Compute { msg })?;
-        let output = ops::gguf::gguf_indexed_experts_tensor_resident(self, expert_input, &weights.gate, &weights.up, &weights.down, &expert_ids, &route_weights, spec.top_k, &spec.activation).map_err(|msg| BackendError::Compute { msg })?;
         state.stats.cache_hits += spec.top_k;
         state.stats.resident_experts = state.gguf_cache.len();
         state.stats.resident_bytes = state.gguf_cache.bytes;

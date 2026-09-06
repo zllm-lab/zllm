@@ -1,5 +1,4 @@
 use super::*;
-use rayon::prelude::*;
 
 static DSA_FUSED_PROLOGUE_PROFILE_DIAGNOSTIC: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
@@ -236,7 +235,12 @@ fn paged_mla_attention_into(
         }
         let host_selection = dsa_state.and_then(|state| state.host_selection(query.rows, query_start));
         let mut hot = hot.lock().map_err(|_| compute_error(format!("L{layer} ROCm MLA hot 锁中毒")))?;
-        let selection = host_selection.map(|selection| hot.prepare_selection(context.device_id, layer, selection, &cached.latent, cached.latent_scales.as_deref().expect("Q8 MLA hot 必有 scales"), &cached.rope)).transpose()?;
+        let selection = host_selection
+            .map(|selection| {
+                hot.take_prefetched_selection(context.device_id, query_start)?
+                    .map_or_else(|| hot.prepare_selection(context.device_id, layer, selection, &cached.latent, cached.latent_scales.as_deref().expect("Q8 MLA hot 必有 scales"), &cached.rope), Ok)
+            })
+            .transpose()?;
         let (context_rows, hot_query_start, selection_width) = match (selection.as_ref(), host_selection) {
             (Some(_), Some(selection)) => (cached.committed_rows, cached.committed_rows - query.rows, selection.len() / query.rows),
             (None, None) if cached.rows <= top_k && cached.rows <= cached.committed_rows => (cached.rows, query_start, top_k),
@@ -395,7 +399,10 @@ fn paged_mla_attention_with_selection(
         }
         if let Some(host_selection) = host_selection {
             let mut hot = hot.lock().map_err(|_| compute_error(format!("L{layer} ROCm cooperative MLA hot 锁中毒")))?;
-            Some(hot.prepare_selection(context.device_id, layer, host_selection, &cached.latent, cached.latent_scales.as_deref().expect("Q8 MLA hot 必有 scales"), &cached.rope)?)
+            Some(
+                hot.take_prefetched_selection(context.device_id, query_start)?
+                    .map_or_else(|| hot.prepare_selection(context.device_id, layer, host_selection, &cached.latent, cached.latent_scales.as_deref().expect("Q8 MLA hot 必有 scales"), &cached.rope), Ok)?,
+            )
         } else {
             None
         }
@@ -489,10 +496,17 @@ fn project_local_sequence_partial(
     o_proj: &RocmWeight,
     rows: usize,
     mla: &crate::attention::mla::MlaSpec,
+    profile_pair: bool,
 ) -> Result<RocmTensor, BackendError> {
+    if profile_pair {
+        ops::hip::device_profile_scope_operator(context.device_id, "glm_pair_attn_kv_b").map_err(compute_error)?;
+    }
     let attention_bytes = rows.checked_mul(mla.q_projection_size).and_then(|n| n.checked_mul(mla_output_element_bytes(rows))).ok_or_else(|| compute_error("ROCm shard attention 大小溢出"))?;
     let attention = ops::hip::DeviceBuffer::allocate_reusable(context.device_id, attention_bytes).map_err(compute_error)?;
     ops::hip::try_paged_mla_shard_scale_project_ct(context.device_id, &shard.weighted, local_stats, remote_stats, ct_mla_weight(kv_b)?, rows, mla.q_projection_size, mla.num_heads, mla.qk_rope_head_dim, &attention).map_err(compute_error)?;
+    if profile_pair {
+        ops::hip::device_profile_scope_operator(context.device_id, "glm_pair_attn_o_proj").map_err(compute_error)?;
+    }
     let attention = device_tensor_with_dtype(attention, rows, mla.q_projection_size, if rows > 1 { RocmTensorDType::Bf16 } else { RocmTensorDType::F32 });
     context.tensor_as_f32(context.linear(&attention, o_proj)?)
 }
@@ -569,6 +583,348 @@ fn project_merged_sequence_heads(
 }
 
 impl RocmContext {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn begin_operator_mla_query_impl(
+        &self,
+        layer: usize,
+        experts: &RocmPrefillExperts,
+        normalized_q_lora: &RocmTensor,
+        position: usize,
+        cosine: &[f32],
+        sine: &[f32],
+        mla: &crate::attention::mla::MlaSpec,
+    ) -> Result<bool, BackendError> {
+        if normalized_q_lora.rows != 1 {
+            return Ok(false);
+        }
+        let (operator, weights) = experts.operator_mla_layer(layer)?;
+        let q_head_dim = mla.q_projection_size / mla.num_heads;
+        let owner_heads = weights.owner_q_b.rows / q_head_dim;
+        if normalized_q_lora.cols != mla.q_lora_rank
+            || q_head_dim == 0
+            || !weights.owner_q_b.rows.is_multiple_of(q_head_dim)
+            || !weights.peer_q_b.rows.is_multiple_of(q_head_dim)
+            || weights.owner_q_b.rows + weights.peer_q_b.rows != mla.q_projection_size
+        {
+            return Err(compute_error(format!("L{layer} operator query 预提交 shape 非法")));
+        }
+
+        // 现在记录 q_lora ready，不能等 KV 链排入同一 owner stream 后再记录，
+        // 否则 peer q_b 会被无关的 kv_a/cache append 串在后面。
+        let q_lora = self.tensor_to_stable_deferred(normalized_q_lora.clone())?;
+        let q_source = q_lora.device.as_ref().ok_or_else(|| compute_error("operator query 预提交缺少 q_lora device buffer"))?.clone();
+        let mut transferred = ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&[q_source.clone()], operator.context.device_id, self.device_id)
+            .map_err(|error| compute_error(format!("L{layer} operator query 提前 owner->peer: {error}")))?;
+        let peer_q_lora = device_tensor_with_dtype(transferred.remove(0), 1, mla.q_lora_rank, q_lora.dtype);
+        operator.worker.retain_for_stage(vec![q_source])?;
+
+        // owner q_b 放到本卡独立 stream，与随后主 stream 的 KV 前导并行。
+        // 下游 attention 取 pending query 时再用 event 接回主 stream。
+        let main_stream = ops::hip::active_compute_stream() as usize;
+        let query_stream = ops::hip::cooperative_shared_stream(self.device_id).map_err(compute_error)?;
+        ops::hip::order_stream_after(self.device_id, main_stream, query_stream).map_err(compute_error)?;
+        ops::hip::activate_compute_stream(self.device_id, query_stream).map_err(compute_error)?;
+        let owner_query = (|| {
+            let query = self.linear(&q_lora, &weights.owner_q_b)?;
+            let query = self.rope(&query, owner_heads, mla.qk_rope_head_dim, mla.rotary_layout, position, cosine, sine)?;
+            self.tensor_to_stable_deferred(query)
+        })();
+        ops::hip::activate_compute_stream(self.device_id, main_stream).map_err(compute_error)?;
+        let owner_query = owner_query?;
+        experts.store_operator_mla_query(layer, position, super::expert::RocmOperatorPendingQuery { owner_query, peer_q_lora, owner_query_stream: query_stream })?;
+        Ok(true)
+    }
+
+    pub(super) fn operator_mla_cache_append_impl(&self, layer: usize, experts: &RocmPrefillExperts, cache: &mut RocmKvCache, latent: &RocmTensor, k_rope: &RocmTensor, position: usize) -> Result<bool, BackendError> {
+        let (operator, _) = experts.operator_mla_layer(layer)?;
+        let peer = operator.context;
+        let peer_cache = cache.ensure_operator_peer(self, &peer)?;
+        // peer cache 初始化会切换当前 HIP device；这里只恢复 device，保留
+        // scheduler 已选中的 background/latency stage stream。
+        ops::hip::set_device(self.device_id).map_err(compute_error)?;
+        let rows = latent.rows;
+        if rows == 0 || k_rope.rows != rows {
+            return Err(compute_error(format!("L{layer} operator cache-only MLA rows={rows}/{} 非法", k_rope.rows)));
+        }
+        if cache.operator_packed_kv_replication_enabled(layer) {
+            cache.append_mla(self, layer, latent, k_rope)?;
+            // 来源是 owner cache 的稳定 view；其生命周期另由 owner completion
+            // 接管，目标直接写入 peer cache 最终 offset。
+            let _ = cache.replicate_operator_mla_append(self, &peer, layer, position, rows)?;
+            return Ok(true);
+        }
+
+        // BF16/CPU 诊断形态保留双端各自 append。默认 Q8 热路径不会走这里；
+        // 两次提交仍由 stream event 串联，不做 device synchronize。
+        let latent = self.tensor_to_stable_deferred(latent.clone())?;
+        let k_rope = self.tensor_to_stable_deferred(k_rope.clone())?;
+        let sources =
+            [latent.device.as_ref().ok_or_else(|| compute_error("operator cache-only latent 缺少 device buffer"))?.clone(), k_rope.device.as_ref().ok_or_else(|| compute_error("operator cache-only rope 缺少 device buffer"))?.clone()];
+        cache.append_mla(self, layer, &latent, &k_rope)?;
+        let mut transferred = ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&sources, peer.device_id, self.device_id).map_err(compute_error)?;
+        let peer_latent = device_tensor_with_dtype(transferred.remove(0), rows, latent.cols, latent.dtype);
+        let peer_rope = device_tensor_with_dtype(transferred.remove(0), rows, k_rope.cols, k_rope.dtype);
+        let owner_stream = ops::hip::active_compute_stream() as usize;
+        let result = (|| {
+            peer.activate().map_err(compute_error)?;
+            peer_cache.lock().map_err(|_| compute_error(format!("L{layer} operator peer KV 锁中毒")))?.append_mla(&peer, layer, &peer_latent, &peer_rope)
+        })();
+        ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
+        result?;
+        Ok(true)
+    }
+
+    pub(super) fn finish_operator_mla_cache_submission_impl(&self, experts: &RocmPrefillExperts) -> Result<(), BackendError> {
+        let Ok(operator) = experts.operator_peer() else { return Ok(()) };
+        let owner_stream = ops::hip::compute_stream_for(self.device_id) as usize;
+        let peer_stream = ops::hip::compute_stream_for(operator.context.device_id) as usize;
+        ops::hip::order_device_stream_after(operator.context.device_id, peer_stream, self.device_id, owner_stream).map_err(compute_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn operator_mla_prefill_add_impl(
+        &self,
+        layer: usize,
+        experts: &RocmPrefillExperts,
+        normalized_q_lora: &RocmTensor,
+        latent: &RocmTensor,
+        k_rope: &RocmTensor,
+        residual: &RocmTensor,
+        cache: Option<&mut RocmKvCache>,
+        dsa_state: Option<&RocmDsaState>,
+        position: usize,
+        cosine: &[f32],
+        sine: &[f32],
+        mla: &crate::attention::mla::MlaSpec,
+        dsa: &crate::attention::dsa::DsaSpec,
+    ) -> Result<RocmTensor, BackendError> {
+        let cache = cache.ok_or_else(|| compute_error(format!("L{layer} operator MLA 必须提供 cache")))?;
+        let (operator, weights) = experts.operator_mla_layer(layer)?;
+        let q_head_dim = mla.q_projection_size / mla.num_heads;
+        let kv_head_dim = mla.kv_projection_size / mla.num_heads;
+        let owner_heads = weights.owner_q_b.rows / q_head_dim;
+        let peer_heads = weights.peer_q_b.rows / q_head_dim;
+        let owner_q = weights.owner_q_b.rows;
+        let peer_q = weights.peer_q_b.rows;
+        let owner_kv = weights.owner_kv_b.rows;
+        let peer_kv = weights.peer_kv_b.rows;
+        if normalized_q_lora.rows == 0
+            || normalized_q_lora.rows != latent.rows
+            || latent.rows != k_rope.rows
+            || residual.rows != latent.rows
+            || normalized_q_lora.cols != mla.q_lora_rank
+            || latent.cols != mla.kv_lora_rank
+            || k_rope.cols != mla.qk_rope_head_dim
+            || q_head_dim == 0
+            || kv_head_dim == 0
+            || !owner_q.is_multiple_of(q_head_dim)
+            || !peer_q.is_multiple_of(q_head_dim)
+            || !owner_kv.is_multiple_of(kv_head_dim)
+            || !peer_kv.is_multiple_of(kv_head_dim)
+            || owner_heads + peer_heads != mla.num_heads
+            || owner_q + peer_q != mla.q_projection_size
+            || owner_kv + peer_kv != mla.kv_projection_size
+            || weights.owner_o.cols != owner_q
+            || weights.peer_o.cols != peer_q
+            || weights.owner_o.rows != residual.cols
+            || weights.peer_o.rows != residual.cols
+        {
+            return Err(compute_error(format!(
+                "L{layer} operator MLA shape 非法: q=[{},{}] latent=[{},{}] rope=[{},{}] residual=[{},{}] heads={} q_proj={} kv_proj={}",
+                normalized_q_lora.rows, normalized_q_lora.cols, latent.rows, latent.cols, k_rope.rows, k_rope.cols, residual.rows, residual.cols, mla.num_heads, mla.q_projection_size, mla.kv_projection_size,
+            )));
+        }
+        let peer = operator.context;
+        let worker = operator.worker.clone();
+        let peer_cache = cache.ensure_operator_peer(self, &peer)?;
+        let rows = normalized_q_lora.rows;
+        let hidden = residual.cols;
+        let pending_query = if rows == 1 { experts.take_operator_mla_query(layer, position)? } else { None };
+        let presubmitted_query = pending_query.is_some();
+        let (pending_owner_query, pending_peer_q_lora, pending_owner_query_stream) = match pending_query {
+            Some(pending) => (Some(pending.owner_query), Some(pending.peer_q_lora), Some(pending.owner_query_stream)),
+            None => (None, None, None),
+        };
+        let query_start = position;
+        let selection = dsa_state.and_then(|state| state.device_selection_arc(rows, query_start));
+        let host_selection_arc = dsa_state.and_then(|state| state.host_selection_arc(rows, query_start));
+        let host_selection = host_selection_arc.as_deref().map(Vec::as_slice);
+        let selection_width = if selection.is_some() || host_selection.is_some() { dsa_state.map_or(dsa.top_k, RocmDsaState::selection_width) } else { dsa.top_k };
+        if host_selection.is_some() && selection.is_none() {
+            return Err(compute_error(format!("L{layer} operator MLA 当前要求 DSA selection 常驻 device")));
+        }
+        let peer_selection = if let Some(source) = selection.as_ref() {
+            if let Some(cached) = cache.cached_operator_selection(peer.device_id, source) {
+                Some(cached)
+            } else {
+                // 显式 device pool 关闭时，DSA selection 可能来自
+                // hipMallocAsync；先在 producer stream 上稳定化，再建立跨卡
+                // event。cache 仍以原 Arc 为 identity，IndexShare 才能复用镜像。
+                let stable = if source.is_async_allocated() { Arc::new(source.copy_to_stable_deferred().map_err(compute_error)?) } else { source.clone() };
+                let copied = Arc::new(stable.copy_stable_to_device_ordered_async_retained_by(peer.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} operator selection owner->peer: {error}")))?);
+                cache.cache_operator_selection(peer.device_id, source.clone(), copied.clone())?;
+                Some(copied)
+            }
+        } else {
+            None
+        };
+
+        let packed_kv_replica = cache.operator_packed_kv_replication_enabled(layer);
+        let q_lora = if presubmitted_query { None } else { Some(self.tensor_to_stable_deferred(normalized_q_lora.clone())?) };
+        let latent = if packed_kv_replica { latent.clone() } else { self.tensor_to_stable_deferred(latent.clone())? };
+        // 默认路径只在 owner 旋转、量化一次 K-RoPE，再复制压缩 cache；兼容
+        // 路径仍传 F32 latent/rope，由 peer 自己 append。
+        let k_rope = self.rope(k_rope, 1, mla.qk_rope_head_dim, mla.rotary_layout, position, cosine, sine)?;
+        let k_rope = if packed_kv_replica { k_rope } else { self.tensor_to_stable_deferred(k_rope)? };
+        let mut peer_sources = Vec::new();
+        if let Some(q_lora) = q_lora.as_ref() {
+            peer_sources.push(q_lora.device.as_ref().ok_or_else(|| compute_error("operator MLA q_lora 缺少 device buffer"))?.clone());
+        }
+        if !packed_kv_replica {
+            peer_sources.push(latent.device.as_ref().ok_or_else(|| compute_error("operator MLA latent 缺少 device buffer"))?.clone());
+            peer_sources.push(k_rope.device.as_ref().ok_or_else(|| compute_error("operator MLA k_rope 缺少 device buffer"))?.clone());
+        }
+        let residual_replica = residual.replica.as_ref().filter(|replica| replica.device_id == peer.device_id && replica.device.bytes() == rows * hidden * replica.dtype.element_bytes()).cloned();
+        let residual = f32_tensor(self, residual)?;
+        let residual_device = residual.device.as_ref().ok_or_else(|| compute_error("operator MLA residual 缺少 F32 device buffer"))?.clone();
+        let copy_residual = residual_replica.is_none();
+        if copy_residual {
+            let stable_residual = self.tensor_to_stable_deferred(residual.clone())?;
+            peer_sources.push(stable_residual.device.ok_or_else(|| compute_error("operator MLA stable residual 缺少 device buffer"))?);
+        }
+        let (peer_cosine, peer_sine) = ops::hip::resident_rope_tables(peer.device_id, cosine, sine, mla.qk_rope_head_dim / 2, position..position + rows).map_err(compute_error)?;
+        let peer_q_b = weights.peer_q_b.clone();
+        let peer_kv_b = weights.peer_kv_b.clone();
+        let peer_o = weights.peer_o.clone();
+        let owner_mla = crate::attention::mla::MlaSpec {
+            q_lora_rank: mla.q_lora_rank,
+            kv_lora_rank: mla.kv_lora_rank,
+            qk_rope_head_dim: mla.qk_rope_head_dim,
+            q_projection_size: owner_q,
+            kv_projection_size: owner_kv,
+            num_heads: owner_heads,
+            rope_theta: mla.rope_theta,
+            rotary_layout: mla.rotary_layout,
+        };
+        let peer_mla = crate::attention::mla::MlaSpec { q_projection_size: peer_q, kv_projection_size: peer_kv, num_heads: peer_heads, ..owner_mla.clone() };
+        let peer_host_selection = host_selection_arc.clone();
+        let q_dtype = normalized_q_lora.dtype;
+        let latent_dtype = latent.dtype;
+        let rope_dtype = k_rope.dtype;
+        // packed 路径只同步两次 host enqueue：peer query 已经排入，随后 compact
+        // KV copy 与 peer attention 在同一 stream 上自然串联；没有 device wait。
+        let (query_ready_sender, query_ready_receiver) = if packed_kv_replica {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        let (kv_ready_sender, kv_ready_receiver) = if packed_kv_replica {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
+        // P2P/event 由 owner submission 线程发起，使源 buffer 与 event 能被
+        // owner stage completion 正确接管；peer worker 只提交计算 kernel。
+        let transferred = if peer_sources.is_empty() {
+            Vec::new()
+        } else {
+            ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&peer_sources, peer.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} operator MLA input owner->peer: {error}")))?
+        };
+        let ticket = worker.submit(move |peer| {
+            peer.activate().map_err(compute_error)?;
+            let mut transferred = transferred;
+            let expected = usize::from(!presubmitted_query) + if packed_kv_replica { 0 } else { 2 } + usize::from(copy_residual);
+            if transferred.len() != expected {
+                return Err(compute_error(format!("L{layer} operator MLA peer 输入数量异常")));
+            }
+            let peer_q_lora = match pending_peer_q_lora {
+                Some(query) => query,
+                None => device_tensor_with_dtype(transferred.remove(0), rows, peer_mla.q_lora_rank, q_dtype),
+            };
+            let (peer_latent, peer_rope) = if packed_kv_replica {
+                (None, None)
+            } else {
+                (Some(device_tensor_with_dtype(transferred.remove(0), rows, peer_mla.kv_lora_rank, latent_dtype)), Some(device_tensor_with_dtype(transferred.remove(0), rows, peer_mla.qk_rope_head_dim, rope_dtype)))
+            };
+            let peer_residual = match residual_replica {
+                Some(residual) => {
+                    let tensor = device_tensor_with_arc(residual.device, rows, hidden, residual.dtype);
+                    let tensor = peer.tensor_to_stable_deferred(peer.tensor_as_f32(tensor)?)?;
+                    tensor.device.ok_or_else(|| compute_error(format!("L{layer} operator MLA peer residual 缺失")))?
+                }
+                None => Arc::new(transferred.remove(0)),
+            };
+            let peer_query = peer.linear(&peer_q_lora, &peer_q_b)?;
+            let peer_query_device = peer_query.device.as_deref().ok_or_else(|| compute_error("operator MLA peer query 缺少 device buffer"))?;
+            let peer_query = ops::hip::try_rope_with_resident_tables_f32(peer.device_id, peer_query_device, rows, peer_q, peer_heads, peer_mla.qk_rope_head_dim, peer_mla.rotary_layout, position, &peer_cosine, &peer_sine, false)
+                .map_err(compute_error)?;
+            let peer_query = device_tensor_f32(peer_query, rows, peer_q);
+            if let Some(sender) = query_ready_sender {
+                sender.send(()).map_err(|_| compute_error(format!("L{layer} operator MLA query ready 通道提前关闭")))?;
+                kv_ready_receiver.expect("packed KV 必有 ready receiver").recv().map_err(|_| compute_error(format!("L{layer} operator MLA packed KV ready 通道提前关闭")))?;
+            }
+            let mut cache = peer_cache.lock().map_err(|_| compute_error(format!("L{layer} operator peer KV 锁中毒")))?;
+            if let (Some(peer_latent), Some(peer_rope)) = (peer_latent.as_ref(), peer_rope.as_ref()) {
+                cache.append_mla(&peer, layer, peer_latent, peer_rope)?;
+            }
+            let attention = paged_mla_attention_with_selection(&peer, &peer_query, &cache, &peer_kv_b, layer, &peer_mla, peer_selection.as_deref(), peer_host_selection.as_deref().map(Vec::as_slice), selection_width)?;
+            drop(cache);
+            let partial = peer.tensor_to_stable_deferred(peer.tensor_as_f32(peer.linear(&attention, &peer_o)?)?)?;
+            let partial = partial.device.ok_or_else(|| compute_error(format!("L{layer} operator peer partial 缺少 device buffer")))?;
+            Ok((partial, peer_residual))
+        })?;
+        worker.retain_for_stage(peer_sources)?;
+
+        // resident_rope_tables/cross-device copy 都可能把当前 host 线程留在
+        // peer context；这里只恢复 device，不能把 owner 切回 context 默认流。
+        ops::hip::set_device(self.device_id).map_err(compute_error)?;
+        let owner_query = if packed_kv_replica {
+            // peer query 与 owner append 并行；compact P2P 等 owner append 的 event，
+            // 随后的 owner query 又可与 peer copy 重叠。
+            cache.append_mla(self, layer, &latent, &k_rope)?;
+            query_ready_receiver.expect("packed KV 必有 query receiver").recv().map_err(|_| compute_error(format!("L{layer} operator MLA peer query 提交失败")))?;
+            let packed_sources = cache.replicate_operator_mla_append(self, &peer, layer, position, rows)?;
+            worker.retain_for_stage(packed_sources)?;
+            kv_ready_sender.expect("packed KV 必有 ready sender").send(()).map_err(|_| compute_error(format!("L{layer} operator MLA peer packed KV 等待失败")))?;
+            match pending_owner_query {
+                Some(query) => {
+                    let main_stream = ops::hip::active_compute_stream() as usize;
+                    ops::hip::order_stream_after(self.device_id, pending_owner_query_stream.expect("pending owner query 必有 stream"), main_stream).map_err(compute_error)?;
+                    query
+                }
+                None => {
+                    let query = self.linear(q_lora.as_ref().expect("普通 operator query 必有 q_lora"), &weights.owner_q_b)?;
+                    self.rope(&query, owner_heads, mla.qk_rope_head_dim, mla.rotary_layout, position, cosine, sine)?
+                }
+            }
+        } else {
+            cache.append_mla(self, layer, &latent, &k_rope)?;
+            match pending_owner_query {
+                Some(query) => {
+                    let main_stream = ops::hip::active_compute_stream() as usize;
+                    ops::hip::order_stream_after(self.device_id, pending_owner_query_stream.expect("pending owner query 必有 stream"), main_stream).map_err(compute_error)?;
+                    query
+                }
+                None => {
+                    let query = self.linear(q_lora.as_ref().expect("普通 operator query 必有 q_lora"), &weights.owner_q_b)?;
+                    self.rope(&query, owner_heads, mla.qk_rope_head_dim, mla.rotary_layout, position, cosine, sine)?
+                }
+            }
+        };
+        let owner_attention = paged_mla_attention_with_selection(self, &owner_query, cache, &weights.owner_kv_b, layer, &owner_mla, selection.as_deref(), host_selection, selection_width)?;
+        let owner_partial = self.tensor_to_stable_deferred(self.tensor_as_f32(self.linear(&owner_attention, &weights.owner_o)?)?)?;
+        let owner_partial = owner_partial.device.ok_or_else(|| compute_error("operator MLA owner partial 缺少 device buffer"))?;
+        let (peer_partial, peer_residual) = ticket.wait()?;
+        let (owner_output, peer_output) = ops::hip::DeviceBuffer::join_peer_partials_residual_ordered_async_retained_by(&owner_partial, &peer_partial, &residual_device, &peer_residual, rows * hidden, self.device_id)
+            .map_err(|error| compute_error(format!("L{layer} operator MLA direct partial join: {error}")))?;
+        worker.retain_for_stage(vec![owner_partial, peer_partial])?;
+        let mut output = device_tensor_f32(owner_output, rows, hidden);
+        output.replica = Some(RocmTensorReplica { device_id: peer.device_id, dtype: RocmTensorDType::F32, device: Arc::new(peer_output) });
+        Ok(output)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn cooperative_mla_prefill_add_impl(
         &self,
@@ -671,7 +1027,7 @@ impl RocmContext {
         let profile_pair = ops::hip::device_profile_enabled();
         peer.activate().map_err(compute_error)?;
         if profile_pair {
-            ops::hip::device_profile_scope_begin(peer.device_id, "glm_pair_attn_peer_pre").map_err(compute_error)?;
+            ops::hip::device_profile_scope_begin(peer.device_id, "glm_pair_attn_peer_input").map_err(compute_error)?;
         }
         let mut transferred = ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&sources, peer.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} MLA owner->peer: {error}")))?;
         trace_step("owner-to-peer");
@@ -693,6 +1049,9 @@ impl RocmContext {
             _ => return Err(compute_error(format!("L{layer} cooperative MLA selection split/P2P 状态不一致"))),
         };
 
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(peer.device_id, "glm_pair_attn_peer_query").map_err(compute_error)?;
+        }
         let decode_q_b_shards = (normalized_q_lora.rows == 1).then(|| weights.decode_q_b_shards()).flatten();
         let query_head_count = if decode_q_b_shards.is_some() { mla.num_heads / 2 } else { mla.num_heads };
         let peer_q_b = decode_q_b_shards.map_or(&weights.peer_q_b, |(_, peer)| peer);
@@ -703,7 +1062,7 @@ impl RocmContext {
 
         ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
         if profile_pair {
-            ops::hip::device_profile_scope_begin(self.device_id, "glm_pair_attn_owner_pre").map_err(compute_error)?;
+            ops::hip::device_profile_scope_begin(self.device_id, "glm_pair_attn_owner_query").map_err(compute_error)?;
         }
         let owner_q_b = decode_q_b_shards.map_or(&weights.owner_q_b, |(owner, _)| owner);
         let owner_query = if let Some(owner_q_lora) = owner_q_lora.as_ref() {
@@ -715,6 +1074,9 @@ impl RocmContext {
         };
         let owner_query = self.tensor_to_stable_deferred(owner_query)?;
         trace_step("owner-query");
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(self.device_id, "glm_pair_attn_owner_query_exchange").map_err(compute_error)?;
+        }
 
         let (owner_query, peer_query) = if decode_q_b_shards.is_some() {
             // q_b 是 decode attention 的最大单个权重流量。两卡各算连续一半 head，
@@ -742,14 +1104,27 @@ impl RocmContext {
         };
 
         if query_row_split {
-            let owner_query_source = owner_query.device.as_ref().ok_or_else(|| compute_error("pair owner query 缺少 device buffer"))?.clone();
-            let peer_query_source = peer_query.device.as_ref().ok_or_else(|| compute_error("pair peer query 缺少 device buffer"))?.clone();
-            let (mut owner_query_on_peer, mut peer_query_on_owner) =
-                ops::hip::DeviceBuffer::exchange_stable_groups_ordered_async_retained_by(&[owner_query_source], &[peer_query_source], self.device_id).map_err(|error| compute_error(format!("L{layer} MLA query row exchange: {error}")))?;
-            let owner_query_on_peer = owner_query_on_peer.pop().ok_or_else(|| compute_error(format!("L{layer} MLA owner query->peer 缺失")))?;
-            let peer_query_on_owner = peer_query_on_owner.pop().ok_or_else(|| compute_error(format!("L{layer} MLA peer query->owner 缺失")))?;
-            let owner_query_on_peer = device_tensor_with_dtype(owner_query_on_peer, half_query_rows, mla.q_projection_size, owner_query.dtype);
-            let peer_query_on_owner = device_tensor_with_dtype(peer_query_on_owner, half_query_rows, mla.q_projection_size, peer_query.dtype);
+            // prefill MLA 最终以 BF16 query 进入 WMMA；跨卡先压成 BF16，把
+            // query 表传输减半。两向传输各走本卡 transfer stream，与另一象限
+            // 的本地 MLA 扫描重叠，helper 在消费远端象限前再显式汇合。
+            peer.activate().map_err(compute_error)?;
+            let peer_query_transfer = peer.tensor_to_stable_deferred(peer.tensor_as_bf16(peer_query.clone())?)?;
+            ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+            let owner_query_transfer = self.tensor_to_stable_deferred(self.tensor_as_bf16(owner_query.clone())?)?;
+            let owner_query_source = owner_query_transfer.device.as_ref().ok_or_else(|| compute_error("pair owner BF16 query 缺少 device buffer"))?.clone();
+            let peer_query_source = peer_query_transfer.device.as_ref().ok_or_else(|| compute_error("pair peer BF16 query 缺少 device buffer"))?.clone();
+            let peer_transfer_stream = ops::hip::cooperative_peer_stream(peer.device_id).map_err(compute_error)?;
+            let owner_transfer_stream = ops::hip::cooperative_peer_stream(self.device_id).map_err(compute_error)?;
+            ops::hip::activate_compute_stream(peer.device_id, peer_transfer_stream).map_err(compute_error)?;
+            let owner_query_on_peer =
+                owner_query_source.copy_stable_to_device_ordered_async_on_streams_retained_by(peer.device_id, self.device_id, 0, peer_transfer_stream).map_err(|error| compute_error(format!("L{layer} MLA owner query->peer: {error}")))?;
+            ops::hip::activate_compute_stream(self.device_id, owner_transfer_stream).map_err(compute_error)?;
+            let peer_query_on_owner =
+                peer_query_source.copy_stable_to_device_ordered_async_on_streams_retained_by(self.device_id, self.device_id, 0, owner_transfer_stream).map_err(|error| compute_error(format!("L{layer} MLA peer query->owner: {error}")))?;
+            ops::hip::activate_compute_stream(peer.device_id, 0).map_err(compute_error)?;
+            ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+            let owner_query_on_peer = device_tensor_with_dtype(owner_query_on_peer, half_query_rows, mla.q_projection_size, RocmTensorDType::Bf16);
+            let peer_query_on_owner = device_tensor_with_dtype(peer_query_on_owner, half_query_rows, mla.q_projection_size, RocmTensorDType::Bf16);
             return self.cooperative_mla_query_row_shards_finish(
                 layer,
                 &peer,
@@ -799,6 +1174,47 @@ impl RocmContext {
         if profile_pair {
             ops::hip::device_profile_scope_end(self.device_id).map_err(compute_error)?;
             ops::hip::device_profile_scope_begin(self.device_id, "glm_pair_attn_owner_post").map_err(compute_error)?;
+        }
+        if normalized_q_lora.rows == 1 && ops::hip::options().cooperative_mla_decode_replicated && weights.decode_replicated() {
+            let (owner_o_full, peer_o_full) = weights.full_o().expect("decode_replicated 已校验完整 o_proj");
+            let (mut owner_on_peer, mut peer_on_owner) = exchange_sequence_shards(&[&owner_shard], &[&peer_shard], self.device_id)?;
+            let owner_on_peer = owner_on_peer.pop().expect("单 shard P2P 已校验");
+            let peer_on_owner = peer_on_owner.pop().expect("单 shard P2P 已校验");
+
+            let residual = f32_tensor(self, residual)?;
+            let peer_residual = match residual.replica.as_ref() {
+                Some(replica) if replica.device_id == peer.device_id && replica.dtype == RocmTensorDType::F32 && replica.device.bytes() == residual.rows * residual.cols * std::mem::size_of::<f32>() => {
+                    RocmTensor { data: Vec::new(), rows: residual.rows, cols: residual.cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: Some(replica.device.clone()), replica: None }
+                }
+                _ => {
+                    let stable = self.tensor_to_stable_deferred(residual.clone())?;
+                    let source = stable.device.as_ref().ok_or_else(|| compute_error("ROCm cooperative MLA residual 缺少 device buffer"))?;
+                    let copied = source.copy_stable_to_device_ordered_async_retained_by(peer.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} MLA residual owner->peer: {error}")))?;
+                    device_tensor_f32(copied, residual.rows, residual.cols)
+                }
+            };
+
+            peer.activate().map_err(compute_error)?;
+            // 两边都固定 owner shard 在前、peer shard 在后，保证 softmax merge
+            // 与后续 o_proj 的归约顺序一致，peer hidden 才能作为精确副本延续。
+            let peer_projected = project_merged_sequence_heads(&peer, &owner_on_peer, &peer_shard, &weights.peer_kv_b, peer_o_full, 1, 0, mla.num_heads, mla)?;
+            let peer_output = peer.add(&peer_projected, &peer_residual)?;
+            let peer_output_device = peer_output.device.as_ref().ok_or_else(|| compute_error("ROCm cooperative MLA peer output 缺少 device buffer"))?.clone();
+            if profile_pair {
+                ops::hip::device_profile_scope_end(peer.device_id).map_err(compute_error)?;
+            }
+
+            ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+            let owner_projected = project_merged_sequence_heads(self, &owner_shard, &peer_on_owner, &weights.owner_kv_b, owner_o_full, 1, 0, mla.num_heads, mla)?;
+            let mut output = self.add(&owner_projected, &residual)?;
+            output.replica = Some(RocmTensorReplica { device_id: peer.device_id, dtype: RocmTensorDType::F32, device: peer_output_device });
+            if profile_pair {
+                ops::hip::device_profile_scope_end(self.device_id).map_err(compute_error)?;
+            }
+            ops::hip::order_stream_after(self.device_id, 0, owner_stream).map_err(compute_error)?;
+            ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
+            trace_step("replicated-output");
+            return Ok(output);
         }
 
         if normalized_q_lora.rows == 1 && weights.o_head_sharded() && ops::hip::options().cooperative_mla_decode_full_merge {
@@ -851,14 +1267,14 @@ impl RocmContext {
             let owner_stats_on_peer = owner_stats.copy_stable_to_device_ordered_async_retained_by(peer.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} MLA owner stats->peer: {error}")))?;
             let peer_stats_on_owner = peer_stats.copy_stable_to_device_ordered_async_retained_by(self.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} MLA peer stats->owner: {error}")))?;
             peer.activate().map_err(compute_error)?;
-            let peer_partial = project_local_sequence_partial(&peer, &peer_shard, &peer_stats, &owner_stats_on_peer, &weights.peer_kv_b, &weights.peer_o, normalized_q_lora.rows, mla)?;
+            let peer_partial = project_local_sequence_partial(&peer, &peer_shard, &peer_stats, &owner_stats_on_peer, &weights.peer_kv_b, &weights.peer_o, normalized_q_lora.rows, mla, profile_pair)?;
             let stable_peer_partial = peer.tensor_to_stable_deferred(peer.tensor_as_bf16(peer_partial)?)?;
             let stable_peer_partial = stable_peer_partial.device.as_ref().ok_or_else(|| compute_error("ROCm cooperative MLA peer partial 缺少 device buffer"))?.clone();
             if profile_pair {
                 ops::hip::device_profile_scope_end(peer.device_id).map_err(compute_error)?;
             }
             ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
-            let local_partial = project_local_sequence_partial(self, &owner_shard, &owner_stats, &peer_stats_on_owner, &weights.owner_kv_b, &weights.owner_o, normalized_q_lora.rows, mla)?;
+            let local_partial = project_local_sequence_partial(self, &owner_shard, &owner_stats, &peer_stats_on_owner, &weights.owner_kv_b, &weights.owner_o, normalized_q_lora.rows, mla, profile_pair)?;
             (local_partial, stable_peer_partial)
         };
         trace_step("output-projection");
@@ -907,7 +1323,16 @@ impl RocmContext {
         profile_pair: bool,
     ) -> Result<RocmTensor, BackendError> {
         let rows = owner_q0.rows;
-        if rows == 0 || owner_q1.rows != rows || peer_q0.rows != rows || peer_q1.rows != rows || [owner_q0, owner_q1, peer_q0, peer_q1].iter().any(|query| query.cols != mla.q_projection_size || query.dtype != RocmTensorDType::F32) {
+        if rows == 0
+            || owner_q1.rows != rows
+            || peer_q0.rows != rows
+            || peer_q1.rows != rows
+            || [owner_q0, owner_q1, peer_q0, peer_q1].iter().any(|query| query.cols != mla.q_projection_size)
+            || owner_q0.dtype != RocmTensorDType::F32
+            || peer_q1.dtype != RocmTensorDType::F32
+            || owner_q1.dtype != RocmTensorDType::Bf16
+            || peer_q0.dtype != RocmTensorDType::Bf16
+        {
             return Err(compute_error(format!(
                 "L{layer} cooperative MLA query row shard shape 非法: owner={:?}/{:?} peer={:?}/{:?}",
                 (owner_q0.rows, owner_q0.cols, owner_q0.dtype),
@@ -935,6 +1360,9 @@ impl RocmContext {
         };
 
         peer.activate().map_err(compute_error)?;
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(peer.device_id, "glm_pair_attn_peer_mla_q1").map_err(compute_error)?;
+        }
         let peer_cache = cache.cooperative_peer_cache(peer.device_id)?;
         let peer_q1_shard = paged_mla_attention_shard(
             peer,
@@ -949,9 +1377,15 @@ impl RocmContext {
             1,
             position + rows,
         )?;
+        let peer_transfer_stream = ops::hip::cooperative_peer_stream(peer.device_id).map_err(compute_error)?;
+        ops::hip::order_stream_after(peer.device_id, peer_transfer_stream, 0).map_err(compute_error)?;
+        let peer_q0 = peer.tensor_as_f32(peer_q0.clone())?;
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(peer.device_id, "glm_pair_attn_peer_mla_q0").map_err(compute_error)?;
+        }
         let peer_q0_shard = paged_mla_attention_shard(
             peer,
-            peer_q0,
+            &peer_q0,
             peer_cache,
             &weights.peer_kv_b,
             layer,
@@ -963,8 +1397,14 @@ impl RocmContext {
             position,
         )?;
         let (peer_q0_shard, peer_q1_shard) = if weights.o_head_sharded() { (stable_sequence_shard(peer_q0_shard)?, stable_sequence_shard(peer_q1_shard)?) } else { (peer_q0_shard, peer_q1_shard) };
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(peer.device_id, "glm_pair_attn_peer_stats_exchange").map_err(compute_error)?;
+        }
 
         ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(self.device_id, "glm_pair_attn_owner_mla_q0").map_err(compute_error)?;
+        }
         let owner_q0_shard = paged_mla_attention_shard(
             self,
             owner_q0,
@@ -978,9 +1418,15 @@ impl RocmContext {
             0,
             position,
         )?;
+        let owner_transfer_stream = ops::hip::cooperative_peer_stream(self.device_id).map_err(compute_error)?;
+        ops::hip::order_stream_after(self.device_id, owner_transfer_stream, 0).map_err(compute_error)?;
+        let owner_q1 = self.tensor_as_f32(owner_q1.clone())?;
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(self.device_id, "glm_pair_attn_owner_mla_q1").map_err(compute_error)?;
+        }
         let owner_q1_shard = paged_mla_attention_shard(
             self,
-            owner_q1,
+            &owner_q1,
             cache,
             &weights.owner_kv_b,
             layer,
@@ -992,6 +1438,42 @@ impl RocmContext {
             position + rows,
         )?;
         let (owner_q0_shard, owner_q1_shard) = if weights.o_head_sharded() { (stable_sequence_shard(owner_q0_shard)?, stable_sequence_shard(owner_q1_shard)?) } else { (owner_q0_shard, owner_q1_shard) };
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(self.device_id, "glm_pair_attn_owner_stats_exchange").map_err(compute_error)?;
+        }
+
+        if ops::hip::options().cooperative_mla_prefill_row_output
+            && weights.o_head_sharded()
+            && let Some((owner_o_full, peer_o_full)) = weights.full_o()
+        {
+            // q0 只在 owner 生成最终 hidden，q1 只在 peer 生成最终 hidden。
+            // 每个方向只传对应行的 P/stats，避免两卡都为全部 token 做半列
+            // o_proj，attention 边界也不再归约两份 full-row hidden partial。
+            let (mut owner_q1_on_peer, mut peer_q0_on_owner) = exchange_sequence_shards(&[&owner_q1_shard], &[&peer_q0_shard], self.device_id)?;
+            let owner_q1_on_peer = owner_q1_on_peer.pop().expect("q1 shard P2P 已校验");
+            let peer_q0_on_owner = peer_q0_on_owner.pop().expect("q0 shard P2P 已校验");
+
+            peer.activate().map_err(compute_error)?;
+            let peer_q1_output = project_merged_sequence_heads(peer, &owner_q1_on_peer, &peer_q1_shard, &weights.peer_kv_b, peer_o_full, rows, 0, mla.num_heads, mla)?;
+            let peer_q1_output = peer.tensor_to_stable_deferred(peer_q1_output)?;
+            let peer_q1_source = peer_q1_output.device.as_ref().ok_or_else(|| compute_error("ROCm cooperative MLA peer q1 output 缺少 device buffer"))?;
+            if profile_pair {
+                ops::hip::device_profile_scope_end(peer.device_id).map_err(compute_error)?;
+            }
+
+            ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+            let owner_q0_output = project_merged_sequence_heads(self, &owner_q0_shard, &peer_q0_on_owner, &weights.owner_kv_b, owner_o_full, rows, 0, mla.num_heads, mla)?;
+            let peer_q1_on_owner = peer_q1_source.copy_stable_to_device_ordered_async_retained_by(self.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} MLA q1 output peer->owner: {error}")))?;
+            let peer_q1_on_owner = device_tensor_f32(peer_q1_on_owner, rows, residual.cols);
+            let projected = <RocmContext as crate::backend::SegmentedTensorBackend>::concat_token_rows(self, &[&owner_q0_output, &peer_q1_on_owner])?;
+            let output = self.add(residual, &projected)?;
+            if profile_pair {
+                ops::hip::device_profile_scope_end(self.device_id).map_err(compute_error)?;
+            }
+            ops::hip::order_stream_after(self.device_id, 0, owner_stream).map_err(compute_error)?;
+            ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
+            return Ok(output);
+        }
 
         let (owner_partial, peer_partial) = if weights.o_head_sharded() {
             let owner_on_peer = copy_sequence_shards_to_device(&[&owner_q0_shard, &owner_q1_shard], peer.device_id, self.device_id)?;
@@ -1029,8 +1511,8 @@ impl RocmContext {
                 return Err(compute_error(format!("L{layer} MLA stats row shard P2P 数量异常")));
             }
             peer.activate().map_err(compute_error)?;
-            let peer_q0_partial = project_local_sequence_partial(peer, &peer_q0_shard, &peer_q0_stats, &owner_stats_on_peer[0], &weights.peer_kv_b, &weights.peer_o, rows, mla)?;
-            let peer_q1_partial = project_local_sequence_partial(peer, &peer_q1_shard, &peer_q1_stats, &owner_stats_on_peer[1], &weights.peer_kv_b, &weights.peer_o, rows, mla)?;
+            let peer_q0_partial = project_local_sequence_partial(peer, &peer_q0_shard, &peer_q0_stats, &owner_stats_on_peer[0], &weights.peer_kv_b, &weights.peer_o, rows, mla, profile_pair)?;
+            let peer_q1_partial = project_local_sequence_partial(peer, &peer_q1_shard, &peer_q1_stats, &owner_stats_on_peer[1], &weights.peer_kv_b, &weights.peer_o, rows, mla, profile_pair)?;
             let peer_q0_partial = peer.tensor_as_bf16(peer_q0_partial)?;
             let peer_q1_partial = peer.tensor_as_bf16(peer_q1_partial)?;
             let peer_partial = <RocmContext as crate::backend::SegmentedTensorBackend>::concat_token_rows(peer, &[&peer_q0_partial, &peer_q1_partial])?;
@@ -1040,18 +1522,21 @@ impl RocmContext {
                 ops::hip::device_profile_scope_end(peer.device_id).map_err(compute_error)?;
             }
             ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
-            let owner_q0_partial = project_local_sequence_partial(self, &owner_q0_shard, &owner_q0_stats, &peer_stats_on_owner[0], &weights.owner_kv_b, &weights.owner_o, rows, mla)?;
-            let owner_q1_partial = project_local_sequence_partial(self, &owner_q1_shard, &owner_q1_stats, &peer_stats_on_owner[1], &weights.owner_kv_b, &weights.owner_o, rows, mla)?;
+            let owner_q0_partial = project_local_sequence_partial(self, &owner_q0_shard, &owner_q0_stats, &peer_stats_on_owner[0], &weights.owner_kv_b, &weights.owner_o, rows, mla, profile_pair)?;
+            let owner_q1_partial = project_local_sequence_partial(self, &owner_q1_shard, &owner_q1_stats, &peer_stats_on_owner[1], &weights.owner_kv_b, &weights.owner_o, rows, mla, profile_pair)?;
             let owner_partial = <RocmContext as crate::backend::SegmentedTensorBackend>::concat_token_rows(self, &[&owner_q0_partial, &owner_q1_partial])?;
             (owner_partial, peer_partial)
         };
         if profile_pair {
             ops::hip::device_profile_scope_end(self.device_id).map_err(compute_error)?;
-            ops::hip::device_profile_scope_begin(self.device_id, "glm_pair_attn_join").map_err(compute_error)?;
+            ops::hip::device_profile_scope_begin(self.device_id, "glm_pair_attn_join_wait").map_err(compute_error)?;
         }
         let peer_partial_on_owner = peer_partial.copy_stable_to_device_ordered_async_retained_by(self.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} MLA peer partial->owner: {error}")))?;
 
         ops::hip::activate_compute_stream(self.device_id, 0).map_err(compute_error)?;
+        if profile_pair {
+            ops::hip::device_profile_scope_operator(self.device_id, "glm_pair_attn_join_add").map_err(compute_error)?;
+        }
         let owner_partial = owner_partial.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative MLA owner partial 缺少 device buffer"))?;
         let residual = f32_tensor(self, residual)?;
         let residual_device = residual.device.as_deref().ok_or_else(|| compute_error("ROCm cooperative MLA residual 缺少 device buffer"))?;
@@ -1277,6 +1762,14 @@ impl DecodeBackend for RocmContext {
 }
 
 impl DsaPrefillBackend for RocmContext {
+    fn dsa_select_prefill_begin(&self, state: &mut Self::DsaState, layer: usize, query: &Self::Tensor, head_weights: &Self::Tensor, spec: &crate::attention::dsa::DsaSpec) -> Result<(), BackendError> {
+        if query.rows == 1 && spec.kpool == 0 && (ops::hip::options().dsa_cpu_select || ops::hip::options().mla_cpu_hot_rows != 0) {
+            state.select_begin(self, layer, query, head_weights)
+        } else {
+            self.dsa_select_prefill(state, layer, query, head_weights, spec)
+        }
+    }
+
     fn dsa_select_prefill(&self, state: &mut Self::DsaState, layer: usize, query: &Self::Tensor, head_weights: &Self::Tensor, spec: &crate::attention::dsa::DsaSpec) -> Result<(), BackendError> {
         if spec.kpool > 0 {
             return state.select_kpool(self, layer, query, head_weights, spec.kpool);
@@ -1285,6 +1778,17 @@ impl DsaPrefillBackend for RocmContext {
             return state.select_prefill_cpu(self, layer, query, head_weights);
         }
         state.select(self, layer, query, head_weights)
+    }
+
+    fn supports_dsa_prefill_selection_reuse(&self, state: &Self::DsaState, layer: usize, position: usize, rows: usize, spec: &crate::attention::dsa::DsaSpec) -> bool {
+        spec.kpool == 0 && state.can_reuse_prefill_selection(layer, position, rows)
+    }
+
+    fn reuse_dsa_prefill_selection(&self, state: &mut Self::DsaState, layer: usize, position: usize, rows: usize, spec: &crate::attention::dsa::DsaSpec) -> Result<(), BackendError> {
+        if spec.kpool != 0 {
+            return Err(compute_error(format!("L{layer} ROCm DSA kpool selection 不能用于 MTP 迭代复用")));
+        }
+        state.reuse_prefill_selection(layer, position, rows)
     }
 
     fn mla_prefill_attention_selected(

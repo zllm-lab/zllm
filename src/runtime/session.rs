@@ -128,6 +128,17 @@ pub fn effective_dspark_draft_tokens(configured: usize, decode: usize) -> usize 
     if decode == 0 { 0 } else { configured.min(32 / decode) }
 }
 
+/// MTP 按当前流水线压力逐轮收缩；prefill 会占满多段流水，按四路 decode 计。
+pub fn effective_mtp_draft_tokens(configured: usize, decode: usize, prefill: usize) -> usize {
+    let load = decode.saturating_add(prefill.saturating_mul(4));
+    configured.min(match load {
+        0 => 0,
+        1..=3 => 5,
+        4..=7 => 3,
+        _ => 2,
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct AtomicCounterU64(AtomicU64);
 
@@ -870,6 +881,21 @@ mod tests {
         assert_eq!(effective_dspark_draft_tokens(8, 5), 6);
         assert_eq!(effective_dspark_draft_tokens(8, 16), 2);
         assert_eq!(effective_dspark_draft_tokens(8, 22), 1);
+    }
+
+    #[test]
+    fn mtp深度按decode与四倍prefill压力收缩() {
+        assert_eq!(effective_mtp_draft_tokens(5, 0, 0), 0);
+        assert_eq!(effective_mtp_draft_tokens(5, 1, 0), 5);
+        assert_eq!(effective_mtp_draft_tokens(5, 3, 0), 5);
+        assert_eq!(effective_mtp_draft_tokens(5, 4, 0), 3);
+        assert_eq!(effective_mtp_draft_tokens(5, 7, 0), 3);
+        assert_eq!(effective_mtp_draft_tokens(5, 8, 0), 2);
+        assert_eq!(effective_mtp_draft_tokens(5, 12, 0), 2);
+        assert_eq!(effective_mtp_draft_tokens(5, 0, 1), 3);
+        assert_eq!(effective_mtp_draft_tokens(5, 4, 1), 2);
+        assert_eq!(effective_mtp_draft_tokens(3, 1, 0), 3);
+        assert_eq!(effective_mtp_draft_tokens(2, 1, 0), 2);
     }
 
     #[test]

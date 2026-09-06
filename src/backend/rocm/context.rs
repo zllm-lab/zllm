@@ -112,19 +112,31 @@ impl crate::backend::StageExecutionBackend for RocmContext {
     }
 
     fn record_stage_completion(&self) -> Result<Self::Completion, BackendError> {
-        ops::hip::DeviceCompletion::record(self.device_id).map(RocmStageCompletion).map_err(compute_error)
+        let owner = ops::hip::DeviceCompletion::record(self.device_id).map_err(compute_error)?;
+        let peers = super::pair_worker::take_pair_stage_completions(self.device_id);
+        Ok(RocmStageCompletion { owner, peers })
     }
 
     fn stage_completion_ready(&self, completion: &Self::Completion) -> Result<bool, BackendError> {
-        completion.0.is_complete().map_err(compute_error)
+        if !completion.owner.is_complete().map_err(compute_error)? {
+            return Ok(false);
+        }
+        completion.peers.iter().try_fold(true, |ready, peer| peer.is_complete().map(|peer_ready| ready && peer_ready))
     }
 
     fn wait_stage_completion(&self, completion: &Self::Completion) -> Result<(), BackendError> {
-        completion.0.wait().map_err(compute_error)
+        completion.owner.wait().map_err(compute_error)?;
+        for peer in &completion.peers {
+            peer.wait()?;
+        }
+        Ok(())
     }
 
     fn retire_ordered_stage_completion(&self, completion: &Self::Completion) -> Result<(), BackendError> {
-        completion.0.retire_ordered();
+        completion.owner.retire_ordered();
+        for peer in &completion.peers {
+            peer.retire_ordered()?;
+        }
         Ok(())
     }
 
@@ -249,6 +261,10 @@ impl crate::backend::SegmentedTensorBackend for RocmContext {
             total_rows = total_rows.checked_add(tensor.rows).ok_or_else(|| compute_error("ROCm token concat rows 溢出"))?;
             total_bytes = total_bytes.checked_add(device.bytes()).ok_or_else(|| compute_error("ROCm token concat bytes 溢出"))?;
         }
+        // 单个输入已经是目标行序；只共享只读 allocation，不物化等价副本。
+        if tensors.len() == 1 {
+            return Ok(device_tensor_with_arc(first.device.as_ref().expect("上方已检查 device").clone(), total_rows, first.cols, first.dtype));
+        }
         let output = <Self as crate::backend::MemoryPool>::allocate_memory(self, crate::backend::MemoryRequest::new(total_bytes, crate::backend::MemoryKind::Activation, crate::backend::MemoryLifetime::Operation))?;
         let mut offset = 0usize;
         for tensor in tensors {
@@ -332,7 +348,20 @@ impl crate::backend::SegmentedTensorBackend for RocmContext {
         let bytes = rows.checked_mul(row_bytes).ok_or_else(|| compute_error("ROCm token slice bytes 溢出"))?;
         let owner = if offset == 0 { owner.prefix_capacity_owner().unwrap_or(owner) } else { owner };
         let view = ops::hip::DeviceBuffer::view(owner, offset, bytes).map_err(compute_error)?;
-        Ok(device_tensor_with_dtype(view, rows, tensor.cols, tensor.dtype))
+        let mut output = device_tensor_with_dtype(view, rows, tensor.cols, tensor.dtype);
+        if let Some(replica) = tensor.replica.as_ref() {
+            let replica_row_bytes = tensor.cols.checked_mul(replica.dtype.element_bytes()).ok_or_else(|| compute_error("ROCm token replica slice 行跨度溢出"))?;
+            let replica_expected = tensor.rows.checked_mul(replica_row_bytes).ok_or_else(|| compute_error("ROCm token replica slice tensor 大小溢出"))?;
+            if replica.device.bytes() != replica_expected {
+                return Err(compute_error(format!("ROCm token replica slice dtype={:?} buffer={} 与 shape=[{},{}] 不匹配", replica.dtype, replica.device.bytes(), tensor.rows, tensor.cols)));
+            }
+            let replica_offset = row_start.checked_mul(replica_row_bytes).ok_or_else(|| compute_error("ROCm token replica slice offset 溢出"))?;
+            let replica_bytes = rows.checked_mul(replica_row_bytes).ok_or_else(|| compute_error("ROCm token replica slice bytes 溢出"))?;
+            let replica_owner = if replica_offset == 0 { replica.device.prefix_capacity_owner().unwrap_or_else(|| replica.device.clone()) } else { replica.device.clone() };
+            let replica_view = ops::hip::DeviceBuffer::view(replica_owner, replica_offset, replica_bytes).map_err(compute_error)?;
+            output.replica = Some(RocmTensorReplica { device_id: replica.device_id, dtype: replica.dtype, device: Arc::new(replica_view) });
+        }
+        Ok(output)
     }
 }
 
@@ -542,7 +571,7 @@ impl BackendResources for RocmContext {
 }
 
 impl RocmContext {
-    fn prepare_gguf_q8_bytes(&self, bytes: &[u8], rows: usize, cols: usize) -> Result<RocmWeight, BackendError> {
+    pub(crate) fn prepare_gguf_q8_bytes(&self, bytes: &[u8], rows: usize, cols: usize) -> Result<RocmWeight, BackendError> {
         if cols % 32 != 0 || cols % 4 != 0 {
             return Err(compute_error(format!("ROCm GGUF Q8_0 columns={cols} 不是 32 的倍数")));
         }
@@ -584,6 +613,19 @@ impl RocmContext {
             shard.extend_from_slice(&source[offset..offset + row_bytes]);
         }
         self.prepare_gguf_q8_bytes(&shard, matrix.rows, range.len())
+    }
+
+    /// Q8_0 每个输出行独立连续，直接只上传目标行；operator peer 不应为了
+    /// 一个 head 半片先常驻完整 q_b 再建立 view。
+    pub(crate) fn prepare_gguf_q8_row_shard(&self, matrix: &crate::weight::container::gguf::GgufMatrix, range: std::ops::Range<usize>) -> Result<RocmWeight, BackendError> {
+        if matrix.tensor_type.0 != 8 || range.start >= range.end || range.end > matrix.rows || !matrix.columns.is_multiple_of(32) {
+            return Err(compute_error(format!("ROCm GGUF Q8_0 row shard={range:?}/{} 非法", matrix.rows)));
+        }
+        let source = matrix.read_bytes().map_err(compute_error)?;
+        let row_bytes = matrix.columns / 32 * 34;
+        let start = range.start * row_bytes;
+        let end = range.end * row_bytes;
+        self.prepare_gguf_q8_bytes(&source[start..end], range.len(), matrix.columns)
     }
 
     pub(crate) fn prepare_gguf_packed_bytes(&self, bytes: &[u8], tensor_type: u32, rows: usize, cols: usize) -> Result<RocmWeight, BackendError> {

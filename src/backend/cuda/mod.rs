@@ -12,6 +12,13 @@ pub mod resident;
 mod vae;
 
 pub use context::{CudaContext, CudaContextOptions, CudaTensor};
+
+/// 目标设备的 (free, total) 显存,供 zllm-metal 等入口做资源规划。
+/// 只初始化 driver context,不构造算子上下文;失败时由调用方决定降级策略。
+pub fn device_memory_info(device: usize) -> Result<(usize, usize), String> {
+    let context = cudarc::driver::safe::CudaContext::new(device).map_err(|error| format!("CUDA 设备 {device} 初始化失败: {error:?}"))?;
+    context.mem_get_info().map_err(|error| format!("查询 CUDA 设备 {device} 显存失败: {error:?}"))
+}
 pub use expert::{CudaMoeAccumulator, CudaMoeState, CudaPrefillExperts};
 pub use gated_delta_net::CudaGatedDeltaNetStorage;
 pub use kv_cache::CudaKvCache;
@@ -53,7 +60,7 @@ impl BackendResources for CudaContext {
 
     fn prepare_weight(&self, weight: LinearWeight<'_>, rows: usize, cols: usize) -> Result<CudaWeight, BackendError> {
         if let LinearWeight::Quantized(QuantizedMatrixRef::Gguf(matrix)) = weight
-            && matches!(matrix.tensor_type.0, 2 | 8 | 12..=14)
+            && matches!(matrix.tensor_type.0, 2 | 6 | 8 | 12..=14)
         {
             if matrix.rows != rows || matrix.columns != cols {
                 return Err(compute_error(format!("GGUF {} weight shape [{},{}]，期望 [{rows},{cols}]", matrix.name, matrix.rows, matrix.columns)));

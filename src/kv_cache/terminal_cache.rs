@@ -495,6 +495,12 @@ impl<S> TerminalCache<S> {
         self.order.iter().find_map(|cache_id| self.entries.get(cache_id).map(|(tokens, state)| (cache_id.as_str(), tokens.as_slice(), state)))
     }
 
+    /// 跳过被 pin 的条目取最早内存 entry,供 append 排队期间的换出保护;
+    /// 全部候选被 pin 时返回 None,由调用方决定报错或把新状态直接落盘。
+    pub fn oldest_unpinned(&self, pinned: &HashSet<String>) -> Option<(&str, &[u32], &S)> {
+        self.order.iter().filter(|cache_id| !pinned.contains(*cache_id)).find_map(|cache_id| self.entries.get(cache_id).map(|(tokens, state)| (cache_id.as_str(), tokens.as_slice(), state)))
+    }
+
     /// 内容最长公共前缀匹配(与 cache_id 无关):返回 lcp 最长的 entry。
     /// 与 `take_longest_prefix` 的差别是允许 cached 比新 tokens 更长——调用方
     /// 按 lcp 与 cached/new 长度的关系自行决定续写或截断复用(llama slot 截断复用)。
@@ -586,12 +592,21 @@ fn terminal_info_key(cache_id: &str) -> String {
     format!("{TERMINAL_INFO_PREFIX}{cache_id}")
 }
 
+/// pin 数量上限:排队风暴不允许锁死整个 resident,超出的 pin 退化为尽力而为。
+/// 由节点命令层在写入 pin 句柄时执行。
+pub const TERMINAL_PIN_LIMIT: usize = 16;
+
 /// 内存 LRU + fjall 换出的统一终点会话管理:resident 满时最旧条目快照落盘,
 /// resume 先查内存、miss 再从盘上恢复。swap 持久化时同时保存 CacheInfo 供上报。
 pub struct TerminalSessions<S: TerminalSnapshot> {
     resident: TerminalCache<S>,
     swap: Option<crate::kv_cache::fjall::FjallValueStore>,
     swap_infos: HashMap<String, TerminalInfo>,
+    /// scheduler 在 append 请求排队期间 pin 的 cache_id:换出循环跳过它们,
+    /// 排到队时命中内存而不是 swap 慢路径。共享句柄让 pin/unpin 不进 engine
+    /// 命令队列(队列在满载 batch 期间会推迟命令,pin 恰恰在这个窗口必须生效)。
+    /// 上限见 [`TERMINAL_PIN_LIMIT`],由写入方(节点命令层)执行。
+    pinned: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -630,7 +645,13 @@ impl<S: TerminalSnapshot> TerminalSessions<S> {
                 }
             }
         }
-        Self { resident: TerminalCache::new(limit), swap, swap_infos }
+        Self { resident: TerminalCache::new(limit), swap, swap_infos, pinned: Arc::new(Mutex::new(HashSet::new())) }
+    }
+
+    /// pin 集合的共享写句柄:节点命令层据此直接响应 scheduler 的 PinCache/UnpinCache,
+    /// 不经 engine 命令队列。上限限流由写入方执行。
+    pub fn pin_handle(&self) -> Arc<Mutex<HashSet<String>>> {
+        self.pinned.clone()
     }
 
     pub fn resident_cost(&self, cost: impl FnMut(&[u32], &S) -> usize) -> usize {
@@ -681,27 +702,35 @@ impl<S: TerminalSnapshot> TerminalSessions<S> {
     }
 
     /// 为 active session 预留 resident 容量；不足时按 LRU 换出终点会话。
+    /// 被排队 append pin 的 cache 跳过不换,全部候选被 pin 时直接报容量不足。
     /// `cost` 与 budget 使用同一单位（token page 或字节），因此可复用在多节点与库模式。
     pub fn reserve_with_eviction(&mut self, budget: &ResidencyBudget, required: usize, mut cost: impl FnMut(&[u32], &S) -> usize) -> Result<ResidencyReservation, String> {
         if budget.used().saturating_add(required) > budget.capacity() {
             return Err(format!("KV_RESIDENCY_EXHAUSTED required={required} available={} active={} resident={} capacity={}", budget.available(), budget.used(), self.resident.resident_cost(&mut cost), budget.capacity(),));
         }
         while budget.used().saturating_add(self.resident.resident_cost(&mut cost)).saturating_add(required) > budget.capacity() {
-            let Some((cache_id, _, state)) = self.resident.oldest() else {
-                return Err(format!(
-                    "KV_RESIDENCY_EXHAUSTED required={required} available={} active={} resident={} capacity={}",
-                    budget.capacity().saturating_sub(budget.used().saturating_add(self.resident.resident_cost(&mut cost))),
-                    budget.used(),
-                    self.resident.resident_cost(&mut cost),
-                    budget.capacity(),
-                ));
+            let pinned_count = {
+                let pinned = self.pinned.lock().expect("pin 集合锁中毒");
+                match self.resident.oldest_unpinned(&pinned) {
+                    Some((cache_id, _, state)) => {
+                        let cache_id = cache_id.to_owned();
+                        if let Some(swap) = &self.swap {
+                            persist_terminal(swap, &cache_id, state).map_err(|error| format!("KV 换出失败 cache_id={cache_id}: {error}"))?;
+                            self.swap_infos.insert(cache_id.clone(), state.info().clone());
+                        }
+                        self.resident.take(&cache_id);
+                        continue;
+                    }
+                    None => pinned.len(),
+                }
             };
-            let cache_id = cache_id.to_owned();
-            if let Some(swap) = &self.swap {
-                persist_terminal(swap, &cache_id, state).map_err(|error| format!("KV 换出失败 cache_id={cache_id}: {error}"))?;
-                self.swap_infos.insert(cache_id.clone(), state.info().clone());
-            }
-            self.resident.take(&cache_id);
+            return Err(format!(
+                "KV_RESIDENCY_EXHAUSTED required={required} available={} active={} resident={} capacity={} pinned={pinned_count}",
+                budget.capacity().saturating_sub(budget.used().saturating_add(self.resident.resident_cost(&mut cost))),
+                budget.used(),
+                self.resident.resident_cost(&mut cost),
+                budget.capacity(),
+            ));
         }
         budget.try_reserve(required).ok_or_else(|| format!("KV_RESIDENCY_RACE required={required} available={}", budget.available()))
     }
@@ -775,16 +804,36 @@ impl<S: TerminalSnapshot> TerminalSessions<S> {
             };
         }
         while self.resident.is_full() {
-            let Some((evicted_id, _, evicted)) = self.resident.oldest() else { break };
-            let evicted_id = evicted_id.to_owned();
+            let evicted = {
+                let pinned = self.pinned.lock().expect("pin 集合锁中毒");
+                self.resident.oldest_unpinned(&pinned).map(|(cache_id, _, _)| cache_id.to_owned())
+            };
+            let Some(evicted_id) = evicted else {
+                // resident 满且可换出的全部被 pin:新终态直接落盘,排队者的换出
+                // 保护不被破坏;无 swap 时只能丢弃(pin 上限之外的最后一道闸)。
+                let _ = tokens;
+                let Some(swap) = &self.swap else { return false };
+                return match persist_terminal(swap, &cache_id, &state) {
+                    Ok(()) => {
+                        self.swap_infos.insert(cache_id, state.info().clone());
+                        true
+                    }
+                    Err(error) => {
+                        eprintln!("[terminal-cache] 落盘写入失败 cache_id={cache_id}: {error}");
+                        false
+                    }
+                };
+            };
+            let Some((evicted_tokens, evicted)) = self.resident.take(&evicted_id) else { continue };
             if let Some(swap) = &self.swap {
-                if let Err(error) = persist_terminal(swap, &evicted_id, evicted) {
+                if let Err(error) = persist_terminal(swap, &evicted_id, &evicted) {
                     eprintln!("[terminal-cache] 换出写入失败 cache_id={evicted_id}: {error}");
+                    // 放回保住状态,本次 retain 失败
+                    let _ = self.resident.insert(evicted_id, evicted_tokens, evicted);
                     return false;
                 }
                 self.swap_infos.insert(evicted_id.clone(), evicted.info().clone());
             }
-            self.resident.take(&evicted_id);
         }
         let inserted = self.resident.insert(cache_id.clone(), tokens, state);
         if inserted && replaces_swap {
@@ -1241,6 +1290,48 @@ mod swap_tests {
             static EMPTY: std::sync::OnceLock<TerminalInfo> = std::sync::OnceLock::new();
             EMPTY.get_or_init(TerminalInfo::default)
         }
+    }
+
+    #[test]
+    fn pin保护resident换出且全pin时新终态落盘() {
+        let directory = std::env::temp_dir().join(format!("zllm-terminal-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let swap = crate::kv_cache::fjall::FjallValueStore::open(&directory, "terminal-test").expect("打开 fjall");
+        let mut sessions = TerminalSessions::<CountingState>::new(1, Some(swap));
+        assert!(sessions.retain("a".into(), vec![1], CountingState { tokens: vec![1], marker: 11 }));
+        // pin 住唯一 resident 条目:新终态不能靠换出 a 腾位,只能自己落盘,a 留在内存
+        let pins = sessions.pin_handle();
+        pins.lock().unwrap().insert("a".to_owned());
+        assert!(sessions.retain("b".into(), vec![2], CountingState { tokens: vec![2], marker: 22 }));
+        assert!(sessions.resident.cached_tokens("a").is_some(), "被 pin 的 a 必须留在内存");
+        assert_eq!(sessions.resume("b", &()).expect("b 应已落盘").expect("b 应解码成功").1.marker, 22);
+        // 解除 pin 后常规换出恢复
+        pins.lock().unwrap().remove("a");
+        assert!(sessions.retain("c".into(), vec![3], CountingState { tokens: vec![3], marker: 33 }));
+        assert!(sessions.resident.cached_tokens("a").is_none(), "unpin 后 a 恢复为可换出");
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn pin保护准入换出并报容量不足() {
+        let mut sessions = TerminalSessions::<CountingState>::new(2, None);
+        sessions.retain("a".into(), vec![1], CountingState { tokens: vec![1], marker: 1 });
+        sessions.retain("b".into(), vec![2], CountingState { tokens: vec![2], marker: 2 });
+        let budget = ResidencyBudget::new(20);
+        let cost = |tokens: &[u32], _: &CountingState| tokens.len() * 10;
+        // 全部候选被 pin:无法靠换出腾容量,报 KV_RESIDENCY_EXHAUSTED 并带上 pinned 计数
+        let pins = sessions.pin_handle();
+        pins.lock().unwrap().insert("a".to_owned());
+        pins.lock().unwrap().insert("b".to_owned());
+        let error = match sessions.reserve_with_eviction(&budget, 15, cost) {
+            Err(error) => error,
+            Ok(_) => panic!("全部候选被 pin 时准入应失败"),
+        };
+        assert!(error.contains("KV_RESIDENCY_EXHAUSTED") && error.contains("pinned=2"), "{error}");
+        // 解 pin 后换出 a/b 腾出容量,准入成功
+        pins.lock().unwrap().clear();
+        assert!(sessions.reserve_with_eviction(&budget, 15, cost).is_ok());
+        assert!(sessions.resident.is_empty(), "无 pin 时 a、b 都应被换出(无 swap 即丢弃)");
     }
 
     #[test]

@@ -960,6 +960,29 @@ mod dense_tile_tests {
             .download_f32(input_rows * hidden)
             .expect("download joined two-device sharded output");
         assert!(joined.iter().zip(&expected).all(|(&actual, &expected)| actual.is_finite() && (actual - expected).abs() <= 2.0e-2), "two-device joined output differs from integrated oracle");
+
+        // 副本 decode 在两卡保持同一归约顺序：owner partial + peer partial
+        // + 各自 residual。两份结果必须逐位相同，才能无同步进入下一层。
+        super::super::activate_compute_stream(1, 0).expect("activate peer for replicated join");
+        let peer_combined_f32 = crate::kernel::rocm::hip::try_add_resident_f32(1, &high_output_device, &high_shared_output_device, input_rows * hidden, 1.0).expect("combine peer F32 partial");
+        let stable_peer_combined = std::sync::Arc::new(peer_combined_f32.copy_to_stable_deferred().expect("stabilize peer F32 partial"));
+        super::super::activate_compute_stream(0, owner_stream).expect("activate owner for replicated join");
+        let stable_owner_combined = std::sync::Arc::new(low_combined.copy_to_stable_deferred().expect("stabilize owner F32 partial"));
+        let stable_residual = std::sync::Arc::new(residual_device.copy_to_stable_deferred().expect("stabilize residual"));
+        let peer_residual = stable_residual.copy_stable_to_device_ordered_async_retained_by(1, 0).expect("copy residual replica");
+        let (mut owner_on_peer, mut peer_on_owner) = DeviceBuffer::exchange_stable_groups_ordered_async_retained_by(&[stable_owner_combined.clone()], &[stable_peer_combined.clone()], 0).expect("exchange replicated F32 partials");
+        let owner_on_peer = owner_on_peer.pop().expect("owner partial on peer");
+        let peer_on_owner = peer_on_owner.pop().expect("peer partial on owner");
+        super::super::activate_compute_stream(1, 0).expect("activate peer replicated epilogue");
+        let peer_sum = crate::kernel::rocm::hip::try_add_resident_f32(1, &owner_on_peer, &stable_peer_combined, input_rows * hidden, 1.0).expect("peer canonical sum");
+        let peer_joined = crate::kernel::rocm::hip::try_add_resident_f32(1, &peer_sum, &peer_residual, input_rows * hidden, 1.0).expect("peer residual add");
+        super::super::activate_compute_stream(0, owner_stream).expect("activate owner replicated epilogue");
+        let owner_sum = crate::kernel::rocm::hip::try_add_resident_f32(0, &stable_owner_combined, &peer_on_owner, input_rows * hidden, 1.0).expect("owner canonical sum");
+        let owner_joined = crate::kernel::rocm::hip::try_add_resident_f32(0, &owner_sum, &residual_device, input_rows * hidden, 1.0).expect("owner residual add");
+        let owner_joined = owner_joined.download_f32(input_rows * hidden).expect("download owner replicated join");
+        let peer_joined = peer_joined.download_f32(input_rows * hidden).expect("download peer replicated join");
+        assert!(owner_joined.iter().zip(&peer_joined).all(|(&owner, &peer)| owner.to_bits() == peer.to_bits()), "replicated owner/peer join must be bit-identical");
+        assert!(owner_joined.iter().zip(&expected).all(|(&actual, &expected)| actual.is_finite() && (actual - expected).abs() <= 1.0e-4), "replicated F32 join differs from integrated oracle");
         super::super::retire_pending_p2p_sources(0);
         super::super::activate_compute_stream(1, 0).expect("restore peer default stream");
         super::super::activate_compute_stream(0, 0).expect("restore owner default stream");

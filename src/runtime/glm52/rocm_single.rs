@@ -59,8 +59,8 @@ impl Glm52SingleEngine {
         runtime: Arc<Mutex<RuntimeStatus>>,
         compute_steps: Arc<AtomicCounterU64>,
     ) -> Result<Self, DynError> {
-        if options.mtp || options.dspark_directory.is_some() || options.cooperative_expert_pairs {
-            return Err("GLM-Dsa 单进程首版要求关闭 MTP、DSpark 与 cooperative experts".into());
+        if options.mtp || options.dspark_directory.is_some() || options.cooperative_expert_pairs || options.parallel_operator_pairs {
+            return Err("GLM-Dsa 单进程首版要求关闭 MTP、DSpark 与双卡算子".into());
         }
         weights.validate_glm_dsa_gguf_types().map_err(|error| -> DynError { error.into() })?;
         let cfg = Glm52Config::standard();

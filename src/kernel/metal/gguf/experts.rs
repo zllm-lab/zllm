@@ -206,6 +206,105 @@ kernel void gguf_gated_gemv_iq2s_indexed_f16(
             float(finite_f16(gate_total)), float(finite_f16(up_total)), activation_kind, alpha, limit));
     }
 }
+kernel void gguf_gated_gemv_iq3xxs_indexed_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *gate_weights [[buffer(1)]],
+    device const uchar *up_weights [[buffer(2)]],
+    device const uint *expert_ids [[buffer(3)]],
+    device half *output [[buffer(4)]],
+    device const ulong *iq2s_grid [[buffer(5)]],
+    constant uint &columns [[buffer(6)]],
+    constant uint &output_rows [[buffer(7)]],
+    constant uint &gate_row_bytes [[buffer(8)]],
+    constant uint &up_row_bytes [[buffer(9)]],
+    constant uint &gate_expert_bytes [[buffer(10)]],
+    constant uint &up_expert_bytes [[buffer(11)]],
+    constant uint &activation_kind [[buffer(12)]],
+    constant float &alpha [[buffer(13)]],
+    constant float &limit [[buffer(14)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    threadgroup uint shared_grid[256];
+    threadgroup uchar shared_signs[128];
+    #pragma unroll
+    for (uint index = 0; index < 4; ++index) shared_grid[thread_index * 4 + index] = iq3xxs_grid[thread_index * 4 + index];
+    #pragma unroll
+    for (uint index = 0; index < 2; ++index) shared_signs[thread_index * 2 + index] = ksigns_iq2xs[thread_index * 2 + index];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint first_row = group.x * 8 + simd_group * 4;
+    if (first_row >= output_rows) return;
+    const uint slot = group.y;
+    const uint expert = expert_ids[slot];
+    device const uchar *gate_expert = gate_weights + ulong(expert) * gate_expert_bytes;
+    device const uchar *up_expert = up_weights + ulong(expert) * up_expert_bytes;
+    float4 gate_sums = 0.0f;
+    float4 up_sums = 0.0f;
+    const uint ib32_count = columns >> 5;
+    for (uint ib32 = simd_lane; ib32 < ib32_count; ib32 += 32) {
+        const uint block_index = ib32 >> 3;
+        device const half *input_block = input + ib32 * 32;
+        gate_sums += iq3xxs_dot32_4r_f16(
+            input_block, gate_expert, gate_row_bytes, first_row, output_rows,
+            block_index, ib32 & 7, shared_grid, shared_signs);
+        up_sums += iq3xxs_dot32_4r_f16(
+            input_block, up_expert, up_row_bytes, first_row, output_rows,
+            block_index, ib32 & 7, shared_grid, shared_signs);
+    }
+    #pragma unroll
+    for (uint offset = 0; offset < 4; ++offset) {
+        const float gate_total = simd_sum(gate_sums[offset]);
+        const float up_total = simd_sum(up_sums[offset]);
+        if (simd_lane == 0 && first_row + offset < output_rows) {
+            output[ulong(slot) * output_rows + first_row + offset] = finite_f16(gated_activation_value(
+                gate_total, up_total, activation_kind, alpha, limit));
+        }
+    }
+}
+kernel void gguf_gated_gemv_iq3s_indexed_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *gate_weights [[buffer(1)]],
+    device const uchar *up_weights [[buffer(2)]],
+    device const uint *expert_ids [[buffer(3)]],
+    device half *output [[buffer(4)]],
+    device const ulong *iq2s_grid [[buffer(5)]],
+    constant uint &columns [[buffer(6)]],
+    constant uint &output_rows [[buffer(7)]],
+    constant uint &gate_row_bytes [[buffer(8)]],
+    constant uint &up_row_bytes [[buffer(9)]],
+    constant uint &gate_expert_bytes [[buffer(10)]],
+    constant uint &up_expert_bytes [[buffer(11)]],
+    constant uint &activation_kind [[buffer(12)]],
+    constant float &alpha [[buffer(13)]],
+    constant float &limit [[buffer(14)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    const uint first_row = group.x * 8 + simd_group * 4;
+    if (first_row >= output_rows) return;
+    const uint slot = group.y;
+    const uint expert = expert_ids[slot];
+    device const uchar *gate_expert = gate_weights + ulong(expert) * gate_expert_bytes;
+    device const uchar *up_expert = up_weights + ulong(expert) * up_expert_bytes;
+    const float4 gate_sums = iq3s_row_sum4_f16(
+        input, gate_expert, gate_row_bytes, first_row, output_rows,
+        columns >> 8, simd_lane >> 2, simd_lane & 3);
+    const float4 up_sums = iq3s_row_sum4_f16(
+        input, up_expert, up_row_bytes, first_row, output_rows,
+        columns >> 8, simd_lane >> 2, simd_lane & 3);
+    #pragma unroll
+    for (uint offset = 0; offset < 4; ++offset) {
+        const float gate_total = simd_sum(gate_sums[offset]);
+        const float up_total = simd_sum(up_sums[offset]);
+        if (simd_lane == 0 && first_row + offset < output_rows) {
+            output[ulong(slot) * output_rows + first_row + offset] = finite_f16(gated_activation_value(
+                float(finite_f16(gate_total)), float(finite_f16(up_total)), activation_kind, alpha, limit));
+        }
+    }
+}
 kernel void gguf_gemv_q3k_indexed_f16(
     device const half *input [[buffer(0)]],
     device const uchar *weights [[buffer(1)]],
@@ -290,6 +389,79 @@ kernel void gguf_gemv_iq2s_indexed_f16(
     const float total = simd_sum(sum);
     if (simd_lane == 0) output[ulong(slot) * output_rows + row] = finite_f16(total);
 }
+kernel void gguf_gemv_iq3xxs_indexed_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *weights [[buffer(1)]],
+    device const uint *expert_ids [[buffer(2)]],
+    device half *output [[buffer(3)]],
+    device const ulong *iq2s_grid [[buffer(4)]],
+    constant uint &columns [[buffer(5)]],
+    constant uint &output_rows [[buffer(6)]],
+    constant uint &row_bytes [[buffer(7)]],
+    constant uint &expert_bytes [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    threadgroup uint shared_grid[256];
+    threadgroup uchar shared_signs[128];
+    #pragma unroll
+    for (uint index = 0; index < 4; ++index) shared_grid[thread_index * 4 + index] = iq3xxs_grid[thread_index * 4 + index];
+    #pragma unroll
+    for (uint index = 0; index < 2; ++index) shared_signs[thread_index * 2 + index] = ksigns_iq2xs[thread_index * 2 + index];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint first_row = group.x * 8 + simd_group * 4;
+    if (first_row >= output_rows) return;
+    const uint slot = group.y;
+    device const half *input_row = input + ulong(slot) * columns;
+    device const uchar *expert = weights + ulong(expert_ids[slot]) * expert_bytes;
+    float4 sums = 0.0f;
+    const uint ib32_count = columns >> 5;
+    for (uint ib32 = simd_lane; ib32 < ib32_count; ib32 += 32) {
+        const uint block_index = ib32 >> 3;
+        sums += iq3xxs_dot32_4r_f16(
+            input_row + ib32 * 32, expert, row_bytes, first_row, output_rows,
+            block_index, ib32 & 7, shared_grid, shared_signs);
+    }
+    #pragma unroll
+    for (uint offset = 0; offset < 4; ++offset) {
+        const float total = simd_sum(sums[offset]);
+        if (simd_lane == 0 && first_row + offset < output_rows) {
+            output[ulong(slot) * output_rows + first_row + offset] = finite_f16(total);
+        }
+    }
+}
+kernel void gguf_gemv_iq3s_indexed_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *weights [[buffer(1)]],
+    device const uint *expert_ids [[buffer(2)]],
+    device half *output [[buffer(3)]],
+    device const ulong *iq2s_grid [[buffer(4)]],
+    constant uint &columns [[buffer(5)]],
+    constant uint &output_rows [[buffer(6)]],
+    constant uint &row_bytes [[buffer(7)]],
+    constant uint &expert_bytes [[buffer(8)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    const uint first_row = group.x * 8 + simd_group * 4;
+    if (first_row >= output_rows) return;
+    const uint slot = group.y;
+    device const uchar *expert = weights + ulong(expert_ids[slot]) * expert_bytes;
+    device const half *input_row = input + ulong(slot) * columns;
+    const float4 sums = iq3s_row_sum4_f16(
+        input_row, expert, row_bytes, first_row, output_rows,
+        columns >> 8, simd_lane >> 2, simd_lane & 3);
+    #pragma unroll
+    for (uint offset = 0; offset < 4; ++offset) {
+        const float total = simd_sum(sums[offset]);
+        if (simd_lane == 0 && first_row + offset < output_rows) {
+            output[ulong(slot) * output_rows + first_row + offset] = finite_f16(total);
+        }
+    }
+}
 kernel void gguf_indexed_experts_reduce_f16(
     device const half *experts [[buffer(0)]],
     device const float *route_weights [[buffer(1)]],
@@ -304,6 +476,50 @@ kernel void gguf_indexed_experts_reduce_f16(
         sum += float(experts[ulong(slot) * columns + column]) * route_weights[slot];
     }
     output[column] = finite_f16(sum);
+}
+
+kernel void gguf_routed_value_iq3s_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *weights [[buffer(1)]],
+    device const uint *expert_ids [[buffer(2)]],
+    device const float *route_weights [[buffer(3)]],
+    device half *output [[buffer(4)]],
+    constant uint &columns [[buffer(5)]],
+    constant uint &output_rows [[buffer(6)]],
+    constant uint &row_bytes [[buffer(7)]],
+    constant uint &expert_bytes [[buffer(8)]],
+    constant uint &top_k [[buffer(9)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]])
+{
+    const uint first_row = group.x * 8 + simd_group * 4;
+    if (first_row >= output_rows) return;
+    const uint token = group.y;
+    device const half *input_row = input + ulong(token) * columns;
+    float4 weighted = 0.0f;
+    for (uint slot = 0; slot < top_k; ++slot) {
+        const ulong route = ulong(token) * top_k + slot;
+        device const uchar *expert = weights + ulong(expert_ids[route]) * expert_bytes;
+        const float4 partials = iq3s_row_sum4_f16(
+            input_row, expert, row_bytes, first_row, output_rows,
+            columns >> 8, simd_lane >> 2, simd_lane & 3);
+        #pragma unroll
+        for (uint offset = 0; offset < 4; ++offset) {
+            const float value = simd_sum(partials[offset]);
+            if (simd_lane == 0) {
+                weighted[offset] += (value / (1.0f + exp(-value))) * route_weights[route];
+            }
+        }
+    }
+    if (simd_lane == 0) {
+        #pragma unroll
+        for (uint offset = 0; offset < 4; ++offset) {
+            if (first_row + offset < output_rows) {
+                output[ulong(token) * output_rows + first_row + offset] = finite_f16(weighted[offset]);
+            }
+        }
+    }
 }
 "#;
 
@@ -375,12 +591,16 @@ pub fn gguf_indexed_experts_tensor_resident(
     let gate_pipeline_name = match *gate_type {
         11 => "gguf_gated_gemv_q3k_indexed_f16",
         12 => "gguf_gated_gemv_q4k_indexed_f16",
+        18 => "gguf_gated_gemv_iq3xxs_indexed_f16",
+        21 => "gguf_gated_gemv_iq3s_indexed_f16",
         22 => "gguf_gated_gemv_iq2s_indexed_f16",
         _ => "gguf_gated_gemv_indexed_f16",
     };
     let down_pipeline_name = match *down_type {
         11 => "gguf_gemv_q3k_indexed_f16",
         12 => "gguf_gemv_q4k_indexed_f16",
+        18 => "gguf_gemv_iq3xxs_indexed_f16",
+        21 => "gguf_gemv_iq3s_indexed_f16",
         22 => "gguf_gemv_iq2s_indexed_f16",
         _ => "gguf_gemv_indexed_f16",
     };
@@ -398,10 +618,14 @@ pub fn gguf_indexed_experts_tensor_resident(
     let down_expert_bytes_u32 = validate_u32("GGUF indexed down expert bytes", down_expert_bytes)?;
     let top_k_u32 = validate_u32("GGUF indexed top_k", top_k)?;
 
-    let generic_gate = !matches!(*gate_type, 11 | 12 | 22);
+    let generic_gate = !matches!(*gate_type, 11 | 12 | 18 | 21 | 22);
     let gate_q3 = *gate_type == 11;
-    let generic_down = !matches!(*down_type, 11 | 12 | 22);
+    let gate_iq3xxs = *gate_type == 18;
+    let gate_iq3s = *gate_type == 21;
+    let generic_down = !matches!(*down_type, 11 | 12 | 18 | 21 | 22);
     let down_q3 = *down_type == 11;
+    let down_iq3xxs = *down_type == 18;
+    let down_iq3s = *down_type == 21;
     let encode_gate = |encoder: &metal::ComputeCommandEncoderRef, barrier: bool| {
         encoder.set_compute_pipeline_state(&gate_pipeline);
         encoder.set_buffer(0, Some(&input.buffer), 0);
@@ -435,7 +659,17 @@ pub fn gguf_indexed_experts_tensor_resident(
                 top_k as u64,
                 1,
             ),
-            MTLSize::new(if generic_gate || gate_q3 { 64 } else { 256 }, 1, 1),
+            MTLSize::new(
+                if gate_iq3xxs || gate_iq3s {
+                    64
+                } else if generic_gate || gate_q3 {
+                    64
+                } else {
+                    256
+                },
+                1,
+                1,
+            ),
         );
         if barrier {
             encoder.memory_barrier_with_resources(&[activated.buffer.as_ref()]);
@@ -467,7 +701,17 @@ pub fn gguf_indexed_experts_tensor_resident(
                 top_k as u64,
                 1,
             ),
-            MTLSize::new(if generic_down || down_q3 { 64 } else { 256 }, 1, 1),
+            MTLSize::new(
+                if down_iq3xxs || down_iq3s {
+                    64
+                } else if generic_down || down_q3 {
+                    64
+                } else {
+                    256
+                },
+                1,
+                1,
+            ),
         );
         if barrier {
             encoder.memory_barrier_with_resources(&[expert_output.buffer.as_ref()]);
@@ -515,6 +759,66 @@ pub fn gguf_indexed_experts_tensor_resident(
     Ok(output)
 }
 
+/// K2-Horizon MoVA：对每个 token 的 top-k IQ3_S value expert 做
+/// `sum(weight * silu(expert(input)))`。路由和专家投影留在同一设备队列，
+/// 不物化 `[tokens, top_k, value_dim]` 中间张量。
+#[allow(clippy::too_many_arguments)]
+pub fn gguf_routed_value_iq3s_tensor_resident(
+    ctx: &MetalContext,
+    input: &MetalTensor,
+    packed: &MetalWeight,
+    expert_ids: &metal::Buffer,
+    route_weights: &metal::Buffer,
+    expert_count: usize,
+    top_k: usize,
+    output_rows: usize,
+) -> Result<MetalTensor, String> {
+    let MetalWeight::Gguf { blob, tensor_type, row_bytes, rows, cols } = packed else {
+        return Err("MoVA packed value experts 必须是 GGUF 权重".to_owned());
+    };
+    if *tensor_type != 21 || expert_count == 0 || top_k == 0 || top_k > expert_count || output_rows == 0 || *rows != expert_count.checked_mul(output_rows).ok_or("MoVA expert 行数溢出")? || input.cols != *cols || !cols.is_multiple_of(256)
+    {
+        return Err(format!("MoVA IQ3_S 布局不兼容: input=[{},{}] packed=[{rows},{cols}] type={tensor_type} experts={expert_count} top_k={top_k} output_rows={output_rows}", input.rows, input.cols,));
+    }
+    let route_count = input.rows.checked_mul(top_k).ok_or("MoVA route 数溢出")?;
+    let route_bytes = route_count.checked_mul(mem::size_of::<u32>()).ok_or("MoVA route bytes 溢出")?;
+    if (expert_ids.length() as usize) < route_bytes || (route_weights.length() as usize) < route_bytes {
+        return Err(format!("MoVA route buffer 太小: ids={} weights={} 需要={route_bytes}", expert_ids.length(), route_weights.length()));
+    }
+    let expert_bytes = row_bytes.checked_mul(output_rows).ok_or("MoVA expert stride 溢出")?;
+    if blob.length() as usize != expert_bytes.checked_mul(expert_count).ok_or("MoVA packed bytes 溢出")? {
+        return Err(format!("MoVA packed buffer={} 与 expert stride={expert_bytes} count={expert_count} 不一致", blob.length()));
+    }
+    let input = to_f16_tensor(ctx, input)?;
+    let output = ctx.tensor_kernel_output(input.rows, output_rows);
+    let pipeline_name = "gguf_routed_value_iq3s_f16";
+    let pipeline = ctx.pipeline(pipeline_name)?;
+    let columns = validate_u32("MoVA columns", *cols)?;
+    let output_rows_u32 = validate_u32("MoVA output rows", output_rows)?;
+    let row_bytes_u32 = validate_u32("MoVA row bytes", *row_bytes)?;
+    let expert_bytes_u32 = validate_u32("MoVA expert bytes", expert_bytes)?;
+    let top_k_u32 = validate_u32("MoVA top-k", top_k)?;
+    let command = ctx.command_buffer();
+    let encoder = command.new_compute_command_encoder();
+    encoder.set_compute_pipeline_state(&pipeline);
+    encoder.set_buffer(0, Some(&input.buffer), 0);
+    encoder.set_buffer(1, Some(blob), 0);
+    encoder.set_buffer(2, Some(expert_ids), 0);
+    encoder.set_buffer(3, Some(route_weights), 0);
+    encoder.set_buffer(4, Some(&output.buffer), 0);
+    set_bytes(&encoder, 5, &columns);
+    set_bytes(&encoder, 6, &output_rows_u32);
+    set_bytes(&encoder, 7, &row_bytes_u32);
+    set_bytes(&encoder, 8, &expert_bytes_u32);
+    set_bytes(&encoder, 9, &top_k_u32);
+    encoder.dispatch_thread_groups(MTLSize::new(output_rows.div_ceil(8) as u64, input.rows as u64, 1), MTLSize::new(64, 1, 1));
+    encoder.end_encoding();
+    let shape = format!("tokens={},experts={expert_count},top_k={top_k},output={output_rows},input={cols}", input.rows);
+    let selected_weight_bytes = expert_bytes.saturating_mul(top_k).saturating_mul(input.rows);
+    ctx.commit_and_wait_profiled(&command, pipeline_name, &shape, input.buffer.length() + selected_weight_bytes as u64 + expert_ids.length() + route_weights.length(), output.buffer.length());
+    Ok(output)
+}
+
 pub fn prewarm_indexed_experts(ctx: &MetalContext, gate: &MetalWeight, down: &MetalWeight) -> Result<(), String> {
     let MetalWeight::Gguf { tensor_type: gate_type, .. } = gate else {
         return Err("indexed expert gate 不是 GGUF".to_owned());
@@ -528,12 +832,16 @@ pub fn prewarm_indexed_experts(ctx: &MetalContext, gate: &MetalWeight, down: &Me
     let gate_pipeline = match *gate_type {
         11 => "gguf_gated_gemv_q3k_indexed_f16",
         12 => "gguf_gated_gemv_q4k_indexed_f16",
+        18 => "gguf_gated_gemv_iq3xxs_indexed_f16",
+        21 => "gguf_gated_gemv_iq3s_indexed_f16",
         22 => "gguf_gated_gemv_iq2s_indexed_f16",
         _ => "gguf_gated_gemv_indexed_f16",
     };
     let down_pipeline = match *down_type {
         11 => "gguf_gemv_q3k_indexed_f16",
         12 => "gguf_gemv_q4k_indexed_f16",
+        18 => "gguf_gemv_iq3xxs_indexed_f16",
+        21 => "gguf_gemv_iq3s_indexed_f16",
         22 => "gguf_gemv_iq2s_indexed_f16",
         _ => "gguf_gemv_indexed_f16",
     };
@@ -799,6 +1107,45 @@ mod gguf_accumulate_tests {
     use super::*;
     use crate::kernel::metal::gguf::{gguf_gated_gemv_tensor_resident, gguf_iq2s_gemv_accumulate_f32, gguf_matmul_tensor_resident, gguf_q3k_gemv_accumulate_f32};
     use crate::kernel::metal::moe::{finish_moe_accumulator, moe_accumulator_zeros, scatter_add_rows_weighted_f32};
+
+    #[test]
+    fn iq3xxs_indexed_expert_matches_unfused_selected_expert() {
+        let ctx = MetalContext::new_default().unwrap();
+        let (hidden, intermediate, expert_count) = (256, 256, 2);
+        let (iq3xxs_row_bytes, iq3s_row_bytes) = (98, 110);
+        let input_values: Vec<f32> = (0..hidden).map(|index| (index as f32 * 0.03125).sin()).collect();
+        let input = ctx.tensor_from_f32(&input_values, 1, hidden).unwrap();
+        let make_experts = |row_bytes: usize, rows: usize| {
+            (0..expert_count)
+                .map(|expert| {
+                    let mut block = vec![0u8; row_bytes];
+                    block[..2].copy_from_slice(&f16::from_f32(0.001 * (expert + 1) as f32).to_bits().to_le_bytes());
+                    (0..rows).flat_map(|_| block.iter().copied()).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let gate_experts = make_experts(iq3xxs_row_bytes, intermediate);
+        let up_experts = make_experts(iq3xxs_row_bytes, intermediate);
+        let down_experts = make_experts(iq3s_row_bytes, hidden);
+        let pack = |experts: &[Vec<u8>]| experts.iter().flat_map(|expert| expert.iter().copied()).collect::<Vec<_>>();
+        let gate = MetalWeight::Gguf { blob: ctx.resident_byte_weight_buffer(&pack(&gate_experts)), tensor_type: 18, row_bytes: iq3xxs_row_bytes, rows: intermediate, cols: hidden };
+        let up = MetalWeight::Gguf { blob: ctx.resident_byte_weight_buffer(&pack(&up_experts)), tensor_type: 18, row_bytes: iq3xxs_row_bytes, rows: intermediate, cols: hidden };
+        let down = MetalWeight::Gguf { blob: ctx.resident_byte_weight_buffer(&pack(&down_experts)), tensor_type: 21, row_bytes: iq3s_row_bytes, rows: hidden, cols: intermediate };
+        let route_weight = 0.375f32;
+        let ids = ctx.shared_buffer(as_bytes(&[1u32]));
+        let weights = ctx.shared_buffer(as_bytes(&[route_weight]));
+        let actual = gguf_indexed_experts_tensor_resident(&ctx, &input, &gate, &up, &down, &ids, &weights, 1, &Activation::Silu).unwrap();
+
+        let gate_blob = ctx.resident_byte_weight_buffer(&gate_experts[1]);
+        let up_blob = ctx.resident_byte_weight_buffer(&up_experts[1]);
+        let down_blob = ctx.resident_byte_weight_buffer(&down_experts[1]);
+        let activated = gguf_gated_gemv_tensor_resident(&ctx, &input, &gate_blob, 18, iq3xxs_row_bytes, intermediate, hidden, &up_blob, 18, iq3xxs_row_bytes, intermediate, hidden, &Activation::Silu).unwrap();
+        let projected = gguf_matmul_tensor_resident(&ctx, &activated, &down_blob, 21, iq3s_row_bytes, hidden, intermediate).unwrap();
+        let accumulator = moe_accumulator_zeros(&ctx, 1, hidden).unwrap();
+        scatter_add_rows_weighted_f32(&ctx, &accumulator, &projected, &[0], &[route_weight]).unwrap();
+        let expected = finish_moe_accumulator(&ctx, accumulator, None).unwrap();
+        assert_eq!(ctx.read_f16_to_f32(&actual.buffer, hidden), ctx.read_f16_to_f32(&expected.buffer, hidden));
+    }
 
     #[test]
     fn q3k_accumulate_matches_gemv_then_scatter() {

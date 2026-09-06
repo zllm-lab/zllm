@@ -101,7 +101,7 @@ fn clone_resident_rows(context: &RocmContext, tensor: &RocmTensor, row: usize, r
     let copy = crate::kernel::rocm::hip::DeviceBuffer::allocate(context.device_id(), bytes).map_err(crate::runtime::compute_error)?;
     let source = (device.device_pointer() + row * tensor.cols * 4) as *mut std::ffi::c_void;
     crate::kernel::rocm::hip::try_peer_copy_kernel_ordered(context.device_id(), copy.device_pointer() as *mut std::ffi::c_void, source, bytes).map_err(crate::runtime::compute_error)?;
-    Ok(RocmTensor { data: Vec::new(), rows, cols: tensor.cols, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: Some(std::sync::Arc::new(copy)) })
+    Ok(RocmTensor { data: Vec::new(), rows, cols: tensor.cols, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: Some(std::sync::Arc::new(copy)), replica: None })
 }
 
 /// 拼接单行 tail 与 chunk 前 length-1 行,构成 MTP 移位 hidden [length, cols]。
@@ -122,7 +122,7 @@ fn concat_two_rows(context: &RocmContext, tail: &RocmTensor, collapsed: &RocmTen
         let source = collapsed.device.as_ref().expect("collapsed resident").device_pointer() as *mut std::ffi::c_void;
         crate::kernel::rocm::hip::try_peer_copy_kernel_ordered(context.device_id(), destination, source, rest).map_err(crate::runtime::compute_error)?;
     }
-    Ok(RocmTensor { data: Vec::new(), rows: length, cols: tail.cols, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: Some(std::sync::Arc::new(target)) })
+    Ok(RocmTensor { data: Vec::new(), rows: length, cols: tail.cols, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: Some(std::sync::Arc::new(target)), replica: None })
 }
 
 /// target token `start` 使用主干 `h[start-1]`，因此 MTP cache 从

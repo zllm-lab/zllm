@@ -151,6 +151,7 @@ pub(crate) struct ResponsesRequest {
     pub(super) max_output_tokens: Option<u64>,
     pub(super) temperature: Option<f32>,
     pub(super) top_p: Option<f32>,
+    pub(super) seed: Option<u64>,
     pub(super) reasoning: Option<Value>,
     pub(super) thinking_token_budget: Option<i64>,
     pub(super) tools: Option<Vec<Value>>,
@@ -400,6 +401,7 @@ pub(super) fn response_chat_request(request: &ResponsesRequest, previous: Option
         stream: request.stream,
         temperature: request.temperature,
         top_p: request.top_p,
+        seed: request.seed,
         thinking,
         reasoning_effort,
         thinking_token_budget: request.thinking_token_budget,
@@ -414,6 +416,7 @@ pub(super) fn response_chat_request(request: &ResponsesRequest, previous: Option
         stream_options: None,
         cache_id: previous.map(|previous| previous.cache_id.clone()).or_else(|| request.cache_id.clone()),
         repeat_loop_breaker: None,
+        prefill_chunk_size: None,
     })
 }
 
@@ -1162,6 +1165,7 @@ pub(super) fn responses_request(stream: bool) -> ResponsesRequest {
         max_output_tokens: Some(8),
         temperature: None,
         top_p: None,
+        seed: None,
         reasoning: None,
         thinking_token_budget: None,
         tools: None,

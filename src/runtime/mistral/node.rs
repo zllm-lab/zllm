@@ -97,7 +97,7 @@ impl MistralEngine {
 #[cfg(target_os = "macos")]
 impl NodeEngine for MistralEngine {
     fn model_key(&self) -> &'static str {
-        "mistral"
+        self.session.model_key()
     }
     fn startup_info(&self) -> (NodeCapabilities, Arc<dyn Fn() -> u64 + Send + Sync>) {
         crate::runtime::metal_node::startup_info(self.session.context(), &self.capabilities)
@@ -120,8 +120,27 @@ impl NodeEngine for MistralEngine {
 impl MistralEngine {
     pub fn generate(&mut self, _request_id: &str, request: &Value, cancellation: &AtomicBool, on_token: &mut dyn FnMut(Option<u32>, String) -> bool) -> Result<GenerationSummary, String> {
         use crate::runtime::session::{BatchTokenGuard, GenerationOutput, parse_stops, requested_completion_tokens};
-        let prompt = mistral::mistral_request_prompt(request)?;
+        let prompt = self.session.render_request_prompt(request)?;
         let tokens = self.session.tokenize(&prompt);
+        // 采样优先级:请求显式 temperature>0 > 官方推荐表(runtime::official_sampling,
+        // 按模型固定)> 贪心。temperature==0 视为显式贪心。
+        let mut sampling_state = match request.get("temperature").and_then(Value::as_f64) {
+            Some(temperature) if temperature > 0.0 => {
+                let top_p = request.get("top_p").and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                Some((temperature as f32, top_p))
+            }
+            Some(_) => None,
+            None => crate::runtime::official_sampling(self.model_key()),
+        }
+        .map(|(temperature, top_p)| {
+            // ZLLM_SAMPLING_SEED=0 固定序列;缺省按请求到达顺序散列,同 seed 可复现。
+            let seed = std::env::var("ZLLM_SAMPLING_SEED").ok().and_then(|value| value.parse::<u64>().ok()).unwrap_or_else(|| {
+                static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                REQUEST_COUNTER.fetch_add(0x9e37_79b9_7f4a_7c15, std::sync::atomic::Ordering::Relaxed)
+            });
+            crate::runtime::output::SamplingState::new(crate::runtime::output::SamplingConfig { temperature, top_p, seed }).map_err(|error| format!("Mistral 采样配置: {error}"))
+        })
+        .transpose()?;
         let max_completion = requested_completion_tokens(request);
         if max_completion == 0 {
             return Err("max_tokens 必须是大于 0 的整数".to_owned());
@@ -146,7 +165,13 @@ impl MistralEngine {
                 output.cancel();
                 break;
             }
-            let token = self.session.next_token(&sequence)?;
+            let token = match sampling_state.as_mut() {
+                Some(sampling) => {
+                    let draw = sampling.next();
+                    self.session.next_token_sampled(&sequence, &draw)?
+                }
+                None => self.session.next_token(&sequence)?,
+            };
             if self.session.is_eos(token) {
                 output.stop();
                 break;

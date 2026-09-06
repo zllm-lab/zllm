@@ -67,7 +67,7 @@ mod tests {
                 return;
             }
         };
-        let rocm_tensor = |data: &[f32]| RocmTensor { data: data.to_vec(), rows: 2, cols: 2, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None };
+        let rocm_tensor = |data: &[f32]| RocmTensor { data: data.to_vec(), rows: 2, cols: 2, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: None, replica: None };
         let current = rocm_tensor(&current_values);
         let residual = rocm_tensor(&residual_values);
         let norm_weight = rocm.prepare_weight(LinearWeight::F32(&norm_values), 1, 2).expect("ROCm norm_weight prepare 失败");

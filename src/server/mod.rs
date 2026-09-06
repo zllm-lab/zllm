@@ -177,6 +177,7 @@ struct ChatCompletionRequest {
     stream: bool,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    seed: Option<u64>,
     thinking: Option<Value>,
     reasoning_effort: Option<String>,
     thinking_token_budget: Option<i64>,
@@ -192,6 +193,8 @@ struct ChatCompletionRequest {
     stream_options: Option<Value>,
     cache_id: Option<String>,
     repeat_loop_breaker: Option<bool>,
+    /// 单请求 prefill chunk 上限；不会超过 YAML 最大值，也不改变 KV 布局。
+    prefill_chunk_size: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -537,6 +540,9 @@ fn validate_chat_request(request: &ChatCompletionRequest, _models: &[String]) ->
     if request.max_completion_tokens == Some(0) {
         return Err(ApiError::invalid("max_completion_tokens 必须大于 0", "max_completion_tokens"));
     }
+    if request.prefill_chunk_size == Some(0) {
+        return Err(ApiError::invalid("prefill_chunk_size 必须大于 0", "prefill_chunk_size"));
+    }
     if request.n.is_some_and(|value| value == 0) {
         return Err(ApiError::invalid("n 必须大于 0", "n"));
     }
@@ -699,6 +705,23 @@ mod tests {
     use super::scheduler::ToolCall;
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn explicit_seed_reaches_chat_runtime_request() {
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "glm-5.2",
+            "messages": [{"role": "user", "content": "你好"}],
+            "seed": 42
+        }))
+        .unwrap();
+        assert_eq!(chat.seed, Some(42));
+        assert_eq!(serde_json::to_value(chat).unwrap()["seed"], 42);
+        let mut response = responses_request(false);
+        response.seed = Some(7);
+        let chat = response_chat_request(&response, None).unwrap();
+        assert_eq!(chat.seed, Some(7));
+        assert_eq!(serde_json::to_value(chat).unwrap()["seed"], 7);
+    }
 
     fn test_state() -> ServerState {
         ServerState {

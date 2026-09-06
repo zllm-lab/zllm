@@ -95,6 +95,9 @@ impl Gemma4Engine {
     pub(crate) fn terminal_cache_infos(&self) -> Vec<CacheInfo> {
         self.terminal_states.infos()
     }
+    pub(crate) fn terminal_cache_pins(&self) -> std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> {
+        self.terminal_states.pin_handle()
+    }
     pub(crate) fn refresh_runtime(&self) {
         self.residency.refresh(&self.runtime, &self.terminal_states);
     }

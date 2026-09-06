@@ -53,6 +53,7 @@ fn shared_mlp<B: Backend>(backend: &B, spec: &LatentTopkMoeSpec, weights: &Laten
 fn finish_routed<B: Backend>(backend: &B, spec: &LatentTopkMoeSpec, weights: &LatentMoeWeights<B::Weight>, routed: &B::Tensor) -> Result<B::Tensor, BackendError> {
     let routed = match spec.routed_output_norm {
         Some(NormSpec::Rms { eps }) => backend.rmsnorm(routed, &weights.routed_norm, eps)?,
+        Some(NormSpec::GroupedRms { eps, groups }) => backend.grouped_rmsnorm(routed, &weights.routed_norm, eps, groups)?,
         Some(NormSpec::GemmaRms { eps }) => backend.gemma_rmsnorm(routed, &weights.routed_norm, eps)?,
         Some(NormSpec::AdaLn { .. }) => return Err(BackendError::Compute { msg: "AdaLN 不用于 latent MoE 路由输出".to_owned() }),
         None => return backend.linear(routed, &weights.routed_up_projection),

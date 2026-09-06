@@ -15,7 +15,8 @@ mod run {
 
     use serde_json::{Value, json};
     use zllm::config::{
-        Gemma4ExecutionConfig, Gemma4NodeModelConfig, MistralNodeModelConfig, NodeBackendConfig, NodeMetalBackendConfig, NodeModelConfig, OrnithNodeModelConfig, Qwen36NodeExecutionConfig, Qwen36NodeModelConfig, Qwen36Variant,
+        Gemma4ExecutionConfig, Gemma4NodeModelConfig, K2HorizonNodeModelConfig, MistralNodeModelConfig, NodeBackendConfig, NodeMetalBackendConfig, NodeModelConfig, OrnithNodeModelConfig, Qwen36NodeExecutionConfig, Qwen36NodeModelConfig,
+        Qwen36Variant,
     };
     use zllm::embedded::{Cancellation, Engine, GenerationResult, SessionConfig};
     use zllm::kv_cache::{DEFAULT_GROUP_SIZE, KvCacheSpec};
@@ -35,11 +36,45 @@ mod run {
 
     /// 已识别的嵌入式模型形态与推导 max_seq_len 所需的静态参数。
     pub enum DetectedModel {
-        Gemma4 { layers: usize, kv_heads: usize, head_dim: usize, sliding_window: usize, sliding_layers: usize, context_limit: usize },
-        Qwen36 { variant: Qwen36Variant, context_limit: usize },
-        Ornith { layers: usize, kv_heads: usize, head_dim: usize, context_limit: usize },
-        Mistral { layers: usize, kv_heads: usize, head_dim: usize, context_limit: usize },
-        MiniCpm5 { layers: usize, kv_heads: usize, head_dim: usize, context_limit: usize },
+        Gemma4 {
+            layers: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            sliding_window: usize,
+            sliding_layers: usize,
+            context_limit: usize,
+        },
+        Qwen36 {
+            variant: Qwen36Variant,
+            context_limit: usize,
+        },
+        Ornith {
+            layers: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            context_limit: usize,
+        },
+        K2Horizon {
+            layers: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            context_limit: usize,
+        },
+        /// dense GQA 家族(Mistral 与 K2-Horizon dense 档);model_key 区分二者,
+        /// 采样参数与能力上报按各自 model_key 查(runtime::official_sampling)。
+        Mistral {
+            model_key: &'static str,
+            layers: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            context_limit: usize,
+        },
+        MiniCpm5 {
+            layers: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            context_limit: usize,
+        },
     }
 
     impl DetectedModel {
@@ -48,7 +83,8 @@ mod run {
                 Self::Gemma4 { .. } => "gemma4 (hybrid GQA, KV f16)".to_owned(),
                 Self::Qwen36 { variant, .. } => format!("{} (KV Q8g64)", variant.model_key()),
                 Self::Ornith { .. } => "ornith (hybrid attention, KV Q8g64)".to_owned(),
-                Self::Mistral { .. } => "mistral (dense GQA, KV Q8g64)".to_owned(),
+                Self::K2Horizon { .. } => "k2-horizon (MoVA MoE, KV Q8g64)".to_owned(),
+                DetectedModel::Mistral { model_key, .. } => format!("{model_key} (dense GQA, KV Q8g64)"),
                 Self::MiniCpm5 { .. } => "minicpm5 (KV Q8g64)".to_owned(),
             }
         }
@@ -78,7 +114,8 @@ mod run {
             DetectedModel::Gemma4 { .. } => "gemma4",
             DetectedModel::Qwen36 { variant, .. } => variant.model_key(),
             DetectedModel::Ornith { .. } => "ornith",
-            DetectedModel::Mistral { .. } => "mistral",
+            DetectedModel::K2Horizon { .. } => "k2-horizon",
+            DetectedModel::Mistral { model_key, .. } => model_key,
             DetectedModel::MiniCpm5 { .. } => "minicpm5",
         };
         let mut engine = load_with_retry(&mut plan)?;
@@ -129,6 +166,12 @@ mod run {
                 }),
                 // llama 架构同时被 Mistral 等使用;MiniCPM5 用 ChatML 模板,据此区分。
                 "llama" => detect_llama_family(&reader),
+                "k2-horizon" => Ok(DetectedModel::K2Horizon {
+                    layers: reader.metadata_u64("k2-horizon.block_count")? as usize,
+                    kv_heads: reader.metadata_u64("k2-horizon.attention.head_count_kv")? as usize,
+                    head_dim: reader.metadata_u64("k2-horizon.attention.key_length")? as usize,
+                    context_limit: reader.metadata_u64("k2-horizon.context_length")? as usize,
+                }),
                 other => Err(format!("GGUF 架构 {other} 尚未接入嵌入式引擎;请使用 zllm-rt-metal --config <yaml>")),
             };
         }
@@ -180,6 +223,7 @@ mod run {
         let chat_template = reader.metadata("tokenizer.chat_template").and_then(|value| value.as_str()).unwrap_or_default();
         if !chat_template.contains("<|im_start|>") {
             return Ok(DetectedModel::Mistral {
+                model_key: "mistral",
                 layers: reader.metadata_u64("llama.block_count")? as usize,
                 kv_heads: reader.metadata_u64("llama.attention.head_count_kv")? as usize,
                 head_dim: reader.metadata_u64("llama.attention.key_length")? as usize,
@@ -252,7 +296,7 @@ mod run {
                 let per_layer = spec.bytes_per_token(DEFAULT_GROUP_SIZE)? as u64;
                 kv_budget / per_layer / (*layers as u64).max(1)
             }
-            DetectedModel::Mistral { layers, kv_heads, head_dim, .. } | DetectedModel::Ornith { layers, kv_heads, head_dim, .. } => {
+            DetectedModel::Mistral { layers, kv_heads, head_dim, .. } | DetectedModel::Ornith { layers, kv_heads, head_dim, .. } | DetectedModel::K2Horizon { layers, kv_heads, head_dim, .. } => {
                 let spec = KvCacheSpec::Gqa { num_kv_heads: *kv_heads, head_dim: *head_dim };
                 let per_layer = spec.bytes_per_token(DEFAULT_GROUP_SIZE)? as u64;
                 kv_budget / per_layer / (*layers as u64).max(1)
@@ -285,7 +329,7 @@ mod run {
             DetectedModel::Gemma4 { context_limit, .. } => *context_limit,
             DetectedModel::Qwen36 { context_limit, .. } => *context_limit,
             DetectedModel::MiniCpm5 { context_limit, .. } => *context_limit,
-            DetectedModel::Ornith { context_limit, .. } | DetectedModel::Mistral { context_limit, .. } => *context_limit,
+            DetectedModel::Ornith { context_limit, .. } | DetectedModel::Mistral { context_limit, .. } | DetectedModel::K2Horizon { context_limit, .. } => *context_limit,
         };
         let max_seq_len = max_seq_len.min(context_limit as u64) as usize;
         let max_seq_len = max_seq_len - max_seq_len % 1024;
@@ -297,7 +341,7 @@ mod run {
                 let spec = KvCacheSpec::Gqa { num_kv_heads: *kv_heads, head_dim: *head_dim };
                 layers * spec.bytes_per_token(DEFAULT_GROUP_SIZE)?
             }
-            DetectedModel::Mistral { layers, kv_heads, head_dim, .. } | DetectedModel::Ornith { layers, kv_heads, head_dim, .. } => {
+            DetectedModel::Mistral { layers, kv_heads, head_dim, .. } | DetectedModel::Ornith { layers, kv_heads, head_dim, .. } | DetectedModel::K2Horizon { layers, kv_heads, head_dim, .. } => {
                 let spec = KvCacheSpec::Gqa { num_kv_heads: *kv_heads, head_dim: *head_dim };
                 layers * spec.bytes_per_token(DEFAULT_GROUP_SIZE)?
             }
@@ -313,7 +357,12 @@ mod run {
     }
 
     fn plan_resources(path: &Path, model: DetectedModel, vision_max_tokens: Option<usize>) -> Result<Plan, String> {
-        let working_set = gpu_working_set_bytes();
+        let mut working_set = gpu_working_set_bytes();
+        // 24 GiB Apple Silicon 的通用 2/3 保守值放不下 14.6 GiB K2 权重；
+        // llama.cpp 已验证可全量驻留。K2 单独采用 3/4 上限，仍保留至少 2 GiB 系统余量。
+        if matches!(model, DetectedModel::K2Horizon { .. }) {
+            working_set = working_set.max(sysctl_u64("hw.memsize").unwrap_or(working_set) * 3 / 4);
+        }
         if working_set == 0 {
             return Err("无法探测本机内存(sysctl hw.memsize 失败)".to_owned());
         }
@@ -331,7 +380,7 @@ mod run {
             DetectedModel::Gemma4 { context_limit, .. } => *context_limit,
             DetectedModel::Qwen36 { context_limit, .. } => *context_limit,
             DetectedModel::MiniCpm5 { context_limit, .. } => *context_limit,
-            DetectedModel::Ornith { context_limit, .. } | DetectedModel::Mistral { context_limit, .. } => *context_limit,
+            DetectedModel::Ornith { context_limit, .. } | DetectedModel::Mistral { context_limit, .. } | DetectedModel::K2Horizon { context_limit, .. } => *context_limit,
         };
         eprintln!(
             "[zllm-metal] {} | 权重 {:.2} GiB | KV 预算 {:.2} GiB | ≈{} B/token | 上下文 {} (模型上限 {})",
@@ -385,6 +434,9 @@ mod run {
             }),
             DetectedModel::Mistral { .. } => {
                 NodeModelConfig::Mistral(MistralNodeModelConfig { weights_directory: plan.weights_directory.clone(), lm_head_quantization: Default::default(), max_sequence_length: plan.max_seq_len, execution: Default::default() })
+            }
+            DetectedModel::K2Horizon { .. } => {
+                NodeModelConfig::K2Horizon(K2HorizonNodeModelConfig { weights_directory: plan.weights_directory.clone(), lm_head_quantization: Default::default(), max_sequence_length: plan.max_seq_len, execution: Default::default() })
             }
         }
     }
@@ -605,28 +657,38 @@ mod run {
     /// LCP 前缀复用或全量 prefill,不会有模板级 suffix 的 BPE 错位问题。
     fn generate(engine: &mut Engine, cancellation: &Cancellation, model_key: &str, messages: Vec<Value>, max_completion_tokens: usize, cache_id: Option<&str>, echo: bool) -> Result<Turn, String> {
         let mut content = String::new();
-        // temperature/top_p 只有 MiniCPM5 路径读取:纯贪心在 MiniCPM5-1B 上会复读
-        // 循环(node.rs 已注明)。思考保持默认开启——空围栏 no-think 下该模型多轮
-        // 召回明显变弱(引擎级对照实测);REPL 只在显示层过滤 <think> 段,历史与
+        // 官方推荐采样(按模型固定,见 runtime::official_sampling):console 显式下发,
+        // 引擎侧同表缺省,口径单一。思考保持默认开启——空围栏 no-think 下 MiniCPM5
+        // 多轮召回明显变弱(引擎级对照实测);REPL 只在显示层过滤 <think> 段,历史与
         // terminal cache 仍持有完整文本。
         // 注意:MiniCPM5/Qwen 的 <think>/</think> 是 special token,引擎解码时
         // skip_special_tokens 输出为空,文本流里没有边界标记,显示层无从过滤——
         // 思考文本按原样显示(信息不丢);filter 只对输出包含字面标记的形态生效。
         let mut filter = ThinkFilter::new(false);
-        let result = engine.generate(
-            &json!({ "model": model_key, "messages": messages, "max_completion_tokens": max_completion_tokens, "cache_id": cache_id, "temperature": 0.7, "top_p": 0.8, "enable_thinking": model_key == "minicpm5" }),
-            cancellation,
-            |_token, text| {
-                content.push_str(text);
-                if echo {
-                    if let Some(visible) = filter.push(text) {
-                        print!("{visible}");
-                        let _ = std::io::stdout().flush();
-                    }
+        let mut request = json!({ "model": model_key, "messages": messages, "max_completion_tokens": max_completion_tokens, "cache_id": cache_id });
+        // enable_thinking 只发给模板消费它的模型:MiniCPM5=true(思考开启,已验证)、
+        // Qwen3.6/3.8=false(原行为);其余缺省,由各自模板决定——K2-Horizon 缺省
+        // =always-high 思考档,显式 false 会注入空思考围栏强制直答,推理模型脱离
+        // 训练分布,采样下输出退化(多语种混杂)。
+        if model_key == "minicpm5" {
+            request["enable_thinking"] = json!(true);
+        } else if model_key == "qwen36" || model_key == "qwen38" {
+            request["enable_thinking"] = json!(false);
+        }
+        if let Some((temperature, top_p)) = zllm::runtime::official_sampling(model_key) {
+            request["temperature"] = json!(temperature);
+            request["top_p"] = json!(top_p);
+        }
+        let result = engine.generate(&request, cancellation, |_token, text| {
+            content.push_str(text);
+            if echo {
+                if let Some(visible) = filter.push(text) {
+                    print!("{visible}");
+                    let _ = std::io::stdout().flush();
                 }
-                true
-            },
-        )?;
+            }
+            true
+        })?;
         if echo {
             println!();
         }

@@ -314,6 +314,62 @@ __device__ __forceinline__ zllm_ct_bf16x2 gguf_kq_pair_bf16(
                     * second_sign)
         };
     }
+    if (type == 13u) {
+        const unsigned int group = local >> 5u;
+        const unsigned int within = local & 31u;
+        const unsigned char* scales = block + 4u;
+        unsigned int group_scale;
+        unsigned int minimum;
+        if (group < 4u) {
+            group_scale = scales[group] & 63u;
+            minimum = scales[group + 4u] & 63u;
+        } else {
+            group_scale = (scales[group + 4u] & 15u)
+                | ((scales[group - 4u] >> 6u) << 4u);
+            minimum = (scales[group + 4u] >> 4u)
+                | ((scales[group] >> 6u) << 4u);
+        }
+        const float d = gguf_kq_f16(block);
+        const float dmin = gguf_kq_f16(block + 2u);
+        const unsigned int shift = 4u * (group & 1u);
+        unsigned int first_quant =
+            (block[48u + (group >> 1u) * 32u + within] >> shift) & 15u;
+        unsigned int second_quant =
+            (block[48u + (group >> 1u) * 32u + within + 1u] >> shift) & 15u;
+        first_quant += ((block[16u + within] >> group) & 1u) << 4u;
+        second_quant += ((block[16u + within + 1u] >> group) & 1u) << 4u;
+        return {
+            zllm_f32_to_bf16(
+                d * (float)(group_scale * first_quant)
+                    - dmin * (float)minimum),
+            zllm_f32_to_bf16(
+                d * (float)(group_scale * second_quant)
+                    - dmin * (float)minimum)
+        };
+    }
+    if (type == 14u) {
+        const unsigned int half = local >> 7u;
+        const unsigned int slot = (local & 127u) >> 5u;
+        const unsigned int within = local & 31u;
+        const unsigned int first_low = block[
+            half * 64u + within + (slot & 1u) * 32u];
+        const unsigned int second_low = block[
+            half * 64u + within + 1u + (slot & 1u) * 32u];
+        const unsigned int nibble_shift = slot < 2u ? 0u : 4u;
+        const unsigned int first_quant =
+            ((first_low >> nibble_shift) & 15u)
+                | (((block[128u + half * 32u + within] >> (slot * 2u)) & 3u) << 4u);
+        const unsigned int second_quant =
+            ((second_low >> nibble_shift) & 15u)
+                | (((block[128u + half * 32u + within + 1u] >> (slot * 2u)) & 3u) << 4u);
+        const float scale = gguf_kq_f16(block + 208u)
+            * (float)(signed char)block[
+                192u + half * 8u + (within >> 4u) + slot * 2u];
+        return {
+            zllm_f32_to_bf16(scale * (float)((int)first_quant - 32)),
+            zllm_f32_to_bf16(scale * (float)((int)second_quant - 32))
+        };
+    }
     return {
         zllm_f32_to_bf16(
             gguf_kq_value_at(row, type, column, block_bytes)),
@@ -654,6 +710,131 @@ __device__ __forceinline__ void gguf_kq_fill_lut(
 // ===== GGUF fused decode experts(小批次：route_count×top_k ≤ 64) =====
 // 对应 CT 的 decode fused 路径：token-major，无路由分组 kernel，activated 常驻 workspace。
 
+// rows=2 时只需在两个 top-k 小数组之间配对，无需引入通用排序 kernel。
+// 返回 >=0 表示第一行 assignment 对应的第二行 assignment，-1 表示不重复，
+// -2 表示当前第二行 assignment 已由第一行负责。
+__device__ __forceinline__ int gguf_rows2_peer_assignment(
+    const unsigned int* route_slots,
+    const unsigned int assignment,
+    const unsigned int top_k)
+{
+    const unsigned int expert = route_slots[assignment];
+    if (assignment < top_k) {
+        for (unsigned int index = top_k; index < top_k * 2u; ++index) {
+            if (route_slots[index] == expert) return (int)index;
+        }
+        return -1;
+    }
+    for (unsigned int index = 0u; index < top_k; ++index) {
+        if (route_slots[index] == expert) return -2;
+    }
+    return -1;
+}
+
+// rows-N（verify 多行）专家分组：收集与 assignment 同专家的全部 assignment 索引
+// （含自身），返回成员数；存在更小索引的同专家 assignment 时返回 -1——本块让位，
+// 输出由 leader 块代写。每行 top_k 内专家互异 ⇒ 同专家成员数 ≤ 行数 ≤ 8
+// （本 kernel 族 route_count ≤ 64 且 top_k ≥ 8），members 容量 8 即完备；
+// 若上游违反该约定则截断并放弃剩余成员（宁可漏算不可越界）。
+__device__ __forceinline__ int gguf_rowsn_members(
+    const unsigned int* route_slots,
+    const unsigned int assignments,
+    const unsigned int assignment,
+    unsigned int* members)
+{
+    const unsigned int expert = route_slots[assignment];
+    unsigned int count = 0u;
+    for (unsigned int index = 0u; index < assignments && count < 8u; ++index) {
+        if (route_slots[index] != expert) continue;
+        if (index < assignment) return -1;
+        members[count++] = index;
+    }
+    return (int)count;
+}
+
+__device__ __forceinline__ int gguf_q3k_group_scale(
+    const unsigned char* block,
+    const unsigned int group)
+{
+    const unsigned int low = group < 8u
+        ? block[96u + group] & 15u
+        : block[96u + group - 8u] >> 4u;
+    const unsigned int high = (block[104u + group % 4u]
+        >> (2u * (group / 4u))) & 3u;
+    return (int)(low | (high << 4u)) - 32;
+}
+
+__device__ __forceinline__ zllm_ct_bf16x2 gguf_q3k_pair_bf16(
+    const unsigned char* block,
+    const unsigned int group,
+    const unsigned int within,
+    const float d,
+    const int group_scale)
+{
+    const unsigned int half = group >> 3u;
+    const unsigned int pair = group & 7u;
+    const unsigned int source = half * 32u + (pair & 1u) * 16u;
+    const unsigned int shift = 2u * (pair >> 1u);
+    const unsigned int low_pair = *(const unsigned short*)(
+        block + 32u + source + within);
+    const unsigned int hmask_pair = *(const unsigned short*)(
+        block + (pair & 1u) * 16u + within);
+    const unsigned int mask = 1u << (group >> 1u);
+    const int first_quant = (int)((low_pair >> shift) & 3u)
+        - ((hmask_pair & mask) == 0u ? 4 : 0);
+    const int second_quant = (int)((low_pair >> (8u + shift)) & 3u)
+        - ((hmask_pair & (mask << 8u)) == 0u ? 4 : 0);
+    return {
+        zllm_f32_to_bf16(
+            d * (float)group_scale * (float)first_quant),
+        zllm_f32_to_bf16(
+            d * (float)group_scale * (float)second_quant)
+    };
+}
+
+__device__ __forceinline__ void gguf_k4_group_scale_min(
+    const unsigned char* block,
+    const unsigned int group,
+    unsigned int& group_scale,
+    unsigned int& minimum)
+{
+    const unsigned char* scales = block + 4u;
+    if (group < 4u) {
+        group_scale = scales[group] & 63u;
+        minimum = scales[group + 4u] & 63u;
+    } else {
+        group_scale = (scales[group + 4u] & 15u)
+            | ((scales[group - 4u] >> 6u) << 4u);
+        minimum = (scales[group + 4u] >> 4u)
+            | ((scales[group] >> 6u) << 4u);
+    }
+}
+
+__device__ __forceinline__ zllm_ct_bf16x2 gguf_q4k_pair_bf16(
+    const unsigned char* block,
+    const unsigned int group,
+    const unsigned int within,
+    const float d,
+    const float dmin,
+    const unsigned int group_scale,
+    const unsigned int minimum)
+{
+    const unsigned int shift = 4u * (group & 1u);
+    const unsigned int packed_pair = *(const unsigned short*)(
+        block + 16u + (group >> 1u) * 32u + within);
+    const unsigned int first_quant = (packed_pair >> shift) & 15u;
+    const unsigned int second_quant
+        = (packed_pair >> (8u + shift)) & 15u;
+    return {
+        zllm_f32_to_bf16(
+            d * (float)(group_scale * first_quant)
+                - dmin * (float)minimum),
+        zllm_f32_to_bf16(
+            d * (float)(group_scale * second_quant)
+                - dmin * (float)minimum)
+    };
+}
+
 // 段一：每个 16-lane 子组计算一个 intermediate 维，一个 block 覆盖
 // 16 维。旧路径让整个 block 同时持有 8 维 gate/up 累加并用 64 KiB
 // LDS 归约，导致寄存器与 occupancy 双重受限。
@@ -723,6 +904,109 @@ extern "C" __global__ void gguf_fused_gate_up_f32(
     }
 }
 
+// Q3_K 的 16-weight group 原先每两个权重都重复解析 d/scale。这里由
+// 8-lane 子组一次处理原 16-lane 的上下半组，并保留两个独立 accumulator；
+// 末尾先合并对应 lane，再执行原 offset=4/2/1 归约，归约树逐位不变。
+extern "C" __global__ void gguf_fused_gate_up_q3_k_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    (void)route_ids;
+    const unsigned int assignment = blockIdx.y;
+    if (assignment >= assignments || input_is_bf16 == 0u) return;
+    const unsigned int token = assignment / top_k;
+    const GgufKqMeta meta = metas[route_slots[assignment]];
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int output_row = blockIdx.x * 32u + subgroup;
+    if (output_row >= intermediate) return;
+    const unsigned char* gate_row = gguf_kq_row(
+        meta.gate, 11u, output_row, hidden);
+    const unsigned char* up_row = gguf_kq_row(
+        meta.up, 11u, output_row, hidden);
+    const unsigned short* token_input = (const unsigned short*)input
+        + (unsigned long long)token * hidden;
+    const unsigned int within = lane * 2u;
+    float gate_sum0 = 0.0f;
+    float up_sum0 = 0.0f;
+    float gate_sum1 = 0.0f;
+    float up_sum1 = 0.0f;
+    for (unsigned int block_index = 0u;
+         block_index < hidden / 256u;
+         ++block_index) {
+        const unsigned char* gate_block
+            = gate_row + (unsigned long long)block_index * 110u;
+        const unsigned char* up_block
+            = up_row + (unsigned long long)block_index * 110u;
+        float gate_d = lane == 0u ? gguf_kq_f16(gate_block + 108u) : 0.0f;
+        float up_d = lane == 0u ? gguf_kq_f16(up_block + 108u) : 0.0f;
+        gate_d = __shfl(gate_d, 0, 8);
+        up_d = __shfl(up_d, 0, 8);
+        const unsigned short* block_input
+            = token_input + block_index * 256u;
+        #pragma unroll
+        for (unsigned int group_pair = 0u; group_pair < 8u; ++group_pair) {
+            const unsigned int group0 = group_pair * 2u;
+            const unsigned int group1 = group0 + 1u;
+            int gate_scale0 = lane == 0u
+                ? gguf_q3k_group_scale(gate_block, group0) : 0;
+            int gate_scale1 = lane == 0u
+                ? gguf_q3k_group_scale(gate_block, group1) : 0;
+            int up_scale0 = lane == 0u
+                ? gguf_q3k_group_scale(up_block, group0) : 0;
+            int up_scale1 = lane == 0u
+                ? gguf_q3k_group_scale(up_block, group1) : 0;
+            gate_scale0 = __shfl(gate_scale0, 0, 8);
+            gate_scale1 = __shfl(gate_scale1, 0, 8);
+            up_scale0 = __shfl(up_scale0, 0, 8);
+            up_scale1 = __shfl(up_scale1, 0, 8);
+            const unsigned int column0 = group0 * 16u + within;
+            const unsigned int column1 = group1 * 16u + within;
+            const zllm_ct_bf16x2 input0 = {
+                block_input[column0], block_input[column0 + 1u]
+            };
+            const zllm_ct_bf16x2 input1 = {
+                block_input[column1], block_input[column1 + 1u]
+            };
+            gate_sum0 += __builtin_amdgcn_fdot2_f32_bf16(
+                input0, gguf_q3k_pair_bf16(
+                    gate_block, group0, within, gate_d, gate_scale0),
+                0.0f, false);
+            up_sum0 += __builtin_amdgcn_fdot2_f32_bf16(
+                input0, gguf_q3k_pair_bf16(
+                    up_block, group0, within, up_d, up_scale0),
+                0.0f, false);
+            gate_sum1 += __builtin_amdgcn_fdot2_f32_bf16(
+                input1, gguf_q3k_pair_bf16(
+                    gate_block, group1, within, gate_d, gate_scale1),
+                0.0f, false);
+            up_sum1 += __builtin_amdgcn_fdot2_f32_bf16(
+                input1, gguf_q3k_pair_bf16(
+                    up_block, group1, within, up_d, up_scale1),
+                0.0f, false);
+        }
+    }
+    gate_sum0 += gate_sum1;
+    up_sum0 += up_sum1;
+    for (unsigned int offset = 4u; offset; offset >>= 1u) {
+        gate_sum0 += __shfl_down(gate_sum0, offset, 8);
+        up_sum0 += __shfl_down(up_sum0, offset, 8);
+    }
+    if (lane == 0u) {
+        const float gate = gate_sum0 / (1.0f + expf(-gate_sum0));
+        activated[(unsigned long long)assignment * intermediate + output_row]
+            = zllm_f32_to_bf16(gate * up_sum0);
+    }
+}
+
 // 段二：每个 16-lane 子组计算一个 hidden 维，跨 top_k 固定顺序
 // 寄存器累加，无原子。
 extern "C" __global__ void gguf_fused_down_f32(
@@ -770,6 +1054,255 @@ extern "C" __global__ void gguf_fused_down_f32(
         sum += __shfl_down(sum, offset, 16);
     if (lane == 0)
         output[(unsigned long long)token * hidden + output_row] = sum;
+}
+
+// Q4_K down 同样以两个 accumulator 模拟原 16-lane 归约的 offset=8，
+// 同一组 d/scale/min 只解析一次，同时把每个 block 的输出行数翻倍。
+extern "C" __global__ void gguf_fused_down_q4_k_f32(
+    const unsigned short* activated,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    const float* route_weights,
+    float* output,
+    const unsigned int tokens,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate)
+{
+    (void)route_ids;
+    const unsigned int token = blockIdx.y;
+    if (token >= tokens) return;
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int output_row = blockIdx.x * 32u + subgroup;
+    if (output_row >= hidden) return;
+    const unsigned int within = lane * 2u;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (unsigned int k = 0u; k < top_k; ++k) {
+        const unsigned int assignment = token * top_k + k;
+        const GgufKqMeta meta = metas[route_slots[assignment]];
+        const unsigned char* down_row = gguf_kq_row(
+            meta.down, 12u, output_row, intermediate);
+        const unsigned short* input = activated
+            + (unsigned long long)assignment * intermediate;
+        const float route_weight = route_weights[assignment];
+        for (unsigned int block_index = 0u;
+             block_index < intermediate / 256u;
+             ++block_index) {
+            const unsigned char* block
+                = down_row + (unsigned long long)block_index * 144u;
+            float d = lane == 0u ? gguf_kq_f16(block) : 0.0f;
+            float dmin = lane == 0u ? gguf_kq_f16(block + 2u) : 0.0f;
+            d = __shfl(d, 0, 8);
+            dmin = __shfl(dmin, 0, 8);
+            const unsigned short* block_input
+                = input + block_index * 256u;
+            #pragma unroll
+            for (unsigned int group = 0u; group < 8u; ++group) {
+                unsigned int group_scale = 0u;
+                unsigned int minimum = 0u;
+                if (lane == 0u) {
+                    gguf_k4_group_scale_min(
+                        block, group, group_scale, minimum);
+                }
+                group_scale = __shfl(group_scale, 0, 8);
+                minimum = __shfl(minimum, 0, 8);
+                const unsigned int column0 = group * 32u + within;
+                const unsigned int column1 = column0 + 16u;
+                const zllm_ct_bf16x2 input0 = {
+                    block_input[column0], block_input[column0 + 1u]
+                };
+                const zllm_ct_bf16x2 input1 = {
+                    block_input[column1], block_input[column1 + 1u]
+                };
+                sum0 += __builtin_amdgcn_fdot2_f32_bf16(
+                    input0, gguf_q4k_pair_bf16(
+                        block, group, within, d, dmin,
+                        group_scale, minimum),
+                    0.0f, false) * route_weight;
+                sum1 += __builtin_amdgcn_fdot2_f32_bf16(
+                    input1, gguf_q4k_pair_bf16(
+                        block, group, within + 16u, d, dmin,
+                        group_scale, minimum),
+                    0.0f, false) * route_weight;
+            }
+        }
+    }
+    sum0 += sum1;
+    for (unsigned int offset = 4u; offset; offset >>= 1u)
+        sum0 += __shfl_down(sum0, offset, 8);
+    if (lane == 0u)
+        output[(unsigned long long)token * hidden + output_row] = sum0;
+}
+
+template <unsigned int TensorType>
+__device__ __forceinline__ void gguf_fused_down_k_f32_impl(
+    const unsigned short* activated,
+    const GgufKqMeta* metas,
+    const unsigned int* route_slots,
+    const float* route_weights,
+    float* output,
+    const unsigned int tokens,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate)
+{
+    const unsigned int token = blockIdx.y;
+    if (token >= tokens) return;
+    const unsigned int lane = threadIdx.x & 15u;
+    const unsigned int subgroup = threadIdx.x >> 4u;
+    const unsigned int output_row = blockIdx.x * 16u + subgroup;
+    if (output_row >= hidden) return;
+    const unsigned int within = lane * 2u;
+    float sum = 0.0f;
+    for (unsigned int k = 0u; k < top_k; ++k) {
+        const unsigned int assignment = token * top_k + k;
+        const GgufKqMeta meta = metas[route_slots[assignment]];
+        const unsigned char* down_row = gguf_kq_row(
+            meta.down, TensorType, output_row, intermediate);
+        const unsigned short* input = activated
+            + (unsigned long long)assignment * intermediate;
+        const float route_weight = route_weights[assignment];
+        for (unsigned int block_index = 0u;
+             block_index < intermediate / 256u;
+             ++block_index) {
+            const unsigned char* block = down_row
+                + (unsigned long long)block_index
+                    * (TensorType == 13u ? 176u : 210u);
+            float d = lane == 0u
+                ? gguf_kq_f16(block + (TensorType == 13u ? 0u : 208u))
+                : 0.0f;
+            d = __shfl(d, 0, 16);
+            float dmin = 0.0f;
+            if (TensorType == 13u) {
+                dmin = lane == 0u ? gguf_kq_f16(block + 2u) : 0.0f;
+                dmin = __shfl(dmin, 0, 16);
+            }
+            #pragma unroll
+            for (unsigned int group = 0u; group < 8u; ++group) {
+                const unsigned int column = block_index * 256u
+                    + group * 32u + within;
+                const zllm_ct_bf16x2 x = {
+                    input[column], input[column + 1u]
+                };
+                zllm_ct_bf16x2 weight;
+                if (TensorType == 13u) {
+                    unsigned int group_scale = 0u;
+                    unsigned int minimum = 0u;
+                    if (lane == 0u) {
+                        const unsigned char* scales = block + 4u;
+                        if (group < 4u) {
+                            group_scale = scales[group] & 63u;
+                            minimum = scales[group + 4u] & 63u;
+                        } else {
+                            group_scale = (scales[group + 4u] & 15u)
+                                | ((scales[group - 4u] >> 6u) << 4u);
+                            minimum = (scales[group + 4u] >> 4u)
+                                | ((scales[group] >> 6u) << 4u);
+                        }
+                    }
+                    group_scale = __shfl(group_scale, 0, 16);
+                    minimum = __shfl(minimum, 0, 16);
+                    const unsigned int shift = 4u * (group & 1u);
+                    const unsigned int low_pair =
+                        *(const unsigned short*)(block + 48u
+                            + (group >> 1u) * 32u + within);
+                    const unsigned int high_pair =
+                        *(const unsigned short*)(block + 16u + within);
+                    const unsigned int first_quant =
+                        ((low_pair >> shift) & 15u)
+                            + (((high_pair >> group) & 1u) << 4u);
+                    const unsigned int second_quant =
+                        ((low_pair >> (8u + shift)) & 15u)
+                            + (((high_pair >> (8u + group)) & 1u) << 4u);
+                    weight = {
+                        zllm_f32_to_bf16(
+                            d * (float)(group_scale * first_quant)
+                                - dmin * (float)minimum),
+                        zllm_f32_to_bf16(
+                            d * (float)(group_scale * second_quant)
+                                - dmin * (float)minimum)
+                    };
+                } else {
+                    const unsigned int half = group >> 2u;
+                    const unsigned int slot = group & 3u;
+                    int group_scale = 0;
+                    if ((lane & 7u) == 0u) {
+                        group_scale = (int)(signed char)block[
+                            192u + half * 8u + (lane >> 3u)
+                                + slot * 2u];
+                    }
+                    group_scale = __shfl(group_scale, 0, 8);
+                    const unsigned int low_pair =
+                        *(const unsigned short*)(block + half * 64u
+                            + within + (slot & 1u) * 32u);
+                    const unsigned int high_pair =
+                        *(const unsigned short*)(block + 128u
+                            + half * 32u + within);
+                    const unsigned int nibble_shift =
+                        slot < 2u ? 0u : 4u;
+                    const unsigned int first_quant =
+                        ((low_pair >> nibble_shift) & 15u)
+                            | (((high_pair >> (slot * 2u)) & 3u) << 4u);
+                    const unsigned int second_quant =
+                        ((low_pair >> (8u + nibble_shift)) & 15u)
+                            | (((high_pair >> (8u + slot * 2u)) & 3u) << 4u);
+                    weight = {
+                        zllm_f32_to_bf16(
+                            d * (float)group_scale
+                                * (float)((int)first_quant - 32)),
+                        zllm_f32_to_bf16(
+                            d * (float)group_scale
+                                * (float)((int)second_quant - 32))
+                    };
+                }
+                sum += __builtin_amdgcn_fdot2_f32_bf16(
+                    x, weight, 0.0f, false) * route_weight;
+            }
+        }
+    }
+    for (unsigned int offset = 8u; offset; offset >>= 1u)
+        sum += __shfl_down(sum, offset, 16);
+    if (lane == 0u)
+        output[(unsigned long long)token * hidden + output_row] = sum;
+}
+
+extern "C" __global__ void gguf_fused_down_q5_k_f32(
+    const unsigned short* activated,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    const float* route_weights,
+    float* output,
+    const unsigned int tokens,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate)
+{
+    (void)route_ids;
+    gguf_fused_down_k_f32_impl<13u>(
+        activated, metas, route_slots, route_weights, output,
+        tokens, top_k, hidden, intermediate);
+}
+
+extern "C" __global__ void gguf_fused_down_q6_k_f32(
+    const unsigned short* activated,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    const float* route_weights,
+    float* output,
+    const unsigned int tokens,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate)
+{
+    (void)route_ids;
+    gguf_fused_down_k_f32_impl<14u>(
+        activated, metas, route_slots, route_weights, output,
+        tokens, top_k, hidden, intermediate);
 }
 
 extern "C" __global__ void gguf_fused_gate_up_iq3s_f32(
@@ -845,7 +1378,8 @@ extern "C" __global__ void gguf_fused_gate_up_iq3s_f32(
     }
 }
 
-extern "C" __global__ void gguf_fused_gate_up_iq4xs_f32(
+template <bool Rows2>
+__device__ __forceinline__ void gguf_fused_gate_up_iq4xs_impl(
     const void* input,
     const GgufKqMeta* metas,
     const unsigned int* route_ids,
@@ -859,6 +1393,12 @@ extern "C" __global__ void gguf_fused_gate_up_iq4xs_f32(
 {
     const unsigned int assignment = blockIdx.y;
     if (assignment >= assignments || input_is_bf16 == 0u) return;
+    int peer_assignment = -1;
+    if (Rows2) {
+        peer_assignment = gguf_rows2_peer_assignment(
+            route_slots, assignment, top_k);
+        if (peer_assignment == -2) return;
+    }
     const unsigned int token = assignment / top_k;
     const GgufKqMeta meta = metas[route_slots[assignment]];
     // 单 lane 消费一个完整 32-column quant group，scale 只解析一次；
@@ -874,15 +1414,10 @@ extern "C" __global__ void gguf_fused_gate_up_iq4xs_f32(
     const unsigned int group = lane;
     const unsigned int column_in_block = group * 32u;
     const unsigned long long input_base = (unsigned long long)token * hidden;
-    // IQ3_S 码本搬到 LDS：__constant__ 发散查表会串行化，LDS 的 bank 访问
-    // 对发散 grid index 友好得多（每 block 一次 2KB 协作加载）。
-    __shared__ unsigned int iq3s_grid_lds[512];
-    for (unsigned int index = threadIdx.x; index < 512u; index += blockDim.x) {
-        iq3s_grid_lds[index] = zllm_iq3s_grid[index];
-    }
-    __syncthreads();
     float gate_sum = 0.0f;
     float up_sum = 0.0f;
+    float peer_gate_sum = 0.0f;
+    float peer_up_sum = 0.0f;
     for (unsigned int block_index = 0u;
          block_index < hidden / 256u;
          ++block_index) {
@@ -896,35 +1431,196 @@ extern "C" __global__ void gguf_fused_gate_up_iq4xs_f32(
             + input_base + block_index * 256u + column_in_block;
         const float gate_scale = gguf_iq4xs_group_scale(gate_block, group);
         const float up_scale = gguf_iq4xs_group_scale(up_block, group);
+        const uint2 gate_words0 = *reinterpret_cast<const uint2*>(gate_codes);
+        const uint2 up_words0 = *reinterpret_cast<const uint2*>(up_codes);
+        const uint2 gate_words1 = *reinterpret_cast<const uint2*>(gate_codes + 8u);
+        const uint2 up_words1 = *reinterpret_cast<const uint2*>(up_codes + 8u);
         gguf_iq4xs_gate_up_word8(
-            block_input,
-            *reinterpret_cast<const uint2*>(gate_codes),
-            *reinterpret_cast<const uint2*>(up_codes),
+            block_input, gate_words0, up_words0,
             0u, gate_scale, up_scale, gate_sum, up_sum);
         gguf_iq4xs_gate_up_word8(
-            block_input + 8u,
-            *reinterpret_cast<const uint2*>(gate_codes + 8u),
-            *reinterpret_cast<const uint2*>(up_codes + 8u),
+            block_input + 8u, gate_words1, up_words1,
             0u, gate_scale, up_scale, gate_sum, up_sum);
         gguf_iq4xs_gate_up_word8(
-            block_input + 16u,
-            *reinterpret_cast<const uint2*>(gate_codes),
-            *reinterpret_cast<const uint2*>(up_codes),
+            block_input + 16u, gate_words0, up_words0,
             4u, gate_scale, up_scale, gate_sum, up_sum);
         gguf_iq4xs_gate_up_word8(
-            block_input + 24u,
-            *reinterpret_cast<const uint2*>(gate_codes + 8u),
-            *reinterpret_cast<const uint2*>(up_codes + 8u),
+            block_input + 24u, gate_words1, up_words1,
             4u, gate_scale, up_scale, gate_sum, up_sum);
+        if (Rows2 && peer_assignment >= 0) {
+            const unsigned int peer_token
+                = (unsigned int)peer_assignment / top_k;
+            const unsigned short* peer_input = (const unsigned short*)input
+                + (unsigned long long)peer_token * hidden
+                + block_index * 256u + column_in_block;
+            gguf_iq4xs_gate_up_word8(
+                peer_input, gate_words0, up_words0,
+                0u, gate_scale, up_scale, peer_gate_sum, peer_up_sum);
+            gguf_iq4xs_gate_up_word8(
+                peer_input + 8u, gate_words1, up_words1,
+                0u, gate_scale, up_scale, peer_gate_sum, peer_up_sum);
+            gguf_iq4xs_gate_up_word8(
+                peer_input + 16u, gate_words0, up_words0,
+                4u, gate_scale, up_scale, peer_gate_sum, peer_up_sum);
+            gguf_iq4xs_gate_up_word8(
+                peer_input + 24u, gate_words1, up_words1,
+                4u, gate_scale, up_scale, peer_gate_sum, peer_up_sum);
+        }
     }
     for (unsigned int offset = 4u; offset; offset >>= 1u) {
         gate_sum += __shfl_down(gate_sum, offset, 8);
         up_sum += __shfl_down(up_sum, offset, 8);
+        if (Rows2) {
+            peer_gate_sum += __shfl_down(peer_gate_sum, offset, 8);
+            peer_up_sum += __shfl_down(peer_up_sum, offset, 8);
+        }
     }
     if (lane == 0u) {
         const float gate = gate_sum / (1.0f + expf(-gate_sum));
         activated[(unsigned long long)assignment * intermediate + output_row]
             = zllm_f32_to_bf16(gate * up_sum);
+        if (Rows2 && peer_assignment >= 0) {
+            const float peer_gate
+                = peer_gate_sum / (1.0f + expf(-peer_gate_sum));
+            activated[(unsigned long long)peer_assignment * intermediate
+                + output_row] = zllm_f32_to_bf16(peer_gate * peer_up_sum);
+        }
+    }
+}
+
+extern "C" __global__ void gguf_fused_gate_up_iq4xs_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    gguf_fused_gate_up_iq4xs_impl<false>(
+        input, metas, route_ids, route_slots, activated, assignments,
+        top_k, hidden, intermediate, input_is_bf16);
+}
+
+extern "C" __global__ void gguf_fused_gate_up_iq4xs_rows2_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    gguf_fused_gate_up_iq4xs_impl<true>(
+        input, metas, route_ids, route_slots, activated, assignments,
+        top_k, hidden, intermediate, input_is_bf16);
+}
+
+// MTP verify 多行（rows 3..8）专家去重：同专家的全部 assignment 由最小索引的
+// leader 块一次读 gate/up 权重、逐成员复用。每个 (assignment, output_row) 的
+// 累加顺序与单行 kernel 完全一致——成员间仅共享权重码读，不共享累加状态，
+// 对 token-major 输出逐位一致。
+extern "C" __global__ void gguf_fused_gate_up_iq4xs_rowsn_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    const unsigned int assignment = blockIdx.y;
+    if (assignment >= assignments || input_is_bf16 == 0u) return;
+    unsigned int members[8];
+    const int member_count = gguf_rowsn_members(
+        route_slots, assignments, assignment, members);
+    if (member_count <= 0) return;
+    unsigned int member_tokens[8];
+    #pragma unroll
+    for (unsigned int member = 0u; member < 8u; ++member) {
+        if (member >= (unsigned int)member_count) break;
+        member_tokens[member] = members[member] / top_k;
+    }
+    const GgufKqMeta meta = metas[route_slots[assignment]];
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int output_row = blockIdx.x * 32u + subgroup;
+    if (output_row >= intermediate) return;
+    const unsigned char* gate_row = gguf_kq_row(
+        meta.gate, 23u, output_row, hidden);
+    const unsigned char* up_row = gguf_kq_row(
+        meta.up, 23u, output_row, hidden);
+    const unsigned int group = lane;
+    const unsigned int column_in_block = group * 32u;
+    float gate_sums[8];
+    float up_sums[8];
+    for (unsigned int member = 0u; member < 8u; ++member) {
+        gate_sums[member] = 0.0f;
+        up_sums[member] = 0.0f;
+    }
+    for (unsigned int block_index = 0u;
+         block_index < hidden / 256u;
+         ++block_index) {
+        const unsigned char* gate_block
+            = gate_row + (unsigned long long)block_index * 136u;
+        const unsigned char* up_block
+            = up_row + (unsigned long long)block_index * 136u;
+        const unsigned char* gate_codes = gate_block + 8u + group * 16u;
+        const unsigned char* up_codes = up_block + 8u + group * 16u;
+        const float gate_scale = gguf_iq4xs_group_scale(gate_block, group);
+        const float up_scale = gguf_iq4xs_group_scale(up_block, group);
+        const uint2 gate_words0 = *reinterpret_cast<const uint2*>(gate_codes);
+        const uint2 up_words0 = *reinterpret_cast<const uint2*>(up_codes);
+        const uint2 gate_words1 = *reinterpret_cast<const uint2*>(gate_codes + 8u);
+        const uint2 up_words1 = *reinterpret_cast<const uint2*>(up_codes + 8u);
+        // 成员循环静态展开:运行期索引局部数组会溢出 local memory(见 merge_pl 教训),
+        // 展开后 members/gate_sums 保持寄存器驻留。
+        #pragma unroll
+        for (unsigned int member = 0u; member < 8u; ++member) {
+            if (member >= (unsigned int)member_count) break;
+            const unsigned short* block_input = (const unsigned short*)input
+                + (unsigned long long)member_tokens[member] * hidden
+                + block_index * 256u + column_in_block;
+            gguf_iq4xs_gate_up_word8(
+                block_input, gate_words0, up_words0,
+                0u, gate_scale, up_scale, gate_sums[member], up_sums[member]);
+            gguf_iq4xs_gate_up_word8(
+                block_input + 8u, gate_words1, up_words1,
+                0u, gate_scale, up_scale, gate_sums[member], up_sums[member]);
+            gguf_iq4xs_gate_up_word8(
+                block_input + 16u, gate_words0, up_words0,
+                4u, gate_scale, up_scale, gate_sums[member], up_sums[member]);
+            gguf_iq4xs_gate_up_word8(
+                block_input + 24u, gate_words1, up_words1,
+                4u, gate_scale, up_scale, gate_sums[member], up_sums[member]);
+        }
+    }
+    for (unsigned int offset = 4u; offset; offset >>= 1u) {
+        #pragma unroll
+        for (unsigned int member = 0u; member < 8u; ++member) {
+            if (member >= (unsigned int)member_count) break;
+            gate_sums[member] += __shfl_down(gate_sums[member], offset, 8);
+            up_sums[member] += __shfl_down(up_sums[member], offset, 8);
+        }
+    }
+    if (lane == 0u) {
+        #pragma unroll
+        for (unsigned int member = 0u; member < 8u; ++member) {
+            if (member >= (unsigned int)member_count) break;
+            const float gate
+                = gate_sums[member] / (1.0f + expf(-gate_sums[member]));
+            activated[(unsigned long long)members[member] * intermediate
+                + output_row] = zllm_f32_to_bf16(gate * up_sums[member]);
+        }
     }
 }
 
@@ -1529,9 +2225,9 @@ extern "C" __global__ void gguf_gate_up_wmma_bf16(
 }
 
 // 多行 prefill down 复用 CT grouped WMMA 的执行结构：每个 active expert/output
-// tile 只启动一个 block，block 内顺序覆盖该 expert 的全部 route。旧 token-major
-// kernel 会为每个 token×8 hidden 发一个 256-thread block，2048 行时单层超过
-// 157 万个 workgroup；这里降为 expert×ceil(hidden/128)。
+// tile 只启动一个 block，block 内顺序覆盖该 expert 的全部 route。各 route 先写
+// 独立 contribution，再由固定 token-major top-k 顺序归约，避免跨 expert 的浮点
+// atomicAdd 让 prompt 末态随 block 调度漂移。
 template <bool Iq4Xs>
 __device__ __forceinline__ void gguf_grouped_down_impl(
     const unsigned short* activated,
@@ -1543,17 +2239,20 @@ __device__ __forceinline__ void gguf_grouped_down_impl(
     unsigned int input_columns,
     unsigned int output_rows,
     unsigned int expert_base,
-    unsigned int expert_count)
+    unsigned int expert_count,
+    unsigned int output_row_base,
+    unsigned int output_slice_rows)
 {
     using namespace rocwmma;
     using AFragment = fragment<matrix_a, 16, 16, 16, bfloat16_t, row_major>;
     using BFragment = fragment<matrix_b, 16, 16, 16, bfloat16_t, col_major>;
     using CFragment = fragment<accumulator, 16, 16, 16, float>;
     static_assert(BFragment::num_elements == 8, "GFX11 GGUF down B fragment lane layout 已改变");
+    (void)token_ids;
     const unsigned int expert = expert_base + blockIdx.z;
     const unsigned int lane = threadIdx.x % warpSize;
     const unsigned int wave = threadIdx.x / warpSize;
-    const unsigned int output_base = (blockIdx.x * 8u + wave) * 16u;
+    const unsigned int output_delta_base = (blockIdx.x * 8u + wave) * 16u;
     if (blockIdx.z >= expert_count || wave >= 8u) return;
     const unsigned int route_begin = route_offsets[expert];
     const unsigned int input_rows = route_offsets[expert + 1u] - route_begin;
@@ -1608,11 +2307,12 @@ __device__ __forceinline__ void gguf_grouped_down_impl(
             __syncthreads();
             const unsigned int lane16 = lane & 15u;
             if (Iq4Xs || tensor_type == 23u) {
-                const unsigned int output_row = output_base + lane16;
+                const unsigned int output_delta = output_delta_base + lane16;
+                const unsigned int output_row = output_row_base + output_delta;
                 const unsigned int lane_column = (lane >> 4u) * 8u;
                 unsigned long long packed = 0u;
                 float scale = 0.0f;
-                if (output_row < output_rows) {
+                if (output_delta < output_slice_rows && output_row < output_rows) {
                     const unsigned char* block
                         = gguf_kq_row(weight, tensor_type, output_row, input_columns)
                         + (unsigned long long)(column_base >> 8u) * 136u;
@@ -1661,9 +2361,10 @@ __device__ __forceinline__ void gguf_grouped_down_impl(
                     #pragma unroll
                     for (unsigned int row_pair = 0u; row_pair < 16u; row_pair += 2u) {
                         const unsigned int tile_row = row_pair + (lane >> 4u);
-                        const unsigned int output_row = output_base + tile_row;
+                        const unsigned int output_delta = output_delta_base + tile_row;
+                        const unsigned int output_row = output_row_base + output_delta;
                         weight_tiles[wave][tile_row * 16u + lane16]
-                            = output_row < output_rows
+                            = output_delta < output_slice_rows && output_row < output_rows
                             ? gguf_kq_segment16_bf16(
                                 gguf_kq_row(weight, tensor_type, output_row, input_columns),
                                 tensor_type, segment_column_base + lane16,
@@ -1697,12 +2398,12 @@ __device__ __forceinline__ void gguf_grouped_down_impl(
             __syncwarp();
             for (unsigned int index = lane; index < 16u * 16u; index += warpSize) {
                 const unsigned int local_row = input_base + tile * 16u + index / 16u;
-                const unsigned int output_row = output_base + index % 16u;
-                if (local_row < input_rows && output_row < output_rows) {
+                const unsigned int output_delta = output_delta_base + index % 16u;
+                const unsigned int output_row = output_row_base + output_delta;
+                if (local_row < input_rows && output_delta < output_slice_rows && output_row < output_rows) {
                     const unsigned int route = route_begin + local_row;
-                    atomicAdd(
-                        &output[(unsigned long long)token_ids[route] * output_rows + output_row],
-                        scratch.output[wave][index] * grouped_weights[route]);
+                    output[(unsigned long long)route * output_slice_rows + output_delta]
+                        = scratch.output[wave][index] * grouped_weights[route];
                 }
             }
             __syncwarp();
@@ -1720,11 +2421,13 @@ extern "C" __global__ void gguf_grouped_down_f32(
     unsigned int input_columns,
     unsigned int output_rows,
     unsigned int expert_base,
-    unsigned int expert_count)
+    unsigned int expert_count,
+    unsigned int output_row_base,
+    unsigned int output_slice_rows)
 {
     gguf_grouped_down_impl<false>(activated, token_ids, grouped_weights,
         experts, route_offsets, output, input_columns, output_rows,
-        expert_base, expert_count);
+        expert_base, expert_count, output_row_base, output_slice_rows);
 }
 
 extern "C" __global__ void gguf_grouped_down_iq4xs_f32(
@@ -1737,11 +2440,13 @@ extern "C" __global__ void gguf_grouped_down_iq4xs_f32(
     unsigned int input_columns,
     unsigned int output_rows,
     unsigned int expert_base,
-    unsigned int expert_count)
+    unsigned int expert_count,
+    unsigned int output_row_base,
+    unsigned int output_slice_rows)
 {
     gguf_grouped_down_impl<true>(activated, token_ids, grouped_weights,
         experts, route_offsets, output, input_columns, output_rows,
-        expert_base, expert_count);
+        expert_base, expert_count, output_row_base, output_slice_rows);
 }
 
 // ===== IQ3_S gate_up wave32 探针 =====
@@ -2106,7 +2811,8 @@ __device__ __forceinline__ void gguf_iq3s_gate_up_tuple8_wide(
     sum = __builtin_amdgcn_fdot2_f32_bf16(x67, gguf_iq3s_pair_bf16(grid1, 16u, signs_byte, 6u, gate_scale), sum, false);
 }
 
-extern "C" __global__ void gguf_fused_gate_up_iq3s_wide_f32(
+template <bool Rows2>
+__device__ __forceinline__ void gguf_fused_gate_up_iq3s_wide_impl(
     const void* input,
     const GgufKqMeta* metas,
     const unsigned int* route_ids,
@@ -2120,6 +2826,12 @@ extern "C" __global__ void gguf_fused_gate_up_iq3s_wide_f32(
 {
     const unsigned int assignment = blockIdx.y;
     if (assignment >= assignments || input_is_bf16 == 0u) return;
+    int peer_assignment = -1;
+    if (Rows2) {
+        peer_assignment = gguf_rows2_peer_assignment(
+            route_slots, assignment, top_k);
+        if (peer_assignment == -2) return;
+    }
     const unsigned int token = assignment / top_k;
     const GgufKqMeta meta = metas[route_slots[assignment]];
     const unsigned int lane = threadIdx.x & 7u;
@@ -2137,6 +2849,8 @@ extern "C" __global__ void gguf_fused_gate_up_iq3s_wide_f32(
     __syncthreads();
     float gate_sum = 0.0f;
     float up_sum = 0.0f;
+    float peer_gate_sum = 0.0f;
+    float peer_up_sum = 0.0f;
     for (unsigned int block_index = 0u; block_index < hidden / 256u; ++block_index) {
         const unsigned char* gate_block = gate_row + (unsigned long long)block_index * 110u;
         const unsigned char* up_block = up_row + (unsigned long long)block_index * 110u;
@@ -2165,15 +2879,297 @@ extern "C" __global__ void gguf_fused_gate_up_iq3s_wide_f32(
         for (unsigned int tuple = 0u; tuple < 4u; ++tuple) {
             gguf_iq3s_gate_up_tuple8_wide(block_input, gate_qs, gate_qh, gate_signs, iq3s_grid_lds, tuple, gate_scale, gate_sum);
             gguf_iq3s_gate_up_tuple8_wide(block_input, up_qs, up_qh, up_signs, iq3s_grid_lds, tuple, up_scale, up_sum);
+            if (Rows2 && peer_assignment >= 0) {
+                const unsigned int peer_token
+                    = (unsigned int)peer_assignment / top_k;
+                const unsigned short* peer_input
+                    = (const unsigned short*)input
+                        + (unsigned long long)peer_token * hidden
+                        + block_index * 256u + group * 32u;
+                gguf_iq3s_gate_up_tuple8_wide(peer_input, gate_qs, gate_qh, gate_signs, iq3s_grid_lds, tuple, gate_scale, peer_gate_sum);
+                gguf_iq3s_gate_up_tuple8_wide(peer_input, up_qs, up_qh, up_signs, iq3s_grid_lds, tuple, up_scale, peer_up_sum);
+            }
         }
     }
     for (unsigned int offset = 4u; offset; offset >>= 1u) {
         gate_sum += __shfl_down(gate_sum, offset, 8);
         up_sum += __shfl_down(up_sum, offset, 8);
+        if (Rows2) {
+            peer_gate_sum += __shfl_down(peer_gate_sum, offset, 8);
+            peer_up_sum += __shfl_down(peer_up_sum, offset, 8);
+        }
     }
     if (lane == 0u) {
         const float gate = gate_sum / (1.0f + expf(-gate_sum));
         activated[(unsigned long long)assignment * intermediate + output_row]
             = zllm_f32_to_bf16(gate * up_sum);
+        if (Rows2 && peer_assignment >= 0) {
+            const float peer_gate
+                = peer_gate_sum / (1.0f + expf(-peer_gate_sum));
+            activated[(unsigned long long)peer_assignment * intermediate
+                + output_row] = zllm_f32_to_bf16(peer_gate * peer_up_sum);
+        }
+    }
+}
+
+extern "C" __global__ void gguf_fused_gate_up_iq3s_wide_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    gguf_fused_gate_up_iq3s_wide_impl<false>(
+        input, metas, route_ids, route_slots, activated, assignments,
+        top_k, hidden, intermediate, input_is_bf16);
+}
+
+extern "C" __global__ void gguf_fused_gate_up_iq3s_wide_rows2_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    gguf_fused_gate_up_iq3s_wide_impl<true>(
+        input, metas, route_ids, route_slots, activated, assignments,
+        top_k, hidden, intermediate, input_is_bf16);
+}
+
+// MTP verify 多行（rows 3..8）专家去重，同 iq4xs_rowsn：leader 块一次读
+// gate/up 权重与码本，逐成员复用；成员累加顺序与单行 kernel 一致，逐位对齐。
+extern "C" __global__ void gguf_fused_gate_up_iq3s_wide_rowsn_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    const unsigned int assignment = blockIdx.y;
+    if (assignment >= assignments || input_is_bf16 == 0u) return;
+    unsigned int members[8];
+    const int member_count = gguf_rowsn_members(
+        route_slots, assignments, assignment, members);
+    if (member_count <= 0) return;
+    unsigned int member_tokens[8];
+    #pragma unroll
+    for (unsigned int member = 0u; member < 8u; ++member) {
+        if (member >= (unsigned int)member_count) break;
+        member_tokens[member] = members[member] / top_k;
+    }
+    const GgufKqMeta meta = metas[route_slots[assignment]];
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int output_row = blockIdx.x * 32u + subgroup;
+    if (output_row >= intermediate) return;
+    const unsigned char* gate_row = gguf_kq_row(meta.gate, 21u, output_row, hidden);
+    const unsigned char* up_row = gguf_kq_row(meta.up, 21u, output_row, hidden);
+    const unsigned int group = lane;
+    __shared__ unsigned int iq3s_grid_lds[512];
+    for (unsigned int index = threadIdx.x; index < 512u; index += blockDim.x) {
+        iq3s_grid_lds[index] = zllm_iq3s_grid[index];
+    }
+    __syncthreads();
+    float gate_sums[8];
+    float up_sums[8];
+    #pragma unroll
+    for (unsigned int member = 0u; member < 8u; ++member) {
+        gate_sums[member] = 0.0f;
+        up_sums[member] = 0.0f;
+    }
+    for (unsigned int block_index = 0u; block_index < hidden / 256u; ++block_index) {
+        const unsigned char* gate_block = gate_row + (unsigned long long)block_index * 110u;
+        const unsigned char* up_block = up_row + (unsigned long long)block_index * 110u;
+        const unsigned short* gate_qs16 = (const unsigned short*)(gate_block + 2u + group * 8u);
+        const unsigned short* up_qs16 = (const unsigned short*)(up_block + 2u + group * 8u);
+        const unsigned long long gate_qs = (unsigned long long)gate_qs16[0]
+            | ((unsigned long long)gate_qs16[1] << 16u)
+            | ((unsigned long long)gate_qs16[2] << 32u)
+            | ((unsigned long long)gate_qs16[3] << 48u);
+        const unsigned long long up_qs = (unsigned long long)up_qs16[0]
+            | ((unsigned long long)up_qs16[1] << 16u)
+            | ((unsigned long long)up_qs16[2] << 32u)
+            | ((unsigned long long)up_qs16[3] << 48u);
+        const unsigned int gate_qh = gate_block[66u + group];
+        const unsigned int up_qh = up_block[66u + group];
+        const unsigned short* gate_signs16 = (const unsigned short*)(gate_block + 74u + group * 4u);
+        const unsigned short* up_signs16 = (const unsigned short*)(up_block + 74u + group * 4u);
+        const unsigned int gate_signs = (unsigned int)gate_signs16[0] | ((unsigned int)gate_signs16[1] << 16u);
+        const unsigned int up_signs = (unsigned int)up_signs16[0] | ((unsigned int)up_signs16[1] << 16u);
+        const float gate_scale = gguf_iq3s_group_scale(gate_block, group);
+        const float up_scale = gguf_iq3s_group_scale(up_block, group);
+        #pragma unroll
+        for (unsigned int tuple = 0u; tuple < 4u; ++tuple) {
+            #pragma unroll
+            for (unsigned int member = 0u; member < 8u; ++member) {
+                if (member >= (unsigned int)member_count) break;
+                const unsigned short* block_input = (const unsigned short*)input
+                    + (unsigned long long)member_tokens[member] * hidden
+                    + block_index * 256u + group * 32u;
+                gguf_iq3s_gate_up_tuple8_wide(block_input, gate_qs, gate_qh, gate_signs, iq3s_grid_lds, tuple, gate_scale, gate_sums[member]);
+                gguf_iq3s_gate_up_tuple8_wide(block_input, up_qs, up_qh, up_signs, iq3s_grid_lds, tuple, up_scale, up_sums[member]);
+            }
+        }
+    }
+    for (unsigned int offset = 4u; offset; offset >>= 1u) {
+        #pragma unroll
+        for (unsigned int member = 0u; member < 8u; ++member) {
+            if (member >= (unsigned int)member_count) break;
+            gate_sums[member] += __shfl_down(gate_sums[member], offset, 8);
+            up_sums[member] += __shfl_down(up_sums[member], offset, 8);
+        }
+    }
+    if (lane == 0u) {
+        #pragma unroll
+        for (unsigned int member = 0u; member < 8u; ++member) {
+            if (member >= (unsigned int)member_count) break;
+            const float gate
+                = gate_sums[member] / (1.0f + expf(-gate_sums[member]));
+            activated[(unsigned long long)members[member] * intermediate
+                + output_row] = zllm_f32_to_bf16(gate * up_sums[member]);
+        }
+    }
+}
+
+// 单专家双行共享 packed 权重，各行累加顺序保持不变。
+extern "C" __global__ void gguf_fused_gate_up_q8_0_rows2_f32(
+    const void* input,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    unsigned short* activated,
+    const unsigned int assignments,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate,
+    const unsigned int input_is_bf16)
+{
+    const unsigned int assignment = blockIdx.y;
+    if (assignment != 0u || assignments != 2u || top_k != 1u || input_is_bf16 == 0u) return;
+    const unsigned int token = assignment / top_k;
+    const GgufKqMeta meta = metas[route_slots[assignment]];
+    const unsigned int lane = threadIdx.x & 15u;
+    const unsigned int subgroup = threadIdx.x >> 4u;
+    const unsigned int output_row = blockIdx.x * 16u + subgroup;
+    if (output_row >= intermediate) return;
+    const unsigned char* gate_row = gguf_kq_row(
+        meta.gate, 8u, output_row, hidden);
+    const unsigned char* up_row = gguf_kq_row(
+        meta.up, 8u, output_row, hidden);
+    const unsigned int group = lane >> 1u;
+    const unsigned int half = lane & 1u;
+    const unsigned int column_in_block = group * 32u + half * 16u;
+    const unsigned long long input_base = (unsigned long long)token * hidden;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+    float peer_gate_sum = 0.0f, peer_up_sum = 0.0f;
+    for (unsigned int block_index = 0u;
+         block_index < hidden / 256u;
+         ++block_index) {
+        const unsigned char* gate_q8 = gate_row
+            + (unsigned long long)block_index * 272u + group * 34u;
+        const unsigned char* up_q8 = up_row
+            + (unsigned long long)block_index * 272u + group * 34u;
+        const unsigned short* block_input = (const unsigned short*)input
+            + input_base + block_index * 256u + column_in_block;
+        const float gate_scale = gguf_kq_f16(gate_q8);
+        const float up_scale = gguf_kq_f16(up_q8);
+        const unsigned char* gate_codes = gate_q8 + 2u + half * 16u;
+        const unsigned char* up_codes = up_q8 + 2u + half * 16u;
+        const uint2 gate0 = gguf_q8_0_load8(gate_codes);
+        const uint2 up0 = gguf_q8_0_load8(up_codes);
+        const uint2 gate1 = gguf_q8_0_load8(gate_codes + 8u);
+        const uint2 up1 = gguf_q8_0_load8(up_codes + 8u);
+        gguf_q8_0_gate_up_word8(block_input, gate0, up0, gate_scale, up_scale, gate_sum, up_sum);
+        gguf_q8_0_gate_up_word8(block_input + 8u, gate1, up1, gate_scale, up_scale, gate_sum, up_sum);
+        gguf_q8_0_gate_up_word8(block_input + hidden, gate0, up0, gate_scale, up_scale, peer_gate_sum, peer_up_sum);
+        gguf_q8_0_gate_up_word8(block_input + hidden + 8u, gate1, up1, gate_scale, up_scale, peer_gate_sum, peer_up_sum);
+    }
+    for (unsigned int offset = 8u; offset; offset >>= 1u) {
+        gate_sum += __shfl_down(gate_sum, offset, 16);
+        up_sum += __shfl_down(up_sum, offset, 16);
+        peer_gate_sum += __shfl_down(peer_gate_sum, offset, 16);
+        peer_up_sum += __shfl_down(peer_up_sum, offset, 16);
+    }
+    if (lane == 0u) {
+        const float gate = gate_sum / (1.0f + expf(-gate_sum));
+        activated[(unsigned long long)assignment * intermediate + output_row]
+            = zllm_f32_to_bf16(gate * up_sum);
+        const float peer_gate = peer_gate_sum / (1.0f + expf(-peer_gate_sum));
+        activated[intermediate + output_row] = zllm_f32_to_bf16(peer_gate * peer_up_sum);
+    }
+}
+
+extern "C" __global__ void gguf_fused_down_q8_0_rows2_f32(
+    const unsigned short* activated,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    const float* route_weights,
+    float* output,
+    const unsigned int tokens,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate)
+{
+    const unsigned int token = blockIdx.y;
+    if (token != 0u || tokens != 2u || top_k != 1u) return;
+    const unsigned int lane = threadIdx.x & 15u;
+    const unsigned int subgroup = threadIdx.x >> 4u;
+    const unsigned int output_row = blockIdx.x * 16u + subgroup;
+    if (output_row >= hidden) return;
+    const unsigned int group = lane >> 1u;
+    const unsigned int half = lane & 1u;
+    const unsigned int column_in_block = group * 32u + half * 16u;
+    float sum = 0.0f, peer_sum = 0.0f;
+    for (unsigned int k = 0u; k < top_k; ++k) {
+        const unsigned int assignment = token * top_k + k;
+        const GgufKqMeta meta = metas[route_slots[assignment]];
+        const unsigned char* down_row = gguf_kq_row(
+            meta.down, 8u, output_row, intermediate);
+        const unsigned short* input = activated
+            + (unsigned long long)assignment * intermediate;
+        float route_sum = 0.0f, peer_route_sum = 0.0f;
+        for (unsigned int block_index = 0u;
+             block_index < intermediate / 256u;
+             ++block_index) {
+            const unsigned char* q8 = down_row
+                + (unsigned long long)block_index * 272u + group * 34u;
+            const unsigned char* codes = q8 + 2u + half * 16u;
+            const unsigned short* block_input = input
+                + block_index * 256u + column_in_block;
+            const float scale = gguf_kq_f16(q8);
+            const uint2 words0 = gguf_q8_0_load8(codes);
+            const uint2 words1 = gguf_q8_0_load8(codes + 8u);
+            route_sum = gguf_q8_0_word8_dot(block_input, words0, scale, route_sum);
+            route_sum = gguf_q8_0_word8_dot(block_input + 8u, words1, scale, route_sum);
+            peer_route_sum = gguf_q8_0_word8_dot(block_input + intermediate, words0, scale, peer_route_sum);
+            peer_route_sum = gguf_q8_0_word8_dot(block_input + intermediate + 8u, words1, scale, peer_route_sum);
+        }
+        sum += route_sum * route_weights[assignment];
+        peer_sum += peer_route_sum * route_weights[top_k + k];
+    }
+    for (unsigned int offset = 8u; offset; offset >>= 1u) {
+        sum += __shfl_down(sum, offset, 16);
+        peer_sum += __shfl_down(peer_sum, offset, 16);
+    }
+    if (lane == 0u) {
+        output[output_row] = sum;
+        output[hidden + output_row] = peer_sum;
     }
 }

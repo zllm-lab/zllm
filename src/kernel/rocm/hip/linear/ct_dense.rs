@@ -387,7 +387,9 @@ fn try_ct_quantized_matmul_bf16_epilogue(
     let use_w8_register_wmma = use_wmma && bits == 8 && group_size.is_multiple_of(16) && functions.wavefront_size == 32;
     let use_w4_g128_wmma = use_wmma && bits == 4 && group_size == 128 && scale_dtype == 0 && functions.wavefront_size == 32;
     let use_w8 = !use_wmma && bits == 8 && group_size % 4 == 0 && input_columns % 4 == 0;
-    let use_w8_rows2 = use_w8 && input_rows == 2 && group_size == 128 && functions.wavefront_size == 32;
+    let g32_rows_shared_occupancy_limited = group_size == 32 && input_columns / group_size >= 128 && output_rows >= 8192;
+    let use_w8_rows_shared = use_w8 && matches!(input_rows, 4 | 6 | 8) && functions.wavefront_size == 32 && (group_size == 32 && !g32_rows_shared_occupancy_limited || group_size == 128 && input_columns / group_size >= 32);
+    let use_w8_row_pairs = use_w8 && !use_w8_rows_shared && matches!(input_rows, 2 | 4 | 6 | 8) && matches!(group_size, 32 | 128) && functions.wavefront_size == 32;
     let use_w4_rows_shared = !use_wmma && bits == 4 && (2..=8).contains(&input_rows) && group_size == 128 && functions.wavefront_size == 32;
     if let Some(residual) = residual {
         if !use_w8_register_wmma && !(use_w8 && input_rows == 1) {
@@ -457,7 +459,6 @@ fn try_ct_quantized_matmul_bf16_epilogue(
         // 多行 verify(draft+anchor)走共享装载路径:权重只读一次,避免超过 L2 的
         // 大矩阵(如 154880 输出的 lm head)被 grid.y 逐行重读 6-8 遍。
         // 仅覆盖 wave32 + group128 的快路径形状,其他形状回退逐行 scalar。
-        let use_w8_rows_shared = use_w8 && matches!(input_rows, 6 | 8) && group_size == 128 && input_columns % 128 == 0 && input_columns / group_size >= 32 && functions.wavefront_size == 32;
         let wmma_profile_started = (use_wmma && options().kernel_profile).then(std::time::Instant::now);
         let gemv_profile_started = (!use_wmma && options().kernel_profile).then(std::time::Instant::now);
         let w8_profile_started = (use_w8 && options().w8_profile).then(std::time::Instant::now);
@@ -470,7 +471,7 @@ fn try_ct_quantized_matmul_bf16_epilogue(
         } else {
             256
         };
-        let scalar_subgroup = if use_w8 && group_size == 32 && functions.wavefront_size == 32 {
+        let scalar_subgroup = if use_w8 && group_size == 32 {
             32
         } else if use_w8 && group_size == 128 && (input_columns == 2048 || input_columns / group_size >= 32) {
             32
@@ -491,8 +492,16 @@ fn try_ct_quantized_matmul_bf16_epilogue(
                         functions.wmma
                     }
                 } else if use_w8_rows_shared {
-                    if input_rows == 6 { functions.w8_rows6 } else { functions.w8_rows8 }
-                } else if use_w8_rows2 {
+                    match (group_size, input_rows) {
+                        (32, 4) => functions.w8_g32_rows4,
+                        (32, 6) => functions.w8_g32_rows6,
+                        (32, 8) => functions.w8_g32_rows8,
+                        (128, 4) => functions.w8_rows4,
+                        (128, 6) => functions.w8_rows6,
+                        (128, 8) => functions.w8_rows8,
+                        _ => unreachable!(),
+                    }
+                } else if use_w8_row_pairs {
                     functions.w8_rows2
                 } else if use_w4_rows_shared {
                     functions.w4_rows8
@@ -503,7 +512,7 @@ fn try_ct_quantized_matmul_bf16_epilogue(
                 } as *mut c_void,
                 if use_wmma {
                     output_rows.div_ceil(wmma_waves * 16)
-                } else if use_w8_rows2 || use_w8_rows_shared {
+                } else if use_w8_row_pairs || use_w8_rows_shared {
                     output_rows.div_ceil(scalar_threads / 32)
                 } else if use_w4_rows_shared {
                     output_rows.div_ceil(scalar_threads / 16)
@@ -512,8 +521,10 @@ fn try_ct_quantized_matmul_bf16_epilogue(
                 },
                 if use_wmma {
                     input_rows.div_ceil(128)
-                } else if use_w8_rows2 || use_w8_rows_shared || use_w4_rows_shared {
+                } else if use_w8_rows_shared || use_w4_rows_shared {
                     1
+                } else if use_w8_row_pairs {
+                    input_rows / 2
                 } else {
                     input_rows
                 },
@@ -542,7 +553,7 @@ fn try_ct_quantized_matmul_bf16_epilogue(
         }
         if let Some(started) = gemv_profile_started {
             eprintln!(
-                "[rocm-kernel] ct-gemv device={device_id} bits={bits} input_rows={input_rows} input_columns={input_columns} output_rows={output_rows} group_size={group_size} shared_rows2={use_w8_rows2} wall={:.6}s",
+                "[rocm-kernel] ct-gemv device={device_id} bits={bits} input_rows={input_rows} input_columns={input_columns} output_rows={output_rows} group_size={group_size} row_pairs={use_w8_row_pairs} wall={:.6}s",
                 started.elapsed().as_secs_f64(),
             );
         }
@@ -664,8 +675,8 @@ pub fn try_ct_dual_gemv_bf16(
                 (&mut d_residual as *mut *mut c_void).cast(),
             ];
             let threads = if output_rows <= 1024 { 128 } else { 256 };
-            let subgroup = if group_size == 32 && functions.wavefront_size == 32 {
-                8
+            let subgroup = if group_size == 32 {
+                32
             } else if group_size == 128 && input_columns / group_size >= 32 {
                 32
             } else {
@@ -688,6 +699,93 @@ pub fn try_ct_dual_gemv_bf16(
             }
             Ok(())
         };
+
+        let g32_rows_shared_occupancy_limited = input_columns / 32 >= 128 && (first_output_rows >= 8192 || second_output_rows >= 8192);
+        let shared_w8_g32_rows = bits == 8
+            && matches!(input_rows, 4 | 6 | 8)
+            && first_group_size == 32
+            && second_group_size == 32
+            && !g32_rows_shared_occupancy_limited
+            && functions.wavefront_size == 32;
+        let shared_w8_row_pairs = bits == 8
+            && !shared_w8_g32_rows
+            && matches!(input_rows, 2 | 4 | 6 | 8)
+            && first_group_size == second_group_size
+            && matches!(first_group_size, 32 | 128)
+            && functions.wavefront_size == 32;
+        if shared_w8_g32_rows || shared_w8_row_pairs {
+            let started = (options().kernel_profile || options().w8_profile).then(std::time::Instant::now);
+            let mut d_input = input_bf16;
+            let mut d_first_packed = first_packed.pointer;
+            let mut d_first_scales = first_scales.pointer;
+            let mut d_first_output = first_result.pointer;
+            let mut first_output_rows = u32::try_from(first_output_rows).map_err(|_| "ROCm dual CT first output_rows 超过 u32".to_owned())?;
+            let mut first_scale_dtype = first_scale_dtype;
+            let mut d_second_packed = second_packed.pointer;
+            let mut d_second_scales = second_scales.pointer;
+            let mut d_second_output = second_result.pointer;
+            let mut second_output_rows = u32::try_from(second_output_rows).map_err(|_| "ROCm dual CT second output_rows 超过 u32".to_owned())?;
+            let mut second_scale_dtype = second_scale_dtype;
+            let mut input_rows_u32 = u32::try_from(input_rows).map_err(|_| "ROCm dual CT input_rows 超过 u32".to_owned())?;
+            let mut input_columns_u32 = u32::try_from(input_columns).map_err(|_| "ROCm dual CT input_columns 超过 u32".to_owned())?;
+            let mut group_size_u32 = u32::try_from(first_group_size).map_err(|_| "ROCm dual CT group_size 超过 u32".to_owned())?;
+            let mut arguments = [
+                (&mut d_input as *mut *mut c_void).cast(),
+                (&mut d_first_packed as *mut *mut c_void).cast(),
+                (&mut d_first_scales as *mut *mut c_void).cast(),
+                (&mut d_first_output as *mut *mut c_void).cast(),
+                (&mut first_output_rows as *mut u32).cast(),
+                (&mut first_scale_dtype as *mut u32).cast(),
+                (&mut d_second_packed as *mut *mut c_void).cast(),
+                (&mut d_second_scales as *mut *mut c_void).cast(),
+                (&mut d_second_output as *mut *mut c_void).cast(),
+                (&mut second_output_rows as *mut u32).cast(),
+                (&mut second_scale_dtype as *mut u32).cast(),
+                (&mut input_rows_u32 as *mut u32).cast(),
+                (&mut input_columns_u32 as *mut u32).cast(),
+                (&mut group_size_u32 as *mut u32).cast(),
+            ];
+            let max_output_rows = first_output_rows.max(second_output_rows);
+            let threads = if max_output_rows >= 12_288 { 512 } else if max_output_rows <= 1024 { 128 } else { 256 };
+            let kernel = if shared_w8_g32_rows {
+                match input_rows {
+                    4 => functions.w8_dual_g32_rows4,
+                    6 => functions.w8_dual_g32_rows6,
+                    8 => functions.w8_dual_g32_rows8,
+                    _ => unreachable!(),
+                }
+            } else {
+                functions.w8_dual_rows2
+            };
+            let status = {
+                let __hip_stats_started = super::hip_api_stats::start();
+                let __hip_launch_result = unsafe {
+                    launch(
+                        kernel as *mut c_void,
+                        max_output_rows.div_ceil(threads / 32),
+                        if shared_w8_g32_rows { 1 } else { input_rows_u32 / 2 },
+                        2,
+                        threads,
+                        1,
+                        1,
+                        0,
+                        crate::kernel::rocm::hip::active_compute_stream(),
+                        arguments.as_mut_ptr(),
+                        ptr::null_mut(),
+                    )
+                };
+                super::hip_api_stats::counted(super::hip_api_stats::LAUNCH, __hip_stats_started);
+                __hip_launch_result
+            };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipModuleLaunchKernel dual CT multi-row shared GEMV"));
+            }
+            if let Some(started) = started {
+                synchronize_device(device_id, "dual CT multi-row shared GEMV profile")?;
+                eprintln!("[rocm-kernel] ct-dual-gemv-multi-row device={device_id} bits=8 input_rows={input_rows} input_columns={input_columns} first_output_rows={first_output_rows} second_output_rows={second_output_rows} group_size={first_group_size} whole_rows={shared_w8_g32_rows} wall={:.6}s", started.elapsed().as_secs_f64());
+            }
+            return Ok(());
+        }
 
         let fused_w8_g32 = bits == 8 && input_rows == 1 && first_group_size == 32 && second_group_size == 32 && functions.wavefront_size == 32;
         if fused_w8_g32 || first_group_size == 128 && second_group_size == 128 && (input_rows == 1 || bits == 4) {
@@ -723,9 +821,26 @@ pub fn try_ct_dual_gemv_bf16(
                         (&mut second_output_rows as *mut u32).cast(),
                         (&mut second_scale_dtype as *mut u32).cast(),
                         (&mut input_columns as *mut u32).cast(),
-                        (&mut input_rows_u32 as *mut u32).cast(),
                     ];
                     unsafe { launch(functions.w4_dual_rows8 as *mut c_void, max_output_rows.div_ceil(16), 1, 2, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) }
+                } else if fused_w8_g32 {
+                    let mut arguments = [
+                        (&mut d_input as *mut *mut c_void).cast(),
+                        (&mut d_first_packed as *mut *mut c_void).cast(),
+                        (&mut d_first_scales as *mut *mut c_void).cast(),
+                        (&mut d_first_output as *mut *mut c_void).cast(),
+                        (&mut first_output_rows as *mut u32).cast(),
+                        (&mut first_scale_dtype as *mut u32).cast(),
+                        (&mut d_second_packed as *mut *mut c_void).cast(),
+                        (&mut d_second_scales as *mut *mut c_void).cast(),
+                        (&mut d_second_output as *mut *mut c_void).cast(),
+                        (&mut second_output_rows as *mut u32).cast(),
+                        (&mut second_scale_dtype as *mut u32).cast(),
+                        (&mut input_columns as *mut u32).cast(),
+                        (&mut input_rows_u32 as *mut u32).cast(),
+                    ];
+                    let threads = if max_output_rows <= 1024 { 128 } else { 256 };
+                    unsafe { launch(functions.w8_dual_g32 as *mut c_void, max_output_rows.div_ceil(threads / 32), 1, 2, threads, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) }
                 } else {
                     let mut arguments = [
                         (&mut d_input as *mut *mut c_void).cast(),
@@ -742,20 +857,8 @@ pub fn try_ct_dual_gemv_bf16(
                         (&mut input_columns as *mut u32).cast(),
                     ];
                     let threads = if bits == 8 && max_output_rows <= 1024 { 128 } else { 256 };
-                    let subgroup = if bits == 4 {
-                        16
-                    } else if fused_w8_g32 {
-                        32
-                    } else {
-                        32
-                    };
-                    let function = if bits == 4 {
-                        functions.w4_dual
-                    } else if fused_w8_g32 {
-                        functions.w8_dual_g32
-                    } else {
-                        functions.w8_dual
-                    };
+                    let subgroup = if bits == 4 { 16 } else { 32 };
+                    let function = if bits == 4 { functions.w4_dual } else { functions.w8_dual };
                     unsafe { launch(function as *mut c_void, max_output_rows.div_ceil(threads / subgroup), 1, 2, threads, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) }
                 };
                 super::hip_api_stats::counted(super::hip_api_stats::LAUNCH, __hip_stats_started);
@@ -936,6 +1039,179 @@ mod tests {
             }
         }
         eprintln!("[rocm-w8-g32-dual-oracle] max_abs={max_abs:.6e} max_rel={max_rel:.6e}");
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn rocm_w8_g32_dual_rows2_matches_single() {
+        const DEVICE: i32 = 0;
+        const ROWS: usize = 2;
+        const COLUMNS: usize = 6_144;
+        const OUTPUT_ROWS: usize = 12_288;
+        const GROUP_SIZE: usize = 32;
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+
+        let input = (0..ROWS * COLUMNS).map(|index| bf16::from_f32(((index * 17 % 61) as f32 - 30.0) / 64.0).to_bits()).collect::<Vec<_>>();
+        let d_input = DeviceBuffer::upload(DEVICE, bytes(&input)).unwrap();
+        let groups = COLUMNS / GROUP_SIZE;
+        let prepare = |seed: usize| {
+            let packed = (0..OUTPUT_ROWS * COLUMNS).map(|index| (121 + (index * 29 + index / 7 + seed) % 15) as u8).collect::<Vec<_>>();
+            let scales = (0..OUTPUT_ROWS * groups).map(|index| f16::from_f32((1 + (index + seed) % 7) as f32 / 256.0).to_bits()).collect::<Vec<_>>();
+            (DeviceBuffer::upload(DEVICE, &packed).unwrap(), DeviceBuffer::upload(DEVICE, bytes(&scales)).unwrap())
+        };
+        let (first_packed, first_scales) = prepare(3);
+        let (second_packed, second_scales) = prepare(11);
+        let rowwise = |packed: &DeviceBuffer, scales: &DeviceBuffer| {
+            let mut output = Vec::with_capacity(ROWS * OUTPUT_ROWS);
+            for row in 0..ROWS {
+                let input = DeviceBuffer::upload(DEVICE, bytes(&input[row * COLUMNS..(row + 1) * COLUMNS])).unwrap();
+                output.extend(try_ct_quantized_matmul_bf16(DEVICE, 8, &[], Some(&input), packed, scales, 1, GROUP_SIZE, 1, COLUMNS, OUTPUT_ROWS).unwrap().download_f32(OUTPUT_ROWS).unwrap());
+            }
+            output
+        };
+        let first_expected = rowwise(&first_packed, &first_scales);
+        let second_expected = rowwise(&second_packed, &second_scales);
+        let first_rows2 = try_ct_quantized_matmul_bf16(DEVICE, 8, &[], Some(&d_input), &first_packed, &first_scales, 1, GROUP_SIZE, ROWS, COLUMNS, OUTPUT_ROWS).unwrap().download_f32(ROWS * OUTPUT_ROWS).unwrap();
+        let second_rows2 = try_ct_quantized_matmul_bf16(DEVICE, 8, &[], Some(&d_input), &second_packed, &second_scales, 1, GROUP_SIZE, ROWS, COLUMNS, OUTPUT_ROWS).unwrap().download_f32(ROWS * OUTPUT_ROWS).unwrap();
+        let (first, second) = try_ct_dual_gemv_bf16(DEVICE, 8, &[], Some(&d_input), COLUMNS, ROWS, &first_packed, &first_scales, 1, GROUP_SIZE, OUTPUT_ROWS, &second_packed, &second_scales, 1, GROUP_SIZE, OUTPUT_ROWS).unwrap();
+        let actual = [[first_rows2, second_rows2], [first.download_f32(ROWS * OUTPUT_ROWS).unwrap(), second.download_f32(ROWS * OUTPUT_ROWS).unwrap()]];
+        let expected = [first_expected, second_expected];
+        let mut max_abs = 0.0_f32;
+        let mut max_rel = 0.0_f32;
+        let mut variant_max_abs = [0.0_f32; 2];
+        let mut variant_max_rel = [0.0_f32; 2];
+        let mut variant_bit_diff = [0_usize; 2];
+        for (variant, outputs) in actual.iter().enumerate() {
+            for projection in 0..2 {
+                for index in 0..ROWS * OUTPUT_ROWS {
+                    let difference = (outputs[projection][index] - expected[projection][index]).abs();
+                    let relative = difference / expected[projection][index].abs().max(1.0e-6);
+                    max_abs = max_abs.max(difference);
+                    max_rel = max_rel.max(relative);
+                    variant_max_abs[variant] = variant_max_abs[variant].max(difference);
+                    variant_max_rel[variant] = variant_max_rel[variant].max(relative);
+                    variant_bit_diff[variant] += usize::from(outputs[projection][index].to_bits() != expected[projection][index].to_bits());
+                    assert!(
+                        difference <= expected[projection][index].abs() * 2.0e-4 + 2.0e-4,
+                        "variant={variant} projection={projection} row={} output_row={} actual={} expected={} difference={difference}",
+                        index / OUTPUT_ROWS,
+                        index % OUTPUT_ROWS,
+                        outputs[projection][index],
+                        expected[projection][index]
+                    );
+                }
+            }
+        }
+        eprintln!("[rocm-w8-g32-dual-rows2-oracle] max_abs={max_abs:.6e} max_rel={max_rel:.6e} variant_max_abs={variant_max_abs:?} variant_max_rel={variant_max_rel:?} variant_bit_diff={variant_bit_diff:?}");
+    }
+
+    fn assert_w8_rows_real_shape<const ROWS: usize>(group_size: usize, columns: usize, first_output_rows: usize, second_output_rows: usize, first_scale_dtype: u32, second_scale_dtype: u32) {
+        const DEVICE: i32 = 0;
+        let input = (0..ROWS * columns).map(|index| bf16::from_f32(((index * 17 % 61) as f32 - 30.0) / 64.0).to_bits()).collect::<Vec<_>>();
+        let d_input = DeviceBuffer::upload(DEVICE, bytes(&input)).unwrap();
+        let groups = columns / group_size;
+        let prepare = |output_rows: usize, seed: usize, scale_dtype: u32| {
+            let packed = (0..output_rows * columns).map(|index| (121 + (index * 29 + index / 7 + seed) % 15) as u8).collect::<Vec<_>>();
+            let scales = (0..output_rows * groups)
+                .map(|index| {
+                    let value = (1 + (index + seed) % 7) as f32 / 256.0;
+                    if scale_dtype == 0 { bf16::from_f32(value).to_bits() } else { f16::from_f32(value).to_bits() }
+                })
+                .collect::<Vec<_>>();
+            (DeviceBuffer::upload(DEVICE, &packed).unwrap(), DeviceBuffer::upload(DEVICE, bytes(&scales)).unwrap())
+        };
+        let (first_packed, first_scales) = prepare(first_output_rows, 3, first_scale_dtype);
+        let (second_packed, second_scales) = prepare(second_output_rows, 11, second_scale_dtype);
+        let rowwise = |packed: &DeviceBuffer, scales: &DeviceBuffer, scale_dtype: u32, output_rows: usize| {
+            let mut output = Vec::with_capacity(ROWS * output_rows);
+            for row in 0..ROWS {
+                let row_input = DeviceBuffer::upload(DEVICE, bytes(&input[row * columns..(row + 1) * columns])).unwrap();
+                output.extend(try_ct_quantized_matmul_bf16(DEVICE, 8, &[], Some(&row_input), packed, scales, scale_dtype, group_size, 1, columns, output_rows).unwrap().download_f32(output_rows).unwrap());
+            }
+            output
+        };
+        let expected = [rowwise(&first_packed, &first_scales, first_scale_dtype, first_output_rows), rowwise(&second_packed, &second_scales, second_scale_dtype, second_output_rows)];
+        let rows = [
+            try_ct_quantized_matmul_bf16(DEVICE, 8, &[], Some(&d_input), &first_packed, &first_scales, first_scale_dtype, group_size, ROWS, columns, first_output_rows).unwrap().download_f32(ROWS * first_output_rows).unwrap(),
+            try_ct_quantized_matmul_bf16(DEVICE, 8, &[], Some(&d_input), &second_packed, &second_scales, second_scale_dtype, group_size, ROWS, columns, second_output_rows).unwrap().download_f32(ROWS * second_output_rows).unwrap(),
+        ];
+        let (first, second) = try_ct_dual_gemv_bf16(
+            DEVICE,
+            8,
+            &[],
+            Some(&d_input),
+            columns,
+            ROWS,
+            &first_packed,
+            &first_scales,
+            first_scale_dtype,
+            group_size,
+            first_output_rows,
+            &second_packed,
+            &second_scales,
+            second_scale_dtype,
+            group_size,
+            second_output_rows,
+        )
+        .unwrap();
+        let dual = [first.download_f32(ROWS * first_output_rows).unwrap(), second.download_f32(ROWS * second_output_rows).unwrap()];
+        let output_rows = [first_output_rows, second_output_rows];
+        let scale_dtypes = [first_scale_dtype, second_scale_dtype];
+        for projection in 0..2 {
+            assert_eq!(rows[projection].len(), expected[projection].len());
+            assert_eq!(dual[projection].len(), expected[projection].len());
+            for index in 0..expected[projection].len() {
+                assert_eq!(
+                    rows[projection][index].to_bits(),
+                    expected[projection][index].to_bits(),
+                    "rows projection={projection} row={} output_row={} columns={columns} output_rows={} scale_dtype={}",
+                    index / output_rows[projection],
+                    index % output_rows[projection],
+                    output_rows[projection],
+                    scale_dtypes[projection],
+                );
+                assert_eq!(
+                    dual[projection][index].to_bits(),
+                    expected[projection][index].to_bits(),
+                    "dual projection={projection} row={} output_row={} columns={columns} output_rows={} scale_dtype={}",
+                    index / output_rows[projection],
+                    index % output_rows[projection],
+                    output_rows[projection],
+                    scale_dtypes[projection],
+                );
+            }
+        }
+        eprintln!("[rocm-w8-rows-real-shape] rows={ROWS} group={group_size} columns={columns} outputs=[{first_output_rows},{second_output_rows}] scale_dtypes=[{first_scale_dtype},{second_scale_dtype}] bit_exact=true");
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn rocm_w8_g32_rows2_real_shapes_are_bit_exact() {
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+        assert_w8_rows_real_shape::<2>(32, 6_144, 2_048, 576, 0, 1);
+        assert_w8_rows_real_shape::<2>(32, 6_144, 2_048, 128, 1, 0);
+        assert_w8_rows_real_shape::<2>(32, 6_144, 12_288, 12_288, 0, 1);
+        assert_w8_rows_real_shape::<2>(32, 2_048, 16_384, 4_096, 1, 0);
+        assert_w8_rows_real_shape::<2>(32, 12_288, 6_144, 257, 0, 1);
+        assert_w8_rows_real_shape::<2>(32, 16_384, 6_144, 257, 1, 0);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn rocm_w8_rows2468_attention_shapes_are_bit_exact() {
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+        assert_w8_rows_real_shape::<4>(32, 6_144, 2_048, 576, 0, 1);
+        assert_w8_rows_real_shape::<6>(32, 6_144, 2_048, 576, 0, 1);
+        assert_w8_rows_real_shape::<6>(32, 6_144, 2_048, 128, 1, 0);
+        assert_w8_rows_real_shape::<6>(32, 6_144, 12_288, 12_288, 0, 1);
+        assert_w8_rows_real_shape::<6>(32, 2_048, 16_384, 4_096, 1, 0);
+        assert_w8_rows_real_shape::<6>(32, 12_288, 6_144, 257, 0, 1);
+        assert_w8_rows_real_shape::<6>(32, 16_384, 6_144, 257, 1, 0);
+        assert_w8_rows_real_shape::<8>(32, 6_144, 2_048, 576, 0, 1);
+        assert_w8_rows_real_shape::<4>(128, 2_048, 16_384, 4_096, 1, 0);
+        assert_w8_rows_real_shape::<6>(128, 6_144, 2_048, 576, 0, 1);
+        assert_w8_rows_real_shape::<6>(128, 2_048, 16_384, 4_096, 1, 0);
+        assert_w8_rows_real_shape::<8>(128, 2_048, 16_384, 4_096, 1, 0);
     }
 
     /// W8 G32 GEMV 全形状微基准：attention 投影各真实形状的带宽利用率。

@@ -44,6 +44,10 @@ pub struct RocmOptions {
     pub(crate) mla_decode_target_blocks: usize,
     /// cooperative decode 用序列拆分（两卡全头各扫半段序列 + LSE 合并）替代半头拆分。
     pub(crate) cooperative_mla_sequence_split: bool,
+    /// decode 两卡各自产生完整 attention hidden，并把副本交给双 router/MoE。
+    pub(crate) cooperative_mla_decode_replicated: bool,
+    /// prefill 按 query 行分工，每卡只为自己负责的 token 行执行完整 o_proj。
+    pub(crate) cooperative_mla_prefill_row_output: bool,
     /// owner 汇合两侧 sequence shard 后直接生成完整 attention 输出，跳过
     /// peer full-hidden partial 的第二次 P2P 与归约。
     pub(crate) cooperative_mla_decode_full_merge: bool,
@@ -109,6 +113,8 @@ impl Default for RocmOptions {
             mla_decode_wmma: true,
             mla_decode_target_blocks: 608,
             cooperative_mla_sequence_split: false,
+            cooperative_mla_decode_replicated: false,
+            cooperative_mla_prefill_row_output: false,
             cooperative_mla_decode_full_merge: false,
             sparse_prefill_heads4: false,
             mla_prefill_target_blocks: 8192,
@@ -150,6 +156,8 @@ impl RocmOptions {
         mla_decode_split_threshold: usize,
         mla_decode_wmma: bool,
         cooperative_mla_sequence_split: bool,
+        cooperative_mla_decode_replicated: bool,
+        cooperative_mla_prefill_row_output: bool,
         cooperative_mla_decode_full_merge: bool,
         dsa_hadamard_i8: bool,
         dsa_hadamard_shadow_samples: usize,
@@ -176,6 +184,8 @@ impl RocmOptions {
             mla_decode_wmma,
             mla_decode_tile_size,
             cooperative_mla_sequence_split,
+            cooperative_mla_decode_replicated,
+            cooperative_mla_prefill_row_output,
             cooperative_mla_decode_full_merge,
             dsa_hadamard_i8,
             // shadow 会同步下载整行 exact/coarse score，只允许显式 profile 使用。

@@ -114,12 +114,26 @@ impl Glm52DsparkBackend for RocmContext {
 }
 
 pub fn attach_dspark_projections(states: &mut [Glm52StageState<RocmContext>], root: &Path, verifier_layer_count: usize, quantization: ResidentWeightQuantization) -> Result<(), BackendError> {
+    attach_dspark_projections_reusing(states, &[], root, verifier_layer_count, quantization)
+}
+
+pub fn attach_dspark_projections_reusing(
+    states: &mut [Glm52StageState<RocmContext>],
+    reference: &[Glm52StageState<RocmContext>],
+    root: &Path,
+    verifier_layer_count: usize,
+    quantization: ResidentWeightQuantization,
+) -> Result<(), BackendError> {
     let checkpoint = Glm52DsparkCheckpoint::open(root).map_err(compute)?;
     let plan = checkpoint.config.capture_plan(verifier_layer_count).map_err(compute)?;
     for (index, &boundary) in plan.boundaries().iter().enumerate() {
         let Some(state) = states.iter_mut().find(|state| boundary > state.layer_start && boundary <= state.layer_start + state.layers.len()) else {
             continue;
         };
+        if let Some(projector) = reference.iter().find(|candidate| candidate.backend.device_id() == state.backend.device_id()).and_then(|candidate| candidate.hidden_projectors.iter().find(|projector| projector.boundary() == boundary)) {
+            state.hidden_projectors.push(projector.clone());
+            continue;
+        }
         let weight = prepare_dspark_matrix(&state.backend, checkpoint.aux_projection(index).map_err(compute)?, quantization)?;
         state.hidden_projectors.push(Arc::new(RocmDsparkProjection { boundary, weight }));
     }

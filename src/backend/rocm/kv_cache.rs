@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::backend::cpu::CpuKvCache;
 use crate::backend::{BackendError, compute_error};
@@ -59,6 +59,13 @@ fn parity_segments(start: usize, rows: usize, parity: usize) -> Vec<(usize, usiz
     segments
 }
 
+fn mla_q8_row_bytes(latent_cols: usize, rope_cols: usize, group_size: usize) -> Option<(usize, usize, usize)> {
+    if group_size == 0 || !latent_cols.is_multiple_of(group_size) {
+        return None;
+    }
+    Some((latent_cols, (latent_cols / group_size).checked_mul(2)?, rope_cols.checked_mul(2)?))
+}
+
 fn split_pair_bytes<'a>(bytes: &'a [u8], owner_rows: usize, peer_rows: usize, row_bytes: usize, label: &str) -> Result<(&'a [u8], &'a [u8]), BackendError> {
     let boundary = owner_rows.checked_mul(row_bytes).ok_or_else(|| compute_error(format!("pair restore {label} boundary 溢出")))?;
     let expected = owner_rows.checked_add(peer_rows).and_then(|rows| rows.checked_mul(row_bytes)).ok_or_else(|| compute_error(format!("pair restore {label} 大小溢出")))?;
@@ -90,6 +97,38 @@ fn truncate_pair_record(record: &mut MlaLayerSerde, rows: usize) -> Result<(), B
     Ok(())
 }
 
+/// cooperative snapshot 按 parity0、parity1 连续保存。operator pair 两卡都
+/// 需要完整逻辑顺序，因此恢复时按 64-token block 重新交织。
+fn join_pair_bytes(bytes: &[u8], rows: usize, row_bytes: usize, label: &str) -> Result<Vec<u8>, BackendError> {
+    let owner_rows = parity_rows(rows, 0);
+    let peer_rows = parity_rows(rows, 1);
+    let (owner, peer) = split_pair_bytes(bytes, owner_rows, peer_rows, row_bytes, label)?;
+    let output_bytes = rows.checked_mul(row_bytes).ok_or_else(|| compute_error(format!("pair join {label} 大小溢出")))?;
+    let mut output = vec![0_u8; output_bytes];
+    for logical in 0..rows {
+        let parity = (logical / ROCM_KV_BLOCK_SIZE) & 1;
+        let source = if parity == 0 { owner } else { peer };
+        let source_offset = parity_row(logical) * row_bytes;
+        let target_offset = logical * row_bytes;
+        output[target_offset..target_offset + row_bytes].copy_from_slice(&source[source_offset..source_offset + row_bytes]);
+    }
+    Ok(output)
+}
+
+fn join_pair_record(mut record: MlaLayerSerde, layer: usize) -> Result<MlaLayerSerde, BackendError> {
+    if record.ownership != RocmKvOwnership::InterleavedPair {
+        return Err(compute_error(format!("L{layer} pair join ownership={:?} 非法", record.ownership)));
+    }
+    let latent_row_bytes = record.latent_cols * if record.latent_group_size == 0 { 2 } else { 1 };
+    let scale_row_bytes = if record.latent_group_size == 0 { 0 } else { record.latent_cols / record.latent_group_size * 2 };
+    let rope_row_bytes = record.rope_cols * 2;
+    record.latent = join_pair_bytes(&record.latent, record.rows, latent_row_bytes, &format!("L{layer} latent"))?;
+    record.latent_scales = record.latent_scales.as_deref().map(|bytes| join_pair_bytes(bytes, record.rows, scale_row_bytes, &format!("L{layer} scales"))).transpose()?;
+    record.rope = join_pair_bytes(&record.rope, record.rows, rope_row_bytes, &format!("L{layer} rope"))?;
+    record.ownership = RocmKvOwnership::Full;
+    Ok(record)
+}
+
 pub(super) struct RocmPagedMlaLayer {
     pub(super) latent: Arc<ops::hip::DeviceBuffer>,
     pub(super) latent_scales: Option<Arc<ops::hip::DeviceBuffer>>,
@@ -118,6 +157,9 @@ pub struct RocmKvCache {
     /// parity 的 compact block，`RocmPagedMlaLayer::rows` 仍是全局逻辑长度。
     pub(super) ownership: RocmKvOwnership,
     cooperative_peer: Option<RocmCooperativeKvPeer>,
+    /// operator pair 保留两张卡各自完整的 KV history；peer worker 只在提交
+    /// 期间短暂持锁，GPU 完成关系仍由 stream/event 表达。
+    operator_peer: Option<RocmOperatorKvPeer>,
     /// SSD restore 的 pair 记录先留在 host；首次拿到 peer context 时直接分别
     /// 上传 parity0/1，避免先在 owner 重建全量再拆分造成峰值 OOM。
     pending_pair_layers: Vec<Option<MlaLayerSerde>>,
@@ -125,11 +167,19 @@ pub struct RocmKvCache {
     /// IndexShare 层复用最近一次 full-indexer 的 selection；peer 镜像也只需
     /// 传一次，不能在随后三层重复搬同一份 16MiB 索引。
     cooperative_selection: Option<RocmCooperativeSelection>,
+    /// operator pair 不拆 selection，只缓存一份 peer 全量镜像；同一个
+    /// IndexShare Arc 在后继层直接复用。
+    operator_selection: Option<RocmOperatorSelection>,
 }
 
 struct RocmCooperativeKvPeer {
     device_id: i32,
     cache: Box<RocmKvCache>,
+}
+
+struct RocmOperatorKvPeer {
+    device_id: i32,
+    cache: Arc<Mutex<RocmKvCache>>,
 }
 
 struct RocmCooperativeSelection {
@@ -140,6 +190,12 @@ struct RocmCooperativeSelection {
     pub(super) peer: Arc<ops::hip::DeviceBuffer>,
     pub(super) peer_counts: Arc<ops::hip::DeviceBuffer>,
     pub(super) width: usize,
+}
+
+struct RocmOperatorSelection {
+    peer_device: i32,
+    source: Arc<ops::hip::DeviceBuffer>,
+    peer: Arc<ops::hip::DeviceBuffer>,
 }
 
 pub(super) struct RocmGqaLayer {
@@ -165,9 +221,11 @@ impl RocmKvCache {
             cooperative_staging_table: RocmBlockTable::new(),
             ownership: RocmKvOwnership::Full,
             cooperative_peer: None,
+            operator_peer: None,
             pending_pair_layers: (0..layer_count).map(|_| None).collect(),
             pending_pair_reserved_rows: 0,
             cooperative_selection: None,
+            operator_selection: None,
         }
     }
 
@@ -254,6 +312,9 @@ impl RocmKvCache {
         if let Some(peer) = self.cooperative_peer.as_mut() {
             peer.cache.truncate_replica_rows(rows)?;
         }
+        if let Some(peer) = self.operator_peer.as_ref() {
+            peer.cache.lock().map_err(|_| compute_error("ROCm operator peer KV 锁中毒"))?.truncate_replica_rows(rows)?;
+        }
         Ok(())
     }
 
@@ -288,6 +349,9 @@ impl RocmKvCache {
         }
         if let Some(peer) = self.cooperative_peer.as_mut() {
             peer.cache.truncate_replica_layer_rows(layer, rows)?;
+        }
+        if let Some(peer) = self.operator_peer.as_ref() {
+            peer.cache.lock().map_err(|_| compute_error("ROCm operator peer KV 锁中毒"))?.truncate_replica_layer_rows(layer, rows)?;
         }
         Ok(())
     }
@@ -611,6 +675,18 @@ impl RocmKvCache {
         Ok(())
     }
 
+    pub(super) fn cached_operator_selection(&self, peer_device: i32, source: &Arc<ops::hip::DeviceBuffer>) -> Option<Arc<ops::hip::DeviceBuffer>> {
+        self.operator_selection.as_ref().filter(|selection| selection.peer_device == peer_device && Arc::ptr_eq(&selection.source, source)).map(|selection| selection.peer.clone())
+    }
+
+    pub(super) fn cache_operator_selection(&mut self, peer_device: i32, source: Arc<ops::hip::DeviceBuffer>, peer: Arc<ops::hip::DeviceBuffer>) -> Result<(), BackendError> {
+        if source.device_id() == peer_device || peer.device_id() != peer_device || source.bytes() != peer.bytes() {
+            return Err(compute_error(format!("ROCm operator selection 镜像非法: source_device={} peer_device={} target={peer_device} source_bytes={} peer_bytes={}", source.device_id(), peer.device_id(), source.bytes(), peer.bytes(),)));
+        }
+        self.operator_selection = Some(RocmOperatorSelection { peer_device, source, peer });
+        Ok(())
+    }
+
     fn ensure_cooperative_peer(&mut self, owner: &RocmContext, peer: &RocmContext) -> Result<(), BackendError> {
         if let Some(existing) = self.cooperative_peer.as_ref() {
             return if existing.device_id == peer.device_id { Ok(()) } else { Err(compute_error(format!("ROCm cooperative peer KV 已绑定 device={}，不能改为 {}", existing.device_id, peer.device_id))) };
@@ -674,6 +750,249 @@ impl RocmKvCache {
         Ok(())
     }
 
+    pub(super) fn ensure_operator_peer(&mut self, owner: &RocmContext, peer: &RocmContext) -> Result<Arc<Mutex<RocmKvCache>>, BackendError> {
+        if self.cooperative_peer.is_some() {
+            return Err(compute_error("ROCm operator KV 不能与 cooperative parity KV 共存"));
+        }
+        if owner.device_id == peer.device_id {
+            return Err(compute_error("ROCm operator KV owner/peer 不能是同一设备"));
+        }
+        if let Some(existing) = self.operator_peer.as_ref() {
+            return if existing.device_id == peer.device_id { Ok(existing.cache.clone()) } else { Err(compute_error(format!("ROCm operator peer KV 已绑定 device={}，不能改为 {}", existing.device_id, peer.device_id))) };
+        }
+        if self.ownership != RocmKvOwnership::Full {
+            return Err(compute_error(format!("ROCm operator KV owner ownership={:?} 非法", self.ownership)));
+        }
+        let owner_stream = ops::hip::active_compute_stream() as usize;
+        let mut peer_cache = Self::with_capacity(self.paged_layers.len(), self.capacity);
+        peer_cache.prepare_block_table(peer)?;
+
+        // 普通 Full snapshot 已经在 owner 恢复时，直接异步 P2P 有效前缀；目标
+        // 仍按 committed 容量分配。复制排在 peer default stream，随后 peer
+        // attention 同流消费，不引入 host synchronize。
+        for (layer, cached) in self.paged_layers.iter().enumerate().filter_map(|(layer, slot)| slot.as_ref().map(|cached| (layer, cached))) {
+            if cached.latent.device_id() != owner.device_id || cached.rope.device_id() != owner.device_id || cached.rows > cached.committed_rows || cached.cpu_hot.is_some() {
+                return Err(compute_error(format!(
+                    "L{layer} operator KV owner cache 非法: device={}/{} rows={}/{} cpu_hot={}",
+                    cached.latent.device_id(),
+                    cached.rope.device_id(),
+                    cached.rows,
+                    cached.committed_rows,
+                    cached.cpu_hot.is_some(),
+                )));
+            }
+            let latent_row_bytes = cached.latent_cols * if cached.latent_group_size == 0 { 2 } else { 1 };
+            let scale_row_bytes = if cached.latent_group_size == 0 { 0 } else { cached.latent_cols / cached.latent_group_size * 2 };
+            let rope_row_bytes = cached.rope_cols * 2;
+            let copy = |source: &Arc<ops::hip::DeviceBuffer>, used_bytes: usize| -> Result<Arc<ops::hip::DeviceBuffer>, BackendError> {
+                if used_bytes == 0 || used_bytes > source.bytes() {
+                    return Err(compute_error(format!("L{layer} operator KV copy bytes={used_bytes}/{} 非法", source.bytes())));
+                }
+                let destination = Arc::new(ops::hip::DeviceBuffer::allocate_cache(peer.device_id, source.bytes()).map_err(compute_error)?);
+                let source = Arc::new(ops::hip::DeviceBuffer::view(source.clone(), 0, used_bytes).map_err(compute_error)?);
+                ops::hip::DeviceBuffer::copy_stable_group_into_device_ordered_async_retained_by(&[source], &[(&destination, 0)], peer.device_id, owner.device_id).map_err(compute_error)?;
+                Ok(destination)
+            };
+            let latent = copy(&cached.latent, cached.rows * latent_row_bytes)?;
+            let latent_scales = cached.latent_scales.as_ref().map(|scales| copy(scales, cached.rows * scale_row_bytes)).transpose()?;
+            let rope = copy(&cached.rope, cached.rows * rope_row_bytes)?;
+            let peer_cpu_mirror = cached
+                .cpu_mirror
+                .as_ref()
+                .map(|mirror| {
+                    let mut mirror = mirror.lock().map_err(|_| compute_error(format!("L{layer} operator owner CPU mirror 锁中毒")))?;
+                    mirror.finish_pending()?;
+                    if mirror.mirror.rows != cached.rows {
+                        return Err(compute_error(format!("L{layer} operator owner CPU mirror rows={}，cache rows={}", mirror.mirror.rows, cached.rows)));
+                    }
+                    Ok(std::sync::Mutex::new(RocmMlaCpuMirror::from_record(mirror.mirror.clone())))
+                })
+                .transpose()?;
+            peer_cache.paged_layers[layer] = Some(RocmPagedMlaLayer {
+                latent,
+                latent_scales,
+                latent_group_size: cached.latent_group_size,
+                rope,
+                rows: cached.rows,
+                latent_cols: cached.latent_cols,
+                rope_cols: cached.rope_cols,
+                committed_rows: cached.committed_rows,
+                cpu_mirror: peer_cpu_mirror,
+                cpu_hot: None,
+            });
+        }
+
+        // 旧 cooperative snapshot 尚未上传时，先在 host 恢复完整逻辑顺序，
+        // 再分别上传两张卡。这样 session 格式不因执行形态切换而失效。
+        let mut owner_restored = Vec::new();
+        let reserved_rows = self.pending_pair_reserved_rows;
+        for layer in 0..self.pending_pair_layers.len() {
+            let Some(record) = self.pending_pair_layers[layer].as_ref().cloned() else { continue };
+            if self.paged_layers[layer].is_some() || peer_cache.paged_layers[layer].is_some() {
+                return Err(compute_error(format!("L{layer} operator KV 同时存在 device 与 pending snapshot")));
+            }
+            let record = join_pair_record(record, layer)?;
+            let committed_rows = reserved_rows.max(record.rows);
+            let latent_element_bytes = if record.latent_group_size == 0 { 2 } else { 1 };
+            let latent_capacity = committed_rows * record.latent_cols * latent_element_bytes;
+            let scale_capacity = if record.latent_group_size == 0 { 0 } else { committed_rows * (record.latent_cols / record.latent_group_size) * 2 };
+            let rope_capacity = committed_rows * record.rope_cols * 2;
+            let restore = |context: &RocmContext, mirror: bool| -> Result<RocmPagedMlaLayer, BackendError> {
+                context.activate().map_err(compute_error)?;
+                Ok(RocmPagedMlaLayer {
+                    latent: upload_cache_buffer(context.device_id, &record.latent, latent_capacity)?,
+                    latent_scales: record.latent_scales.as_deref().map(|bytes| upload_cache_buffer(context.device_id, bytes, scale_capacity)).transpose()?,
+                    latent_group_size: record.latent_group_size,
+                    rope: upload_cache_buffer(context.device_id, &record.rope, rope_capacity)?,
+                    rows: record.rows,
+                    latent_cols: record.latent_cols,
+                    rope_cols: record.rope_cols,
+                    committed_rows,
+                    cpu_mirror: mirror.then(|| std::sync::Mutex::new(RocmMlaCpuMirror::from_record(record.clone()))),
+                    cpu_hot: None,
+                })
+            };
+            let mirror = (ops::hip::options().mla_cpu_hot_rows != 0 || ops::hip::options().prefill_attention_cpu) && record.latent_group_size != 0;
+            owner_restored.push((layer, restore(owner, mirror)?));
+            peer_cache.paged_layers[layer] = Some(restore(peer, mirror)?);
+        }
+        for (layer, restored) in owner_restored {
+            self.paged_layers[layer] = Some(restored);
+            self.pending_pair_layers[layer] = None;
+        }
+        ops::hip::activate_compute_stream(owner.device_id, owner_stream).map_err(compute_error)?;
+        let cache = Arc::new(Mutex::new(peer_cache));
+        self.operator_peer = Some(RocmOperatorKvPeer { device_id: peer.device_id, cache: cache.clone() });
+        Ok(cache)
+    }
+
+    /// operator pair 的默认 Q8 cache 由 owner 量化一次，再把新增长度的压缩
+    /// 记录直接写进 peer 最终 cache。BF16 / CPU hot / CPU mirror 仍走两卡各自
+    /// append 的兼容路径，避免改变这些诊断形态的双写语义。
+    pub(super) fn operator_packed_kv_replication_enabled(&self, layer: usize) -> bool {
+        !ops::hip::options().kv_f16
+            && ops::hip::options().mla_cpu_hot_rows == 0
+            && !ops::hip::options().prefill_attention_cpu
+            && !mla_cpu_mirror_enabled()
+            && self.ownership == RocmKvOwnership::Full
+            && self.operator_peer.is_some()
+            && self.paged_layers.get(layer).is_some_and(|slot| slot.as_ref().is_none_or(|cached| cached.cpu_hot.is_none() && cached.cpu_mirror.is_none()))
+    }
+
+    /// `append_mla` 已经在 owner stream 排入量化后调用。identity block table
+    /// 使逻辑行与物理行同址，因此只需把三段压缩字节复制到 peer 的同一 offset。
+    /// 返回的来源由 peer stage completion 保活，不能只依赖 owner completion。
+    pub(super) fn replicate_operator_mla_append(&mut self, owner: &RocmContext, peer: &RocmContext, layer: usize, position: usize, rows: usize) -> Result<Vec<Arc<ops::hip::DeviceBuffer>>, BackendError> {
+        if !self.operator_packed_kv_replication_enabled(layer) || rows == 0 {
+            return Err(compute_error(format!("L{layer} operator packed KV replica 当前配置不支持")));
+        }
+        let end = position.checked_add(rows).ok_or_else(|| compute_error(format!("L{layer} operator packed KV rows 溢出")))?;
+        let peer_state = self.operator_peer.as_ref().ok_or_else(|| compute_error("ROCm operator peer KV 尚未创建"))?;
+        if peer_state.device_id != peer.device_id || owner.device_id == peer.device_id {
+            return Err(compute_error(format!("L{layer} operator packed KV device={}/{} 非法", owner.device_id, peer.device_id)));
+        }
+        let peer_cache = peer_state.cache.clone();
+        let owner_layer = self.paged_layers.get(layer).and_then(Option::as_ref).ok_or_else(|| compute_error(format!("L{layer} operator owner KV 尚未初始化")))?;
+        if owner_layer.rows != end || owner_layer.latent_group_size != crate::kv_cache::DEFAULT_GROUP_SIZE || owner_layer.latent_scales.is_none() || owner_layer.cpu_hot.is_some() || owner_layer.cpu_mirror.is_some() {
+            return Err(compute_error(format!(
+                "L{layer} operator owner packed KV 非法: rows={}/{} group={} scales={} cpu_hot={} cpu_mirror={}",
+                owner_layer.rows,
+                end,
+                owner_layer.latent_group_size,
+                owner_layer.latent_scales.is_some(),
+                owner_layer.cpu_hot.is_some(),
+                owner_layer.cpu_mirror.is_some(),
+            )));
+        }
+        let latent_cols = owner_layer.latent_cols;
+        let rope_cols = owner_layer.rope_cols;
+        let group_size = owner_layer.latent_group_size;
+        let committed_rows = owner_layer.committed_rows;
+        let (latent_row_bytes, scale_row_bytes, rope_row_bytes) = mla_q8_row_bytes(latent_cols, rope_cols, group_size).ok_or_else(|| compute_error(format!("L{layer} operator packed KV row layout 非法")))?;
+        let owner_latent = owner_layer.latent.clone();
+        let owner_scales = owner_layer.latent_scales.as_ref().expect("上面已校验 Q8 scales").clone();
+        let owner_rope = owner_layer.rope.clone();
+
+        let owner_stream = ops::hip::active_compute_stream() as usize;
+        let peer_buffers = (|| {
+            peer.activate().map_err(compute_error)?;
+            let mut cache = peer_cache.lock().map_err(|_| compute_error(format!("L{layer} operator peer KV 锁中毒")))?;
+            if cache.ownership != RocmKvOwnership::Full || cache.capacity != self.capacity {
+                return Err(compute_error(format!("L{layer} operator peer KV ownership/capacity 非法")));
+            }
+            let slot = cache.paged_layers.get_mut(layer).ok_or(BackendError::UnsupportedLayer { layer })?;
+            if slot.is_none() {
+                let latent_bytes = committed_rows.checked_mul(latent_row_bytes).ok_or_else(|| compute_error(format!("L{layer} operator peer latent 大小溢出")))?;
+                let scale_bytes = committed_rows.checked_mul(scale_row_bytes).ok_or_else(|| compute_error(format!("L{layer} operator peer scales 大小溢出")))?;
+                let rope_bytes = committed_rows.checked_mul(rope_row_bytes).ok_or_else(|| compute_error(format!("L{layer} operator peer rope 大小溢出")))?;
+                *slot = Some(RocmPagedMlaLayer {
+                    latent: Arc::new(ops::hip::DeviceBuffer::allocate(peer.device_id, latent_bytes).map_err(compute_error)?),
+                    latent_scales: Some(Arc::new(ops::hip::DeviceBuffer::allocate(peer.device_id, scale_bytes).map_err(compute_error)?)),
+                    latent_group_size: group_size,
+                    rope: Arc::new(ops::hip::DeviceBuffer::allocate(peer.device_id, rope_bytes).map_err(compute_error)?),
+                    rows: 0,
+                    latent_cols,
+                    rope_cols,
+                    committed_rows,
+                    cpu_mirror: None,
+                    cpu_hot: None,
+                });
+            }
+            let cached = slot.as_mut().expect("刚创建 operator peer KV layer");
+            if cached.rows != position
+                || cached.latent_cols != latent_cols
+                || cached.rope_cols != rope_cols
+                || cached.latent_group_size != group_size
+                || cached.latent_scales.is_none()
+                || cached.cpu_hot.is_some()
+                || cached.cpu_mirror.is_some()
+            {
+                return Err(compute_error(format!(
+                    "L{layer} operator peer packed KV 非法: rows={}/{} latent={}/{} rope={}/{} group={}/{} scales={} cpu_hot={} cpu_mirror={}",
+                    cached.rows,
+                    position,
+                    cached.latent_cols,
+                    latent_cols,
+                    cached.rope_cols,
+                    rope_cols,
+                    cached.latent_group_size,
+                    group_size,
+                    cached.latent_scales.is_some(),
+                    cached.cpu_hot.is_some(),
+                    cached.cpu_mirror.is_some(),
+                )));
+            }
+            if committed_rows > cached.committed_rows {
+                cached.latent = grow_cache_buffer(peer.device_id, &cached.latent, position * latent_row_bytes, committed_rows * latent_row_bytes)?;
+                cached.latent_scales = Some(grow_cache_buffer(peer.device_id, cached.latent_scales.as_ref().expect("Q8 peer cache 必有 scales"), position * scale_row_bytes, committed_rows * scale_row_bytes)?);
+                cached.rope = grow_cache_buffer(peer.device_id, &cached.rope, position * rope_row_bytes, committed_rows * rope_row_bytes)?;
+                cached.committed_rows = committed_rows;
+            }
+            if end > cached.committed_rows {
+                return Err(compute_error(format!("L{layer} operator peer packed KV end={end} 超过 committed={}", cached.committed_rows)));
+            }
+            Ok((cached.latent.clone(), cached.latent_scales.as_ref().expect("Q8 peer cache 必有 scales").clone(), cached.rope.clone()))
+        })();
+        ops::hip::activate_compute_stream(owner.device_id, owner_stream).map_err(compute_error)?;
+        let (peer_latent, peer_scales, peer_rope) = peer_buffers?;
+
+        let stable_range = |source: Arc<ops::hip::DeviceBuffer>, row_bytes: usize, name: &str| -> Result<Arc<ops::hip::DeviceBuffer>, BackendError> {
+            let offset = position.checked_mul(row_bytes).ok_or_else(|| compute_error(format!("L{layer} operator {name} offset 溢出")))?;
+            let bytes = rows.checked_mul(row_bytes).ok_or_else(|| compute_error(format!("L{layer} operator {name} bytes 溢出")))?;
+            let view = Arc::new(ops::hip::DeviceBuffer::view(source, offset, bytes).map_err(compute_error)?);
+            if view.is_async_allocated() { view.copy_to_stable_deferred().map(Arc::new).map_err(compute_error) } else { Ok(view) }
+        };
+        let sources = vec![stable_range(owner_latent, latent_row_bytes, "latent")?, stable_range(owner_scales, scale_row_bytes, "scales")?, stable_range(owner_rope, rope_row_bytes, "rope")?];
+        let targets = [(peer_latent.as_ref(), position * latent_row_bytes), (peer_scales.as_ref(), position * scale_row_bytes), (peer_rope.as_ref(), position * rope_row_bytes)];
+        ops::hip::DeviceBuffer::copy_stable_group_into_device_ordered_async_retained_by(&sources, &targets, peer.device_id, owner.device_id).map_err(|error| compute_error(format!("L{layer} operator packed KV owner->peer: {error}")))?;
+        {
+            let mut cache = peer_cache.lock().map_err(|_| compute_error(format!("L{layer} operator peer KV 锁中毒")))?;
+            cache.paged_layers[layer].as_mut().expect("operator peer KV layer 已创建").rows = end;
+        }
+        ops::hip::activate_compute_stream(owner.device_id, owner_stream).map_err(compute_error)?;
+        Ok(sources)
+    }
+
     fn truncate_replica_rows(&mut self, rows: usize) -> Result<(), BackendError> {
         for layer in 0..self.paged_layers.len() {
             self.truncate_replica_layer_rows(layer, rows)?;
@@ -721,6 +1040,55 @@ impl RocmKvCache {
         Ok(())
     }
 
+    pub(super) fn prefetch_selected_layers(&mut self, context: &RocmContext, layers: std::ops::Range<usize>, selection: &[u32], position: usize, rows: usize) -> Result<(), BackendError> {
+        let hot_rows = ops::hip::options().mla_cpu_hot_rows;
+        if hot_rows == 0 || rows != 1 || self.ownership != RocmKvOwnership::Full {
+            return Ok(());
+        }
+        if selection.is_empty() || selection.len().saturating_add(rows) > hot_rows {
+            return Ok(());
+        }
+        ops::hip::set_device(context.device_id).map_err(compute_error)?;
+        let main_stream = ops::hip::active_compute_stream() as usize;
+        let mut planned = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let Some(cached) = self.paged_layers.get(layer).and_then(Option::as_ref) else { continue };
+            if cached.rows != position || cached.rows <= hot_rows || cached.latent_group_size == 0 {
+                continue;
+            }
+            self.enable_cpu_hot_layer(context, layer, hot_rows)?;
+            let cached = self.paged_layers[layer].as_ref().expect("预取层已校验");
+            let mut hot = cached.cpu_hot.as_ref().expect("预取 hot 已创建").lock().map_err(|_| compute_error(format!("L{layer} ROCm MLA hot 预取锁中毒")))?;
+            if hot.prefetched.as_ref().is_some_and(|(start, _, _)| *start == position) {
+                continue;
+            }
+            hot.join_prefetch(context.device_id)?;
+            hot.prefetched = None;
+            // 当前 token 的 KV 尚未生成，但可以先保留它最终写入的 slot。这样
+            // 预取能一次产出完整 remapped selection，attention 不必再次映射上传。
+            if selection.contains(&(position as u32)) {
+                hot.reserve_slot(position)?;
+            }
+            let stream = ops::hip::cache_prefetch_stream(context.device_id, layer).map_err(compute_error)?;
+            planned.push((layer, stream));
+        }
+        let streams = planned.iter().map(|&(_, stream)| stream).collect::<Vec<_>>();
+        ops::hip::order_streams_after(context.device_id, main_stream, &streams).map_err(compute_error)?;
+        let prepared = (|| {
+            for (layer, stream) in planned {
+                let cached = self.paged_layers[layer].as_ref().expect("预取层已校验");
+                let mut hot = cached.cpu_hot.as_ref().expect("预取 hot 已创建").lock().map_err(|_| compute_error(format!("L{layer} ROCm MLA hot 预取锁中毒")))?;
+                ops::hip::activate_compute_stream(context.device_id, stream).map_err(compute_error)?;
+                let selection = hot.prepare_selection(context.device_id, layer, selection, &cached.latent, cached.latent_scales.as_deref().expect("Q8 hot 必有 scale"), &cached.rope)?;
+                hot.prefetched = Some((position, Some(stream), selection));
+            }
+            Ok(())
+        })();
+        let restore = ops::hip::activate_compute_stream(context.device_id, main_stream).map_err(compute_error);
+        restore?;
+        prepared
+    }
+
     fn enable_cpu_hot_layer(&mut self, context: &RocmContext, layer: usize, hot_rows: usize) -> Result<(), BackendError> {
         let cached = self.paged_layers.get_mut(layer).and_then(Option::as_mut).ok_or_else(|| compute_error(format!("L{layer} ROCm MLA hot 启用前 cache 尚未初始化")))?;
         if cached.cpu_hot.is_some() {
@@ -761,6 +1129,8 @@ impl RocmKvCache {
         let cached = self.paged_layers.get_mut(layer).and_then(Option::as_mut).ok_or(BackendError::UnsupportedLayer { layer })?;
         let hot_mutex = cached.cpu_hot.as_ref().ok_or_else(|| compute_error(format!("L{layer} ROCm MLA hot state 缺失")))?;
         let mut hot = hot_mutex.lock().map_err(|_| compute_error(format!("L{layer} ROCm MLA hot 锁中毒")))?;
+        let prefetched = hot.prefetched.as_ref().is_some_and(|(position, _, _)| *position == cached.rows);
+        hot.join_prefetch(context.device_id)?;
         hot.finish_pending()?;
         if latent.rows == 0 || latent.rows != rope.rows || hot.mirror.rows != cached.rows {
             return Err(compute_error(format!("L{layer} ROCm MLA hot append latent={} rope={} mirror={} cache={} 非法", latent.rows, rope.rows, hot.mirror.rows, cached.rows)));
@@ -777,7 +1147,9 @@ impl RocmKvCache {
         // CPU-prefill 的 staging 路径不会建立 token→slot 映射，单行走它会在
         // 下一轮 selection 缺失刚追加的 token。
         if latent.rows == 1 {
-            let slot = hot.append_slot(logical_start)?;
+            // 预取已为当前 selection 留出新行容量；保留 pin，避免 append
+            // 驱逐刚搬到 GPU 的历史行，导致 attention 再次补传。
+            let slot = if prefetched { hot.assign_slot(logical_start)? } else { hot.append_slot(logical_start)? };
             match rope_rotation {
                 Some((position, rotary_dim, layout, cos, sin)) => {
                     if position != logical_start {
@@ -1180,6 +1552,8 @@ pub(super) struct RocmMlaCpuHotLayer {
     staging_scales: Option<Arc<ops::hip::DeviceBuffer>>,
     staging_rope: Option<Arc<ops::hip::DeviceBuffer>>,
     warm_source: Option<RocmMlaHotWarm>,
+    /// append 前把预取队列接回计算流；attention 直接消费已经上传的 selection。
+    prefetched: Option<(usize, Option<usize>, ops::hip::DeviceBuffer)>,
     lookups: u64,
     hits: u64,
     samples: usize,
@@ -1213,6 +1587,7 @@ impl RocmMlaCpuHotLayer {
             staging_scales: None,
             staging_rope: None,
             warm_source,
+            prefetched: None,
             lookups: 0,
             hits: 0,
             samples: 0,
@@ -1227,6 +1602,24 @@ impl RocmMlaCpuHotLayer {
             misses_scratch: Vec::new(),
             loaded_scratch: Vec::new(),
         })
+    }
+
+    fn join_prefetch(&mut self, device_id: i32) -> Result<(), BackendError> {
+        if let Some((_, stream, _)) = &mut self.prefetched
+            && let Some(stream) = stream.take()
+        {
+            ops::hip::set_device(device_id).map_err(compute_error)?;
+            ops::hip::order_stream_after(device_id, stream, ops::hip::active_compute_stream() as usize).map_err(compute_error)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn take_prefetched_selection(&mut self, device_id: i32, position: usize) -> Result<Option<ops::hip::DeviceBuffer>, BackendError> {
+        if !self.prefetched.as_ref().is_some_and(|(start, _, _)| *start == position) {
+            return Ok(None);
+        }
+        self.join_prefetch(device_id)?;
+        Ok(self.prefetched.take().map(|(_, _, selection)| selection))
     }
 
     fn staging_buffer(slot: &mut Option<Arc<ops::hip::DeviceBuffer>>, device_id: i32, bytes: usize) -> Result<Arc<ops::hip::DeviceBuffer>, BackendError> {
@@ -1368,6 +1761,12 @@ impl RocmMlaCpuHotLayer {
         self.assign_slot(token)
     }
 
+    fn reserve_slot(&mut self, token: usize) -> Result<(), BackendError> {
+        let slot = self.assign_slot(token)?;
+        self.pin(slot);
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn prepare_selection(
         &mut self,
@@ -1378,7 +1777,6 @@ impl RocmMlaCpuHotLayer {
         scales: &ops::hip::DeviceBuffer,
         rope: &ops::hip::DeviceBuffer,
     ) -> Result<ops::hip::DeviceBuffer, BackendError> {
-        self.finish_pending()?;
         if selection.is_empty() {
             return Err(compute_error(format!("L{layer} ROCm MLA hot selection 为空")));
         }
@@ -1409,6 +1807,12 @@ impl RocmMlaCpuHotLayer {
             self.referenced[slot] = true;
             remapped[index] = slot as u32;
             hits += 1;
+        }
+        // 上一 token 已经留在 hot cache 时，预取只读 GPU 槽位，不必在这里
+        // 等待它的 CPU mirror 下载。只有它已被驱逐且本轮确实选中时才提前收尾；
+        // 常规路径把等待延后到本层 append，让 D2H 与前面的层计算重叠。
+        if misses.iter().any(|&(_, token)| token >= self.mirror.rows) {
+            self.finish_pending()?;
         }
         let mut loaded = std::mem::take(&mut self.loaded_scratch);
         loaded.clear();
@@ -1602,6 +2006,8 @@ impl RocmMlaCpuHotLayer {
     }
 
     fn truncate(&mut self, rows: usize) -> Result<(), BackendError> {
+        self.join_prefetch(self.transfer.device_id())?;
+        self.prefetched = None;
         self.finish_pending()?;
         if rows > self.mirror.rows {
             return Err(compute_error(format!("ROCm MLA CPU mirror truncate={rows} 超过 {}", self.mirror.rows)));
@@ -1699,6 +2105,8 @@ impl RocmKvCache {
     /// 调用方需先用 `with_capacity` 构造空 cache，再 `upload_layers`。
     pub fn upload_layers(&mut self, context: &RocmContext, layers: &[Option<MlaLayerSerde>], reserved_rows: usize) -> Result<(), BackendError> {
         self.cooperative_peer = None;
+        self.operator_peer = None;
+        self.operator_selection = None;
         self.ownership = RocmKvOwnership::Full;
         self.pending_pair_layers.fill(None);
         self.pending_pair_reserved_rows = reserved_rows;
@@ -1779,13 +2187,24 @@ impl RocmKvCache {
             .map(|cached| cached.latent.bytes() as u64 + cached.latent_scales.as_ref().map_or(0, |scales| scales.bytes() as u64) + cached.rope.bytes() as u64)
             .sum::<u64>()
             .saturating_add(self.gqa_layers.iter().filter_map(|slot| slot.as_ref()).map(|cached| (cached.key.bytes() + cached.value.bytes()) as u64).sum());
-        local.saturating_add(self.cooperative_peer.as_ref().map_or(0, |peer| peer.cache.allocated_bytes()))
+        let cooperative = self.cooperative_peer.as_ref().map_or(0, |peer| peer.cache.allocated_bytes());
+        let operator = self.operator_peer.as_ref().and_then(|peer| peer.cache.lock().ok()).map_or(0, |cache| cache.allocated_bytes());
+        local.saturating_add(cooperative).saturating_add(operator)
     }
 }
 
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    fn glm_mla_q8_replica_is_656_bytes_per_token_layer() {
+        let (latent, scales, rope) = mla_q8_row_bytes(512, 64, 64).unwrap();
+        assert_eq!((latent, scales, rope), (512, 16, 128));
+        assert_eq!(latent + scales + rope, 656);
+        assert_eq!(mla_q8_row_bytes(510, 64, 64), None);
+        assert_eq!(mla_q8_row_bytes(512, 64, 0), None);
+    }
 
     #[test]
     fn block_parity_mapping_never_moves_existing_rows() {
@@ -1835,5 +2254,22 @@ mod ownership_tests {
         // 70 行 = owner block0 的 64 行 + peer block1 的前 6 行。
         assert_eq!(&record.latent[126..130], &[63, 63, 128, 128]);
         assert_eq!(&record.latent[138..140], &[133, 133]);
+    }
+
+    #[test]
+    fn pair_record_join_restores_logical_row_order() {
+        let rows = 150;
+        let row_bytes = 3;
+        let mut compact = Vec::with_capacity(rows * row_bytes);
+        for parity in 0..2 {
+            for logical in (0..rows).filter(|logical| (logical / ROCM_KV_BLOCK_SIZE) & 1 == parity) {
+                compact.extend(std::iter::repeat_n(logical as u8, row_bytes));
+            }
+        }
+        let joined = join_pair_bytes(&compact, rows, row_bytes, "test").unwrap();
+        assert_eq!(joined.len(), rows * row_bytes);
+        for (logical, bytes) in joined.chunks_exact(row_bytes).enumerate() {
+            assert!(bytes.iter().all(|&byte| byte == logical as u8));
+        }
     }
 }

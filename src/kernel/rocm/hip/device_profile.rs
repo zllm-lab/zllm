@@ -184,6 +184,20 @@ pub(crate) fn device_profile_scope_begin(device_id: i32, label: &'static str) ->
     record_locked(device_id, timeline, label)
 }
 
+/// 给当前组合算子 scope 增加连续区间边界。marker 记录在设备当前 compute
+/// stream；调用方负责在跨 stream 工作结束后先建立 event 依赖，再切到下一标签。
+pub(crate) fn device_profile_scope_operator(device_id: i32, label: &'static str) -> Result<(), String> {
+    if !ENABLED.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    let mut timelines = scope_timelines().lock().map_err(|_| "ROCm device scope profile mutex 已损坏".to_owned())?;
+    let timeline = timelines.get_mut(&device_id).ok_or_else(|| format!("ROCm device={device_id} profile scope 尚未开始"))?;
+    if !timeline.detailed {
+        return Err(format!("ROCm device={device_id} profile scope 已结束"));
+    }
+    record_locked(device_id, timeline, label)
+}
+
 pub(crate) fn device_profile_scope_end(device_id: i32) -> Result<(), String> {
     let mut timelines = scope_timelines().lock().map_err(|_| "ROCm device scope profile mutex 已损坏".to_owned())?;
     let timeline = timelines.get_mut(&device_id).ok_or_else(|| format!("ROCm device={device_id} profile scope 尚未开始"))?;
