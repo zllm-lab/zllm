@@ -61,7 +61,7 @@ Qwen3.8-Flash-Next 使用独立的 `qwen4exp` 架构，支持 CUDA QSA 稀疏注
 
 | 模型与权重 | 硬件 / 后端 | Prefill | Decode | 测试说明 |
 | --- | --- | ---: | ---: | --- |
-| GLM-5.3 UD-IQ4_XS GGUF | 双机 16× AMD GPU / ROCm | 约 910–959 tok/s | **26.912 tok/s** | 50K prompt、1,024-token 输出、动态 MTP5；三轮中位数 |
+| GLM-5.3 UD-IQ4_XS GGUF | 双机 16× AMD GPU / ROCm | **1600+ tok/s** | **26.912 tok/s** | 最新 50K prefill；decode 为独立的 1,024-token 动态 MTP5 测试（三轮中位数） |
 | Qwen 3.8 27B UD-Q3_K_XL | Apple M5 24GB / Metal | 58 tokens / 1.278s | 8.33 tok/s | 短提示 fused prefill；普通 decode |
 | Qwen 3.8 27B Q4_K_M | 双路 E5-2696 v4 + RTX 3060 12GB / CPU+CUDA | — | **2.68 tok/s** | CPU 前缀层 + CUDA 后缀层；40 个 CPU decode 线程 |
 | Gemma 4 12B IQ4_NL GGUF | Apple M5 24GB / Metal | 337.4 tok/s | 14.5–15.2 tok/s | 约 5.6K token 长提示，64-token 回复 |
@@ -210,7 +210,7 @@ The following results were measured on a fanless Apple M5 with 24 GB unified mem
 
 | Model and weights | Hardware / backend | Prefill | Decode | Workload |
 | --- | --- | ---: | ---: | --- |
-| GLM-5.3 UD-IQ4_XS GGUF | Two nodes, 16× AMD GPUs / ROCm | About 910–959 tok/s | **26.912 tok/s** | 50K-token prompt, 1,024-token output, dynamic MTP5; median of three runs |
+| GLM-5.3 UD-IQ4_XS GGUF | Two nodes, 16× AMD GPUs / ROCm | **1600+ tok/s** | **26.912 tok/s** | Latest 50K prefill; decode is a separate 1,024-token dynamic-MTP5 run (three-run median) |
 | Qwen 3.8 27B UD-Q3_K_XL | Apple M5 24GB / Metal | 58 tokens / 1.278s | 8.33 tok/s | Short-prompt fused prefill; standard decode |
 | Qwen 3.8 27B Q4_K_M | Dual E5-2696 v4 + RTX 3060 12GB / CPU+CUDA | — | **2.68 tok/s** | CPU prefix layers + CUDA suffix layers; 40 CPU decode threads |
 | Gemma 4 12B IQ4_NL GGUF | Apple M5 24GB / Metal | 337.4 tok/s | 14.5–15.2 tok/s | About 5.6K prompt tokens, 64-token response |
