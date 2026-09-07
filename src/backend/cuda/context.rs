@@ -149,27 +149,41 @@ impl PinnedUploadRing {
     }
 }
 
-// 锁页注册持有原始数据所有者,直到全部 DMA 完成后解除注册。
-// 即使调用方提前释放 source,上传用的主存地址也不会失效。
-struct RegisteredHostMemory {
-    context: Arc<CudaCtx>,
-    _owner: Arc<dyn Send + Sync>,
-    ranges: Vec<(usize, usize)>,
-    data_ranges: Vec<(usize, usize)>,
+/// 驱动 pinned 主机字节(专家驻留背书);区间入 pinned_sources 后
+/// 上传可 DMA 直读,见 upload_u8_pinned 的安全论证。
+///
+/// 运维警示:进程被 SIGKILL 时 cuMemAllocHost 的 pinned 页不走应用侧
+/// Drop,驱动清理可能失败并在 nvidia 模块内泄漏(实测 ~96GB 直到重启,
+/// dmesg 伴生 NVRM NV_ERR_NO_MEMORY)。持有 pinned 驻留的进程必须
+/// 优雅退出(SIGTERM→Drop→cuMemFreeHost),回收脚本禁用 -9。
+struct CudaPinnedSourceBytes {
+    pinned: cudarc::driver::safe::PinnedHostSlice<u8>,
 }
 
-impl Drop for RegisteredHostMemory {
-    fn drop(&mut self) {
-        if let Err(error) = self.context.synchronize() {
-            eprintln!("CUDA host registration 释放前同步失败: {error:?}");
-        }
-        for &(start, _) in &self.ranges {
-            let status = unsafe { cudarc::driver::sys::cuMemHostUnregister(start as *mut std::ffi::c_void) };
-            if let Err(error) = status.result() {
-                eprintln!("CUDA host unregister 失败: address={start:#x}: {error:?}");
-            }
-        }
+impl crate::weight::container::gguf::HostBytes for CudaPinnedSourceBytes {
+    fn as_bytes(&self) -> &[u8] {
+        let ptr = self.pinned.as_ptr().expect("CUDA pinned source as_ptr");
+        unsafe { std::slice::from_raw_parts(ptr, self.pinned.len()) }
     }
+}
+
+impl crate::weight::container::gguf::HostBytesBuilder for CudaPinnedSourceBytes {
+    fn as_mut(&mut self) -> &mut [u8] {
+        let ptr = self.pinned.as_mut_ptr().expect("CUDA pinned source as_mut_ptr");
+        unsafe { std::slice::from_raw_parts_mut(ptr, self.pinned.len()) }
+    }
+    fn finish(self: Box<Self>) -> Arc<dyn crate::weight::container::gguf::HostBytes> {
+        let backing: Arc<Self> = Arc::from(self);
+        backing
+    }
+}
+
+/// 驱动 pinned 驻留源注册表:ranges 升序用于上传二分命中,owners
+/// 钉住锁页内存生命周期(与 context 同寿,不随矩阵释放)。
+#[derive(Default)]
+struct PinnedSourceRegistry {
+    ranges: Vec<(usize, usize)>,
+    owners: Vec<Arc<dyn crate::weight::container::gguf::HostBytes>>,
 }
 
 pub struct CudaContext {
@@ -181,14 +195,16 @@ pub struct CudaContext {
     row_maps: Mutex<HashMap<Vec<u32>, Arc<CudaSlice<u32>>>>,
     /// rope 表窗口缓存:键 = (源切片地址, 元素数)。rope 表由引擎长期持有,地址稳定;
     /// 同一窗口(query/key × 各层)跨层命中,避免逐层 pageable 上传的重型负载 stall。
-    /// 容量封顶:decode 逐 token 前移窗口,超过上限后退化为直接 pinned 上传。
+    /// 容量封顶:decode 逐 token 前移窗口,超过上限退化为直接 pinned 上传。
     rope_windows: Mutex<HashMap<(usize, usize), Arc<CudaSlice<f16>>>>,
     pinned_u32: Mutex<Option<cudarc::driver::safe::PinnedHostSlice<u32>>>,
     pinned_f16: Mutex<Option<cudarc::driver::safe::PinnedHostSlice<f16>>>,
     pinned_f32_src: Mutex<Option<cudarc::driver::safe::PinnedHostSlice<f32>>>,
     /// expert 流式上传的 pinned 槽环:槽复用前只等自己的 DMA 事件,不排空计算流。
     pinned_u8_ring: Mutex<PinnedUploadRing>,
-    registered_host: Mutex<Option<RegisteredHostMemory>>,
+    /// 驱动 pinned 驻留源:区间升序供上传直读命中;owners 持有背书 Arc
+    /// 保证区间对应的锁页内存与 context 同生命周期,不随矩阵提前释放。
+    pinned_sources: Mutex<PinnedSourceRegistry>,
     /// expert 流式上传专用 copy 流:分配/DMA 不进计算流 backlog,消费侧
     /// wait copy fence 事件拿跨流依赖。
     copy_stream: Arc<cudarc::driver::safe::CudaStream>,
@@ -287,7 +303,7 @@ impl CudaContext {
             pinned_f16: Mutex::new(None),
             pinned_f32_src: Mutex::new(None),
             pinned_u8_ring: Mutex::new(PinnedUploadRing::default()),
-            registered_host: Mutex::new(None),
+            pinned_sources: Mutex::new(PinnedSourceRegistry::default()),
             copy_stream,
             copy_fence: Mutex::new(None),
             copy_fence_dirty: AtomicBool::new(false),
@@ -648,10 +664,15 @@ impl CudaContext {
         Ok(())
     }
 
-    /// u8 主机数组 → 设备 buffer,经 pinned 槽环 + 事件异步中转。
-    /// 复用槽前只等待该槽上一次 DMA 的事件,计算流不被排空;pageable clone_htod
-    /// 在 PCIe3 上带宽仅 ~1/3 且有 SyncOnDrop stall,逐次 ctx.synchronize 又会
-    /// 消灭预取重叠,事件环是两者的折中。
+    /// u8 主机数组 → 设备 buffer。源命中驱动 pinned 驻留区间时 DMA 直读
+    /// (fire-and-forget);否则经 pinned 槽环 + 事件异步中转,复用槽前只
+    /// 等待该槽上一次 DMA 的事件,计算流不被排空。
+    ///
+    /// 安全边界(2026-09-07 堆损坏战役的结论):DMA 直读**驱动自有
+    /// cuMemAllocHost 内存**与槽环同类,30 请求验证干净;而直读
+    /// **cuMemHostRegister 注册的 glibc 堆**(页对齐扩展会盖住相邻堆块)
+    /// 在 host 并发 malloc/free 时被驱动侧写坏 tcache——该路径已连同
+    /// register_host_memory 一并移除,不要以任何形式复活。
     pub fn upload_u8_pinned(&self, src: &[u8], dst: &mut CudaSlice<u8>) -> Result<(), String> {
         if dst.len() < src.len() {
             return Err(format!("CUDA upload_u8_pinned dst.len={} < src.len={}", dst.len(), src.len()));
@@ -659,25 +680,19 @@ impl CudaContext {
         if src.is_empty() {
             return Ok(());
         }
-        let registered = self.registered_host.lock().map_err(|_| "CUDA registered host 锁已中毒")?;
         let start = src.as_ptr() as usize;
         let end = start.checked_add(src.len()).ok_or("CUDA upload host range 溢出")?;
-        if registered.as_ref().is_some_and(|memory| {
-            let index = memory.data_ranges.partition_point(|&(address, _)| address <= start);
-            index > 0 && end <= memory.data_ranges[index - 1].1
-        }) {
+        let sources = self.pinned_sources.lock().map_err(|_| "CUDA pinned sources 锁已中毒".to_owned())?;
+        let index = sources.ranges.partition_point(|&(address, _)| address <= start);
+        if index > 0 && end <= sources.ranges[index - 1].1 {
+            drop(sources);
             use cudarc::driver::safe::DevicePtrMut;
-            let use_copy = std::env::var_os("ZLLM_CUDA_COPY_STREAM").is_some();
-            let stream = if use_copy { &self.copy_stream } else { &self.stream };
-            let (device, _sync) = dst.device_ptr_mut(stream);
+            let (device, _sync) = dst.device_ptr_mut(&self.stream);
             self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA context 失败: {e:?}"))?;
-            unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(device, src.as_ptr().cast(), src.len(), stream.cu_stream()) }.result().map_err(|e| format!("CUDA registered host upload bytes={}: {e:?}", src.len()))?;
-            if use_copy {
-                self.record_copy_fence()?;
-            }
+            unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(device, src.as_ptr().cast(), src.len(), self.stream.cu_stream()) }.result().map_err(|e| format!("CUDA pinned source upload bytes={}: {e:?}", src.len()))?;
             return Ok(());
         }
-        drop(registered);
+        drop(sources);
         let mut ring = self.pinned_u8_ring.lock().map_err(|_| "CUDA pinned u8 ring 锁已中毒".to_owned())?;
         let (slot_index, mut slot) = ring.take_slot();
         let result = self.upload_u8_slot(&mut slot, src, dst);
@@ -685,76 +700,54 @@ impl CudaContext {
         result
     }
 
-    /// 只用于预先完成分配的专家 arena;调用者还须保证该区域的旧计算已经结束。
-    /// 每次上传立即把完成事件接到计算流,错误退出时区域释放也不会越过 DMA。
-    pub(crate) unsafe fn upload_registered_expert_overlap(&self, src: &[u8], dst: &mut CudaSlice<u8>) -> Result<(), String> {
+    /// 分配一段驱动 pinned 主机字节作为矩阵驻留背书的构建器(文件直读填充)。
+    pub fn alloc_pinned_source_bytes(&self, len: usize) -> Result<Box<dyn crate::weight::container::gguf::HostBytesBuilder>, String> {
+        if len == 0 {
+            return Err("CUDA pinned source 不支持 0 字节".to_owned());
+        }
+        let pinned = unsafe { self.ctx.alloc_pinned::<u8>(len) }.map_err(|e| format!("CUDA pinned source alloc {len}B: {e:?}"))?;
+        Ok(Box::new(CudaPinnedSourceBytes { pinned }))
+    }
+
+    /// 登记一段已完成的驱动 pinned 背书:区间入升序表供上传直读命中,
+    /// owners 持有 Arc 保证锁页内存与 context 同生命周期。驻留构建完成后
+    /// 对每个矩阵的 extern 背书调用一次。
+    pub fn retain_pinned_source(&self, source: &Arc<dyn crate::weight::container::gguf::HostBytes>) -> Result<(), String> {
+        let bytes = source.as_bytes();
+        let start = bytes.as_ptr() as usize;
+        let end = start.checked_add(bytes.len()).ok_or("CUDA pinned source 区间溢出")?;
+        let mut sources = self.pinned_sources.lock().map_err(|_| "CUDA pinned sources 锁已中毒".to_owned())?;
+        let at = sources.ranges.partition_point(|&(address, _)| address < start);
+        sources.ranges.insert(at, (start, end));
+        sources.owners.push(source.clone());
+        Ok(())
+    }
+
+    /// 分组 overlap 上传:DMA 源必须是驱动 pinned 驻留(区间命中注册表),
+    /// 走 copy 流并立即栅栏到计算流。调用者保证 arena 区域旧计算已结束
+    /// (packed_groups 整层入口同步)。
+    pub(crate) unsafe fn upload_pinned_source_overlap(&self, src: &[u8], dst: &mut CudaSlice<u8>) -> Result<(), String> {
         use cudarc::driver::safe::DevicePtrMut;
-        let registered = self.registered_host.lock().map_err(|_| "CUDA registered host 锁已中毒")?;
+        if dst.len() < src.len() {
+            return Err(format!("CUDA overlap 目标 {} < 源 {}", dst.len(), src.len()));
+        }
         let start = src.as_ptr() as usize;
         let end = start.checked_add(src.len()).ok_or("CUDA overlap host range 溢出")?;
-        let covered = registered.as_ref().is_some_and(|memory| {
-            let index = memory.data_ranges.partition_point(|&(address, _)| address <= start);
-            index > 0 && end <= memory.data_ranges[index - 1].1
-        });
-        if !covered || dst.len() < src.len() {
-            return Err("CUDA expert overlap 需要已注册的长期源数据和足够大的目标区域".into());
+        let sources = self.pinned_sources.lock().map_err(|_| "CUDA pinned sources 锁已中毒".to_owned())?;
+        let index = sources.ranges.partition_point(|&(address, _)| address <= start);
+        let covered = index > 0 && end <= sources.ranges[index - 1].1;
+        drop(sources);
+        if !covered {
+            return Err("CUDA overlap 上传需要 pinned 驻留源数据".into());
         }
         self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA overlap context: {e:?}"))?;
         let (device, _sync) = dst.device_ptr_mut(&self.copy_stream);
-        unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(device, src.as_ptr().cast(), src.len(), self.copy_stream.cu_stream()) }.result().map_err(|e| format!("CUDA expert overlap DMA: {e:?}"))?;
+        unsafe { cudarc::driver::sys::cuMemcpyHtoDAsync_v2(device, src.as_ptr().cast(), src.len(), self.copy_stream.cu_stream()) }.result().map_err(|e| format!("CUDA overlap DMA: {e:?}"))?;
         let result = self.record_copy_fence().and_then(|()| self.wait_copy_fence());
         if result.is_err() {
             let _ = self.copy_stream.synchronize();
         }
         result
-    }
-
-    /// 注册长期不可变数据,owner 保证切片在 context 生命周期内有效。
-    /// 页边界合并避免相邻分配共享页时重复注册;只允许一次注册以保持所有权直接。
-    #[cfg(unix)]
-    pub fn register_host_memory<T: Send + Sync + 'static>(&self, owner: Arc<T>, slices: impl FnOnce(&T) -> Result<Vec<&[u8]>, String>) -> Result<usize, String> {
-        let mut registered = self.registered_host.lock().map_err(|_| "CUDA registered host 锁已中毒")?;
-        if registered.is_some() {
-            return Err("CUDA host memory 已注册".into());
-        }
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page <= 0 {
-            return Err(format!("读取 host page size 失败: {page}"));
-        }
-        let page = page as usize;
-        let mut ranges = Vec::new();
-        let mut data_ranges = Vec::new();
-        for bytes in slices(&owner)? {
-            if bytes.is_empty() {
-                continue;
-            }
-            let start = bytes.as_ptr() as usize;
-            let data_end = start.checked_add(bytes.len()).ok_or("CUDA host range 溢出")?;
-            let end = data_end.checked_add(page - 1).ok_or("CUDA host page range 溢出")? / page * page;
-            ranges.push((start / page * page, end));
-            // 直传只认所有者提供的原始切片,不能把共享锁页的临时分配也当成长期数据。
-            data_ranges.push((start, data_end));
-        }
-        ranges.sort_unstable();
-        data_ranges.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = Vec::new();
-        for (start, end) in ranges {
-            if let Some(last) = merged.last_mut().filter(|last| start <= last.1) {
-                last.1 = last.1.max(end);
-            } else {
-                merged.push((start, end));
-            }
-        }
-        self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA context 失败: {e:?}"))?;
-        let mut registration = RegisteredHostMemory { context: self.ctx.clone(), _owner: owner, ranges: Vec::new(), data_ranges };
-        let mut total = 0;
-        for (start, end) in merged {
-            unsafe { cudarc::driver::sys::cuMemHostRegister_v2(start as *mut std::ffi::c_void, end - start, 0) }.result().map_err(|e| format!("CUDA host register address={start:#x} bytes={}: {e:?}", end - start))?;
-            registration.ranges.push((start, end));
-            total += end - start;
-        }
-        *registered = Some(registration);
-        Ok(total)
     }
 
     /// 槽内执行一次上传;`slot` 为 None 时按需创建新槽。
@@ -766,6 +759,12 @@ impl CudaContext {
         }
         let slot = slot.as_mut().expect("槽已就位");
         if slot.buffer.len() < src.len() {
+            // 旧槽可能仍有在途 DMA;其 PinnedHostSlice 内部事件从未被记录,
+            // drop 的 synchronize 是空操作,必须先等槽自己的事件再让扩容
+            // 赋值触发 cuMemFreeHost,否则 DMA 读已释放的锁页内存。
+            if let Some(event) = slot.event.take() {
+                event.synchronize().map_err(|e| format!("CUDA pinned_u8 扩容前旧 DMA 等待失败: {e:?}"))?;
+            }
             let capacity = src.len().checked_next_power_of_two().ok_or_else(|| "CUDA pinned u8 容量溢出".to_owned())?;
             slot.buffer = unsafe { self.ctx.alloc_pinned::<u8>(capacity) }.map_err(|e| format!("CUDA pinned_u8 扩容失败: {e:?}"))?;
             slot.event = None;
@@ -909,38 +908,31 @@ mod host_registration_tests {
     }
 
     #[test]
-    fn registered_host_upload_keeps_owner_and_exact_bytes() {
+    fn pinned_source_upload_exact_bytes_and_ring_fallback() {
         let ctx = CudaContext::new_default().unwrap();
-        let owner = Arc::new(vec![(0..12345).map(|i| (i * 31) as u8).collect::<Vec<_>>(), vec![197u8; 8193]]);
-        let weak = Arc::downgrade(&owner);
-        ctx.register_host_memory(owner.clone(), |data| Ok(data.iter().map(|bytes| &bytes[16..bytes.len() - 16]).collect())).unwrap();
-        drop(owner);
-        let retained = weak.upgrade().expect("注册必须持有主存数据");
-        for source in retained.iter() {
-            // 上传内部切片同时覆盖注册范围二分查找的边界。
+        let fill = |bytes: &mut [u8], seed: u8| bytes.iter_mut().enumerate().for_each(|(index, value)| *value = (index as u8).wrapping_mul(31).wrapping_add(seed));
+        let mut retained = Vec::new();
+        for len in [12345usize, 8193, 4096] {
+            let mut builder = ctx.alloc_pinned_source_bytes(len).unwrap();
+            fill(crate::weight::container::gguf::HostBytesBuilder::as_mut(&mut *builder), 7);
+            let backing = crate::weight::container::gguf::HostBytesBuilder::finish(builder);
+            ctx.retain_pinned_source(&backing).unwrap();
+            retained.push(backing);
+        }
+        for backing in &retained {
+            let source = backing.as_bytes();
+            // 内部切片同时覆盖区间二分查找的边界。
             let source = &source[33..source.len() - 33];
             let mut device = ctx.buffer_uninit::<u8>(source.len()).unwrap();
             ctx.upload_u8_pinned(source, &mut device).unwrap();
-            let actual = ctx.stream().clone_dtoh(&device).unwrap();
-            assert_eq!(actual, source);
-            // 从零缓冲读取可暴露遗漏跨流等待;不能用上一轮相同内容掩盖旧数据。
-            let mut device = ctx.stream().alloc_zeros::<u8>(source.len()).unwrap();
-            ctx.stream().synchronize().unwrap();
-            unsafe { ctx.upload_registered_expert_overlap(source, &mut device) }.unwrap();
-            let copied = device.clone();
-            assert_eq!(ctx.stream().clone_dtoh(&copied).unwrap(), source);
-            assert!(unsafe { ctx.upload_registered_expert_overlap(&retained[0][..8], &mut device) }.is_err());
+            assert_eq!(ctx.stream().clone_dtoh(&device).unwrap(), source);
         }
-        assert!(ctx.pinned_u8_ring.lock().unwrap().slots.is_empty(), "已注册原始切片必须直接上传");
-        // 同一页中未被声明为长期切片的区域仍须经过 staging。
-        let source = &retained[0][..8];
-        let mut device = ctx.buffer_uninit::<u8>(source.len()).unwrap();
-        ctx.upload_u8_pinned(source, &mut device).unwrap();
-        assert_eq!(ctx.stream().clone_dtoh(&device).unwrap(), source);
+        assert!(ctx.pinned_u8_ring.lock().unwrap().slots.is_empty(), "命中 pinned 源区间必须直接上传");
+        // 未命中区间(临时栈缓冲)仍须经过槽环中转。
+        let temporary: Vec<u8> = (0..97).map(|index| (index * 13) as u8).collect();
+        let mut device = ctx.buffer_uninit::<u8>(temporary.len()).unwrap();
+        ctx.upload_u8_pinned(&temporary, &mut device).unwrap();
+        assert_eq!(ctx.stream().clone_dtoh(&device).unwrap(), temporary);
         assert!(!ctx.pinned_u8_ring.lock().unwrap().slots.is_empty());
-        drop(device);
-        drop(retained);
-        drop(ctx);
-        assert!(weak.upgrade().is_none(), "解除锁页后必须释放所有者");
     }
 }

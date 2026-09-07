@@ -439,8 +439,9 @@ impl CudaMoeState {
                 CudaExpertBuffer::Owned(data)
             };
             if overlap {
-                // 整层入口已同步旧读者,active 引用保证当前层区域不能被回收。
-                unsafe { ctx.upload_registered_expert_overlap(bytes, &mut slice) }.map_err(BackendError::ExpertLoad)?;
+                // 整层入口已同步旧读者,active 引用保证当前层区域不能被回收;
+                // DMA 源必须是驱动 pinned 驻留(注册堆版本已因堆损坏移除)。
+                unsafe { ctx.upload_pinned_source_overlap(bytes, &mut slice) }.map_err(BackendError::ExpertLoad)?;
             } else {
                 ctx.upload_u8_pinned(bytes, &mut slice).map_err(BackendError::ExpertLoad)?;
             }

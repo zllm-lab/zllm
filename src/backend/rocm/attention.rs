@@ -222,6 +222,10 @@ fn paged_mla_attention_into(
     top_k: usize,
     output: &ops::hip::DeviceBuffer,
 ) -> Result<(), BackendError> {
+    // MLA decode 三段计时:lock/remap(主机)、kernel launch+exec(设备)、residual。
+    // `kernel_sync=on` 时 kernel 段时间 ≈ 真实设备执行;off 时仅入队。开启 `mla_hot_trace`
+    // 打印每层四段时间,用于归因 0.41–0.48 ms/层是否落在 host 端 hot lock + remap。
+    let t_total_start = std::time::Instant::now();
     let cached = cache.paged_layers.get(layer).and_then(Option::as_ref).ok_or_else(|| compute_error(format!("L{layer} ROCm paged MLA cache 尚未初始化")))?;
     if query.rows == 0 || query.rows > cached.rows {
         return Err(compute_error(format!("L{layer} ROCm paged MLA query rows={}，cache rows={}", query.rows, cached.rows,)));
@@ -241,6 +245,7 @@ fn paged_mla_attention_into(
                     .map_or_else(|| hot.prepare_selection(context.device_id, layer, selection, &cached.latent, cached.latent_scales.as_deref().expect("Q8 MLA hot 必有 scales"), &cached.rope), Ok)
             })
             .transpose()?;
+        let t_lock_end = std::time::Instant::now();
         let (context_rows, hot_query_start, selection_width) = match (selection.as_ref(), host_selection) {
             (Some(_), Some(selection)) => (cached.committed_rows, cached.committed_rows - query.rows, selection.len() / query.rows),
             (None, None) if cached.rows <= top_k && cached.rows <= cached.committed_rows => (cached.rows, query_start, top_k),
@@ -268,13 +273,27 @@ fn paged_mla_attention_into(
             None,
         )
         .map_err(compute_error)?;
+        let t_kernel_end = std::time::Instant::now();
         if ops::hip::options().kernel_sync {
             ops::hip::synchronize_device(context.device_id, &format!("L{layer} ROCm paged MLA hot synchronize")).map_err(compute_error)?;
+        }
+        let t_sync_end = std::time::Instant::now();
+        if ops::hip::options().mla_hot_trace {
+            let t_lock_ms = t_lock_end.duration_since(t_total_start).as_secs_f64() * 1e3;
+            let t_kernel_ms = t_kernel_end.duration_since(t_lock_end).as_secs_f64() * 1e3;
+            let t_sync_ms = t_sync_end.duration_since(t_kernel_end).as_secs_f64() * 1e3;
+            let t_total_ms = t_sync_end.duration_since(t_total_start).as_secs_f64() * 1e3;
+            eprintln!(
+                "[mla-decode-trace] branch=hot layer={layer} rows={} start={query_start} selected={} lock_ms={t_lock_ms:.3} kernel_ms={t_kernel_ms:.3} sync_ms={t_sync_ms:.3} total_ms={t_total_ms:.3}",
+                query.rows,
+                selection.is_some(),
+            );
         }
         return Ok(());
     }
     let selection = dsa_state.and_then(|state| state.device_selection(query.rows, query_start));
     let selection_width = if selection.is_some() { dsa_state.map_or(top_k, RocmDsaState::selection_width) } else { top_k };
+    let t_lock_end = std::time::Instant::now();
     ops::hip::try_paged_mla_attention_ct_into(
         context.device_id,
         query_device,
@@ -297,8 +316,21 @@ fn paged_mla_attention_into(
         None,
     )
     .map_err(compute_error)?;
+    let t_kernel_end = std::time::Instant::now();
     if ops::hip::options().kernel_sync {
         ops::hip::synchronize_device(context.device_id, &format!("L{layer} ROCm paged MLA synchronize")).map_err(compute_error)?;
+    }
+    let t_sync_end = std::time::Instant::now();
+    if ops::hip::options().mla_hot_trace {
+        let t_lock_ms = t_lock_end.duration_since(t_total_start).as_secs_f64() * 1e3;
+        let t_kernel_ms = t_kernel_end.duration_since(t_lock_end).as_secs_f64() * 1e3;
+        let t_sync_ms = t_sync_end.duration_since(t_kernel_end).as_secs_f64() * 1e3;
+        let t_total_ms = t_sync_end.duration_since(t_total_start).as_secs_f64() * 1e3;
+        eprintln!(
+            "[mla-decode-trace] branch=paged layer={layer} rows={} start={query_start} selected={} lock_ms={t_lock_ms:.3} kernel_ms={t_kernel_ms:.3} sync_ms={t_sync_ms:.3} total_ms={t_total_ms:.3}",
+            query.rows,
+            selection.is_some(),
+        );
     }
     Ok(())
 }
@@ -651,6 +683,15 @@ impl RocmContext {
             // 来源是 owner cache 的稳定 view；其生命周期另由 owner completion
             // 接管，目标直接写入 peer cache 最终 offset。
             let _ = cache.replicate_operator_mla_append(self, &peer, layer, position, rows)?;
+            // cache-only 追赶没有 peer worker 段，owner 侧在 peer 设备上下文里
+            // 补一次 mirror 喂养。
+            let owner_stream = ops::hip::active_compute_stream() as usize;
+            let fed = (|| {
+                peer.activate().map_err(compute_error)?;
+                peer_cache.lock().map_err(|_| compute_error(format!("L{layer} operator peer KV 锁中毒")))?.feed_peer_mirror_layer(&peer, layer)
+            })();
+            ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
+            fed?;
             return Ok(true);
         }
 
@@ -872,6 +913,11 @@ impl RocmContext {
                 cache.append_mla(&peer, layer, peer_latent, peer_rope)?;
             }
             let attention = paged_mla_attention_with_selection(&peer, &peer_query, &cache, &peer_kv_b, layer, &peer_mla, peer_selection.as_deref(), peer_host_selection.as_deref().map(Vec::as_slice), selection_width)?;
+            if packed_kv_replica {
+                // 本锁段内顺手喂养 peer mirror:省掉 owner 侧每层一次 peer 设备
+                // 切换与额外锁往返,且与 owner 线程并行。
+                cache.feed_peer_mirror_layer(&peer, layer)?;
+            }
             drop(cache);
             let partial = peer.tensor_to_stable_deferred(peer.tensor_as_f32(peer.linear(&attention, &peer_o)?)?)?;
             let partial = partial.device.ok_or_else(|| compute_error(format!("L{layer} operator peer partial 缺少 device buffer")))?;

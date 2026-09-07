@@ -119,32 +119,32 @@ impl BackendResources for QnnContext {
     fn finish_batch(&self) {}
 
     fn prepare_weight(&self, weight: LinearWeight<'_>, rows: usize, cols: usize) -> Result<Self::Weight, BackendError> {
-        // lm_head(vocab 64256)同样进 HTP:CPU gemv 实测 ~450ms/token,是 decode
-        // 最大单项。embedding 不经过 prepare_weight。
-        //
-        // 精度:层内矩阵全 W8(959MB 超出 ~800MB HTP 预算的尾部层由 6031 降级 CPU 兜底)。
-        // packed-W4 已全部证伪:SFIXED_POINT_4/BLOCK 编码被拒;weightsPacking setConfig
-        // 接受且数值无损但运行时内存不减;W4 per-channel 质量为重复循环级。
-        let decoded = match weight {
-            LinearWeight::F32(values) => Some(values.to_vec()),
-            LinearWeight::F16(values) => Some(values.iter().map(|value| value.to_f32()).collect()),
-            LinearWeight::Bf16Bytes(values) => Some(values.chunks_exact(2).map(|bytes| half::bf16::from_le_bytes([bytes[0], bytes[1]]).to_f32()).collect()),
-            LinearWeight::Quantized(matrix) => Some(matrix.decode().map_err(|msg| BackendError::Compute { msg })?),
-        };
-        let quantized = if rows > 1 {
-            let bytes = u64::try_from(rows.checked_mul(cols).ok_or_else(|| BackendError::Compute { msg: "QNN 权重 shape 溢出".to_owned() })?).map_err(|_| BackendError::Compute { msg: "QNN 权重 shape 溢出".to_owned() })?;
-            (self.int8_resident_bytes.load(Ordering::Relaxed) + bytes <= HTP_INT8_BUDGET_BYTES).then(|| {
-                let weight = quantize_linear_weight(decoded.as_deref().expect("decoded 已生成"), rows, cols, 8).map_err(|msg| BackendError::Compute { msg })?;
-                self.int8_resident_bytes.fetch_add(bytes, Ordering::Relaxed);
-                Ok(weight)
-            }).transpose()?
-        } else {
-            None
-        };
         // lm_head(vocab 级)且 F32 常驻量可控时走 F32 gemv 快路径(实测比 BF16 GGUF
-        // 快 ~20×);超限(E4B 2.7GB 级)保持原始量化形态,不消耗预算也不爆 host。
-        let cpu = if rows > 8192 && u64::try_from(rows.checked_mul(cols).unwrap_or(usize::MAX)).map(|elements| elements * 4).unwrap_or(u64::MAX) <= CPU_F32_HEAD_LIMIT_BYTES {
-            self.cpu.prepare_f32(decoded.as_deref().expect("decoded 已生成"), rows, cols)?
+        // 快 ~20×);超限(E4B 2.7GB 级)保持原始量化形态。INT8 进 HTP 受预算记账
+        // 约束,超预算层纯 CPU。decoded 惰性求值:只有真的要量化或转 F32 头时才
+        // dequant——decode 会把 GGUF 整表缓存进 OnceLock,大模型下预算外矩阵
+        // 白做 decode 等于把全部权重再常驻一份(真机实测直接把 11GB 手机压死)。
+        let elements = rows.checked_mul(cols).ok_or_else(|| BackendError::Compute { msg: "QNN 权重 shape 溢出".to_owned() })?;
+        let element_bytes = u64::try_from(elements).map_err(|_| BackendError::Compute { msg: "QNN 权重 shape 溢出".to_owned() })?;
+        let needs_int8 = rows > 1 && self.int8_resident_bytes.load(Ordering::Relaxed) + element_bytes <= HTP_INT8_BUDGET_BYTES;
+        let needs_f32_head = rows > 8192 && element_bytes * 4 <= CPU_F32_HEAD_LIMIT_BYTES;
+        let decoded = (needs_int8 || needs_f32_head)
+            .then(|| match weight {
+                LinearWeight::F32(values) => Ok(values.to_vec()),
+                LinearWeight::F16(values) => Ok(values.iter().map(|value| value.to_f32()).collect()),
+                LinearWeight::Bf16Bytes(values) => Ok(values.chunks_exact(2).map(|bytes| half::bf16::from_le_bytes([bytes[0], bytes[1]]).to_f32()).collect()),
+                LinearWeight::Quantized(matrix) => matrix.decode().map_err(|msg| BackendError::Compute { msg }),
+            })
+            .transpose()?;
+        let quantized = needs_int8
+            .then(|| {
+                let weight = quantize_linear_weight(decoded.as_deref().expect("needs_int8 时 decoded 已生成"), rows, cols, 8).map_err(|msg| BackendError::Compute { msg })?;
+                self.int8_resident_bytes.fetch_add(element_bytes, Ordering::Relaxed);
+                Ok(weight)
+            })
+            .transpose()?;
+        let cpu = if needs_f32_head {
+            self.cpu.prepare_f32(decoded.as_deref().expect("needs_f32_head 时 decoded 已生成"), rows, cols)?
         } else {
             self.cpu.prepare_weight(weight, rows, cols)?
         };

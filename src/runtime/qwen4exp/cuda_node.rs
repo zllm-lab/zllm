@@ -69,20 +69,25 @@ impl Qwen4ExpCudaEngine {
             let available = mem.lines().find_map(|line| line.strip_prefix("MemAvailable:").and_then(|value| value.split_whitespace().next()).and_then(|value| value.parse::<usize>().ok())).ok_or("无法读取 MemAvailable")? * 1024;
             let host_bytes: usize = source.reader().tensors().iter().filter(|t| t.name.contains("_exps.weight")).map(|t| t.bytes).sum();
             if available < host_bytes + 8 * 1024 * 1024 * 1024 {
-                return Err(format!("专家驻留需要 {} bytes + 8GiB 余量,可用主存 {} bytes", host_bytes, available).into());
+                // 警告而非拒绝:驱动 pinned 池保留使 MemAvailable 保守偏低,
+                // 真实不足由逐矩阵分配的 CUDA OOM 兜底(见 cuda.rs 同款注释)。
+                eprintln!("[qwen4exp-meminfo-warn] 专家驻留 {} bytes,MemAvailable 仅 {} bytes(可能为驱动 pinned 池保留,继续加载)", host_bytes, available);
             }
         }
         let started = std::time::Instant::now();
-        source.make_experts_resident()?;
-        let source = Arc::new(source);
         if model.execution.pin_experts {
-            let pinned = std::time::Instant::now();
-            let bytes = backend.register_host_memory(Arc::new(source.clone()), |source| {
-                let main = source.resident_experts.as_ref().ok_or("主存专家尚未加载".to_owned())?;
-                main.iter().flat_map(|expert| [&expert.gate, &expert.up, &expert.down]).map(|matrix| matrix.bytes()).collect()
-            })?;
-            eprintln!("[qwen4exp-host-pinned] bytes={bytes} wall={:.3}s", pinned.elapsed().as_secs_f64());
+            // 驱动自有 pinned 驻留:文件直读进 cuMemAllocHost 内存,上传 DMA
+            // 直读零 memcpy。替代已移除的 cuMemHostRegister 注册堆直读快路
+            // (该快路被驱动侧写坏 glibc 堆,见 upload_u8_pinned 教训注释)。
+            let bytes = source.make_experts_resident_extern(&mut |len| backend.alloc_pinned_source_bytes(len))?;
+            for backing in source.resident_extern_backings() {
+                backend.retain_pinned_source(&backing)?;
+            }
+            eprintln!("[qwen4exp-host-pinned] bytes={bytes}");
+        } else {
+            source.make_experts_resident()?;
         }
+        let source = Arc::new(source);
         eprintln!("[qwen4exp-resident-ready] wall={:.3}s", started.elapsed().as_secs_f64());
         let template = source.reader().metadata("tokenizer.chat_template").and_then(crate::weight::container::gguf::GgufValue::as_str);
         let chat_template = template

@@ -914,6 +914,7 @@ fn try_paged_cache_append_mla_f32_q8_bf16_inner(
     block_size: usize,
     rope_rotation: Option<(usize, usize, RotaryLayout, &[f32], &[f32])>,
     cache_device: Option<i32>,
+    log: Option<(&DeviceBuffer, &DeviceBuffer, &DeviceBuffer, usize)>,
 ) -> Result<(), String> {
     if group_size == 0 || group_size > 256 || !group_size.is_power_of_two() || !latent_columns.is_multiple_of(group_size) {
         return Err(format!("paged MLA Q8 cache group_size={group_size} latent_columns={latent_columns} 非法"));
@@ -964,6 +965,17 @@ fn try_paged_cache_append_mla_f32_q8_bf16_inner(
     let mut split_half = u32::from(resident_rotation.as_ref().is_some_and(|(_, _, _, layout)| *layout == RotaryLayout::SplitHalf));
     let mut group_size = u32::try_from(group_size).map_err(|_| "paged MLA Q8 group_size 超过 u32")?;
     let mut block_size = u32::try_from(block_size).map_err(|_| "paged MLA block_size 超过 u32")?;
+    let log_span = log.map(|(_, _, _, row)| row + rows as usize);
+    let (mut d_log_latent, mut d_log_scales, mut d_log_rope, mut log_row) = match log {
+        Some((log_latent, log_scales, log_rope, row)) => {
+            let span = log_span.expect("log span 已计算");
+            validate_resident(log_latent, device_id, span.checked_mul(latent_columns as usize).ok_or("paged MLA log latent 大小溢出")?, "paged MLA log latent")?;
+            validate_resident(log_scales, device_id, span.checked_mul(groups_per_row).and_then(|n| n.checked_mul(2)).ok_or("paged MLA log scales 大小溢出")?, "paged MLA log scales")?;
+            validate_resident(log_rope, device_id, span.checked_mul(rope_columns as usize).and_then(|n| n.checked_mul(2)).ok_or("paged MLA log rope 大小溢出")?, "paged MLA log rope")?;
+            (log_latent.pointer, log_scales.pointer, log_rope.pointer, u32::try_from(row).map_err(|_| "paged MLA log row 超过 u32")?)
+        }
+        None => (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0u32),
+    };
     let mut arguments = [
         (&mut d_latent_input as *mut *mut c_void).cast(),
         (&mut d_latent_cache as *mut *mut c_void).cast(),
@@ -982,6 +994,10 @@ fn try_paged_cache_append_mla_f32_q8_bf16_inner(
         (&mut split_half as *mut u32).cast(),
         (&mut group_size as *mut u32).cast(),
         (&mut block_size as *mut u32).cast(),
+        (&mut d_log_latent as *mut *mut c_void).cast(),
+        (&mut d_log_scales as *mut *mut c_void).cast(),
+        (&mut d_log_rope as *mut *mut c_void).cast(),
+        (&mut log_row as *mut u32).cast(),
     ];
     launch_tensor_kernel(functions.cache_append_mla_q8_bf16, u32::try_from(blocks).map_err(|_| "paged MLA Q8 cache grid 超过 u32")?, group_size, &mut arguments, "HIP paged MLA cache append Q8G+BF16")
 }
@@ -1002,7 +1018,7 @@ pub fn try_paged_cache_append_mla_f32_q8_bf16(
     group_size: usize,
     block_size: usize,
 ) -> Result<(), String> {
-    try_paged_cache_append_mla_f32_q8_bf16_inner(device_id, latent_input, latent_cache, latent_scales, rope_input, rope_cache, block_table, position, rows, latent_columns, rope_columns, group_size, block_size, None, None)
+    try_paged_cache_append_mla_f32_q8_bf16_inner(device_id, latent_input, latent_cache, latent_scales, rope_input, rope_cache, block_table, position, rows, latent_columns, rope_columns, group_size, block_size, None, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1040,6 +1056,7 @@ pub fn try_paged_cache_append_mla_rope_f32_q8_bf16(
         group_size,
         block_size,
         Some((position, rotary_dim, layout, cos, sin)),
+        None,
         None,
     )
 }
@@ -1081,6 +1098,78 @@ pub fn try_paged_cache_append_mla_rope_at_f32_q8_bf16(
         block_size,
         Some((rope_position, rotary_dim, layout, cos, sin)),
         None,
+        None,
+    )
+}
+
+/// 热窗单行 append 的日志双写变体:量化结果同时写入窗口槽位与 64 行环形
+/// mirror 日志,供批量 D2H 喂养 CPU mirror(append 路径零额外流操作)。
+#[allow(clippy::too_many_arguments)]
+pub fn try_paged_cache_append_mla_f32_q8_bf16_with_log(
+    device_id: i32,
+    latent_input: &DeviceBuffer,
+    latent_cache: &DeviceBuffer,
+    latent_scales: &DeviceBuffer,
+    rope_input: &DeviceBuffer,
+    rope_cache: &DeviceBuffer,
+    block_table: &DeviceBuffer,
+    position: usize,
+    rows: usize,
+    latent_columns: usize,
+    rope_columns: usize,
+    group_size: usize,
+    block_size: usize,
+    log_latent: &DeviceBuffer,
+    log_scales: &DeviceBuffer,
+    log_rope: &DeviceBuffer,
+    log_row: usize,
+) -> Result<(), String> {
+    try_paged_cache_append_mla_f32_q8_bf16_inner(device_id, latent_input, latent_cache, latent_scales, rope_input, rope_cache, block_table, position, rows, latent_columns, rope_columns, group_size, block_size, None, None, Some((log_latent, log_scales, log_rope, log_row)))
+}
+
+/// 热窗单行 append(带 RoPE)的日志双写变体,语义同上。
+#[allow(clippy::too_many_arguments)]
+pub fn try_paged_cache_append_mla_rope_at_f32_q8_bf16_with_log(
+    device_id: i32,
+    latent_input: &DeviceBuffer,
+    latent_cache: &DeviceBuffer,
+    latent_scales: &DeviceBuffer,
+    rope_input: &DeviceBuffer,
+    rope_cache: &DeviceBuffer,
+    block_table: &DeviceBuffer,
+    cache_position: usize,
+    rope_position: usize,
+    rows: usize,
+    latent_columns: usize,
+    rope_columns: usize,
+    rotary_dim: usize,
+    layout: RotaryLayout,
+    group_size: usize,
+    block_size: usize,
+    cos: &[f32],
+    sin: &[f32],
+    log_latent: &DeviceBuffer,
+    log_scales: &DeviceBuffer,
+    log_rope: &DeviceBuffer,
+    log_row: usize,
+) -> Result<(), String> {
+    try_paged_cache_append_mla_f32_q8_bf16_inner(
+        device_id,
+        latent_input,
+        latent_cache,
+        latent_scales,
+        rope_input,
+        rope_cache,
+        block_table,
+        cache_position,
+        rows,
+        latent_columns,
+        rope_columns,
+        group_size,
+        block_size,
+        Some((rope_position, rotary_dim, layout, cos, sin)),
+        None,
+        Some((log_latent, log_scales, log_rope, log_row)),
     )
 }
 
@@ -1126,6 +1215,7 @@ pub fn try_paged_cache_append_mla_rope_remote_f32_q8_bf16(
         block_size,
         Some((rope_position, rotary_dim, layout, cos, sin)),
         Some(cache_device_id),
+        None,
     )
 }
 

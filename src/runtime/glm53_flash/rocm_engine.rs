@@ -1241,14 +1241,14 @@ fn dims(config: &Glm53FlashConfig, vision: &Glm53FlashVisionConfig) -> crate::we
 mod tests {
     use super::*;
 
-    /// Amd-1 真机 head 冒烟:加载 0..23 层到 8 卡,两轮 chunk prefill,
+    /// 8-GPU 真机 head 冒烟:加载 0..23 层到 8 卡,两轮 chunk prefill,
     /// 校验 boundary hidden 有限且非零。需要 62 片权重与 8 卡 ROCm,
     /// 仅在 --ignored 时执行。
     #[test]
-    #[ignore = "需要 Amd-1 全量权重与 8 卡 ROCm"]
+    #[ignore = "需要全量权重与 8 卡 ROCm"]
     fn head_smoke_prefill() {
         let options = Options {
-            weights_directory: "/workspace/models/GLM-5.3-Flash".into(),
+            weights_directory: "/path/to/GLM-5.3-Flash".into(),
             devices: vec![0, 1, 2, 3, 4, 5, 6, 7],
             layer_ends: vec![3, 6, 9, 12, 14, 17, 20, 23],
             layer_start: 0,

@@ -66,12 +66,26 @@ impl MtpSource {
             if weights.gate.tensor_type.0 != 12 || weights.up.tensor_type.0 != 12 || !matches!(weights.down.tensor_type.0, 7 | 8) {
                 return Err(format!("MTP E{expert} 原生专家格式不支持"));
             }
-            weights.gate.bytes()?;
-            weights.up.bytes()?;
-            weights.down.bytes()?;
             experts.push(weights);
         }
         Ok(Self { reader, experts, cfg: cfg.clone() })
+    }
+
+    /// 草稿专家矩阵文件直读进驱动 pinned 背书(上传 DMA 直读,免槽环
+    /// memcpy);调用方随后登记 backings 到 context 的直读注册表。
+    pub(super) fn make_experts_resident_extern(&mut self, alloc: &mut dyn FnMut(usize) -> Result<Box<dyn crate::weight::container::gguf::HostBytesBuilder>, String>) -> Result<usize, String> {
+        let mut bytes = 0;
+        for weights in &self.experts {
+            for matrix in [&weights.gate, &weights.up, &weights.down] {
+                bytes += matrix.storage_len();
+                matrix.load_extern(alloc)?;
+            }
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn resident_extern_backings(&self) -> impl Iterator<Item = Arc<dyn crate::weight::container::gguf::HostBytes>> + '_ {
+        self.experts.iter().flat_map(|weights| [&weights.gate, &weights.up, &weights.down]).filter_map(crate::weight::container::gguf::GgufMatrix::extern_backing)
     }
 }
 

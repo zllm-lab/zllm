@@ -195,7 +195,7 @@ Models × backends (`zllm-server` / `zllm-rt-*` service entries, per the config 
 | Mistral | — | ✅ | ✅ | — | |
 | K2-Horizon MoVA 36B-A4B | — | ✅ | — | — | Grouped RMSNorm, MoVA, and MoE; GGUF IQ3_XS validated on Apple M5 |
 | MiniCPM5 | ✅ | ✅ | — | — | |
-| GLM-5.2 / GLM-5.3 | — | — | — | ✅ | Distributed; GGUF prefill/decode/MTP path validated on the Amd-1/Amd-2 16-GPU deployment |
+| GLM-5.2 / GLM-5.3 | — | — | — | ✅ | Distributed; GGUF prefill/decode/MTP path validated on a two-node 16-GPU deployment |
 | GLM-5.3-Flash | — | — | — | ✅ | |
 | DeepSeek-V4 | — | — | — | ✅ | |
 | MiniMax-H3 | — | — | — | ✅ 1/2/4/8 GPUs | |

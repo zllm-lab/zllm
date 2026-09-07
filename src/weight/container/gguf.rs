@@ -171,6 +171,33 @@ pub struct GgufTensorInfo {
     shard: usize,
 }
 
+/// 矩阵主机字节的非 glibc 背书(如 CUDA 驱动 pinned 内存)。
+/// weight 层不依赖具体后端;由后端在驻留期注入,bytes() 透明返回。
+pub trait HostBytes: Send + Sync {
+    fn as_bytes(&self) -> &[u8];
+}
+
+/// HostBytes 的构建形态:先可变填充(文件直读),再冻结共享。
+pub trait HostBytesBuilder: Send {
+    fn as_mut(&mut self) -> &mut [u8];
+    fn finish(self: Box<Self>) -> Arc<dyn HostBytes>;
+}
+
+enum HostBacking {
+    Heap(Vec<u8>),
+    Extern(Arc<dyn HostBytes>),
+}
+
+impl std::fmt::Debug for HostBacking {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = match self {
+            Self::Heap(bytes) => bytes.len(),
+            Self::Extern(bytes) => bytes.as_bytes().len(),
+        };
+        formatter.debug_struct("HostBacking").field("len", &len).finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GgufMatrix {
     pub name: String,
@@ -180,7 +207,7 @@ pub struct GgufMatrix {
     file: Arc<File>,
     offset: u64,
     bytes_len: usize,
-    bytes: Arc<OnceLock<Vec<u8>>>,
+    bytes: Arc<OnceLock<HostBacking>>,
 }
 
 impl GgufMatrix {
@@ -194,13 +221,36 @@ impl GgufMatrix {
         (self.file.as_raw_fd(), self.offset)
     }
 
+    /// 文件直读进调用方提供的驱动背书(零 glibc 物化)。
+    /// 已有驻留(Heap 或 Extern)时拒绝;一次矩阵一次背书。
+    pub fn load_extern(&self, alloc: &mut dyn FnMut(usize) -> Result<Box<dyn HostBytesBuilder>, String>) -> Result<(), String> {
+        if self.bytes.get().is_some() {
+            return Err(format!("GGUF matrix {} 已有主机驻留", self.name));
+        }
+        let mut builder = alloc(self.bytes_len)?;
+        self.read_into(HostBytesBuilder::as_mut(&mut *builder))?;
+        let _ = self.bytes.set(HostBacking::Extern(builder.finish()));
+        Ok(())
+    }
+
+    /// extern 背书的共享句柄(供后端登记 DMA 直读区间);Heap/未驻留为 None。
+    pub fn extern_backing(&self) -> Option<Arc<dyn HostBytes>> {
+        match self.bytes.get() {
+            Some(HostBacking::Extern(bytes)) => Some(bytes.clone()),
+            _ => None,
+        }
+    }
+
     pub fn bytes(&self) -> Result<&[u8], String> {
         if self.bytes.get().is_none() {
-            let mut bytes = vec![0u8; self.bytes_len];
-            FileExt::read_exact_at(&self.file, &mut bytes, self.offset).map_err(|error| format!("读取 GGUF matrix {}: {error}", self.name))?;
-            let _ = self.bytes.set(bytes);
+            let mut heap = vec![0u8; self.bytes_len];
+            FileExt::read_exact_at(&self.file, &mut heap, self.offset).map_err(|error| format!("读取 GGUF matrix {}: {error}", self.name))?;
+            let _ = self.bytes.set(HostBacking::Heap(heap));
         }
-        Ok(self.bytes.get().expect("GGUF matrix bytes 已加载"))
+        Ok(match self.bytes.get().expect("GGUF matrix bytes 已加载") {
+            HostBacking::Heap(bytes) => bytes,
+            HostBacking::Extern(bytes) => bytes.as_bytes(),
+        })
     }
 
     pub fn read_into(&self, output: &mut [u8]) -> Result<(), String> {

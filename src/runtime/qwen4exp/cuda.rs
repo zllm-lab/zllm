@@ -68,6 +68,11 @@ pub(super) fn hc_mix(ctx: &CudaContext, cfg: &Qwen4ExpConfig, residual: &CudaTen
 pub(super) fn selected_rows(ctx: &CudaContext, source: &Qwen4ExpGguf, name: &str, ids: &[u32], rows: usize, columns: usize) -> Result<CudaTensor, crate::backend::BackendError> {
     let op = crate::backend::compute_error;
     let matrix = source.reader().read_matrix(name).map_err(op)?;
+    static CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if std::env::var_os("ZLLM_Q4E_AUDIT").is_some() {
+        eprintln!("[selected_rows #{count}] name={name} ids={} rows={rows} cols={columns} gguf_cols={} type={}", ids.len(), matrix.columns, matrix.tensor_type.0);
+    }
     // packed 按 GGUF 矩阵实际列宽分配;调用方 columns 与 GGUF columns 不一致
     // 时 read_rows_into 会越界写穿 Vec(堆损坏根因),显式拒绝。
     if matrix.columns != columns {
@@ -368,7 +373,7 @@ pub fn run(path: &Path, prompt: &str, options: CudaOptions) -> Result<(), Box<dy
     let mut source = Qwen4ExpGguf::open(path)?;
     let cfg = source.config().clone();
     if options.expert_transfer_group > cfg.num_experts_per_tok || (options.expert_transfer_group > 0 && (!options.pin_experts || options.profile)) {
-        return Err("专家分组上传要求已锁定主存、关闭分段计时,组大小不超过 top_k".into());
+        return Err("专家分组上传要求 pinned 驻留、关闭分段计时,组大小不超过 top_k".into());
     }
     let tokens = source.tokenizer()?.tokenize(prompt.as_bytes());
     if tokens.is_empty() || tokens.len().saturating_add(options.decode_steps) > options.max_seq_len || options.prefill_chunk_size == 0 {
@@ -397,32 +402,39 @@ pub fn run(path: &Path, prompt: &str, options: CudaOptions) -> Result<(), Box<dy
         let mem = std::fs::read_to_string("/proc/meminfo")?;
         let available = mem.lines().find_map(|line| line.strip_prefix("MemAvailable:").and_then(|value| value.split_whitespace().next()).and_then(|value| value.parse::<usize>().ok())).ok_or("无法读取 MemAvailable")? * 1024;
         if available < host_bytes + 8 * 1024 * 1024 * 1024 {
-            return Err(format!("专家驻留需要 {} bytes + 8GiB 余量,可用主存 {} bytes", host_bytes, available).into());
+            // 警告而非拒绝:上一个 pinned 进程退出后 cuMemFreeHost 把页还给
+            // 驱动 host 池而非 OS,MemAvailable 长期偏低但新 cuMemAllocHost
+            // 可复用池页(2026-09-07 实测)。真实不足由逐矩阵分配的
+            // CUDA OOM 错误兜底中止。
+            eprintln!("[qwen4exp-meminfo-warn] 专家驻留 {} bytes,MemAvailable 仅 {} bytes(可能为驱动 pinned 池保留,继续加载)", host_bytes, available);
         }
     }
     let started = Instant::now();
-    source.make_experts_resident()?;
+    let ctx = CudaContext::new_default()?;
+    if options.pin_experts {
+        // 驱动自有 pinned 驻留(与 node 同路径);MTP 草稿专家保持堆驻留。
+        let bytes = source.make_experts_resident_extern(&mut |len| ctx.alloc_pinned_source_bytes(len))?;
+        for backing in source.resident_extern_backings() {
+            ctx.retain_pinned_source(&backing)?;
+        }
+        eprintln!("[qwen4exp-host-pinned] bytes={bytes}");
+    } else {
+        source.make_experts_resident()?;
+    }
     let source = Arc::new(source);
     eprintln!("[qwen4exp-resident-ready] bytes={host_bytes} wall={:.3}s", started.elapsed().as_secs_f64());
-    let mtp_source = options.mtp_weights.as_ref().map(|path| super::cuda_mtp::MtpSource::open(path, &cfg).map(Arc::new)).transpose()?;
+    let mut mtp_source = options.mtp_weights.as_ref().map(|path| super::cuda_mtp::MtpSource::open(path, &cfg).map(Arc::new)).transpose()?;
+    if options.pin_experts && let Some(source) = mtp_source.as_mut().and_then(Arc::get_mut) {
+        // 草稿专家同样走驱动 pinned 驻留:草稿 forward 的 miss 上传
+        // DMA 直读,免槽环 memcpy(draft_wall 主要构成)。
+        let bytes = source.make_experts_resident_extern(&mut |len| ctx.alloc_pinned_source_bytes(len))?;
+        for backing in source.resident_extern_backings() {
+            ctx.retain_pinned_source(&backing)?;
+        }
+        eprintln!("[qwen4exp-mtp-pinned] bytes={bytes}");
+    }
     if mtp_source.is_some() && (options.mtp_steps == 0 || options.mtp_steps > 8 || !options.mtp_min_confidence.is_finite() || !(0.0..=1.0).contains(&options.mtp_min_confidence)) {
         return Err("MTP 草稿长度要求 1..=8, confidence 要求 0..=1".into());
-    }
-    let ctx = CudaContext::new_default()?;
-    #[cfg(not(unix))]
-    if options.pin_experts {
-        return Err("专家主存锁页注册当前仅支持 Unix".into());
-    }
-    #[cfg(unix)]
-    if options.pin_experts {
-        let pin_started = Instant::now();
-        let owners = Arc::new((source.clone(), mtp_source.clone()));
-        let bytes = ctx.register_host_memory(owners, |(source, mtp)| {
-            let main = source.resident_experts.as_ref().ok_or("主存专家尚未加载".to_owned())?;
-            let draft = mtp.as_ref().map_or(&[][..], |mtp| &mtp.experts);
-            main.iter().chain(draft.iter()).flat_map(|expert| [&expert.gate, &expert.up, &expert.down]).map(|matrix| matrix.bytes()).collect()
-        })?;
-        eprintln!("[qwen4exp-host-pinned] bytes={bytes} wall={:.3}s", pin_started.elapsed().as_secs_f64());
     }
     let layers = super::prepare_qwen4exp_layers(&ctx, &source)?;
     let output_hc = Qwen4ExpHyperConnection {

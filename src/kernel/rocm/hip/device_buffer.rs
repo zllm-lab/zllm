@@ -1764,7 +1764,7 @@ impl DeviceBuffer {
             super::device_profile_operator(device_id, "handoff_copy")?;
             // W7900D 的 hipMemcpyPeerAsync copy-engine 路径会在连续多层提交时退化；
             // peer access 已启用，改用目标卡上的 float4 拷贝 kernel 经 PCIe BAR
-            // 直读源卡显存。Amd-4 完整 19-step 为 154.316s，对照全 DMA
+            // 直读源卡显存。完整 19-step 实测为 154.316s，对照全 DMA
             // 201.295s、仅大块 DMA 181.090s。
             if synchronize_source_event {
                 let status = unsafe { copy_ready(output.pointer, device_id, self.pointer, self.device_id, self.bytes) };

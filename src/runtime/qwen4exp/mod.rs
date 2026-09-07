@@ -330,6 +330,7 @@ fn prepare_layer<B: Backend>(backend: &B, reader: &GgufReader, cfg: &Qwen4ExpCon
 use crate::tokenizer::{Detokenizer, Tokenizer};
 use crate::weight::expert_source::{ExpertSource, ExpertSourceProvider, GgufExpertSource, GgufExpertWeights};
 use std::path::Path;
+use std::sync::Arc;
 
 pub struct Qwen4ExpGguf {
     reader: GgufReader,
@@ -391,6 +392,32 @@ impl Qwen4ExpGguf {
         }
         self.resident_experts = Some(experts);
         Ok(bytes)
+    }
+
+    /// 驱动 pinned 驻留:文件直读进外部背书(如 CUDA cuMemAllocHost),
+    /// 零 glibc 物化。上传侧命中背书区间可 DMA 直读,免槽环 memcpy。
+    /// 调用方随后应遍历矩阵 extern_backing() 登记到后端的直读注册表。
+    pub fn make_experts_resident_extern(&mut self, alloc: &mut dyn FnMut(usize) -> Result<Box<dyn crate::weight::container::gguf::HostBytesBuilder>, String>) -> Result<usize, String> {
+        let mut experts = Vec::with_capacity(self.cfg.num_layers * self.cfg.num_experts);
+        let mut bytes = 0;
+        for layer in 0..self.cfg.num_layers {
+            for expert in 0..self.cfg.num_experts {
+                let weights = self.load_expert_gguf(layer, expert)?;
+                bytes += weights.gate.storage_len() + weights.up.storage_len() + weights.down.storage_len();
+                for matrix in [&weights.gate, &weights.up, &weights.down] {
+                    matrix.load_extern(alloc)?;
+                }
+                experts.push(weights);
+            }
+            eprintln!("[qwen4exp-host-pinned] layer={layer} bytes={bytes}");
+        }
+        self.resident_experts = Some(experts);
+        Ok(bytes)
+    }
+
+    /// 驻留矩阵的 extern 背书遍历(登记 DMA 直读区间用)。
+    pub fn resident_extern_backings(&self) -> impl Iterator<Item = Arc<dyn crate::weight::container::gguf::HostBytes>> + '_ {
+        self.resident_experts.iter().flatten().flat_map(|weights| [&weights.gate, &weights.up, &weights.down]).filter_map(GgufMatrix::extern_backing)
     }
 
     pub fn reader(&self) -> &GgufReader {

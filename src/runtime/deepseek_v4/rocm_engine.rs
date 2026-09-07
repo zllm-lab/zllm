@@ -841,7 +841,7 @@ impl RocmDeepSeekV4Engine {
                     }
                 }
 
-                // 单路 target decode 在 Amd-1 上比 DSpark 更快；按本次 engine batch
+                // 单路 target decode 在目标 ROCm 机器上比 DSpark 更快；按本次 engine batch
                 // 的初始会话数固定模式，避免同一会话因后续请求到达而中途切换语义。
                 if let Some(dspark) = self.dspark.clone().filter(|_| tasks.len() >= self.options.dspark_min_sessions) {
                     struct DraftWork {

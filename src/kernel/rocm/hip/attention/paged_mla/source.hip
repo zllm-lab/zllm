@@ -685,7 +685,11 @@ __device__ __forceinline__ void paged_cache_append_mla_body(
     unsigned int rotary_dim,
     unsigned int split_half,
     unsigned int group_size,
-    unsigned int block_size)
+    unsigned int block_size,
+    signed char* log_latent,
+    unsigned short* log_scales,
+    unsigned short* log_rope,
+    unsigned int log_row)
 {
     const unsigned int groups_per_row = latent_columns / group_size;
     const unsigned int latent_groups = rows * groups_per_row;
@@ -713,6 +717,9 @@ __device__ __forceinline__ void paged_cache_append_mla_body(
             value = column == real_column ? real * c - imaginary * s : imaginary * c + real * s;
         }
         rope_cache[physical * rope_columns + column] = zllm_f32_to_bf16(value);
+        if (log_rope != 0) {
+            log_rope[(unsigned long long)log_row * rope_columns + column] = rope_cache[physical * rope_columns + column];
+        }
         return;
     }
 
@@ -734,12 +741,18 @@ __device__ __forceinline__ void paged_cache_append_mla_body(
         const float scale = maxima[0] == 0.0f ? 1.0f : maxima[0] * (1.0f / 127.0f);
         const unsigned short encoded = zllm_f32_to_bf16(scale);
         latent_scales[physical * groups_per_row + group] = encoded;
+        if (log_scales != 0) {
+            log_scales[(unsigned long long)log_row * groups_per_row + group] = encoded;
+        }
         quant_scale = zllm_bf16_to_f32(encoded);
     }
     __syncthreads();
     const float quantized = nearbyintf(value / quant_scale);
-    latent_cache[physical * latent_columns + column]
-        = (signed char)fmaxf(-127.0f, fminf(127.0f, quantized));
+    const signed char quantized_byte = (signed char)fmaxf(-127.0f, fminf(127.0f, quantized));
+    latent_cache[physical * latent_columns + column] = quantized_byte;
+    if (log_latent != 0) {
+        log_latent[(unsigned long long)log_row * latent_columns + column] = quantized_byte;
+    }
 }
 
 // 既有 kernel：position 来自 host 参数。
@@ -760,9 +773,13 @@ extern "C" __global__ void paged_cache_append_mla_f32_q8_bf16(
     unsigned int rotary_dim,
     unsigned int split_half,
     unsigned int group_size,
-    unsigned int block_size)
+    unsigned int block_size,
+    signed char* log_latent,
+    unsigned short* log_scales,
+    unsigned short* log_rope,
+    unsigned int log_row)
 {
-    paged_cache_append_mla_body(latent_input, latent_cache, latent_scales, rope_input, cosine, sine, rope_cache, block_table, position, rope_position, rows, latent_columns, rope_columns, rotary_dim, split_half, group_size, block_size);
+    paged_cache_append_mla_body(latent_input, latent_cache, latent_scales, rope_input, cosine, sine, rope_cache, block_table, position, rope_position, rows, latent_columns, rope_columns, rotary_dim, split_half, group_size, block_size, log_latent, log_scales, log_rope, log_row);
 }
 
 // 间接变体：position/rope_position 从 device buffer 读（graph replay 固定参数）。
@@ -784,7 +801,7 @@ extern "C" __global__ void paged_cache_append_mla_f32_q8_bf16_indirect(
     unsigned int group_size,
     unsigned int block_size)
 {
-    paged_cache_append_mla_body(latent_input, latent_cache, latent_scales, rope_input, cosine, sine, rope_cache, block_table, positions[0], positions[1], rows, latent_columns, rope_columns, rotary_dim, split_half, group_size, block_size);
+    paged_cache_append_mla_body(latent_input, latent_cache, latent_scales, rope_input, cosine, sine, rope_cache, block_table, positions[0], positions[1], rows, latent_columns, rope_columns, rotary_dim, split_half, group_size, block_size, (signed char*)0, (unsigned short*)0, (unsigned short*)0, 0u);
 }
 
 // CPU 全历史只上传本轮缺失行；slot 是 GPU hot cache 中的精确落点。
