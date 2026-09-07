@@ -9,11 +9,11 @@
 
 pub mod cpu;
 #[cfg(feature = "with-cuda")]
+pub mod cuda_node;
+#[cfg(feature = "with-cuda")]
 pub mod cuda;
 #[cfg(feature = "with-cuda")]
 mod cuda_mtp;
-#[cfg(feature = "with-cuda")]
-pub mod cuda_node;
 
 use crate::{
     attention::{

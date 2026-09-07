@@ -120,6 +120,14 @@ impl Mtp {
         Ok(Self { source, weights, enorm, hnorm, eh_proj, head, cache, experts })
     }
 
+    /// 请求级重置:KV 截到 0 + 专家管线的 token 边界追踪归零。
+    /// 管线 position 残留上一请求末尾时,新请求 position=0 会触发
+    /// "token 边界错误"或预取队列按错误差值越界。
+    pub fn reset_request(&mut self) {
+        self.truncate(0);
+        self.experts.reset_token_boundary();
+    }
+
     pub fn truncate(&mut self, position: usize) {
         self.cache.truncate(position);
     }
@@ -156,6 +164,17 @@ impl Mtp {
     pub fn sample(&self, ctx: &CudaContext, hidden: &CudaTensor, target_head: &CudaWeight) -> Result<(u32, f32), Box<dyn std::error::Error>> {
         let (mixed, _) = super::cuda::hc_mix(ctx, &self.source.cfg, hidden, &self.head)?;
         let logits = ctx.linear(&mixed, target_head)?;
+        // sigmoid_residual 通道的 F32 残差会经 linear 传播 F32 logits;
+        // token_probability 仅收 F16——统一在这里降级(1×vocab)
+        let logits = if logits.slice_f32.is_some() {
+            let raw = logits.slice_f32.as_ref().expect("checked");
+            let host = ctx.stream().clone_dtoh(raw).map_err(|e| format!("logits 回读: {e:?}"))?;
+            let packed: Vec<half::f16> = host.iter().map(|&v| half::f16::from_f32(v)).collect();
+            let slice = ctx.stream().clone_htod(&packed).map_err(|e| format!("logits 上传: {e:?}"))?;
+            CudaTensor::new(slice, 1, packed.len())
+        } else {
+            logits
+        };
         let token = ctx.argmax(&logits)?;
         let probability = crate::kernel::cuda::tensor::token_probability_f16(ctx, &logits, token)?;
         Ok((token, probability))

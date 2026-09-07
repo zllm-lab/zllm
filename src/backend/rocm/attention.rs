@@ -646,7 +646,7 @@ impl RocmContext {
         if rows == 0 || k_rope.rows != rows {
             return Err(compute_error(format!("L{layer} operator cache-only MLA rows={rows}/{} 非法", k_rope.rows)));
         }
-        if cache.operator_packed_kv_replication_enabled(layer) {
+        if cache.operator_packed_kv_replication_enabled(layer) && !(rows > 1 && cache.operator_layer_is_hot(layer)) {
             cache.append_mla(self, layer, latent, k_rope)?;
             // 来源是 owner cache 的稳定 view；其生命周期另由 owner completion
             // 接管，目标直接写入 peer cache 最终 offset。
@@ -769,7 +769,9 @@ impl RocmContext {
             None
         };
 
-        let packed_kv_replica = cache.operator_packed_kv_replication_enabled(layer);
+        // 热窗期多行 append（MTP catch-up/追加轮）没有窗口槽位语义，回退
+        // 双端各自 append；单行 decode 与全量期 prefill 保持 packed 复制。
+        let packed_kv_replica = cache.operator_packed_kv_replication_enabled(layer) && !(rows > 1 && cache.operator_layer_is_hot(layer));
         let q_lora = if presubmitted_query { None } else { Some(self.tensor_to_stable_deferred(normalized_q_lora.clone())?) };
         let latent = if packed_kv_replica { latent.clone() } else { self.tensor_to_stable_deferred(latent.clone())? };
         // 默认路径只在 owner 旋转、量化一次 K-RoPE，再复制压缩 cache；兼容

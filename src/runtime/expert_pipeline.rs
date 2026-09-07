@@ -96,6 +96,11 @@ impl<S> ExpertDecodePipeline<S> {
         start_prefetch_with_state(&mut self.predictor, &mut self.stats, backend, spec, layer, source, &mut self.backend_state)
     }
 
+    /// 请求级重置:position 边界回到 None(新 token 流从头开始)。
+    pub fn reset_token_boundary(&mut self) {
+        self.position = None;
+    }
+
     pub fn decode<B>(&mut self, backend: &B, spec: &TopkMoeSpec, weights: &MoeFfnRef<'_, B::Weight>, request: ExpertDecodeRequest<'_>, input: &B::Tensor) -> Result<B::Tensor, BackendError>
     where
         B: ExpertDecodeBackend<MoeState = S>,

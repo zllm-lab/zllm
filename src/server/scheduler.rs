@@ -50,37 +50,15 @@ pub enum NodeMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SchedulerMessage {
-    Registered {
-        node_id: String,
-        heartbeat_seconds: u64,
-        task_ids: Vec<String>,
-    },
-    NewPrefill {
-        request_id: String,
-        model: String,
-        request: Value,
-    },
-    Cancel {
-        request_id: String,
-    },
-    NewTask {
-        task_id: String,
-        model: String,
-        task_kind: String,
-        request: Value,
-    },
-    ArtifactCommitted {
-        task_id: String,
-        artifact_id: String,
-    },
+    Registered { node_id: String, heartbeat_seconds: u64, task_ids: Vec<String> },
+    NewPrefill { request_id: String, model: String, request: Value },
+    Cancel { request_id: String },
+    NewTask { task_id: String, model: String, task_kind: String, request: Value },
+    ArtifactCommitted { task_id: String, artifact_id: String },
     /// append 请求在 owner 满载排队期间 pin 终点 cache,节点换出循环跳过被 pin
     /// 条目,排到队时命中内存而不是 swap 慢路径;`UnpinCache` 解除。
-    PinCache {
-        cache_id: String,
-    },
-    UnpinCache {
-        cache_id: String,
-    },
+    PinCache { cache_id: String },
+    UnpinCache { cache_id: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -628,7 +606,14 @@ impl Scheduler {
 
     /// 查 `cache_id` 的全部持有者节点及命令通道(`cache_owner` 只返回最早一个)。
     async fn cache_holders(&self, cache_id: &str) -> Vec<(String, NodeCommands)> {
-        self.state.lock().await.nodes.iter().filter(|(_, node)| node.view.caches.iter().any(|cache| cache.cache_id == cache_id)).map(|(node_id, node)| (node_id.clone(), node.commands.clone())).collect()
+        self.state
+            .lock()
+            .await
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.view.caches.iter().any(|cache| cache.cache_id == cache_id))
+            .map(|(node_id, node)| (node_id.clone(), node.commands.clone()))
+            .collect()
     }
 
     /// 节点真实并发槽位暂满时等待流式 runtime 释放容量；模型未注册则立即返回。
@@ -656,9 +641,7 @@ impl Scheduler {
                 result => break result,
             }
         };
-        if !pinned.is_empty()
-            && let Some(cache_id) = cache_id
-        {
+        if !pinned.is_empty() && let Some(cache_id) = cache_id {
             // 解 pin 对象覆盖 pin 时刻与退出时刻持有者的并集:窗口内持有者变化时
             // 多发的 unpin 在节点侧是无害 no-op。
             let mut targets = self.cache_holders(cache_id).await;

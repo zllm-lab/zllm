@@ -68,6 +68,11 @@ pub(super) fn hc_mix(ctx: &CudaContext, cfg: &Qwen4ExpConfig, residual: &CudaTen
 pub(super) fn selected_rows(ctx: &CudaContext, source: &Qwen4ExpGguf, name: &str, ids: &[u32], rows: usize, columns: usize) -> Result<CudaTensor, crate::backend::BackendError> {
     let op = crate::backend::compute_error;
     let matrix = source.reader().read_matrix(name).map_err(op)?;
+    // packed 按 GGUF 矩阵实际列宽分配;调用方 columns 与 GGUF columns 不一致
+    // 时 read_rows_into 会越界写穿 Vec(堆损坏根因),显式拒绝。
+    if matrix.columns != columns {
+        return Err(op(format!("selected_rows {name}: GGUF columns={} 与调用方 columns={columns} 不一致", matrix.columns)));
+    }
     let mut packed = vec![0u8; matrix.tensor_type.storage_bytes(matrix.columns).map_err(op)? * ids.len()];
     matrix.read_rows_into(ids, &mut packed).map_err(op)?;
     crate::kernel::cuda::linear::gguf_rows_f16(ctx, &packed, rows, columns, matrix.tensor_type.0).map_err(op)
@@ -87,7 +92,12 @@ fn ple(
     let op = crate::backend::compute_error;
     let ple = cfg.ple.as_ref().expect("PLE 权重与配置同时存在");
     let indices = super::ple_row_indices(ple, tokens, prev);
-    let input = selected_rows(ctx, gguf, "per_layer_token_embd.weight", &indices, tokens.len(), cfg.hidden_size)?;
+    // PLE 表列宽是 head_dim(160),不是 hidden_size(2560);走 GGUF 的
+    // 专用行 gather(按 head 拼接),不能用 selected_rows(按整行 gather)。
+    let ple_rows = gguf.ple_rows_f32(ple, &indices).map_err(op)?;
+    let packed: Vec<half::f16> = ple_rows.iter().map(|&v| half::f16::from_f32(v)).collect();
+    let slice = ctx.stream().clone_htod(&packed).map_err(|e| op(format!("PLE 行上传: {e:?}")))?;
+    let input = CudaTensor::new(slice, tokens.len(), cfg.hidden_size);
     let key = ctx.linear(&input, &weights.key)?;
     let value = ctx.linear(&input, &weights.value)?;
     let groups = cfg.hyper_connection.streams;
@@ -165,24 +175,7 @@ pub(super) fn sparse_attention(
     let mut block_scores = ctx.buffer_uninit_f32(rows * n_blocks).map_err(op)?;
     let mut selected = ctx.stream().alloc_zeros::<u32>(rows * width).map_err(|e| op(format!("selected 分配: {e:?}")))?;
     let mut selected_count = ctx.stream().alloc_zeros::<u32>(rows).map_err(|e| op(format!("count 分配: {e:?}")))?;
-    crate::kernel::cuda::qsa::qsa_score_select(
-        ctx,
-        &qsa_layer.pooled,
-        &index_query,
-        &mut block_scores,
-        &mut selected,
-        &mut selected_count,
-        rows,
-        n_cells,
-        dead_block,
-        position,
-        ratio,
-        cfg.indexer.top_k,
-        cfg.indexer.head_count,
-        head_dim,
-        width,
-    )
-    .map_err(op)?;
+    crate::kernel::cuda::qsa::qsa_score_select(ctx, &qsa_layer.pooled, &index_query, &mut block_scores, &mut selected, &mut selected_count, rows, n_cells, dead_block, position, ratio, cfg.indexer.top_k, cfg.indexer.head_count, head_dim, width).map_err(op)?;
     // 掩码 GQA:按缓存形态分流(Q8G64 / F16)
     let kv_layer = cache.layer(layer)?;
     let attended = if let Some(q8) = kv_layer.q8.as_ref() {
@@ -292,6 +285,18 @@ impl CudaState {
         ctx.stream().memcpy_dtod(&checkpoints.slice((retained - 1) * count..retained * count), &mut self.ple_state)?;
         self.cache.truncate(position + retained);
         self.previous.truncate(position + retained);
+        // QSA 游标同步回退:raw 截到保留边界,块游标重算;截断边界块的内容
+        // 由下次追加的池化 kernel 按 first_block 覆写。
+        let boundary = position + retained;
+        for layer in self.qsa.layers.iter_mut() {
+            if layer.raw_rows > boundary {
+                layer.raw_rows = boundary;
+            }
+            let blocks = layer.raw_rows / 4;
+            if layer.pooled_blocks > blocks {
+                layer.pooled_blocks = blocks;
+            }
+        }
         Ok(())
     }
 
@@ -321,7 +326,17 @@ impl CudaState {
             profile_stage(ctx, profile, &mut stage_start, &mut stage_wall[1])?;
             let mixed = match &weights.mixer {
                 Qwen4ExpMixer::Delta(weights) => attention.delta(weights, &mut self.delta, layer, &mixed, position)?,
-                Qwen4ExpMixer::SparseAttention { attention, indexer } => sparse_attention(ctx, cfg, attention, indexer, &mut self.cache, &mut self.qsa, layer, &rope, &mixed, position)?,
+                Qwen4ExpMixer::SparseAttention { attention, indexer } => {
+                    // 短上下文走 dense(QSA 全可见区间与因果 GQA 精确等价):
+                    // sparse kernel 的 Q8 掩码路径存在形状相关越界嫌疑
+                    // (MTP node 二请求 token probability 崩溃的排除法分支)。
+                    let n_cells = position + chunk.len();
+                    if n_cells <= cfg.indexer.top_k {
+                        full_attention(ctx, cfg, attention, &mut self.cache, &rope, layer, &mixed, position)?
+                    } else {
+                        sparse_attention(ctx, cfg, attention, indexer, &mut self.cache, &mut self.qsa, layer, &rope, &mixed, position)?
+                    }
+                }
             };
             profile_stage(ctx, profile, &mut stage_start, &mut stage_wall[2])?;
             residual = grouped::sigmoid_residual(ctx, &residual, &mixed, inject.as_ref().unwrap())?;
@@ -357,7 +372,14 @@ pub fn run(path: &Path, prompt: &str, options: CudaOptions) -> Result<(), Box<dy
     }
     let tokens = source.tokenizer()?.tokenize(prompt.as_bytes());
     if tokens.is_empty() || tokens.len().saturating_add(options.decode_steps) > options.max_seq_len || options.prefill_chunk_size == 0 {
-        return Err(format!("Qwen4-Exp CUDA 要求 0 < prompt+decode <= max_seq_len,实际 prompt={} decode={} max_seq_len={} chunk={}", tokens.len(), options.decode_steps, options.max_seq_len, options.prefill_chunk_size).into());
+        return Err(format!(
+            "Qwen4-Exp CUDA 要求 0 < prompt+decode <= max_seq_len,实际 prompt={} decode={} max_seq_len={} chunk={}",
+            tokens.len(),
+            options.decode_steps,
+            options.max_seq_len,
+            options.prefill_chunk_size
+        )
+        .into());
     }
     let host_bytes: usize = source.reader().tensors().iter().filter(|t| t.name.contains("_exps.weight")).map(|t| t.bytes).sum();
     // 启动时拒绝任何会落入 F16 专家展开的格式,使这条路线始终保持原始 packed 编码。

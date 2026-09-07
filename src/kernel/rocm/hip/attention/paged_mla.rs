@@ -3285,21 +3285,15 @@ fn try_paged_mla_attention_ct_inner(
     ];
     let value_dim = kv_head_dim.checked_sub(q_head_dim - rope_dim).ok_or("paged MLA value_dim 下溢")?;
     let project_wmma = query_rows > 2;
-    // W8G32 单行 decode 走 perm 直读臂(kv_b 权重 W8A16 直读省一次发散常量查表,
-    // 真机 oracle 已过);perm kernel 仅支持该形态,形状或行数不满足时必须回落原
-    // kernel——kernel 内部对不满足的形态是直接返回不写输出,host 侧不门控会静默产错。
-    let project_perm = !project_wmma && query_rows == 1 && bits_u32 == 8 && group_u32 == 32 && latent_u32 % 128 == 0;
+    // PV perm 生产切换已回退:服务进程中该 kernel 发射返回成功但整体不执行
+    // (入口盖章不落、输出保持池内旧值,输入/参数/发射路径六轮取证全部正常,
+    // 同源码 cargo test 进程 oracle 逐位一致)——根因未明,取证链见
+    // docs/rocm-glm53-kernel-probe-20260903.md。kernel 保留在模块内待后续排查。
     let project_tile = if project_wmma { 128 } else { 16 };
     let project_tiles = head_count.checked_mul(value_dim.div_ceil(project_tile)).ok_or("paged MLA project grid x 溢出")?;
     let project_started = profile_mla.then(std::time::Instant::now);
     launch_moe_kernel(
-        if project_wmma {
-            functions.project_value_wmma
-        } else if project_perm {
-            functions.project_value_perm
-        } else {
-            functions.project_value
-        },
+        if project_wmma { functions.project_value_wmma } else { functions.project_value },
         u32::try_from(project_tiles).map_err(|_| "paged MLA project grid x 超过 u32")?,
         u32::try_from(query_rows.div_ceil(project_tile)).map_err(|_| "paged MLA project grid y 超过 u32")?,
         if project_wmma { functions.wavefront_size * 8 } else { 256 },

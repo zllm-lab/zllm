@@ -1014,6 +1014,19 @@ impl Glm52Engine {
         Ok(())
     }
 
+    /// hot 形态的 host 侧 mirror 容量：MemAvailable 的一半除以每 token 的
+    /// mirror 字节（层数 × 单层行宽 × mirror 份数）。
+    fn host_mirror_token_budget(mla_bytes: usize, mirror_copies: usize, layers: usize) -> Result<usize, String> {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|error| format!("读取 /proc/meminfo: {error}"))?;
+        let available = meminfo.lines().find_map(|line| line.strip_prefix("MemAvailable:").and_then(|value| value.split_whitespace().next()).and_then(|value| value.parse::<u64>().ok())).ok_or("无法解析 MemAvailable")? * 1024;
+        let budget = available / 2;
+        let per_token = (mla_bytes as u64) * (layers as u64) * (mirror_copies as u64);
+        if per_token == 0 {
+            return Err("MLA host mirror 每 token 字节为零".to_owned());
+        }
+        Ok(usize::try_from(budget / per_token).unwrap_or(usize::MAX).max(1))
+    }
+
     fn memory_capacity(&self) -> Result<(usize, usize, Vec<KvCacheDeviceCapacity>), String> {
         let safety_bytes = self.options.memory_reserve_bytes;
         // 链头不知道下游的物理分层，部署可以用整条流水线最大单卡层数覆盖。
@@ -1021,9 +1034,21 @@ impl Glm52Engine {
         let latent_bytes = if self.options.kv_cache_format == KvCacheFormat::F16 { self.mla.kv_lora_rank * 2 } else { self.mla.kv_lora_rank + self.mla.kv_lora_rank / crate::kv_cache::DEFAULT_GROUP_SIZE * 2 };
         let mla_bytes = latent_bytes + self.mla.qk_rope_head_dim * 2;
         let index_bytes = self.cfg.index_head_dim * 2;
-        // pair 卡按固定 block parity 各持有一半 MLA KV；DSA 为按 query rows
-        // 并行扫描完整历史，Indexer cache 仍各保留一份。
-        let kv_bytes_per_layer_token = if self.options.cooperative_expert_pairs { mla_bytes.div_ceil(2) + index_bytes } else { mla_bytes + index_bytes };
+        // hot 形态下 MLA 全量驻留 CPU mirror，GPU 每层只剩固定 hot 窗 + 每 token
+        // 的 DSA index key。token 项因此只记 index；热窗按并发会话数放大成固定
+        // 开销从 free 里扣。8 是覆盖典型并发 decode 的保守倍数，超出部分由
+        // memory_reserve_bytes 吸收。
+        const HOT_WINDOW_SESSIONS: usize = 8;
+        let hot_rows = crate::kernel::rocm::hip::options().mla_cpu_hot_rows;
+        let (kv_bytes_per_layer_token, hot_window_layer_bytes) = if hot_rows != 0 {
+            (index_bytes, hot_rows * mla_bytes * HOT_WINDOW_SESSIONS)
+        } else if self.options.cooperative_expert_pairs {
+            // pair 卡按固定 block parity 各持有一半 MLA KV；DSA 为按 query rows
+            // 并行扫描完整历史，Indexer cache 仍各保留一份。
+            (mla_bytes.div_ceil(2) + index_bytes, 0)
+        } else {
+            (mla_bytes + index_bytes, 0)
+        };
         let mut layer_start = 0usize;
         let mut token_capacity = usize::MAX;
         let mut devices = Vec::with_capacity(self.contexts.len() + self.cooperative_peer_contexts.len() + self.downstream_memory.len());
@@ -1031,7 +1056,7 @@ impl Glm52Engine {
             let layers = layer_end + 1 - layer_start + usize::from(device_index == 0 && self.options.mtp) * self.cfg.mtp_layer_count;
             layer_start = layer_end + 1;
             for (role, context) in std::iter::once(("owner", context)).chain(self.cooperative_peer_contexts.get(device_index).map(|peer| ("peer", peer))) {
-                let free = context.stage_available_bytes().map_err(|error| format!("查询 ROCm device {} 可用显存: {error:?}", context.device_id()))?;
+                let free = context.stage_available_bytes().map_err(|error| format!("查询 ROCm device {} 可用显存: {error:?}", context.device_id()))?.saturating_sub(layers.saturating_mul(hot_window_layer_bytes));
                 let total = context.stage_total_bytes().map_err(|error| format!("查询 ROCm device {} 总显存: {error:?}", context.device_id()))?;
                 // operator peer 不保存 DSA，沿用 owner 的每 token 字节数会略保守；
                 // 但必须把完整 MLA replica 与 MTP L78 计入 admission 下界。
@@ -1049,7 +1074,7 @@ impl Glm52Engine {
             }
         }
         for report in &self.downstream_memory {
-            let free = usize::try_from(report.available_bytes).map_err(|_| format!("下游 device {} 可用显存超过 usize", report.device))?;
+            let free = usize::try_from(report.available_bytes).map_err(|_| format!("下游 device {} 可用显存超过 usize", report.device))?.saturating_sub(report.model_units.saturating_mul(hot_window_layer_bytes));
             let total = usize::try_from(report.total_bytes).map_err(|_| format!("下游 device {} 总显存超过 usize", report.device))?;
             let device = crate::runtime::rocm_chain::kv_capacity_from_free(format!("downstream/rocm-device-{}", report.device), free, total, report.model_units, kv_bytes_per_layer_token, safety_bytes, admission_layers)?;
             token_capacity = token_capacity.min(device.token_capacity);
@@ -1062,6 +1087,20 @@ impl Glm52Engine {
                 device.bytes_per_token,
             );
             devices.push(device);
+        }
+        if hot_rows != 0 {
+            // MLA mirror 全量在 host：operator pair 下 owner/peer 各持一份 mirror。
+            // 用本机 MemAvailable 的一半做两侧的 token 上界（双机同型，借用
+            // head 的读数近似 tail），防止 admission 放大后打爆主机内存。
+            let mirror_copies = 1 + usize::from(!self.cooperative_peer_contexts.is_empty());
+            let local_layers = self.layer_ends.last().copied().unwrap_or(0) + 1 + usize::from(self.options.mtp) * self.cfg.mtp_layer_count;
+            token_capacity = token_capacity.min(Self::host_mirror_token_budget(mla_bytes, mirror_copies, local_layers)?);
+            let downstream_layers = self.downstream_memory.iter().map(|report| report.model_units).sum::<usize>();
+            token_capacity = token_capacity.min(Self::host_mirror_token_budget(mla_bytes, mirror_copies, downstream_layers)?);
+            // 总量再以 max_sequence_length 为窗口上界：prefill 期间 KV 仍全量在
+            // GPU，1M 窗口把最坏情况下的双卡 prefill 瞬态钉死在约 6GiB/卡。
+            token_capacity = token_capacity.min(self.max_seq_len);
+            eprintln!("[glm52-head] MLA host mirror admission mla_bytes={mla_bytes} copies={mirror_copies} head_layers={local_layers} tail_layers={downstream_layers} prefill_window_tokens={} token_capacity={token_capacity}", self.max_seq_len);
         }
         let token_capacity = token_capacity.max(1);
         let memory_capacity = (token_capacity / self.kv_reservation_page_tokens).max(1);

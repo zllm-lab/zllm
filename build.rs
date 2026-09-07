@@ -24,7 +24,7 @@ fn copy_qnn_headers(source: &Path, destination: &Path, core_minor: &str) {
 }
 
 fn main() {
-    println!("cargo:rerun-if-changed=native/qnn_linear.cpp");
+    println!("cargo:rerun-if-changed=src/backend/qnn/qnn_linear.cpp");
     println!("cargo:rerun-if-env-changed=QNN_SDK_ROOT");
     println!("cargo:rerun-if-env-changed=ZLLM_QNN_CORE_API_MINOR");
     if env::var_os("CARGO_FEATURE_WITH_QNN").is_none() {
@@ -39,5 +39,5 @@ fn main() {
     // 若要对接手机系统自带旧 QAIRT(≤2.29,core 2.22),用该环境变量降级。
     let minor = env::var("ZLLM_QNN_CORE_API_MINOR").unwrap_or_else(|_| "28".to_owned());
     copy_qnn_headers(&source, &out, &minor);
-    cc::Build::new().cpp(true).std("c++17").include(out).file("native/qnn_linear.cpp").flag_if_supported("-fno-exceptions").compile("zllm_qnn");
+    cc::Build::new().cpp(true).std("c++17").include(out).file("src/backend/qnn/qnn_linear.cpp").flag_if_supported("-fno-exceptions").compile("zllm_qnn");
 }

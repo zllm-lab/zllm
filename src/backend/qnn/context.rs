@@ -2,7 +2,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
@@ -24,7 +24,16 @@ pub struct QnnContext {
     cpu: CpuContext,
     backend: PathBuf,
     graph_capacity_available: AtomicBool,
+    /// HTP 静态权重预算记账。SM8635 实测 ~800MB 后逐图 6031 abort;装载期
+    /// 按层序累计 INT8 副本字节,超预算的层直接不量化,省 host 内存并避免
+    /// finalize+abort 试错(大模型下试错一次就是一个权重一份 CPU 校准)。
+    int8_resident_bytes: AtomicU64,
 }
+
+/// HTP 静态权重预算上限,留 ~100MB 余量覆盖图结构与中间缓冲。
+const HTP_INT8_BUDGET_BYTES: u64 = 700 * 1024 * 1024;
+/// vocab 级输出头 F32 常驻的上限(K2 lm_head 394MB 在内,E4B 2.7GB 保持量化形态)。
+const CPU_F32_HEAD_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 
 pub struct QnnWeight {
     cpu: crate::backend::cpu::CpuWeight,
@@ -68,7 +77,7 @@ fn is_execute_aborted(msg: &str) -> bool {
 
 impl QnnContext {
     pub fn new(backend: impl AsRef<Path>) -> Result<Self, String> {
-        Ok(Self { cpu: CpuContext, backend: backend.as_ref().to_owned(), graph_capacity_available: AtomicBool::new(true) })
+        Ok(Self { cpu: CpuContext, backend: backend.as_ref().to_owned(), graph_capacity_available: AtomicBool::new(true), int8_resident_bytes: AtomicU64::new(0) })
     }
 
     fn cpu_weight<'a>(&self, weight: &'a QnnWeight) -> &'a crate::backend::cpu::CpuWeight {
@@ -122,10 +131,23 @@ impl BackendResources for QnnContext {
             LinearWeight::Bf16Bytes(values) => Some(values.chunks_exact(2).map(|bytes| half::bf16::from_le_bytes([bytes[0], bytes[1]]).to_f32()).collect()),
             LinearWeight::Quantized(matrix) => Some(matrix.decode().map_err(|msg| BackendError::Compute { msg })?),
         };
-        let quantized = if rows > 1 { Some(quantize_linear_weight(decoded.as_deref().expect("decoded 已生成"), rows, cols, 8).map_err(|msg| BackendError::Compute { msg })?) } else { None };
-        // lm_head(vocab 级)F32 常驻 CPU:BF16 GGUF gemv 实测 ~450ms/token,而 F32 gemv
-        // 路径快约 20×;不消耗 HTP 预算(host ~394MB RAM 换 decode 尾部大头)。
-        let cpu = if rows > 8192 { self.cpu.prepare_f32(decoded.as_deref().expect("decoded 已生成"), rows, cols)? } else { self.cpu.prepare_weight(weight, rows, cols)? };
+        let quantized = if rows > 1 {
+            let bytes = u64::try_from(rows.checked_mul(cols).ok_or_else(|| BackendError::Compute { msg: "QNN 权重 shape 溢出".to_owned() })?).map_err(|_| BackendError::Compute { msg: "QNN 权重 shape 溢出".to_owned() })?;
+            (self.int8_resident_bytes.load(Ordering::Relaxed) + bytes <= HTP_INT8_BUDGET_BYTES).then(|| {
+                let weight = quantize_linear_weight(decoded.as_deref().expect("decoded 已生成"), rows, cols, 8).map_err(|msg| BackendError::Compute { msg })?;
+                self.int8_resident_bytes.fetch_add(bytes, Ordering::Relaxed);
+                Ok(weight)
+            }).transpose()?
+        } else {
+            None
+        };
+        // lm_head(vocab 级)且 F32 常驻量可控时走 F32 gemv 快路径(实测比 BF16 GGUF
+        // 快 ~20×);超限(E4B 2.7GB 级)保持原始量化形态,不消耗预算也不爆 host。
+        let cpu = if rows > 8192 && u64::try_from(rows.checked_mul(cols).unwrap_or(usize::MAX)).map(|elements| elements * 4).unwrap_or(u64::MAX) <= CPU_F32_HEAD_LIMIT_BYTES {
+            self.cpu.prepare_f32(decoded.as_deref().expect("decoded 已生成"), rows, cols)?
+        } else {
+            self.cpu.prepare_weight(weight, rows, cols)?
+        };
         Ok(QnnWeight { cpu, q: quantized, decode: Mutex::new(None), dual_decode: Mutex::new(None), triple_decode: Mutex::new(None), mlp: Mutex::new(None) })
     }
 
