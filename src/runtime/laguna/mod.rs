@@ -458,9 +458,6 @@ impl<'a, B: Backend> LagunaRuntime<'a, B> {
         let query = self.backend.rope_prefix(&query, heads, spec.rope_dim, RotaryLayout::SplitHalf, position, &table.cos, &table.sin)?;
         let key = self.backend.rope_prefix(&key_normed, cfg.num_kv_heads, spec.rope_dim, RotaryLayout::SplitHalf, position, &table.cos, &table.sin)?;
         if std::env::var_os("ZLLM_CUDA_NAN_AUDIT").is_some() && std::env::var("ZLLM_CUDA_AUDIT_LAYER").map(|value| value.parse::<usize>() == Ok(layer)).unwrap_or(false) {
-            let rows = |tensor: &B::Tensor, row: usize| {
-                self.backend.debug_row_head_f32(tensor, row).map(|values| values.iter().map(|value| if value.is_nan() { "NaN".to_owned() } else { format!("{value:.4}") }).collect::<Vec<_>>().join(",")).unwrap_or_else(|_| "err".to_owned())
-            };
             let full = |tensor: &B::Tensor, row: usize| {
                 self.backend
                     .debug_row_full_f32(tensor, row)
@@ -521,7 +518,6 @@ impl<'a, B: Backend> LagunaRuntime<'a, B> {
             return Err(BackendError::Compute { msg: format!("Laguna prefill position={position} rows={rows} 超过 max_position={}", self.config.max_position_embeddings) });
         }
         let mut hidden = hidden;
-        let nan_audit = std::env::var_os("ZLLM_CUDA_NAN_AUDIT").is_some();
         let result = (|| {
             for (layer, weights) in self.layers.iter().enumerate() {
                 let _scope = self.backend.layer_scope();
@@ -780,7 +776,7 @@ mod model_tests {
         assert_eq!(cfg.layer_kind(4), Some(LagunaLayerKind::FullAttention));
         assert_eq!(cfg.layer_kind(39), Some(LagunaLayerKind::SlidingAttention));
         assert_eq!(cfg.layer_kind(40), None);
-        assert_eq!(cfg.layer_kind(0).is_some_and(|kind| cfg.num_heads(0) == Some(48)), true);
+        assert_eq!(cfg.layer_kind(0).is_some_and(|_| cfg.num_heads(0) == Some(48)), true);
         assert_eq!(cfg.num_heads(1), Some(64));
     }
 

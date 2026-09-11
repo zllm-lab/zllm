@@ -174,10 +174,14 @@ __device__ __forceinline__ zllm_f16x2 zllm_w8_perm_f16(
 "#;
 
 pub(super) fn compile_hip_source(source: &str, name: &str) -> Result<Vec<u8>, String> {
+    compile_hip_source_with_options(source, name, &[])
+}
+
+pub(super) fn compile_hip_source_with_options(source: &str, name: &str, extra_options: &[&str]) -> Result<Vec<u8>, String> {
     let rocm_root = options().rocm_root.clone();
     let version_tag = hip_runtime_version_tag().to_le_bytes();
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for byte in source.bytes().chain(name.bytes()).chain(rocm_root.bytes()).chain(version_tag) {
+    for byte in source.bytes().chain(name.bytes()).chain(rocm_root.bytes()).chain(version_tag).chain(extra_options.iter().flat_map(|option| option.bytes().chain(std::iter::once(0)))) {
         hash ^= byte as u64;
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -204,7 +208,10 @@ pub(super) fn compile_hip_source(source: &str, name: &str) -> Result<Vec<u8>, St
     if create_status != HIPRTC_SUCCESS {
         return Err(format!("hiprtcCreateProgram 失败: code={create_status}"));
     }
-    let option_values = [CString::new("--std=c++17").unwrap(), CString::new(format!("-I{rocm_root}/include")).unwrap()];
+    let mut option_values = vec![CString::new("--std=c++17").unwrap(), CString::new(format!("-I{rocm_root}/include")).unwrap()];
+    for option in extra_options {
+        option_values.push(CString::new(*option).map_err(|error| format!("HIPRTC 编译选项 {option:?} 无效: {error}"))?);
+    }
     let options = option_values.iter().map(|option| option.as_ptr()).collect::<Vec<_>>();
     let compile_status = unsafe { compile_program(program, options.len() as i32, options.as_ptr()) };
     if compile_status != HIPRTC_SUCCESS {

@@ -211,6 +211,77 @@ fn ct_mla_weight(weight: &RocmWeight) -> Result<ops::hip::CtMlaWeightRef<'_>, Ba
     Ok(ops::hip::CtMlaWeightRef { packed, scales, rows: weight.rows, cols: weight.cols, group_size, scale_dtype, bits })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn gpu_hot_attention_into(
+    context: &RocmContext,
+    query: &RocmTensor,
+    cached: &super::kv_cache::RocmPagedMlaLayer,
+    hot: &mut super::kv_cache::RocmMlaCpuHotLayer,
+    kv_b: &RocmWeight,
+    spec: &crate::attention::mla::MlaSpec,
+    selection: Option<&ops::hip::DeviceBuffer>,
+    width: usize,
+    output: &ops::hip::DeviceBuffer,
+) -> Result<bool, BackendError> {
+    if !hot.uses_gpu() {
+        return Ok(false);
+    }
+    let selection = selection.ok_or_else(|| compute_error("GPU hot MLA 缺少 device selection"))?;
+    let query_device = query.device.as_deref().ok_or_else(|| compute_error("GPU hot query 缺少 device"))?;
+    let kv_weight = ct_mla_weight(kv_b)?;
+    if ops::hip::options().mla_hot_trace && query.rows > 1 {
+        ops::hip::try_validate_finite_resident_range_f32(context.device_id, query.device.as_deref().ok_or_else(|| compute_error("GPU hot query 缺少 device"))?, 0, query.rows * query.cols)
+            .map_err(|error| compute_error(format!("GPU hot query rows={} 非有限: {error}", query.rows)))?;
+    }
+    let profile = ops::hip::device_profile_enabled();
+    if profile {
+        ops::hip::device_profile_scope_begin(context.device_id, "mla_hot_gather").map_err(compute_error)?;
+    }
+    let gathered = hot.prepare_device_selection(context.device_id, selection, [&cached.latent, cached.latent_scales.as_deref().expect("GPU hot 必有 scales"), &cached.rope], query.rows, width, cached.rows);
+    if profile {
+        ops::hip::device_profile_scope_end(context.device_id).map_err(compute_error)?;
+    }
+    let (gathered, table, indices, rows) = gathered?;
+    if ops::hip::options().mla_hot_trace && query.rows > 1 {
+        ops::hip::try_validate_finite_resident_range_bf16(context.device_id, &gathered[1], 0, rows * cached.latent_cols / cached.latent_group_size).map_err(|error| compute_error(format!("GPU hot gathered scales 非有限: {error}")))?;
+        ops::hip::try_validate_finite_resident_range_bf16(context.device_id, &gathered[2], 0, rows * cached.rope_cols).map_err(|error| compute_error(format!("GPU hot gathered rope 非有限: {error}")))?;
+    }
+    // 单 query 直接扫描紧凑选集；多 query 通过 identity selection 保留各自行界。
+    if profile {
+        ops::hip::device_profile_scope_begin(context.device_id, "mla_hot_scan").map_err(compute_error)?;
+    }
+    let attention = ops::hip::try_paged_mla_attention_ct_into(
+        context.device_id,
+        query_device,
+        &gathered[0],
+        Some(&gathered[1]),
+        cached.latent_group_size,
+        &gathered[2],
+        &table,
+        indices.as_deref(),
+        kv_weight,
+        query.rows,
+        rows,
+        rows - query.rows,
+        spec.q_projection_size,
+        spec.num_heads,
+        spec.qk_rope_head_dim,
+        width,
+        1,
+        output,
+        None,
+    )
+    .map_err(compute_error);
+    if profile {
+        ops::hip::device_profile_scope_end(context.device_id).map_err(compute_error)?;
+    }
+    attention?;
+    if ops::hip::options().mla_hot_trace && query.rows > 1 {
+        ops::hip::try_validate_finite_resident_range_bf16(context.device_id, output, 0, query.rows * spec.q_projection_size).map_err(|error| compute_error(format!("GPU hot attention output 非有限: {error}")))?;
+    }
+    Ok(true)
+}
+
 fn paged_mla_attention_into(
     context: &RocmContext,
     query: &RocmTensor,
@@ -225,6 +296,13 @@ fn paged_mla_attention_into(
     // MLA decode 三段计时:lock/remap(主机)、kernel launch+exec(设备)、residual。
     // `kernel_sync=on` 时 kernel 段时间 ≈ 真实设备执行;off 时仅入队。开启 `mla_hot_trace`
     // 打印每层四段时间,用于归因 0.41–0.48 ms/层是否落在 host 端 hot lock + remap。
+    static DEBUG_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if ops::hip::options().mla_hot_trace {
+        let dc = DEBUG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if dc < 4 || dc % 256 == 0 {
+            eprintln!("[mla-decode-trace-debug] layer={layer} rows={} dc={dc} mla_hot_trace=true kernel_sync={}", query.rows, ops::hip::options().kernel_sync);
+        }
+    }
     let t_total_start = std::time::Instant::now();
     let cached = cache.paged_layers.get(layer).and_then(Option::as_ref).ok_or_else(|| compute_error(format!("L{layer} ROCm paged MLA cache 尚未初始化")))?;
     if query.rows == 0 || query.rows > cached.rows {
@@ -239,6 +317,9 @@ fn paged_mla_attention_into(
         }
         let host_selection = dsa_state.and_then(|state| state.host_selection(query.rows, query_start));
         let mut hot = hot.lock().map_err(|_| compute_error(format!("L{layer} ROCm MLA hot 锁中毒")))?;
+        if gpu_hot_attention_into(context, query, cached, &mut hot, kv_b, spec, dsa_state.and_then(|state| state.device_selection(query.rows, query_start)), dsa_state.map_or(top_k, RocmDsaState::selection_width), output)? {
+            return Ok(());
+        }
         let selection = host_selection
             .map(|selection| {
                 hot.take_prefetched_selection(context.device_id, query_start)?
@@ -283,11 +364,7 @@ fn paged_mla_attention_into(
             let t_kernel_ms = t_kernel_end.duration_since(t_lock_end).as_secs_f64() * 1e3;
             let t_sync_ms = t_sync_end.duration_since(t_kernel_end).as_secs_f64() * 1e3;
             let t_total_ms = t_sync_end.duration_since(t_total_start).as_secs_f64() * 1e3;
-            eprintln!(
-                "[mla-decode-trace] branch=hot layer={layer} rows={} start={query_start} selected={} lock_ms={t_lock_ms:.3} kernel_ms={t_kernel_ms:.3} sync_ms={t_sync_ms:.3} total_ms={t_total_ms:.3}",
-                query.rows,
-                selection.is_some(),
-            );
+            eprintln!("[mla-decode-trace] branch=hot layer={layer} rows={} start={query_start} selected={} lock_ms={t_lock_ms:.3} kernel_ms={t_kernel_ms:.3} sync_ms={t_sync_ms:.3} total_ms={t_total_ms:.3}", query.rows, selection.is_some(),);
         }
         return Ok(());
     }
@@ -326,11 +403,7 @@ fn paged_mla_attention_into(
         let t_kernel_ms = t_kernel_end.duration_since(t_lock_end).as_secs_f64() * 1e3;
         let t_sync_ms = t_sync_end.duration_since(t_kernel_end).as_secs_f64() * 1e3;
         let t_total_ms = t_sync_end.duration_since(t_total_start).as_secs_f64() * 1e3;
-        eprintln!(
-            "[mla-decode-trace] branch=paged layer={layer} rows={} start={query_start} selected={} lock_ms={t_lock_ms:.3} kernel_ms={t_kernel_ms:.3} sync_ms={t_sync_ms:.3} total_ms={t_total_ms:.3}",
-            query.rows,
-            selection.is_some(),
-        );
+        eprintln!("[mla-decode-trace] branch=paged layer={layer} rows={} start={query_start} selected={} lock_ms={t_lock_ms:.3} kernel_ms={t_kernel_ms:.3} sync_ms={t_sync_ms:.3} total_ms={t_total_ms:.3}", query.rows, selection.is_some(),);
     }
     Ok(())
 }
@@ -373,6 +446,15 @@ fn paged_mla_attention_with_selection(
     let query_start = cached.rows - query.rows;
     let element_bytes = mla_output_element_bytes(query.rows);
     let output_bytes = query.rows.checked_mul(spec.q_projection_size).and_then(|elements| elements.checked_mul(element_bytes)).ok_or_else(|| compute_error("ROCm cooperative MLA output 大小溢出"))?;
+
+    if let Some(hot) = &cached.cpu_hot {
+        let mut hot = hot.lock().map_err(|_| compute_error(format!("L{layer} ROCm GPU hot 锁中毒")))?;
+        if hot.uses_gpu() {
+            let output = ops::hip::DeviceBuffer::allocate_reusable(context.device_id, output_bytes).map_err(compute_error)?;
+            gpu_hot_attention_into(context, query, cached, &mut hot, kv_b, spec, selection, selection_width, &output)?;
+            return Ok(device_tensor_with_dtype(output, query.rows, spec.q_projection_size, if query.rows > 1 { RocmTensorDType::Bf16 } else { RocmTensorDType::F32 }));
+        }
+    }
 
     if let (Some(hot), Some(host_selection)) = (&cached.cpu_hot, host_selection)
         && query.rows > 1
@@ -804,15 +886,22 @@ impl RocmContext {
                 let stable = if source.is_async_allocated() { Arc::new(source.copy_to_stable_deferred().map_err(compute_error)?) } else { source.clone() };
                 let copied = Arc::new(stable.copy_stable_to_device_ordered_async_retained_by(peer.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} operator selection owner->peer: {error}")))?);
                 cache.cache_operator_selection(peer.device_id, source.clone(), copied.clone())?;
+                // 拷贝在 peer 流上读 owner 侧 selection；owner completion 与下一次
+                // select 的 invalidate 都只按 owner 流记账，不覆盖 peer 流。DSA
+                // 分片把扫描搬到 peer 后两流完成顺序反转，owner 先退休会让池提前
+                // 复用/trim 源显存——由 pair worker 的 stage completion 保活到
+                // peer 流排空。与 7617c4a1 两处补丁同类，此处为第三个漏网调用点。
+                worker.retain_for_stage(vec![stable])?;
                 Some(copied)
             }
         } else {
             None
         };
 
-        // 热窗期多行 append（MTP catch-up/追加轮）没有窗口槽位语义，回退
-        // 双端各自 append；单行 decode 与全量期 prefill 保持 packed 复制。
-        let packed_kv_replica = cache.operator_packed_kv_replication_enabled(layer) && !(rows > 1 && cache.operator_layer_is_hot(layer));
+        // GPU recent 环能表达小批 verify 的连续槽位，两卡复用同一份量化结果。
+        // CPU 选集模式的多行槽位仍由各卡独立追加。
+        cache.prepare_mla_append(self, layer, rows)?;
+        let packed_kv_replica = cache.operator_packed_kv_replication_enabled(layer) && !(rows > 1 && !super::kv_cache::gpu_hot_selection(rows) && cache.operator_layer_is_hot(layer));
         let q_lora = if presubmitted_query { None } else { Some(self.tensor_to_stable_deferred(normalized_q_lora.clone())?) };
         let latent = if packed_kv_replica { latent.clone() } else { self.tensor_to_stable_deferred(latent.clone())? };
         // 默认路径只在 owner 旋转、量化一次 K-RoPE，再复制压缩 cache；兼容
@@ -912,12 +1001,12 @@ impl RocmContext {
             if let (Some(peer_latent), Some(peer_rope)) = (peer_latent.as_ref(), peer_rope.as_ref()) {
                 cache.append_mla(&peer, layer, peer_latent, peer_rope)?;
             }
-            let attention = paged_mla_attention_with_selection(&peer, &peer_query, &cache, &peer_kv_b, layer, &peer_mla, peer_selection.as_deref(), peer_host_selection.as_deref().map(Vec::as_slice), selection_width)?;
             if packed_kv_replica {
-                // 本锁段内顺手喂养 peer mirror:省掉 owner 侧每层一次 peer 设备
-                // 切换与额外锁往返,且与 owner 线程并行。
+                // verify 跨过 recent 环边界时，先把完整旧段入队，gather 才能
+                // 在覆盖后的窗口中读取全部历史；仍在同一 worker 锁段完成。
                 cache.feed_peer_mirror_layer(&peer, layer)?;
             }
+            let attention = paged_mla_attention_with_selection(&peer, &peer_query, &cache, &peer_kv_b, layer, &peer_mla, peer_selection.as_deref(), peer_host_selection.as_deref().map(Vec::as_slice), selection_width)?;
             drop(cache);
             let partial = peer.tensor_to_stable_deferred(peer.tensor_as_f32(peer.linear(&attention, &peer_o)?)?)?;
             let partial = partial.device.ok_or_else(|| compute_error(format!("L{layer} operator peer partial 缺少 device buffer")))?;

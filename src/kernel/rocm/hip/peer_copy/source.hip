@@ -4,7 +4,8 @@
 extern "C" __global__ void zllm_peer_copy_f32x4(
     const float4* source,
     float4* target,
-    const unsigned int vectors)
+    const unsigned int vectors,
+    const unsigned int tail_bytes)
 {
     const unsigned int total = gridDim.x * blockDim.x;
     unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -27,9 +28,15 @@ extern "C" __global__ void zllm_peer_copy_f32x4(
     }
     for (; index < vectors; index += total)
         target[index] = source[index];
+    // 小块 pinned 上传的打包长度不一定对齐；只读写有效尾字节。
+    const unsigned int tail = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tail < tail_bytes) {
+        reinterpret_cast<unsigned char*>(target)[(unsigned long long)vectors * 16 + tail]
+            = reinterpret_cast<const unsigned char*>(source)[(unsigned long long)vectors * 16 + tail];
+    }
 }
 
-// 三段增量共用一个 CTA，省去逐段 launch；大小由调用方传入，保持原始字节。
+// 三段增量共用一次 launch；按总量增加 CTA，兼顾逐行增量和批量日志。
 extern "C" __global__ void zllm_peer_copy3_f32x4(
     const float4* source0,
     const float4* source1,
@@ -41,7 +48,7 @@ extern "C" __global__ void zllm_peer_copy3_f32x4(
     const unsigned int vectors1,
     const unsigned int vectors2)
 {
-    unsigned int index = threadIdx.x;
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
     if (index < vectors0) {
         target0[index] = source0[index];
     } else if ((index -= vectors0) < vectors1) {

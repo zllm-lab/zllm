@@ -103,6 +103,10 @@ impl FjallCacheStore {
         self.manifests.get(cache_id.as_bytes()).map_err(fjall_error).map(|value| value.map(|value| value.to_vec()))
     }
 
+    pub fn info(&self, cache_id: &str) -> Result<Option<Vec<u8>>, String> {
+        self.infos.get(cache_id.as_bytes()).map_err(fjall_error).map(|value| value.map(|value| value.to_vec()))
+    }
+
     pub fn contains(&self, cache_id: &str) -> Result<bool, String> {
         self.manifests.contains_key(cache_id.as_bytes()).map_err(fjall_error)
     }

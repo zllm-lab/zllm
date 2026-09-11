@@ -46,6 +46,7 @@ MiniCPM5 无 CUDA 执行路径；CUDA 上的 Qwen3.6/3.8 暂不支持 MTP。需�
 | Mistral | — | ✅ | ✅ | — | |
 | K2-Horizon MoVA 36B-A4B | — | ✅ | — | — | 分组 RMSNorm、MoVA、MoE；GGUF IQ3_XS 已在 Apple M5 真机验证 |
 | MiniCPM5 | ✅ | ✅ | — | — | |
+| SenseVoice-Small（ASR） | ✅ oracle | — | — | — | 中/英/日/韩/粤；Android QNN HTP 已真机验证 |
 | GLM-5.2 / GLM-5.3 | — | — | — | ✅ | 分布式；GGUF prefill/decode/MTP 双机 16 卡路径已真机验证 |
 | GLM-5.3-Flash | — | — | — | ✅ | |
 | DeepSeek-V4 | — | — | — | ✅ | |
@@ -55,6 +56,8 @@ CPU 主要承担跨后端 oracle、单元测试与 Qwen 混合分层的前缀层
 
 Qwen3.8-Flash-Next 使用独立的 `qwen4exp` 架构，支持 CUDA QSA 稀疏注意力、按需专家上传与 shared MTP。GLM-5.3 ROCm 支持多 GPU 分层、算子并行与动态 MTP。
 
+MiniCPM5-1B 已在 Snapdragon HTP 上完成 QNN 端到端验证，混合 INT4/INT8 热态 decode 达到 10.335 tok/s；SenseVoice-Small 的 encoder 与 CTC head 也已通过 HTP 真机验证，设备转写与 CPU oracle 一致。当前 QNN calibration profile 面向已验证输入，尚不代表任意 prompt 的通用服务能力。
+
 ### 实测性能
 
 以下结果来自无风扇 Apple M5 24GB 与 NVIDIA RTX 3060 12GB 真机。吞吐会随提示长度、温度、量化格式和 MTP 接受率变化；表中数据用于说明已验证路径，不代表所有工作负载的固定值。
@@ -62,7 +65,8 @@ Qwen3.8-Flash-Next 使用独立的 `qwen4exp` 架构，支持 CUDA QSA 稀疏注
 | 模型与权重 | 硬件 / 后端 | Prefill | Decode | 测试说明 |
 | --- | --- | ---: | ---: | --- |
 | GLM-5.3 UD-IQ4_XS GGUF | 双机 16× AMD GPU / ROCm | **1600+ tok/s** | **26.912 tok/s** | 最新 50K prefill；decode 为独立的 1,024-token 动态 MTP5 测试（三轮中位数） |
-| Qwen 3.8 27B UD-Q3_K_XL | Apple M5 24GB / Metal | 58 tokens / 1.278s | 8.33 tok/s | 短提示 fused prefill；普通 decode |
+| GLM-5.3 UD-Q4_K_XL GGUF | 双机 16× AMD GPU / ROCm | — | **29.22 tok/s** | 50K 输入、1,024-token 动态 MTP5 输出；三轮中位数 |
+| Qwen 3.8 27B UD-Q3_K_XL | Apple M5 24GB / Metal | 42 tokens / 0.73s；4K 155 tok/s | 8.33 tok/s | Metal4 cooperative tensor prefill；普通 decode |
 | Qwen 3.8 27B Q4_K_M | 双路 E5-2696 v4 + RTX 3060 12GB / CPU+CUDA | — | **2.68 tok/s** | CPU 前缀层 + CUDA 后缀层；40 个 CPU decode 线程 |
 | Gemma 4 12B IQ4_NL GGUF | Apple M5 24GB / Metal | 337.4 tok/s | 14.5–15.2 tok/s | 约 5.6K token 长提示，64-token 回复 |
 | Gemma 4 E4B MLX 4-bit | Apple M5 24GB / Metal | 32.2–38.8 tok/s | 40.3–40.7 tok/s | 22-token 短提示；MTP 路径 |
@@ -195,6 +199,7 @@ Models × backends (`zllm-server` / `zllm-rt-*` service entries, per the config 
 | Mistral | — | ✅ | ✅ | — | |
 | K2-Horizon MoVA 36B-A4B | — | ✅ | — | — | Grouped RMSNorm, MoVA, and MoE; GGUF IQ3_XS validated on Apple M5 |
 | MiniCPM5 | ✅ | ✅ | — | — | |
+| SenseVoice-Small (ASR) | ✅ oracle | — | — | — | zh/en/ja/ko/yue; Android QNN HTP validated on device |
 | GLM-5.2 / GLM-5.3 | — | — | — | ✅ | Distributed; GGUF prefill/decode/MTP path validated on a two-node 16-GPU deployment |
 | GLM-5.3-Flash | — | — | — | ✅ | |
 | DeepSeek-V4 | — | — | — | ✅ | |
@@ -204,6 +209,8 @@ CPU mainly serves as the cross-backend oracle, unit-test baseline, and CPU prefi
 
 Qwen3.8-Flash-Next uses the separate `qwen4exp` architecture with CUDA QSA sparse attention, on-demand expert uploads, and shared MTP. GLM-5.3 on ROCm supports multi-GPU layer placement, operator parallelism, and dynamic MTP.
 
+MiniCPM5-1B has completed end-to-end QNN validation on Snapdragon HTP, reaching 10.335 tok/s for warm mixed INT4/INT8 decoding. SenseVoice-Small's encoder and CTC head have also passed on-device HTP validation, matching the CPU oracle. The current QNN calibration profiles target validated inputs and are not yet general arbitrary-prompt services.
+
 ### Measured performance
 
 The following results were measured on a fanless Apple M5 with 24 GB unified memory and an NVIDIA RTX 3060 with 12 GB VRAM. Throughput varies with prompt length, temperature, quantization, and MTP acceptance rate; these numbers describe validated paths rather than guaranteed performance.
@@ -211,7 +218,8 @@ The following results were measured on a fanless Apple M5 with 24 GB unified mem
 | Model and weights | Hardware / backend | Prefill | Decode | Workload |
 | --- | --- | ---: | ---: | --- |
 | GLM-5.3 UD-IQ4_XS GGUF | Two nodes, 16× AMD GPUs / ROCm | **1600+ tok/s** | **26.912 tok/s** | Latest 50K prefill; decode is a separate 1,024-token dynamic-MTP5 run (three-run median) |
-| Qwen 3.8 27B UD-Q3_K_XL | Apple M5 24GB / Metal | 58 tokens / 1.278s | 8.33 tok/s | Short-prompt fused prefill; standard decode |
+| GLM-5.3 UD-Q4_K_XL GGUF | Two nodes, 16× AMD GPUs / ROCm | — | **29.22 tok/s** | 50K-token input and 1,024-token dynamic-MTP5 output; three-run median |
+| Qwen 3.8 27B UD-Q3_K_XL | Apple M5 24GB / Metal | 42 tokens / 0.73s; 4K at 155 tok/s | 8.33 tok/s | Metal4 cooperative-tensor prefill; standard decode |
 | Qwen 3.8 27B Q4_K_M | Dual E5-2696 v4 + RTX 3060 12GB / CPU+CUDA | — | **2.68 tok/s** | CPU prefix layers + CUDA suffix layers; 40 CPU decode threads |
 | Gemma 4 12B IQ4_NL GGUF | Apple M5 24GB / Metal | 337.4 tok/s | 14.5–15.2 tok/s | About 5.6K prompt tokens, 64-token response |
 | Gemma 4 E4B MLX 4-bit | Apple M5 24GB / Metal | 32.2–38.8 tok/s | 40.3–40.7 tok/s | 22-token short prompt with MTP |

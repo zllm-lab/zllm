@@ -7,6 +7,7 @@
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
@@ -20,6 +21,8 @@ use crate::{
 };
 
 use crate::backend::rocm::{DsaLayerSerde, MlaLayerSerde, RocmContext, RocmKvOwnership};
+
+pub(super) const MIN_PERSIST_TOKENS: usize = 2048;
 
 const VERSION: u32 = 9;
 const INFO_MAGIC: [u8; 8] = *b"ZGLM5I01";
@@ -384,6 +387,7 @@ fn read_blob(reader: &mut SnapshotReader<'_>, what: &str) -> Result<FjallBlob, S
 
 pub struct Glm52SwapStore {
     store: FjallCacheStore,
+    cache_revision: AtomicU64,
 }
 
 pub struct Glm52CacheIdentity {
@@ -391,6 +395,15 @@ pub struct Glm52CacheIdentity {
 }
 
 impl Glm52CacheIdentity {
+    pub fn with_dflash2(mut self, source: Option<&std::path::Path>) -> Result<Self, String> {
+        if let Some(source) = source {
+            self.metadata.retain(|(key, _)| key != "dspark_source");
+            self.metadata.push(("draft_algorithm".into(), "dflash2-greedy-v1".into()));
+            self.metadata.push(("dflash2_fingerprint".into(), crate::weight::model::dflash2::checkpoint_fingerprint(source)?));
+        }
+        Ok(self)
+    }
+
     pub fn new(weights: &Glm52Weights, kv_cache_format: KvCacheFormat, layer_start: usize, layer_end: usize, mtp: bool, max_seq_len: usize, dspark_source: Option<&std::path::Path>) -> Self {
         let cfg = weights.cfg();
         let mut metadata = vec![
@@ -425,24 +438,37 @@ impl Glm52SwapStore {
         let dir = dir.into();
         let store = FjallCacheStore::open(dir.join("fjall"))?;
         store.bind_metadata(&identity.metadata)?;
-        Ok(Self { store })
+        Ok(Self { store, cache_revision: AtomicU64::new(0) })
+    }
+
+    pub(super) fn cache_revision(&self) -> u64 {
+        self.cache_revision.load(Ordering::Acquire)
     }
 
     pub fn put(&self, snapshot: &Glm52CacheSnapshot) -> Result<Glm52SwapInfo, String> {
+        self.put_completed(snapshot, SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+    }
+
+    /// 沿用 info 的时间字段保存 decode 结束时间；换出不能刷新淘汰年龄。
+    pub fn put_completed(&self, snapshot: &Glm52CacheSnapshot, completed_unix: u64) -> Result<Glm52SwapInfo, String> {
         validate_snapshot(snapshot)?;
         let previous = self.manifest(&snapshot.cache_id)?.map(|manifest| manifest.generation);
         let generation = new_generation();
         let prepared = self.prepare(snapshot, generation);
-        let (info, manifest) = match prepared {
+        let (mut info, manifest) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 let _ = self.store.remove_generation(&snapshot.cache_id, generation);
                 return Err(error);
             }
         };
+        info.modified_unix = completed_unix;
         let info_bytes = encode_info(&info)?;
         let manifest_bytes = encode_manifest(&manifest)?;
-        self.store.commit(&snapshot.cache_id, &info_bytes, &manifest_bytes)?;
+        let committed = self.store.commit(&snapshot.cache_id, &info_bytes, &manifest_bytes);
+        // persist 报错前元数据也可能已经可见，读方仍需重新枚举。
+        self.cache_revision.fetch_add(1, Ordering::Release);
+        committed?;
         if let Some(previous) = previous.filter(|previous| *previous != generation) {
             let _ = self.store.remove_generation(&snapshot.cache_id, previous);
         }
@@ -672,12 +698,25 @@ impl Glm52SwapStore {
     }
 
     pub fn delete(&self, cache_id: &str) -> Result<(), String> {
-        let generation = self.manifest(cache_id)?.map(|manifest| manifest.generation);
-        self.store.remove_entry(cache_id)?;
-        if let Some(generation) = generation {
-            self.store.remove_generation(cache_id, generation)?;
-        }
+        let Some(manifest) = self.manifest(cache_id)? else { return Ok(()) };
+        let removed = self.store.remove_entry(cache_id);
+        self.cache_revision.fetch_add(1, Ordering::Release);
+        removed?;
+        self.store.remove_generation(cache_id, manifest.generation)?;
         Ok(())
+    }
+
+    /// 重试换出只需确认已提交的元数据，不能重新读取整份 KV。
+    pub fn info(&self, cache_id: &str) -> Result<Option<Glm52SwapInfo>, String> {
+        if self.manifest(cache_id)?.is_none() {
+            return Ok(None);
+        }
+        let bytes = self.store.info(cache_id)?.ok_or_else(|| format!("GLM cache={cache_id} 已提交但缺少 info"))?;
+        let info = decode_info(&bytes)?;
+        if info.cache_id != cache_id {
+            return Err(format!("GLM info cache_id 不匹配: 请求={cache_id} 存储={}", info.cache_id));
+        }
+        Ok(Some(info))
     }
 
     #[cfg(test)]
@@ -688,12 +727,16 @@ impl Glm52SwapStore {
     // 本文件同时被 standalone 与 node 二进制 include，只有 node 需要枚举缓存。
     #[allow(dead_code)]
     pub fn infos(&self) -> Vec<Glm52SwapInfo> {
-        let Ok(manifests) = self.store.manifest_values() else { return Vec::new() };
+        self.try_infos().unwrap_or_default()
+    }
+
+    pub(super) fn try_infos(&self) -> Result<Vec<Glm52SwapInfo>, String> {
+        let manifests = self.store.manifest_values()?;
         let current = manifests.into_iter().filter_map(|bytes| decode_manifest(&bytes).ok()).map(|manifest| manifest.cache_id).collect::<std::collections::HashSet<_>>();
-        let Ok(values) = self.store.info_values() else { return Vec::new() };
+        let values = self.store.info_values()?;
         let mut infos = values.into_iter().filter_map(|bytes| decode_info(&bytes).ok()).filter(|info| current.contains(&info.cache_id)).collect::<Vec<_>>();
         infos.sort_by_key(|info| info.modified_unix);
-        infos
+        Ok(infos)
     }
 
     fn manifest(&self, cache_id: &str) -> Result<Option<Glm52Manifest>, String> {
@@ -973,7 +1016,12 @@ mod tests {
     fn disk_roundtrip_lists_and_deletes() {
         let root = std::env::temp_dir().join(format!("zllm-glm52-swap-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
         let store = Glm52SwapStore::open(&root, &identity()).unwrap();
-        let info = store.put(&snapshot()).unwrap();
+        let empty_revision = store.cache_revision();
+        let info = store.put_completed(&snapshot(), 1234).unwrap();
+        let published_revision = store.cache_revision();
+        assert_ne!(empty_revision, published_revision);
+        assert_eq!(info.modified_unix, 1234);
+        assert_eq!(store.info("session-a").unwrap().unwrap().modified_unix, 1234);
         assert_eq!(info.cache_id, "session-a");
         assert!(info.file_bytes > 0);
         assert!(store.contains("session-a"));
@@ -1002,9 +1050,14 @@ mod tests {
         assert_eq!(target.layers[0].start_position, 1);
         assert_eq!(target.layers[0].key.values, vec![1.25, 2.5, 3.75, 4.0]);
         assert_eq!(target.layers[0].value.values, vec![5.25, 6.5]);
+        assert_eq!(store.cache_revision(), published_revision, "读取快照不能触发缓存列表刷新");
         store.delete("session-a").unwrap();
+        let deleted_revision = store.cache_revision();
+        assert_ne!(published_revision, deleted_revision);
         assert!(!store.contains("session-a"));
         assert!(store.infos().is_empty());
+        store.delete("session-a").unwrap();
+        assert_eq!(store.cache_revision(), deleted_revision, "删除不存在的缓存不改变列表");
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -229,7 +229,7 @@ impl Gemma4CudaEngine {
                 output.stop();
                 break;
             }
-            let bytes = self.detokenizer.decode_bytes(&[token], true).map_err(|error| format!("Gemma4 detokenize {token}: {error}"))?;
+            let bytes = crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| format!("Gemma4 detokenize {token}: {error}"))?;
             if !output.push(&bytes, |chunk| on_token(token, chunk)) {
                 break;
             }
@@ -291,7 +291,7 @@ impl Gemma4CudaEngine {
                         output.stop();
                         return Ok(false);
                     }
-                    let bytes = self.detokenizer.decode_bytes(&[token], true).map_err(|error| format!("Gemma4 detokenize {token}: {error}"))?;
+                    let bytes = crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| format!("Gemma4 detokenize {token}: {error}"))?;
                     Ok(output.push(&bytes, |chunk| on_token(token, chunk)))
                 })()
             }};

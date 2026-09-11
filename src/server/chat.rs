@@ -78,14 +78,7 @@ pub(super) fn parsed_tool_call(scope: &str, index: usize, call: ParsedToolCall) 
     ToolCall { id: tool_call_id(scope, index, &call.name), kind: "function".to_owned(), function: scheduler::ToolFunction { name: call.name, arguments: call.arguments } }
 }
 
-fn split_reasoning_delta<'a>(text: &'a str, reasoning: &mut bool) -> (&'a str, &'a str) {
-    if !*reasoning {
-        return ("", text);
-    }
-    let Some(end) = text.find("</think>") else { return (text, "") };
-    *reasoning = false;
-    (&text[..end], &text[end + "</think>".len()..])
-}
+use crate::runtime::session::ReasoningStream;
 
 /// 流式 SSE 状态机：直接在 hyper 连接任务上被 poll（stream::unfold），
 /// 不再经独立 producer task 转发，每 token 少一跳 mpsc + 一次任务唤醒。
@@ -107,7 +100,7 @@ struct SseState {
     tool_fallback: Option<ToolCallStream>,
     fallback_tool_index: usize,
     fallback_has_tools: bool,
-    in_reasoning: bool,
+    in_reasoning: ReasoningStream,
 }
 
 /// chunk 前缀与线上输出保持同一 key 序（serde_json Map 字典序）：
@@ -144,7 +137,7 @@ impl SseState {
             tool_fallback: (!tool_schemas.is_empty()).then(|| ToolDialect::Auto.stream(tool_schemas)),
             fallback_tool_index: 0,
             fallback_has_tools: false,
-            in_reasoning: reasoning,
+            in_reasoning: ReasoningStream::new(reasoning),
         }
     }
 
@@ -184,11 +177,7 @@ impl SseState {
         }
     }
 
-    fn handle(&mut self, event: InferenceEvent) {
-        match event {
-            InferenceEvent::Started => {}
-            InferenceEvent::Token { text, .. } => {
-                let (reasoning, text) = split_reasoning_delta(&text, &mut self.in_reasoning);
+    fn emit_text(&mut self, reasoning: &str, text: &str) {
                 if !reasoning.is_empty() {
                     self.pending.push_back(Ok(Event::default().data(self.reasoning_chunk(reasoning))));
                 }
@@ -232,6 +221,14 @@ impl SseState {
                     };
                     self.pending.push_back(Ok(Event::default().data(chunk)));
                 }
+    }
+
+    fn handle(&mut self, event: InferenceEvent) {
+        match event {
+            InferenceEvent::Started => {}
+            InferenceEvent::Token { text, .. } => {
+                let (reasoning, text) = self.in_reasoning.push(&text);
+                self.emit_text(&reasoning, &text);
             }
             InferenceEvent::ToolCallDelta { delta } => {
                 self.streamed_tool_calls.insert(delta.index);
@@ -289,6 +286,8 @@ impl SseState {
             }
             InferenceEvent::Completed { finish_reason, prompt_tokens, completion_tokens } => {
                 self.cancellation.disarm();
+                let (reasoning, text) = self.in_reasoning.finish();
+                self.emit_text(&reasoning, &text);
                 if let Some(fallback) = self.tool_fallback.as_mut() {
                     for item in fallback.finish() {
                         let chunk = match item {
@@ -410,19 +409,22 @@ pub(super) async fn collect_completion(_state: ServerState, request_id: String, 
     }
     let mut content = String::new();
     let mut reasoning_content = String::new();
-    let mut in_reasoning = reasoning;
+    let mut in_reasoning = ReasoningStream::new(reasoning);
     let mut tool_calls = Vec::<ToolCall>::new();
     while let Some(event) = events.recv().await {
         match event {
             InferenceEvent::Token { text, .. } => {
-                let (reasoning, text) = split_reasoning_delta(&text, &mut in_reasoning);
-                reasoning_content.push_str(reasoning);
-                content.push_str(text);
+                let (reasoning, text) = in_reasoning.push(&text);
+                reasoning_content.push_str(&reasoning);
+                content.push_str(&text);
             }
             InferenceEvent::ToolCallDelta { .. } => {}
             InferenceEvent::ToolCall { tool_call, .. } => tool_calls.push(tool_call),
             InferenceEvent::Completed { finish_reason, prompt_tokens, completion_tokens } => {
                 lease.disarm();
+                let (reasoning, text) = in_reasoning.finish();
+                reasoning_content.push_str(&reasoning);
+                content.push_str(&text);
                 let mut finish_reason = finish_reason;
                 if !tool_schemas.is_empty() {
                     let (text, parsed_tool_calls) = ToolDialect::Auto.split_output(&content, &tool_schemas);

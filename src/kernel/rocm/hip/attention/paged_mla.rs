@@ -36,6 +36,9 @@ struct PagedMlaFunctions {
     dsa_clear: usize,
     dsa_gather_selection_scores: usize,
     mla_gather_selected_q8: usize,
+    mla_gpu_hot_gather_q8: usize,
+    mla_gpu_hot_pin: usize,
+    mla_gpu_hot_invalidate: usize,
     dsa_merge_sequence_shards: usize,
     dsa_score: usize,
     dsa_quantize_query_i8: usize,
@@ -67,8 +70,10 @@ struct PagedMlaFunctions {
     decode_attention: usize,
     decode_partial: usize,
     decode_partial_wmma_q8: usize,
+    prefill_wmma_q8_heads32: usize,
     decode_partial_wmma_q8_colpar: usize,
     decode_partial_wmma_q8_colpar512: usize,
+    decode_partial_wmma_q8_colpar512_shared: usize,
     decode_partial_wmma_q8_colpar512_abl: usize,
     split_merge: usize,
     split_merge_pl: usize,
@@ -80,6 +85,9 @@ struct PagedMlaFunctions {
     project_value_perm: usize,
     wavefront_size: u32,
 }
+
+#[cfg(test)]
+static TEST_SPARSE_PREFILL_HEADS32: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 #[cfg(test)]
 static TEST_SPARSE_PREFILL_WMMA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -183,6 +191,96 @@ pub fn try_paged_cache_append_f32_bf16(device_id: i32, input: &DeviceBuffer, cac
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn try_mla_gpu_hot_gather_q8(
+    device_id: i32,
+    host: [&RegisteredHostBuffer; 3],
+    cache: [&DeviceBuffer; 3],
+    metadata: &DeviceBuffer,
+    map_rows: usize,
+    epoch: u32,
+    selection: &DeviceBuffer,
+    output: [&DeviceBuffer; 3],
+    count: usize,
+    columns: [usize; 3],
+    cache_rows: usize,
+    recent_rows: usize,
+    host_rows: usize,
+    context_rows: usize,
+    trace_counts: Option<&DeviceBuffer>,
+) -> Result<(), String> {
+    if count == 0 || cache_rows == 0 || recent_rows == 0 || columns.contains(&0) || epoch == 0 || host_rows > context_rows || context_rows - host_rows > recent_rows || context_rows > map_rows {
+        return Err(format!("GPU hot gather 状态非法: count={count} columns={columns:?} cache={cache_rows} recent={recent_rows} host={host_rows} context={context_rows} map={map_rows}"));
+    }
+    let row_bytes = [columns[0], columns[1].checked_mul(2).ok_or("GPU hot scale 行溢出")?, columns[2].checked_mul(2).ok_or("GPU hot rope 行溢出")?];
+    let stored_rows = cache_rows.checked_add(recent_rows).ok_or("GPU hot cache 行数溢出")?;
+    for i in 0..3 {
+        let required = host_rows.checked_mul(row_bytes[i]).ok_or("GPU hot host 大小溢出")?;
+        if host[i].bytes() < required {
+            return Err(format!("GPU hot host[{i}] bytes={}，期望 {required}", host[i].bytes()));
+        }
+        validate_resident(cache[i], device_id, stored_rows.checked_mul(row_bytes[i]).ok_or("GPU hot cache 大小溢出")?, "GPU hot cache")?;
+        validate_resident(output[i], device_id, count.checked_mul(row_bytes[i]).ok_or("GPU hot output 大小溢出")?, "GPU hot gather output")?;
+    }
+    let meta_words = cache_rows.checked_mul(2).and_then(|n| n.checked_add(map_rows)).and_then(|n| n.checked_add(1)).ok_or("GPU hot metadata 溢出")?;
+    validate_resident(metadata, device_id, meta_words.checked_mul(4).ok_or("GPU hot metadata bytes 溢出")?, "GPU hot metadata")?;
+    validate_resident(selection, device_id, count.checked_mul(4).ok_or("GPU hot selection 溢出")?, "GPU hot selection")?;
+    if let Some(counts) = trace_counts {
+        validate_resident(counts, device_id, 12, "GPU hot trace counts")?;
+    }
+    set_device(device_id)?;
+    let functions = paged_mla_functions(device_id)?;
+    let mut dimensions = [count, columns[0], columns[1], columns[2], cache_rows, recent_rows, host_rows, context_rows, map_rows, epoch as usize]
+        .map(|v| u32::try_from(v).map_err(|_| "GPU hot dimension 超过 u32".to_owned()))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    if count < cache_rows {
+        let mut pointers = [metadata.device_pointer(), selection.device_pointer()];
+        let mut pin_dimensions = [dimensions[0], dimensions[8], dimensions[4], dimensions[6], epoch];
+        let mut args = [ptr::null_mut(); 7];
+        for (target, value) in args.iter_mut().zip(pointers.iter_mut()) {
+            *target = (value as *mut usize).cast();
+        }
+        for (target, value) in args[2..].iter_mut().zip(pin_dimensions.iter_mut()) {
+            *target = (value as *mut u32).cast();
+        }
+        launch_tensor_kernel(functions.mla_gpu_hot_pin, dimensions[0].div_ceil(256), 256, &mut args, "HIP GPU hot pin")?;
+    }
+    let mut pointers = [
+        host[0].device_pointer(),
+        host[1].device_pointer(),
+        host[2].device_pointer(),
+        cache[0].device_pointer(),
+        cache[1].device_pointer(),
+        cache[2].device_pointer(),
+        metadata.device_pointer(),
+        selection.device_pointer(),
+        output[0].device_pointer(),
+        output[1].device_pointer(),
+        output[2].device_pointer(),
+        trace_counts.map_or(0, DeviceBuffer::device_pointer),
+    ];
+    let mut args = [ptr::null_mut(); 22];
+    for (target, value) in args.iter_mut().zip(pointers.iter_mut()) {
+        *target = (value as *mut usize).cast();
+    }
+    for (target, value) in args[12..].iter_mut().zip(dimensions.iter_mut()) {
+        *target = (value as *mut u32).cast();
+    }
+    // 行内仅搬运字节；较小 block 减少空闲 wave 与跨 wave barrier。
+    launch_tensor_kernel(functions.mla_gpu_hot_gather_q8, dimensions[0], 64, &mut args, "HIP GPU hot gather Q8")
+}
+
+pub(crate) fn try_mla_gpu_hot_invalidate(device_id: i32, metadata: &DeviceBuffer, map_rows: usize, cache_rows: usize, keep: usize, end: usize) -> Result<(), String> {
+    if end <= keep {
+        return Ok(());
+    }
+    set_device(device_id)?;
+    let mut pointer = metadata.device_pointer();
+    let mut dimensions = [map_rows, cache_rows, keep, end].map(|v| u32::try_from(v).map_err(|_| "GPU hot invalidate dimension 超过 u32".to_owned())).into_iter().collect::<Result<Vec<_>, _>>()?;
+    let mut args = [(&mut pointer as *mut usize).cast(), (&mut dimensions[0] as *mut u32).cast(), (&mut dimensions[1] as *mut u32).cast(), (&mut dimensions[2] as *mut u32).cast(), (&mut dimensions[3] as *mut u32).cast()];
+    launch_tensor_kernel(paged_mla_functions(device_id)?.mla_gpu_hot_invalidate, ((end - keep).div_ceil(256)) as u32, 256, &mut args, "HIP GPU hot invalidate")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_mla_gather_selected_q8(
     device_id: i32,
@@ -1124,7 +1222,24 @@ pub fn try_paged_cache_append_mla_f32_q8_bf16_with_log(
     log_rope: &DeviceBuffer,
     log_row: usize,
 ) -> Result<(), String> {
-    try_paged_cache_append_mla_f32_q8_bf16_inner(device_id, latent_input, latent_cache, latent_scales, rope_input, rope_cache, block_table, position, rows, latent_columns, rope_columns, group_size, block_size, None, None, Some((log_latent, log_scales, log_rope, log_row)))
+    try_paged_cache_append_mla_f32_q8_bf16_inner(
+        device_id,
+        latent_input,
+        latent_cache,
+        latent_scales,
+        rope_input,
+        rope_cache,
+        block_table,
+        position,
+        rows,
+        latent_columns,
+        rope_columns,
+        group_size,
+        block_size,
+        None,
+        None,
+        Some((log_latent, log_scales, log_rope, log_row)),
+    )
 }
 
 /// 热窗单行 append(带 RoPE)的日志双写变体,语义同上。
@@ -1359,8 +1474,11 @@ struct PagedDsaWorkspace {
 
 fn reserve_paged_dsa_buffer(buffer: &mut Option<std::rc::Rc<DeviceBuffer>>, capacity: &mut usize, device_id: i32, bytes: usize) -> Result<std::rc::Rc<DeviceBuffer>, String> {
     if *capacity < bytes {
-        *buffer = Some(std::rc::Rc::new(DeviceBuffer::allocate(device_id, bytes)?));
-        *capacity = bytes;
+        // score 工作区随上下文增长；按小块预留，减少跨 score tile 时的
+        // hipMalloc/hipFree。大 prefill 最多额外保留不足 64 KiB。
+        let reserved = if bytes < 65536 { bytes.next_power_of_two() } else { bytes.checked_add(65535).ok_or("paged DSA scratch 容量溢出")? / 65536 * 65536 };
+        *buffer = Some(std::rc::Rc::new(DeviceBuffer::allocate(device_id, reserved)?));
+        *capacity = reserved;
     }
     buffer.as_ref().cloned().ok_or_else(|| "paged DSA scratch 分配失败".to_owned())
 }
@@ -1376,6 +1494,14 @@ struct PagedMlaWorkspace {
     absorbed_bytes: usize,
     weighted: Option<std::rc::Rc<DeviceBuffer>>,
     weighted_bytes: usize,
+    // 重排结果必须活到 attention 消费之后；按提交线程/流复用，避免每层
+    // 反复取还池块，也避免非 stage 调用在 scan 发射前回收裸指针的 owner。
+    gathered_latent: Option<std::rc::Rc<DeviceBuffer>>,
+    gathered_latent_bytes: usize,
+    gathered_scales: Option<std::rc::Rc<DeviceBuffer>>,
+    gathered_scales_bytes: usize,
+    gathered_rope: Option<std::rc::Rc<DeviceBuffer>>,
+    gathered_rope_bytes: usize,
 }
 
 thread_local! {
@@ -2713,22 +2839,6 @@ pub(crate) fn try_paged_mla_attention_ct_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// selected decode 预重排后的 identity selection（0..top_k），按 device 缓存一次上传。
-fn mla_identity_selection(device_id: i32, top_k: usize) -> Result<std::sync::Arc<DeviceBuffer>, String> {
-    static CACHE: OnceLock<Mutex<HashMap<i32, std::sync::Arc<DeviceBuffer>>>> = OnceLock::new();
-    let mut cache = CACHE.get_or_init(|| Mutex::new(HashMap::new())).lock().map_err(|_| "MLA identity selection cache 已损坏".to_owned())?;
-    if let Some(buffer) = cache.get(&device_id)
-        && buffer.bytes() >= top_k * 4
-    {
-        return Ok(buffer.clone());
-    }
-    let ids: Vec<u32> = (0..top_k as u32).collect();
-    let bytes = unsafe { std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), top_k * 4) };
-    let buffer = std::sync::Arc::new(DeviceBuffer::upload(device_id, bytes)?);
-    cache.insert(device_id, buffer.clone());
-    Ok(buffer)
-}
-
 fn try_paged_mla_attention_ct_inner(
     device_id: i32,
     query: &DeviceBuffer,
@@ -3013,15 +3123,26 @@ fn try_paged_mla_attention_ct_inner(
             let selection = selection.expect("selected 已检查");
             let scales_source = latent_scales.expect("Q8 scales 已检查");
             let groups = latent_dim / latent_group_size;
-            let gathered_latent = DeviceBuffer::allocate_reusable(device_id, gather_rows * latent_dim)?;
-            let gathered_scales = DeviceBuffer::allocate_reusable(device_id, gather_rows * groups * 2)?;
-            let gathered_rope = DeviceBuffer::allocate_reusable(device_id, gather_rows * rope_dim * 2)?;
+            let (gathered_latent, gathered_scales, gathered_rope) = PAGED_MLA_WORKSPACES.with(|workspaces| -> Result<_, String> {
+                let mut workspaces = workspaces.borrow_mut();
+                let workspace = workspaces.entry(crate::kernel::rocm::hip::compute_workspace_key(device_id)).or_default();
+                Ok((
+                    reserve_paged_dsa_buffer(&mut workspace.gathered_latent, &mut workspace.gathered_latent_bytes, device_id, gather_rows * latent_dim)?,
+                    reserve_paged_dsa_buffer(&mut workspace.gathered_scales, &mut workspace.gathered_scales_bytes, device_id, gather_rows * groups * 2)?,
+                    reserve_paged_dsa_buffer(&mut workspace.gathered_rope, &mut workspace.gathered_rope_bytes, device_id, gather_rows * rope_dim * 2)?,
+                ))
+            })?;
             try_mla_gather_selected_q8(device_id, latent_cache, scales_source, rope_cache, block_table, selection, &gathered_latent, &gathered_scales, &gathered_rope, gather_rows, latent_dim, latent_group_size, rope_dim, block_size)?;
-            let identity = mla_identity_selection(device_id, top_k)?;
             d_latent = gathered_latent.pointer;
             d_latent_scales = gathered_scales.pointer;
             d_rope = gathered_rope.pointer;
-            d_selection = identity.pointer;
+            // gather 已完成逻辑页表映射，结果是按 selection 顺序排列的紧凑行。
+            // scan 直接读行号，不能再次套用源页表或原上下文的可见行数。
+            d_table = ptr::null_mut();
+            d_selection = ptr::null_mut();
+            selected_u32 = 0;
+            context_u32 = gather_rows as u32;
+            start_u32 = context_u32 - 1;
         }
         let requested_tile_size = options().mla_decode_tile_size;
         let visible_rows = query_start.checked_add(query_rows).ok_or("paged MLA decode visible rows 溢出")?.min(context_rows);
@@ -3044,6 +3165,40 @@ fn try_paged_mla_attention_ct_inner(
         let tile_count = decode_rows.div_ceil(decode_tile_size);
         if tile_count == 0 || tile_count > DECODE_MAX_TILES {
             return Err(format!("paged MLA decode tile_count={tile_count} 非法"));
+        }
+        let colpar512 = decode_wmma_q8 && functions.decode_partial_wmma_q8_colpar512 != 0 && latent_dim == 512 && latent_group_size == 64 && rope_dim == 64;
+        // 相同 tile 的交替 A/B：单行及 3..8 行受益，2 行会退化；
+        // 不改变 split 大小与求和顺序，未验证的形状保留原路径。
+        let shared_kv_tile = colpar512 && head_count == 32 && decode_rows >= 1024 && decode_tile_size == 64 && (query_rows == 1 || (3..=8).contains(&query_rows));
+        // 共享 BF16 tile 的单行路径直接从原 KV 扫描，省去一次 top-k gather
+        // 和三个临时输出；旧路径继续先把 top-k 行收集到连续
+        // workspace，scan 各 head-group 不再对同一批行做冗余散读。仅非分片路径
+        // （分片下 gathered 行序与 parity compact 行号不一致，不适用）。
+        if !shared_kv_tile && query_rows == 1 && selected_wmma_q8 && shard.is_none() && selection.is_some() && latent_scales.is_some() && latent_group_size != 0 && top_k >= 1024 {
+            let visible_rows = query_start.checked_add(1).ok_or("paged MLA decode visible rows 溢出")?.min(context_rows);
+            let gather_rows = visible_rows.min(top_k);
+            let selection = selection.expect("selected 已检查");
+            let scales_source = latent_scales.expect("Q8 scales 已检查");
+            let groups = latent_dim / latent_group_size;
+            let (gathered_latent, gathered_scales, gathered_rope) = PAGED_MLA_WORKSPACES.with(|workspaces| -> Result<_, String> {
+                let mut workspaces = workspaces.borrow_mut();
+                let workspace = workspaces.entry(crate::kernel::rocm::hip::compute_workspace_key(device_id)).or_default();
+                Ok((
+                    reserve_paged_dsa_buffer(&mut workspace.gathered_latent, &mut workspace.gathered_latent_bytes, device_id, gather_rows * latent_dim)?,
+                    reserve_paged_dsa_buffer(&mut workspace.gathered_scales, &mut workspace.gathered_scales_bytes, device_id, gather_rows * groups * 2)?,
+                    reserve_paged_dsa_buffer(&mut workspace.gathered_rope, &mut workspace.gathered_rope_bytes, device_id, gather_rows * rope_dim * 2)?,
+                ))
+            })?;
+            try_mla_gather_selected_q8(device_id, latent_cache, scales_source, rope_cache, block_table, selection, &gathered_latent, &gathered_scales, &gathered_rope, gather_rows, latent_dim, latent_group_size, rope_dim, block_size)?;
+            d_latent = gathered_latent.pointer;
+            d_latent_scales = gathered_scales.pointer;
+            d_rope = gathered_rope.pointer;
+            // gather 已解析页表和 selection，scan 直接读取紧凑行，避免二次映射。
+            d_table = ptr::null_mut();
+            d_selection = ptr::null_mut();
+            selected_u32 = 0;
+            context_u32 = gather_rows as u32;
+            start_u32 = context_u32 - 1;
         }
         let partial_elements = query_rows.checked_mul(tile_count).and_then(|elements| elements.checked_mul(head_count)).and_then(|elements| elements.checked_mul(latent_dim)).ok_or("paged MLA decode partial 元素数溢出")?;
         let stats_elements = query_rows.checked_mul(tile_count).and_then(|elements| elements.checked_mul(head_count)).and_then(|elements| elements.checked_mul(2)).ok_or("paged MLA decode stats 元素数溢出")?;
@@ -3118,23 +3273,36 @@ fn try_paged_mla_attention_ct_inner(
             // GLM-5.3 生产形状走列并行 QK 特化（8 wave 分列段 + LDS 归约，全常量展开）；
             // 生产实际 q_head_dim=256（nope 192+rope 64），不门控 q_head。
             // 数值为容差族（score 归约顺序变化），bench 位级对照见 decode_scan_bench。
-            let colpar512 = functions.decode_partial_wmma_q8_colpar512 != 0 && latent_dim == 512 && latent_group_size == 64 && rope_dim == 64;
-            let launch_shared = if colpar512 {
-                // colpar LDS 布局：key 8 片 + probability + value(=score_reduce 复用)
-                // + alpha + physicals + latent code + scale。
+            let launch_shared = if shared_kv_tile {
+                // 16 KiB scratch 供 rope/QK 归约分时复用，完整 BF16 KV tile 供 QK/PV 共用。
+                let bytes = (8 * 2 * 8 * 32 * 2 + WMMA_HEADS_PER_BLOCK * 16 + WMMA_TOKEN_TILE * (latent_dim + 8)) * 2 + (WMMA_HEADS_PER_BLOCK + WMMA_TOKEN_TILE) * 4;
+                u32::try_from(bytes).map_err(|_| "paged MLA decoded KV shared 超过 u32")?
+            } else if colpar512 {
                 let bytes =
                     (8 * WMMA_TOKEN_TILE * 16 + WMMA_HEADS_PER_BLOCK * 16 + 16 * latent_dim) * 2 + WMMA_HEADS_PER_BLOCK * 4 + WMMA_TOKEN_TILE * 4 + WMMA_TOKEN_TILE * latent_dim + WMMA_TOKEN_TILE * (latent_dim / latent_group_size) * 2;
                 u32::try_from(bytes).map_err(|_| "paged MLA colpar shared 超过 u32")?
             } else {
                 decode_shared_u32
             };
-            let launch_function = if colpar512 { functions.decode_partial_wmma_q8_colpar512 } else { functions.decode_partial_wmma_q8 };
+            let launch_function = if shared_kv_tile {
+                functions.decode_partial_wmma_q8_colpar512_shared
+            } else if colpar512 {
+                functions.decode_partial_wmma_q8_colpar512
+            } else {
+                functions.decode_partial_wmma_q8
+            };
             // 一次性打印 kernel 选择，供生产 engagement 核查。
             static COLPAR_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !COLPAR_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!(
                     "[mla-decode-scan] kernel={} tile_size={decode_tile_size} tiles={tile_count} heads={head_count} latent={latent_dim} group={latent_group_size} rope={rope_dim} q_head={q_head_dim}",
-                    if colpar512 { "colpar512" } else { "baseline" }
+                    if shared_kv_tile {
+                        "colpar512_shared"
+                    } else if colpar512 {
+                        "colpar512"
+                    } else {
+                        "baseline"
+                    }
                 );
             }
             // WMMA kernel 没有标量软件流水的 stage_chunk 参数；必须单独维护
@@ -3276,12 +3444,27 @@ fn try_paged_mla_attention_ct_inner(
                 (&mut direct_split_tile_count_u32 as *mut u32).cast(),
                 (&mut shard_u32 as *mut u32).cast(),
             ];
+            let shared_bytes = selected_wmma_shared.expect("sparse WMMA 已检查 shared memory");
+            let prefill_shared_bytes = latent_dim
+                .checked_add(8)
+                .and_then(|stride| stride.checked_mul(WMMA_TOKEN_TILE))
+                .and_then(|elements| elements.checked_add(WMMA_TOKEN_TILE * 16 + 32 * 16))
+                .and_then(|elements| elements.checked_mul(2))
+                .and_then(|bytes| bytes.checked_add((32 + WMMA_TOKEN_TILE) * 4))
+                .ok_or("paged MLA prefill BF16 KV tile 字节数溢出")?;
+            let heads32 = query_rows >= 16 && head_count.is_multiple_of(32) && prefill_shared_bytes <= WMMA_MAX_SHARED_BYTES;
+            #[cfg(test)]
+            let heads32 = heads32 && TEST_SPARSE_PREFILL_HEADS32.load(std::sync::atomic::Ordering::Relaxed);
+            let heads_per_block = if heads32 { 32 } else { WMMA_HEADS_PER_BLOCK };
+            // Q8G64 的完整 BF16 tile 与旧 code/scale + PV scratch 占用相同 LDS，
+            // QK/PV 共享一次反量化，decode 保持原来的暂存路径。
+            let shared_bytes = if heads32 { prefill_shared_bytes } else { shared_bytes };
             launch_moe_kernel(
-                functions.decode_partial_wmma_q8,
-                heads_u32.div_ceil(WMMA_HEADS_PER_BLOCK as u32),
+                if heads32 { functions.prefill_wmma_q8_heads32 } else { functions.decode_partial_wmma_q8 },
+                heads_u32.div_ceil(heads_per_block as u32),
                 query_rows_u32,
                 256,
-                u32::try_from(selected_wmma_shared.expect("sparse WMMA 已检查 shared memory")).map_err(|_| "paged MLA sparse WMMA shared memory 超过 u32")?,
+                u32::try_from(shared_bytes).map_err(|_| "paged MLA sparse WMMA shared memory 超过 u32")?,
                 &mut direct_args,
                 "HIP paged MLA sparse prefill Q8 WMMA",
             )?;
@@ -3692,6 +3875,49 @@ mod tests {
         assert_eq!(parallel_select_tile_rows(128 * 1024, true), 2048);
         assert_eq!(parallel_select_tile_rows(119 * 1024, true), 1024);
         assert_eq!(parallel_select_tile_rows(256 * 1024, false), 4096);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn mla_project_value_rows2_bf16_preserves_output_guard() {
+        let bf16 = |value: f32| (value.to_bits() >> 16) as u16;
+        let as_bytes = |values: &[u16]| unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), values.len() * 2) };
+        let (mut rows, mut heads, mut head_start, mut q_head, mut kv_head, mut latent, mut rope, mut group, mut scale_type, mut bits) = (2_u32, 2_u32, 0_u32, 8_u32, 8_u32, 16_u32, 4_u32, 16_u32, 0_u32, 16_u32);
+        let inputs = (0..rows * heads * latent).map(|i| bf16((i as i32 % 7 - 3) as f32 / 8.0)).collect::<Vec<_>>();
+        let weights = (0..heads * kv_head * latent).map(|i| bf16((i as i32 % 11 - 5) as f32 / 16.0)).collect::<Vec<_>>();
+        let input = DeviceBuffer::upload(0, as_bytes(&inputs)).unwrap();
+        let weight = DeviceBuffer::upload(0, as_bytes(&weights)).unwrap();
+        let scales = DeviceBuffer::upload(0, as_bytes(&[bf16(1.0)])).unwrap();
+        let elements = (rows * heads * q_head) as usize;
+        // guard 与输出等大，错误的 F32 写入也不会破坏其他 allocation。
+        let output = DeviceBuffer::upload(0, &vec![0xa5; elements * 4]).unwrap();
+        let (mut d_input, mut d_weight, mut d_scales, mut d_output) = (input.pointer, weight.pointer, scales.pointer, output.pointer);
+        let mut args = [
+            (&mut d_input as *mut *mut c_void).cast(), (&mut d_weight as *mut *mut c_void).cast(),
+            (&mut d_scales as *mut *mut c_void).cast(), (&mut d_output as *mut *mut c_void).cast(),
+            (&mut rows as *mut u32).cast(), (&mut heads as *mut u32).cast(), (&mut head_start as *mut u32).cast(),
+            (&mut q_head as *mut u32).cast(), (&mut kv_head as *mut u32).cast(), (&mut latent as *mut u32).cast(),
+            (&mut rope as *mut u32).cast(), (&mut group as *mut u32).cast(), (&mut scale_type as *mut u32).cast(), (&mut bits as *mut u32).cast(),
+        ];
+        let functions = paged_mla_functions(0).unwrap();
+        launch_moe_kernel(functions.project_value, heads, 1, 256, 0, &mut args, "MLA 双行 BF16 输出门禁").unwrap();
+        let mut actual = vec![0; elements * 4];
+        output.copy_to_host(&mut actual).unwrap();
+        assert!(actual[elements * 2..].iter().all(|&byte| byte == 0xa5), "双行 projection 越过 BF16 输出边界");
+        let mut expected = vec![0_u16; elements];
+        for row in 0..rows as usize {
+            for head in 0..heads as usize {
+                for value in 0..4 {
+                    let sum = (0..latent as usize).map(|column| {
+                        let x = f32::from_bits(u32::from(inputs[(row * heads as usize + head) * latent as usize + column]) << 16);
+                        let w = f32::from_bits(u32::from(weights[(head * kv_head as usize + 4 + value) * latent as usize + column]) << 16);
+                        x * w
+                    }).sum::<f32>();
+                    expected[(row * heads as usize + head) * q_head as usize + value] = bf16(sum);
+                }
+            }
+        }
+        assert_eq!(&actual[..elements * 2], as_bytes(&expected), "双行 projection 与 CPU oracle 不一致");
     }
 
     fn ordered_score(score: f32) -> u32 {
@@ -5076,6 +5302,10 @@ mod tests {
             super::super::synchronize_device(DEVICE_ID, "HIP MLA sparse prefill oracle").unwrap();
             started.elapsed().as_secs_f64() * 1e3
         };
+        let legacy_wmma = DeviceBuffer::allocate(DEVICE_ID, QUERY_ROWS * Q_PROJECTION * 2).unwrap();
+        TEST_SPARSE_PREFILL_HEADS32.store(false, std::sync::atomic::Ordering::Relaxed);
+        run(&legacy_wmma, true);
+        TEST_SPARSE_PREFILL_HEADS32.store(true, std::sync::atomic::Ordering::Relaxed);
         run(&baseline, false);
         run(&candidate, true);
         let baseline_ms = (0..3).map(|_| run(&baseline, false)).sum::<f64>() / 3.0;
@@ -5085,6 +5315,9 @@ mod tests {
         let mut candidate_bits = vec![0_u16; QUERY_ROWS * Q_PROJECTION];
         baseline.copy_to_host(as_bytes_mut(&mut baseline_bits)).unwrap();
         candidate.copy_to_host(as_bytes_mut(&mut candidate_bits)).unwrap();
+        let legacy_bits = legacy_wmma.download_u16(QUERY_ROWS * Q_PROJECTION).unwrap();
+        let different = legacy_bits.iter().zip(&candidate_bits).filter(|(left, right)| left != right).count();
+        assert_eq!(different, 0, "32-head prefill 与原 16-head WMMA 必须逐位一致");
         let baseline_host = baseline_bits.into_iter().map(|bits| f32::from_bits(u32::from(bits) << 16)).collect::<Vec<_>>();
         let candidate_host = candidate_bits.into_iter().map(|bits| f32::from_bits(u32::from(bits) << 16)).collect::<Vec<_>>();
         let mut max_abs = 0.0_f32;
@@ -5666,6 +5899,94 @@ mod tests {
 
     #[test]
     #[ignore = "需要 ROCm GPU"]
+    fn paged_workspace_growth_reuses_storage_and_keeps_live_readers() {
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        let mut buffer = None;
+        let mut capacity = 0;
+        let original = reserve_paged_dsa_buffer(&mut buffer, &mut capacity, 0, 200000).unwrap();
+        original.copy_from_host(&[17, 29, 61, 101]).unwrap();
+        for bytes in [200004, 208192, 262144] {
+            let next = reserve_paged_dsa_buffer(&mut buffer, &mut capacity, 0, bytes).unwrap();
+            assert_eq!(next.device_pointer(), original.device_pointer());
+            assert!(next.bytes() >= bytes);
+        }
+        let larger = reserve_paged_dsa_buffer(&mut buffer, &mut capacity, 0, 262148).unwrap();
+        assert_ne!(larger.device_pointer(), original.device_pointer());
+        // 扩容后的旧读者仍持有来源，不能把尚在使用的 allocation 提前归还。
+        let mut bytes = [0; 4];
+        original.copy_to_host(&mut bytes).unwrap();
+        assert_eq!(bytes, [17, 29, 61, 101]);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn mla_selected_gather_nonidentity_pages_match_serial() {
+        const DEVICE: i32 = 0;
+        const CONTEXT: usize = 2176;
+        const BLOCK: usize = 128;
+        const HEADS: usize = 16;
+        const Q_HEAD: usize = 96;
+        const KV_HEAD: usize = 64;
+        const LATENT: usize = 512;
+        const GROUP: usize = 64;
+        const ROPE: usize = 64;
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        TEST_MLA_DECODE_WMMA.store(true, std::sync::atomic::Ordering::Relaxed);
+        let bf16 = |value: f32| (value.to_bits() >> 16) as u16;
+        let query = DeviceBuffer::upload_f32(DEVICE, &(0..HEADS * Q_HEAD).map(|i| ((i % 31) as f32 - 15.0) / 32.0).collect::<Vec<_>>()).unwrap();
+        let weight = (0..HEADS * KV_HEAD * LATENT).map(|i| bf16(((i * 17 % 127) as f32 - 63.0) / 4096.0)).collect::<Vec<_>>();
+        let weight = DeviceBuffer::upload(DEVICE, as_bytes(&weight)).unwrap();
+        let weight_scales = DeviceBuffer::upload(DEVICE, as_bytes(&[bf16(1.0)])).unwrap();
+        let latent = (0..CONTEXT * LATENT).map(|i| ((i * 29 + i / LATENT * 7) % 63 + 1) as u8).collect::<Vec<_>>();
+        let latent = DeviceBuffer::upload(DEVICE, &latent).unwrap();
+        let scales = DeviceBuffer::upload(DEVICE, as_bytes(&vec![bf16(1.0 / 256.0); CONTEXT * (LATENT / GROUP)])).unwrap();
+        let rope = (0..CONTEXT * ROPE).map(|i| bf16(((i * 13 % 127) as f32 - 63.0) / 128.0)).collect::<Vec<_>>();
+        let rope = DeviceBuffer::upload(DEVICE, as_bytes(&rope)).unwrap();
+        // 首个逻辑页位于物理末页；重排后误用源页表会越过紧凑 buffer。
+        let table = (0..(CONTEXT / BLOCK) as u32).rev().collect::<Vec<_>>();
+        let table = DeviceBuffer::upload(DEVICE, as_bytes(&table)).unwrap();
+        let serial = DeviceBuffer::allocate(DEVICE, HEADS * Q_HEAD * 4).unwrap();
+        let gathered = DeviceBuffer::allocate(DEVICE, HEADS * Q_HEAD * 4).unwrap();
+        // 增长、缩短并改选集，覆盖 workspace 复用和近似 rollback 后的重新读取。
+        for (generation, top_k) in [1024, 2048, 1024].into_iter().enumerate() {
+            let selection = (0..top_k).map(|i| ((i * 251 + generation * 17) % CONTEXT) as u32).collect::<Vec<_>>();
+            let selection = DeviceBuffer::upload(DEVICE, as_bytes(&selection)).unwrap();
+            for (output, split) in [(&serial, false), (&gathered, true)] {
+                try_paged_mla_attention_ct_into(
+                    DEVICE,
+                    &query,
+                    &latent,
+                    Some(&scales),
+                    GROUP,
+                    &rope,
+                    &table,
+                    Some(&selection),
+                    CtMlaWeightRef { packed: &weight, scales: &weight_scales, rows: HEADS * KV_HEAD, cols: LATENT, group_size: LATENT, scale_dtype: 0, bits: 16 },
+                    1,
+                    CONTEXT,
+                    CONTEXT - 1,
+                    HEADS * Q_HEAD,
+                    HEADS,
+                    ROPE,
+                    top_k,
+                    BLOCK,
+                    output,
+                    Some(split),
+                )
+                .unwrap();
+            }
+            let mut expected = vec![0.0_f32; HEADS * Q_HEAD];
+            let mut actual = expected.clone();
+            serial.copy_to_host(as_bytes_mut(&mut expected)).unwrap();
+            gathered.copy_to_host(as_bytes_mut(&mut actual)).unwrap();
+            for (i, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(actual.is_finite() && (actual - expected).abs() <= 1.0e-2 + 1.0e-2 * expected.abs(), "generation={generation} top_k={top_k} element={i} actual={actual} expected={expected}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
     fn mla_decode_split_matches_serial_and_reports_latency() {
         const DEVICE_ID: i32 = 0;
         const Q_HEAD_DIM: usize = 256;
@@ -5675,7 +5996,7 @@ mod tests {
         const LATENT_GROUP: usize = 64;
         const BLOCK_SIZE: usize = 128;
 
-        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        super::super::configure(super::super::RocmOptions { mla_decode_tile_size: 64, ..Default::default() }).unwrap();
 
         // head_count=32 复现 cooperative 半头拆分下每卡的 grid.x=1 形态；
         // 131072 上下文让 WMMA split 超过旧 merge 上限 128，验证扩容后的正确性。
@@ -5686,6 +6007,7 @@ mod tests {
             ("q8g64", LATENT_GROUP, 64_usize, true, 16_u32),
             ("q8g64", LATENT_GROUP, 64, true, 8),
             ("q8g64", LATENT_GROUP, 32, true, 16),
+            ("q8g64", LATENT_GROUP, 32, true, 8),
             ("f16", 0, 64, true, 16),
             ("q8g64", LATENT_GROUP, 64, false, 16),
             ("q8g64", LATENT_GROUP, 32, false, 16),
@@ -6090,8 +6412,8 @@ mod decode_scan_bench {
         let as_bytes = |values: &[u16]| unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 2) };
         let bf16 = |value: f32| (value.to_bits() >> 16) as u16;
 
-        // query F32 [576]
-        let query: Vec<f32> = (0..Q_HEAD_DIM).map(|i| (((i as i32 * 37) % 41 - 20) as f32) / 32.0).collect();
+        // query F32 [head_count, q_head_dim]
+        let query: Vec<f32> = (0..HEAD_COUNT * Q_HEAD_DIM).map(|i| (((i as i32 * 37) % 41 - 20) as f32) / 32.0).collect();
         let query_device = DeviceBuffer::upload_f32(DEVICE, &query).unwrap();
         // absorbed BF16 [64, 512]
         let absorbed: Vec<u16> = (0..HEAD_COUNT * LATENT_DIM).map(|i| bf16((((i as i32 * 13) % 31 - 15) as f32) / 64.0)).collect();
@@ -6173,7 +6495,13 @@ mod decode_scan_bench {
                 (&mut split_tiles as *mut u32).cast(),
                 (&mut shard as *mut u32).cast(),
             ];
-            let shared = if kernel != functions.decode_partial_wmma_q8 { colpar_shared } else { baseline_shared } as u32;
+            let shared = if kernel == functions.decode_partial_wmma_q8_colpar512_shared {
+                (8 * 2 * 8 * 32 * 2 + 16 * 16 + 32 * (LATENT_DIM + 8)) * 2 + (16 + 32) * 4
+            } else if kernel != functions.decode_partial_wmma_q8 {
+                colpar_shared
+            } else {
+                baseline_shared
+            } as u32;
             let grid_y = tile_count as u32;
             for _ in 0..3 {
                 launch_moe_kernel(kernel, 4, grid_y, 256, shared, &mut args, "scan bench partial").unwrap();
@@ -6279,14 +6607,14 @@ mod decode_scan_bench {
         }
 
         // 臂 D：512 全常量特化（与 colpar 同档位必须逐位一致）。
-        assert!(functions.decode_partial_wmma_q8_colpar512 != 0);
+        assert!(functions.decode_partial_wmma_q8_colpar512_shared != 0);
         for (tile, colpar_ref) in &colpar_refs {
-            let (pmin, pavg, mmin, mavg) = run_arm(functions.decode_partial_wmma_q8_colpar512, *tile, functions.split_merge, 100);
-            eprintln!("[scan-bench] colpar512-t{tile} partial min/avg={pmin:.1}/{pavg:.1}us merge min/avg={mmin:.1}/{mavg:.1}us");
+            let (pmin, pavg, mmin, mavg) = run_arm(functions.decode_partial_wmma_q8_colpar512_shared, *tile, functions.split_merge, 100);
+            eprintln!("[scan-bench] colpar512-shared-t{tile} partial min/avg={pmin:.1}/{pavg:.1}us merge min/avg={mmin:.1}/{mavg:.1}us");
             let current = weighted.download_u16(HEAD_COUNT * LATENT_DIM).unwrap();
             let diff = current.iter().zip(colpar_ref.iter()).filter(|(a, b)| a != b).count();
-            eprintln!("[scan-bench] colpar512-t{tile} vs colpar bit-diff={diff}/{}", colpar_ref.len());
-            assert!(current == *colpar_ref, "colpar512-t{tile} 与 colpar 不逐位一致");
+            eprintln!("[scan-bench] colpar512-shared-t{tile} vs colpar bit-diff={diff}/{}", colpar_ref.len());
+            assert!(current == *colpar_ref, "colpar512-shared-t{tile} 与 colpar 不逐位一致");
         }
 
         // 臂 E：merge 软件流水（同输入必须与 merge 逐位一致；在各 tile 档位计时）。

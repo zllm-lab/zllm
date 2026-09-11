@@ -21,6 +21,8 @@ pub(super) struct TailResident {
     pub(super) placement: usize,
     pub(super) hidden: RocmTensor,
     pub(super) position: usize,
+    pub(super) completed_unix: u64,
+    pub(super) prompt_tokens: usize,
 }
 
 pub(super) struct TailOpenRequest {
@@ -261,14 +263,26 @@ pub(super) fn tail_stage_cache_commit(
         tail.position = tokens;
     }
     let hidden = tail.hidden.ok_or_else(|| "后继 Cache 缺少 terminal hidden".to_owned())?;
-    resident.insert(next_request_id, TailResident { states: tail.states, placement: tail.placement, hidden, position: tokens });
+    let completed_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    resident.insert(next_request_id, TailResident { states: tail.states, placement: tail.placement, hidden, position: tokens, completed_unix, prompt_tokens: tail.prompt_position.unwrap_or(tokens) });
     link.send_ready(request_id, tokens)?;
     Ok(())
 }
 
 /// 把 resident session 换出到本机 SSD 并 ACK。continuous 入口此前没有换出日志,收编后统一。
 pub(super) fn tail_stage_swap_out(link: &mut StageTransport, resident: &mut HashMap<RequestId, TailResident>, swap: &Glm52SwapStore, output_context: &RocmContext, request_id: RequestId) -> Result<(), String> {
-    let saved = resident.remove(&request_id).ok_or_else(|| format!("后继 SwapOut cache={request_id} 不在 resident"))?;
+    // 快照下载或 SSD 提交失败时，完整 RAM/GPU 状态必须仍由 resident 持有。
+    let Some(saved) = resident.get(&request_id) else {
+        let info = swap.info(&request_id.to_string())?.ok_or_else(|| format!("后继 SwapOut cache={request_id} 不在 resident 或 SSD"))?;
+        link.send_ready(request_id, info.token_count)?;
+        return Ok(());
+    };
+    if saved.prompt_tokens < crate::runtime::glm52::rocm_swap::MIN_PERSIST_TOKENS {
+        let position = saved.position;
+        resident.remove(&request_id);
+        link.send_ready(request_id, position)?;
+        return Ok(());
+    }
     let snapshot = Glm52CacheSnapshot {
         cache_id: request_id.to_string(),
         cache_namespace: None,
@@ -281,9 +295,11 @@ pub(super) fn tail_stage_swap_out(link: &mut StageTransport, resident: &mut Hash
         dspark_aux: None,
         dspark_target: None,
     };
-    swap.put(&snapshot)?;
-    link.send_ready(request_id, saved.position)?;
-    eprintln!("[stage-swap-out] cache_id={request_id} tokens={}", saved.position);
+    swap.put_completed(&snapshot, saved.completed_unix)?;
+    let position = saved.position;
+    resident.remove(&request_id);
+    link.send_ready(request_id, position)?;
+    eprintln!("[stage-swap-out] cache_id={request_id} tokens={position}");
     Ok(())
 }
 
@@ -291,6 +307,9 @@ pub(super) fn tail_stage_swap_out(link: &mut StageTransport, resident: &mut Hash
 /// continuous 入口此前只处理 resident 命中分支,收编后统一三分支,差异仅为诊断日志。
 pub(super) fn tail_stage_persist(resident: &mut HashMap<RequestId, TailResident>, swap: &Glm52SwapStore, output_context: &RocmContext, request_id: RequestId) -> Result<(), String> {
     if let Some(saved) = resident.get(&request_id) {
+        if saved.prompt_tokens < crate::runtime::glm52::rocm_swap::MIN_PERSIST_TOKENS {
+            return Ok(());
+        }
         let snapshot = Glm52CacheSnapshot {
             cache_id: request_id.to_string(),
             cache_namespace: None,
@@ -303,7 +322,7 @@ pub(super) fn tail_stage_persist(resident: &mut HashMap<RequestId, TailResident>
             dspark_aux: None,
             dspark_target: None,
         };
-        swap.put(&snapshot)?;
+        swap.put_completed(&snapshot, saved.completed_unix)?;
         eprintln!("[stage-persist] cache_id={request_id} tokens={}", saved.position);
     } else if swap.get(&request_id.to_string())?.is_some() {
         eprintln!("[stage-persist] cache_id={request_id} 已在 SSD");
@@ -343,7 +362,12 @@ pub(in crate::runtime::glm52) fn gather_embedding_rows(context: &RocmContext, ta
     }
     let device_id = context.device_id();
     let ids_bytes = ids.len().checked_mul(std::mem::size_of::<u32>()).ok_or("embedding ids 字节溢出")?;
-    let ids_buffer = ops::hip::DeviceBuffer::upload(device_id, unsafe { std::slice::from_raw_parts(ids.as_ptr().cast(), ids_bytes) }).map_err(|error| format!("上传 embedding ids: {error}"))?;
+    let bytes = unsafe { std::slice::from_raw_parts(ids.as_ptr().cast(), ids_bytes) };
+    // 调度线程可能没有 active stream。普通 upload 会独立分配，
+    // gather 后的 hipFree 因此等待整卡；临时 ids 改走已有显式池，Drop
+    // 通过 gather 所在 stream 的完成事件回收。stage0 原有的 default→
+    // background 依赖继续保护输出，MTP 内则直接保持同一 consumer stream。
+    let ids_buffer = ops::hip::DeviceBuffer::upload_independent(device_id, bytes).map_err(|error| format!("上传 embedding ids: {error}"))?;
     let output = ops::hip::try_gather_bf16_rows_f32(device_id, table, &ids_buffer, ids.len(), hidden).map_err(|error| format!("embedding gather kernel: {error}"))?;
     Ok(RocmTensor { data: Vec::new(), rows: ids.len(), cols: hidden, dtype: crate::backend::rocm::RocmTensorDType::F32, layout: crate::backend::rocm::RocmTensorLayout::RowMajor, device: Some(std::sync::Arc::new(output)), replica: None })
 }
@@ -375,6 +399,44 @@ mod mtp_catch_up_tests {
         let groups = mtp_catch_up_groups(&[Some((10, 1)), Some((20, 3)), None, Some((30, 2)), Some((40, 1))]);
         assert_eq!(groups[0], [0, 4]);
         assert_eq!(groups[1], [1, 3]);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn embedding_pool_ids_survive_stage_handoff() {
+        use super::{RocmContext, gather_embedding_rows, ops};
+        use crate::backend::StageExecutionBackend;
+
+        ops::hip::configure(ops::hip::RocmOptions { memory_pool: true, ..Default::default() }).unwrap();
+        let context = RocmContext::new(0).unwrap();
+        context.activate().unwrap();
+        let columns = 256;
+        let table_values = (0..37 * columns).map(|index| half::bf16::from_f32(((index * 13 % 71) as f32 - 35.0) / 128.0)).collect::<Vec<_>>();
+        let table_bytes = table_values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+        let table = std::sync::Arc::new(ops::hip::DeviceBuffer::upload(0, &table_bytes).unwrap());
+        let mut pending = Vec::new();
+        // default stream 构造后立刻交给 background 消费；交错不同 id 与行数，
+        // 让已 Drop 的 ids 槽反复进入复用池，检查回收事件确实保护 gather。
+        for round in 0..16 {
+            context.activate().unwrap();
+            let rows = [1, 2, 4, 8, 16, 33, 128, 1024][round % 8];
+            let ids = (0..rows).map(|row| ((row * 7 + round * 11) % 37) as u32).collect::<Vec<_>>();
+            let gathered = gather_embedding_rows(&context, &table, &ids, columns).unwrap();
+            context.activate_stage_submission(crate::backend::StageSubmissionKind::Background).unwrap();
+            let device = gathered.device.as_deref().unwrap();
+            let output = ops::hip::try_add_resident_f32(0, device, device, rows * columns, 1.0).unwrap();
+            pending.push((ids, output));
+        }
+        ops::hip::synchronize_compute_stream(0, "embedding pool handoff oracle").unwrap();
+        for (ids, output) in pending {
+            let actual = output.download_f32(ids.len() * columns).unwrap();
+            for (row, id) in ids.into_iter().enumerate() {
+                for column in 0..columns {
+                    assert_eq!(actual[row * columns + column], table_values[id as usize * columns + column].to_f32() * 2.0);
+                }
+            }
+        }
+        context.activate().unwrap();
     }
 }
 
@@ -417,11 +479,14 @@ pub(crate) fn mtp_catch_up_batch(
                 return Err(crate::backend::BackendError::Compute { msg: format!("MTP batch catch-up position={}，期望 {expected}", item.session.position) });
             }
             let previous = item.session.pending_hidden.as_ref().ok_or_else(|| crate::backend::BackendError::Compute { msg: "MTP batch catch-up 缺少跨 batch hidden".to_owned() })?;
+            // 驻留状态是 F32，SSD snapshot 按 BF16 恢复；拼接前只扩展存储
+            // 类型，不能对已经 normalized 的 pending hidden 再做一次 norm。
+            let previous = runtime.backend.tensor_as_f32(previous.clone())?;
             let hidden = if rows == 1 {
-                previous.clone()
+                previous
             } else {
                 let prefix = runtime.backend.slice_token_rows(&item.target_hidden, 0, rows - 1)?;
-                runtime.backend.concat_token_rows(&[previous, &prefix])?
+                runtime.backend.concat_token_rows(&[&previous, &prefix])?
             };
             (item.target_inputs.clone(), hidden, expected)
         };

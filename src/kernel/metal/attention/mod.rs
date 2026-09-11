@@ -656,6 +656,7 @@ kernel void gqa_decode_split_kv(
     constant uint &group_size [[buffer(17)]],
     constant uint &groups_per_head [[buffer(18)]],
     constant uint &q8 [[buffer(19)]],
+    constant uint &dynamic_blocks [[buffer(20)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
@@ -681,8 +682,17 @@ kernel void gqa_decode_split_kv(
     if (block >= block_count || kv_head >= kv_head_count || head_dim > max_head_dim
         || block_tokens == 0 || block_tokens > max_block_tokens) return;
 
-    const uint active_block_count = (source_rows + block_tokens - 1) / block_tokens;
-    if (block >= active_block_count) {
+    // dynamic_blocks=1:块的覆盖区间按 source_rows 均分(row_begin = block*ceil(rows/count)),
+    // 固定数量的 block 覆盖任意长度历史,每块行数 <= ceil(source/count) <= block_tokens
+    // (host 保证 count >= ceil(max_seq/block_tokens)),没有 inactive 写放大。
+    // dynamic_blocks=0:固定 block_tokens 步长,kv_rows 之后的块写中性 partial。
+    const uint rows_per_block = dynamic_blocks != 0
+        ? (source_rows + block_count - 1) / block_count
+        : block_tokens;
+    const uint row_begin = block * rows_per_block;
+    const uint rows = min(rows_per_block, source_rows - row_begin);
+    const uint active_block_count = dynamic_blocks != 0 ? block_count : (source_rows + block_tokens - 1) / block_tokens;
+    if (block >= active_block_count || rows == 0 || row_begin >= source_rows || rows_per_block > max_block_tokens) {
         for (uint query_head = 0; query_head < active_heads; ++query_head) {
             const uint global_head = first_query_head + query_head;
             const ulong statistic = (ulong(global_head) * block_count + block) * 2;
@@ -697,8 +707,6 @@ kernel void gqa_decode_split_kv(
         return;
     }
 
-    const uint row_begin = block * block_tokens;
-    const uint rows = min(block_tokens, source_rows - row_begin);
     // Metal function constant 不能用于数组长度；容量对应上面的通用 kernel 上限。
     threadgroup half query_tile[2048];
     threadgroup float weights[1024];
@@ -3667,7 +3675,9 @@ pub(crate) fn gqa_decode_attention_append_direct_q8_position_tensor(
 }
 
 /// Q8 replay 的分块 attention。当前行先按 state[0] 写入 cache，随后以固定
-/// 四个 128-token block 录制；超出当前 kv_rows 的 block 在设备端写中性 partial。
+/// `block_count` 个 `BLOCK_TOKENS`-token block 录制；超出当前 kv_rows 的 block
+/// 在设备端写中性 partial。Full attention 按 max_sequence_len 取
+/// ceil(max/BLOCK_TOKENS) 覆盖全部历史，短上下文重放由 direct 路径接管。
 #[allow(clippy::too_many_arguments)]
 fn gqa_decode_attention_append_split_q8_position_into(
     ctx: &MetalContext,
@@ -3679,10 +3689,10 @@ fn gqa_decode_attention_append_split_q8_position_into(
     decode_state: &metal::Buffer,
     state_offset: u64,
     output: &MetalTensor,
+    block_count: usize,
 ) -> Result<(), String> {
     const THREADS: usize = 256;
     const BLOCK_TOKENS: usize = 128;
-    const BLOCK_COUNT: usize = 4;
     let key_scale_offset = view.key_scale_offset.ok_or("GQA replay split 缺少 K scales")?;
     let value_scale_offset = view.value_scale_offset.ok_or("GQA replay split 缺少 V scales")?;
     if view.format != MetalKvCacheFormat::Int8
@@ -3695,8 +3705,9 @@ fn gqa_decode_attention_append_split_q8_position_into(
         || new_value.rows != 1
         || new_key.cols != spec.num_kv_heads * spec.head_dim
         || new_value.cols != spec.num_kv_heads * spec.head_dim
+        || block_count == 0
     {
-        return Err(format!("GQA replay split shape 不符: Q=[{},{}] K=[{},{}] V=[{},{}]", query.rows, query.cols, new_key.rows, new_key.cols, new_value.rows, new_value.cols));
+        return Err(format!("GQA replay split shape 不符: Q=[{},{}] K=[{},{}] V=[{},{}] blocks={block_count}", query.rows, query.cols, new_key.rows, new_key.cols, new_value.rows, new_value.cols));
     }
     let heads = validate_u32("GQA replay split heads", spec.num_heads)?;
     let kv_heads = validate_u32("GQA replay split KV heads", spec.num_kv_heads)?;
@@ -3726,17 +3737,20 @@ fn gqa_decode_attention_append_split_q8_position_into(
     encoder.end_encoding();
     ctx.commit_and_wait_profiled(&command, "gqa_kv_quantize_q8_position", "rows=1", new_key.buffer.length() + new_value.buffer.length(), (new_key.cols * 2) as u64);
 
-    let statistics = ctx.tensor_pooled_f32("gqa_replay_q8_statistics", 1, spec.num_heads * BLOCK_COUNT * 2);
-    let partial = ctx.tensor_pooled_f32("gqa_replay_q8_partial", 1, spec.num_heads * BLOCK_COUNT * spec.head_dim);
+    let statistics = ctx.tensor_pooled_f32("gqa_replay_q8_statistics", 1, spec.num_heads * block_count * 2);
+    let partial = ctx.tensor_pooled_f32("gqa_replay_q8_partial", 1, spec.num_heads * block_count * spec.head_dim);
     let split = ctx.pipeline("gqa_decode_split_kv")?;
     let merge = ctx.pipeline("gqa_decode_split_kv_merge")?;
     if split.max_total_threads_per_threadgroup() < THREADS as u64 || merge.max_total_threads_per_threadgroup() < THREADS as u64 {
         return Err("GQA replay split 需要 256 threads，超过 Metal pipeline 上限".to_owned());
     }
     let block_tokens = BLOCK_TOKENS as u32;
-    let block_count = BLOCK_COUNT as u32;
+    let block_count = block_count as u32;
     let capacity = 0u32;
     let q8 = 1u32;
+    // 均分模式:block 的覆盖区间由 kernel 按 source_rows 动态划分,固定 block_count
+    // 覆盖任意 KV 长度;要求 block_count >= ceil(max_sequence_len/128) 使每块 <=256 行。
+    let dynamic_blocks = 1u32;
     let command = ctx.command_buffer();
     let encoder = command.new_compute_command_encoder();
     encoder.set_compute_pipeline_state(&split);
@@ -3759,8 +3773,9 @@ fn gqa_decode_attention_append_split_q8_position_into(
     set_bytes(&encoder, 17, &group_size);
     set_bytes(&encoder, 18, &groups_per_head);
     set_bytes(&encoder, 19, &q8);
+    set_bytes(&encoder, 20, &dynamic_blocks);
     let split_height = spec.num_kv_heads * (spec.num_heads / spec.num_kv_heads).div_ceil(4);
-    encoder.dispatch_thread_groups(MTLSize::new(BLOCK_COUNT as u64, split_height as u64, 1), MTLSize::new(THREADS as u64, 1, 1));
+    encoder.dispatch_thread_groups(MTLSize::new(block_count as u64, split_height as u64, 1), MTLSize::new(THREADS as u64, 1, 1));
     encoder.end_encoding();
     ctx.commit_and_wait_profiled(&command, "gqa_decode_attention_split_kv_q8_position", "max_rows=512", query.buffer.length() + view.buffer.length(), statistics.buffer.length() + partial.buffer.length());
 
@@ -3782,6 +3797,7 @@ fn gqa_decode_attention_append_split_q8_position_into(
 
 /// Q8 replay 同时录制短上下文直通与长上下文分块算子，两条路径写同一输出。
 /// 提交时必须用 [`Q8PositionReplayPipelines::accepts`] 过滤掉另一条路径。
+/// `block_count` 个 128-token block 必须覆盖请求的最大 KV 长度。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gqa_decode_attention_append_adaptive_q8_position_tensor(
     ctx: &MetalContext,
@@ -3792,9 +3808,10 @@ pub(crate) fn gqa_decode_attention_append_adaptive_q8_position_tensor(
     spec: &GqaSpec,
     decode_state: &metal::Buffer,
     state_offset: u64,
+    block_count: usize,
 ) -> Result<MetalTensor, String> {
     let output = gqa_decode_attention_append_direct_q8_position_tensor(ctx, query, new_key, new_value, view, spec, decode_state, state_offset)?;
-    gqa_decode_attention_append_split_q8_position_into(ctx, query, new_key, new_value, view, spec, decode_state, state_offset, &output)?;
+    gqa_decode_attention_append_split_q8_position_into(ctx, query, new_key, new_value, view, spec, decode_state, state_offset, &output, block_count)?;
     Ok(output)
 }
 

@@ -12,7 +12,9 @@ mod gated_delta_net;
 mod hyper_connection;
 mod kda;
 mod kv_cache;
+mod kv_cache_gpu_hot;
 mod pair_worker;
+mod speculative;
 mod tensor;
 mod vae;
 mod vision;
@@ -313,7 +315,7 @@ fn grow_cache_buffer(device_id: i32, current: &Arc<ops::hip::DeviceBuffer>, used
     if current.bytes() >= capacity_bytes {
         return Ok(current.clone());
     }
-    let grown = Arc::new(ops::hip::DeviceBuffer::allocate(device_id, capacity_bytes).map_err(compute_error)?);
+    let grown = Arc::new(ops::hip::DeviceBuffer::allocate_cache(device_id, capacity_bytes).map_err(compute_error)?);
     grown.copy_from_device(0, current, 0, used_bytes).map_err(compute_error)?;
     Ok(grown)
 }
@@ -368,7 +370,7 @@ impl RocmBlockTable {
         let blocks = capacity.div_ceil(ROCM_KV_BLOCK_SIZE).max(blocks);
         let ids = (0..blocks).map(|block| u32::try_from(block).map_err(|_| compute_error(format!("ROCm {tag} block ID 超过 u32")))).collect::<Result<Vec<_>, _>>()?;
         let bytes = unsafe { std::slice::from_raw_parts(ids.as_ptr().cast::<u8>(), std::mem::size_of_val(ids.as_slice())) };
-        let table = Arc::new(ops::hip::DeviceBuffer::upload(device_id, bytes).map_err(compute_error)?);
+        let table = upload_cache_buffer(device_id, bytes, bytes.len())?;
         self.table = Some(table.clone());
         self.block_count = blocks;
         Ok(table)

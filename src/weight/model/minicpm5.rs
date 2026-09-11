@@ -6,7 +6,7 @@
 //! hidden_size % num_heads == 0、num_heads % num_kv_heads == 0、tensor 命名对齐）。
 //!
 //! 架构（典型 MiniCPM5-1B）：
-//! - hidden_size=1536, intermediate_size=4608 (SwiGLU 合并宽度), num_hidden_layers=24
+//! - hidden_size=1536, intermediate_size=4608（gate/up 各自的输出宽度）, num_hidden_layers=24
 //! - num_attention_heads=16, num_key_value_heads=2 (GQA 8:1), head_dim=128
 //! - query_cols = 16*128 = 2048, kv_cols = 2*128 = 256
 //! - vocab_size≈73728, max_position_embeddings=131072, rope_theta=1e6
@@ -16,8 +16,7 @@
 //!   检测并切换 `lm_head()` 返回 `token_embd.weight` 矩阵。
 //!
 //! **GGUF metadata `llama.feed_forward_length` 存的是单个矩阵（gate/up 任一）的输出维度**，
-//! 即 `intermediate_size / 2 = 2304`（HF transformers 里的 `intermediate_size=4608` 是
-//! SwiGLU 合并宽度，本字段取 half）。
+//! 当前 1B 权重为 4608，对应 gate/up shape 均为 `[1536, 4608]`。
 //!
 //! GGUF tensor 命名（llama.cpp convention，**不是 HF Safetensors 路径**）：
 //! - `token_embd.weight`: [hidden, vocab]（GGUF dims 顺序 = [cols, rows]）
@@ -69,7 +68,7 @@ impl MiniCpm5Config {
         reader.expect_metadata_str("general.architecture", "llama")?;
         let layer_count = reader.metadata_u64("llama.block_count")? as usize;
         let hidden_size = reader.metadata_u64("llama.embedding_length")? as usize;
-        // llama.cpp `feed_forward_length` = 单矩阵宽度 = HF intermediate_size / 2 (SwiGLU)
+        // llama.cpp `feed_forward_length` = gate/up 任一矩阵的输出宽度。
         let intermediate_size = reader.metadata_u64("llama.feed_forward_length")? as usize;
         let num_heads = reader.metadata_u64("llama.attention.head_count")? as usize;
         let num_kv_heads = reader.metadata_u64("llama.attention.head_count_kv")? as usize;

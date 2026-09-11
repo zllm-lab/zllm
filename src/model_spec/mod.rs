@@ -3,6 +3,7 @@
 //! runtime 负责算法编排，weight 负责张量装配；二者共同依赖这里的单一规格定义。
 
 pub mod deepseek_v4;
+pub mod dflash2;
 pub mod gemma4;
 pub mod glm52;
 pub mod glm53_flash;
@@ -15,3 +16,4 @@ pub mod ornith;
 pub mod qwen36;
 pub mod qwen3_vl;
 pub mod qwen4exp;
+pub mod sensevoice;

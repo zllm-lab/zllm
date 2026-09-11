@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<OpDefCollection PackageName="ZllmQ4" Domain="zllm" Version="1.0">
+  <OpDefList>
+    <OpDef>
+      <Name>BlockQ4Gemv</Name>
+      <Description><Content>Block-32 Q4 matrix-vector product for zLLM low-bit decode.</Content></Description>
+      <Input><Name>activation</Name><Mandatory>true</Mandatory><Datatype>BACKEND_SPECIFIC</Datatype><Shape><Rank>2D</Rank></Shape></Input>
+      <Input><Name>codes</Name><Mandatory>true</Mandatory><Datatype>BACKEND_SPECIFIC</Datatype><Shape><Rank>2D</Rank></Shape></Input>
+      <Input><Name>scales</Name><Mandatory>true</Mandatory><Datatype>BACKEND_SPECIFIC</Datatype><Shape><Rank>2D</Rank></Shape></Input>
+      <Output><Name>output</Name><Mandatory>true</Mandatory><Datatype>BACKEND_SPECIFIC</Datatype><Shape><Rank>2D</Rank></Shape></Output>
+      <UseDefaultTranslation>true</UseDefaultTranslation>
+      <SupportedBackend>HTP</SupportedBackend>
+    </OpDef>
+  </OpDefList>
+  <SupplementalOpDefList Backend="HTP">
+    <SupportedOps><OpName>BlockQ4Gemv</OpName></SupportedOps>
+    <SupplementalOpDef>
+      <Name>BlockQ4Gemv</Name>
+      <Input><Name>activation</Name><Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype></Input>
+      <Input><Name>codes</Name><Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype></Input>
+      <Input><Name>scales</Name><Datatype>QNN_DATATYPE_UFIXED_POINT_8</Datatype></Input>
+      <Output><Name>output</Name><Datatype>QNN_DATATYPE_UFIXED_POINT_16</Datatype></Output>
+    </SupplementalOpDef>
+  </SupplementalOpDefList>
+</OpDefCollection>

@@ -280,6 +280,9 @@ pub(super) fn defer_stage_buffer_recycle(device_id: i32, pointer: *mut c_void, b
     if !options().memory_pool || pointer.is_null() {
         return false;
     }
+    if std::env::var("ZLLM_ROCM_POOL_NO_DEFER").map_or(false, |value| value == "1") {
+        return false;
+    }
     STAGE_BUFFER_RECYCLES
         .try_with(|batches| {
             let mut batches = batches.borrow_mut();
@@ -556,7 +559,17 @@ fn take_device_buffer_bounded(device_id: i32, bytes: usize, max_capacity: usize)
 pub(super) fn take_device_buffer_inner(device_id: i32, bytes: usize, max_capacity: usize) -> Option<(*mut c_void, usize)> {
     let pool = device_buffer_pool(device_id)?;
     let mut pool = pool.lock().ok()?;
-    let key = pool.buffers.iter().filter(|(key, pointers)| key.0 == device_id && key.1 >= bytes && key.1 <= max_capacity && !pointers.is_empty()).map(|(key, _)| *key).min_by_key(|&(_, capacity)| capacity);
+    // 稳态 decode 反复取同一组精确尺寸；先精确命中再退到全表 best-fit 扫描。
+    if let Some(pointer) = pool.buffers.get_mut(&(device_id, bytes)).and_then(Vec::pop) {
+        let used = pool.bytes.entry(device_id).or_default();
+        debug_assert!(*used >= bytes, "HIP 池计账下溢: device={device_id} bytes={bytes} used={used}");
+        *used = used.saturating_sub(bytes);
+        if std::env::var("ZLLM_ROCM_POOL_TRACE").map_or(false, |value| value == "1") {
+            eprintln!("[pool-trace] T-exact dev={device_id} bytes={bytes} ptr={pointer:#x} thread={:?}", std::thread::current().id());
+        }
+        return Some((pointer as *mut c_void, bytes));
+    }
+    let key = pool.buffers.iter().filter(|(key, pointers)| key.0 == device_id && key.1 > bytes && key.1 <= max_capacity && !pointers.is_empty()).map(|(key, _)| *key).min_by_key(|&(_, capacity)| capacity);
     if let Some(key @ (_, capacity)) = key {
         let pointer = pool.buffers.get_mut(&key).and_then(Vec::pop).expect("best-fit key 已检查非空");
         let used = pool.bytes.entry(device_id).or_default();
@@ -591,6 +604,9 @@ pub(super) fn take_device_buffer_inner(device_id: i32, bytes: usize, max_capacit
     debug_assert!(*used >= capacity, "HIP 池计账下溢: device={device_id} capacity={capacity} used={used}");
     *used = used.saturating_sub(capacity);
     pool.available_events.push(buffer.event);
+    if std::env::var("ZLLM_ROCM_POOL_TRACE").map_or(false, |value| value == "1") {
+        eprintln!("[pool-trace] T-pending dev={device_id} bytes={capacity} ptr={:#x} thread={:?}", buffer.pointer, std::thread::current().id());
+    }
     Some((buffer.pointer as *mut c_void, capacity))
 }
 
@@ -629,6 +645,9 @@ pub(super) fn recycle_device_buffer(device_id: i32, pointer: *mut c_void, bytes:
     let used = pool.bytes.get(&device_id).copied().unwrap_or(0);
     pool.pending.entry((device_id, bytes)).or_default().push(PendingDeviceBuffer { pointer: pointer as usize, event: event as usize });
     pool.bytes.insert(device_id, used.saturating_add(bytes));
+    if std::env::var("ZLLM_ROCM_POOL_TRACE").map_or(false, |value| value == "1") {
+        eprintln!("[pool-trace] R dev={device_id} bytes={bytes} ptr={pointer:p} thread={:?} stream={:p}", std::thread::current().id(), crate::kernel::rocm::hip::active_compute_stream());
+    }
     true
 }
 
@@ -775,6 +794,65 @@ pub(super) struct PinnedHostBuffer {
     bytes: usize,
 }
 
+/// 借用稳定的 host allocation，只拥有注册生命周期，不拥有被注册的内存。
+/// 释放注册前排空设备读取；调用方必须让原 allocation 活得更久。
+pub(crate) struct RegisteredHostBuffer {
+    device_id: i32,
+    host: *mut c_void,
+    device: *mut c_void,
+    bytes: usize,
+}
+
+unsafe impl Send for RegisteredHostBuffer {}
+unsafe impl Sync for RegisteredHostBuffer {}
+
+impl RegisteredHostBuffer {
+    /// # Safety
+    /// pointer..pointer+bytes 必须是稳定的 allocation；注册存活期间不得释放、
+    /// realloc，或并发改写 GPU 正在读取的字节。未初始化尾部不得交给 kernel 读取。
+    pub(crate) unsafe fn register(device_id: i32, pointer: *mut u8, bytes: usize) -> Result<Self, String> {
+        set_device(device_id)?;
+        let runtime = RocmRuntime::open()?;
+        type Register = unsafe extern "C" fn(*mut c_void, usize, u32) -> HipError;
+        type Unregister = unsafe extern "C" fn(*mut c_void) -> HipError;
+        type DevicePointer = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u32) -> HipError;
+        let register: Symbol<Register> = runtime.symbol(&runtime.hip, b"hipHostRegister\0")?;
+        let unregister: Symbol<Unregister> = runtime.symbol(&runtime.hip, b"hipHostUnregister\0")?;
+        let mapped: Symbol<DevicePointer> = runtime.symbol(&runtime.hip, b"hipHostGetDevicePointer\0")?;
+        let host = pointer.cast();
+        let status = unsafe { register(host, bytes, 2) }; // hipHostRegisterMapped
+        if status != HIP_SUCCESS {
+            return Err(runtime.hip_error(status, "hipHostRegister KV history"));
+        }
+        let mut device = ptr::null_mut();
+        let status = unsafe { mapped(&mut device, host, 0) };
+        if status != HIP_SUCCESS || device.is_null() {
+            let _ = unsafe { unregister(host) };
+            return Err(runtime.hip_error(status, "hipHostGetDevicePointer KV history"));
+        }
+        Ok(Self { device_id, host, device, bytes })
+    }
+
+    pub(crate) fn device_pointer(&self) -> usize {
+        self.device as usize
+    }
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for RegisteredHostBuffer {
+    fn drop(&mut self) {
+        let _ = synchronize_device(self.device_id, "registered host buffer release");
+        if let Ok(runtime) = RocmRuntime::open() {
+            type Unregister = unsafe extern "C" fn(*mut c_void) -> HipError;
+            if let Ok(unregister) = runtime.symbol::<Unregister>(&runtime.hip, b"hipHostUnregister\0") {
+                let _ = unsafe { unregister(self.host) };
+            }
+        }
+    }
+}
+
 /// 在 compute stream 上提交 D2H 后，把等待移动到消费线程。
 /// staging 与 event 常驻复用；分段接口避免额外的 device pack buffer。
 pub(crate) struct AsyncHostDownload {
@@ -809,6 +887,46 @@ impl AsyncHostDownload {
 
     pub(crate) fn enqueue(&mut self, source: &DeviceBuffer, bytes: usize) -> Result<(), String> {
         self.enqueue_segments(&[(source, 0, bytes)])
+    }
+
+    /// 小块选集由 compute kernel 写入 pinned staging，避免 DMA 队列切换。
+    /// CPU 仍通过原 event 等待，不能提前读取尚未完成的设备写入。
+    pub(crate) fn enqueue_small(&mut self, source: &DeviceBuffer, bytes: usize) -> Result<(), String> {
+        if bytes > 64 * 1024 || !(source.pointer as usize).is_multiple_of(16) {
+            return self.enqueue(source, bytes);
+        }
+        if self.pending || source.device_id != self.device_id || bytes > source.bytes {
+            return Err(format!("small async D2H 状态非法: pending={} device={}/{} bytes={bytes}/{}", self.pending, self.device_id, source.device_id, source.bytes));
+        }
+        if bytes > self.staging.bytes {
+            self.staging = PinnedHostBuffer::allocate(bytes)?;
+        }
+        set_device(self.device_id)?;
+        let runtime = RocmRuntime::open()?;
+        type HostDevicePointer = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u32) -> HipError;
+        let Ok(mapped): Result<Symbol<HostDevicePointer>, _> = runtime.symbol(&runtime.hip, b"hipHostGetDevicePointer\0") else {
+            return self.enqueue(source, bytes);
+        };
+        let mut destination = ptr::null_mut();
+        if unsafe { mapped(&mut destination, self.staging.pointer, 0) } != HIP_SUCCESS || destination.is_null() {
+            return self.enqueue(source, bytes);
+        }
+        let record = runtime.event_record()?;
+        let stream = crate::kernel::rocm::hip::active_compute_stream();
+        super::peer_copy::try_peer_copy_kernel_ordered(self.device_id, destination, source.pointer, bytes)?;
+        let started = hip_api_stats::start();
+        let status = unsafe { record(self.event, stream) };
+        hip_api_stats::counted(hip_api_stats::EVENT_RECORD, started);
+        if status != HIP_SUCCESS {
+            if let Ok(synchronize) = runtime.stream_synchronize() {
+                let _ = unsafe { synchronize(stream) };
+            }
+            return Err(runtime.hip_error(status, "hipEventRecord small async D2H"));
+        }
+        self.bytes = bytes;
+        self.pending = true;
+        record_host_transfer(false, bytes);
+        Ok(())
     }
 
     /// 在同一 producer 边界后把多个 device 片段直接拼入 pinned staging，
@@ -1364,7 +1482,8 @@ impl DeviceBuffer {
         }
         let runtime = RocmRuntime::open()?;
         // 超大 activation 在 ROCm 默认异步池中容易形成无法及时 trim 的碎片；层边界用同步释放保证复用空间。
-        if !explicit_pool && bytes <= DEVICE_ASYNC_MAX_BUFFER_BYTES {
+        let async_max_bytes = std::env::var("ZLLM_ROCM_ASYNC_POOL_OFF").map_or(DEVICE_ASYNC_MAX_BUFFER_BYTES, |value| if value == "1" { 0 } else { DEVICE_ASYNC_MAX_BUFFER_BYTES });
+        if !explicit_pool && bytes <= async_max_bytes {
             if let Ok(malloc_async) = runtime.malloc_async() {
                 let mut pointer = ptr::null_mut();
                 let stats_started = hip_api_stats::start();
@@ -1592,6 +1711,36 @@ impl DeviceBuffer {
             return Err(runtime.hip_error(status, "hipMemcpyAsync resident D2D"));
         }
         Ok(())
+    }
+
+    /// 三段小 resident 数据共用一次 kernel 提交；来源与目标由调用方持有到
+    /// stream 消费完成。热窗日志用它避免三次独立 D2D 流操作。
+    pub(crate) fn copy3_from_device(sources: [(&Self, usize); 3], destinations: [(&Self, usize); 3], bytes: [usize; 3]) -> Result<(), String> {
+        let device_id = sources[0].0.device_id;
+        for index in 0..3 {
+            let (source, source_offset) = sources[index];
+            let (destination, destination_offset) = destinations[index];
+            if source.device_id != device_id
+                || destination.device_id != device_id
+                || source_offset.checked_add(bytes[index]).is_none_or(|end| end > source.bytes)
+                || destination_offset.checked_add(bytes[index]).is_none_or(|end| end > destination.bytes)
+            {
+                return Err(format!(
+                    "ROCm D2D copy3 第 {index} 段 device/范围非法: device={device_id} source={}/{source_offset}+{}/{} destination={}/{destination_offset}+{}/{}",
+                    source.device_id, bytes[index], source.bytes, destination.device_id, bytes[index], destination.bytes
+                ));
+            }
+        }
+        if bytes.iter().any(|bytes| !bytes.is_multiple_of(16) || *bytes > 65536) || bytes.iter().sum::<usize>() > 65536 || sources.iter().chain(&destinations).any(|(buffer, offset)| !(buffer.pointer as usize + offset).is_multiple_of(16)) {
+            for index in 0..3 {
+                destinations[index].0.copy_from_device(destinations[index].1, sources[index].0, sources[index].1, bytes[index])?;
+            }
+            return Ok(());
+        }
+        set_device(device_id)?;
+        let sources = sources.map(|(buffer, offset)| unsafe { buffer.pointer.cast::<u8>().add(offset).cast() });
+        let destinations = destinations.map(|(buffer, offset)| unsafe { buffer.pointer.cast::<u8>().add(offset).cast() });
+        super::peer_copy::try_peer_copy3_kernel_ordered(device_id, sources, destinations, bytes)
     }
 
     /// 把 per-thread async allocation 稳定到当前线程的显式设备池，供跨线程/P2P 使用。
@@ -2291,6 +2440,37 @@ impl DeviceBuffer {
         if status != HIP_SUCCESS {
             self.deferred_upload_enqueued.store(false, std::sync::atomic::Ordering::Release);
             return Err(runtime.hip_error(status, "hipMemcpyAsync deferred boundary H2D"));
+        }
+        record_host_transfer(true, self.bytes);
+        Ok(())
+    }
+
+    /// 小块选集/缺失行直接由 GPU 读取 pinned staging，避免一次小 DMA 的
+    /// host 提交开销。保活规则与普通 deferred H2D 完全相同。
+    pub(crate) fn enqueue_small_deferred_upload(&self) -> Result<(), String> {
+        if self.bytes > 64 * 1024 {
+            return self.enqueue_deferred_upload();
+        }
+        let Some(staging) = self.deferred_host.as_ref() else { return Ok(()) };
+        if self.deferred_upload_enqueued.load(std::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
+        set_device(self.device_id)?;
+        let runtime = RocmRuntime::open()?;
+        type HostDevicePointer = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u32) -> HipError;
+        let Ok(mapped): Result<Symbol<HostDevicePointer>, _> = runtime.symbol(&runtime.hip, b"hipHostGetDevicePointer\0") else {
+            return self.enqueue_deferred_upload();
+        };
+        let mut source = ptr::null_mut();
+        if unsafe { mapped(&mut source, staging.pointer, 0) } != HIP_SUCCESS || source.is_null() {
+            return self.enqueue_deferred_upload();
+        }
+        if self.deferred_upload_enqueued.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return Ok(());
+        }
+        if let Err(error) = super::peer_copy::try_peer_copy_kernel_ordered(self.device_id, self.pointer, source, self.bytes) {
+            self.deferred_upload_enqueued.store(false, std::sync::atomic::Ordering::Release);
+            return Err(error);
         }
         record_host_transfer(true, self.bytes);
         Ok(())

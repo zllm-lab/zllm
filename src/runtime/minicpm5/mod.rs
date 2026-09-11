@@ -13,6 +13,8 @@
 //! - EOS 从 GGUF metadata `tokenizer.ggml.eos_token_id` 读（默认 2 作 fallback）
 
 pub mod protocol;
+#[cfg(feature = "with-qnn")]
+pub mod qnn;
 
 use crate::{
     attention::{
@@ -88,11 +90,32 @@ pub fn minicpm5_text_hidden<B: GqaPrefillBackend>(
     backend: &B,
     config: &MiniCpm5Config,
     layers: &[MiniCpm5TextLayer<B::Weight>],
+    cache: Option<&mut B::Cache>,
+    hidden: B::Tensor,
+    rope: &RopeTable,
+    position: usize,
+) -> Result<B::Tensor, BackendError>
+where
+    B::Tensor: Clone,
+{
+    Ok(minicpm5_text_hidden_with_captures(backend, config, layers, cache, hidden, rope, position, &[])?.0)
+}
+
+/// `minicpm5_text_hidden` 的捕获变体：额外返回 `capture_layers` 里各层（按层序号，
+/// 取该层输出 hidden）的 [rows, hidden] 张量，供 DSpark drafter 投影 target 上下文。
+pub fn minicpm5_text_hidden_with_captures<B: GqaPrefillBackend>(
+    backend: &B,
+    config: &MiniCpm5Config,
+    layers: &[MiniCpm5TextLayer<B::Weight>],
     mut cache: Option<&mut B::Cache>,
     mut hidden: B::Tensor,
     rope: &RopeTable,
     position: usize,
-) -> Result<B::Tensor, BackendError> {
+    capture_layers: &[usize],
+) -> Result<(B::Tensor, Vec<B::Tensor>), BackendError>
+where
+    B::Tensor: Clone,
+{
     let positions = backend.token_rows(&hidden);
     if positions == 0 {
         return Err(crate::runtime::compute_error(format!("MiniCPM5 prefill positions={positions}，期望非零")));
@@ -103,13 +126,17 @@ pub fn minicpm5_text_hidden<B: GqaPrefillBackend>(
     if layers.len() != config.layer_count {
         return Err(crate::runtime::compute_error(format!("MiniCPM5 prepared layers={}，期望 {}", layers.len(), config.layer_count)));
     }
+    let mut captures = Vec::with_capacity(capture_layers.len());
     backend.begin_batch();
     for (layer, prepared) in layers.iter().enumerate() {
         let _scope = backend.layer_scope();
         hidden = minicpm5_layer(backend, config, cache.as_deref_mut(), layer, prepared, &hidden, rope, position)?;
+        if capture_layers.contains(&layer) {
+            captures.push(hidden.clone());
+        }
     }
     backend.finish_batch();
-    Ok(hidden)
+    Ok((hidden, captures))
 }
 
 /// 单 token 增量推理（prefill 后用），维护 KV cache。`layers` 语义同 `minicpm5_text_hidden`。
@@ -278,5 +305,7 @@ fn minicpm5_layer<B: GqaPrefillBackend>(
 // Node 适配器：组合 MiniCPM5 平台无关运行时与 Metal / CPU 后端资源，匹配 zllm 通用模式。
 // macOS 走 Metal 路径，非 macOS 暴露占位 `NodeEngine` 提示当前平台不支持。
 pub mod cpu_node;
+#[cfg(target_os = "macos")]
+pub mod dspark;
 pub mod engine;
 pub mod node;

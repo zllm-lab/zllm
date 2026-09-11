@@ -2,6 +2,7 @@
 
 pub mod attn_res;
 pub mod blas;
+pub mod block_conv;
 pub mod block_fp8;
 pub mod dsa;
 pub mod ggml_quant;

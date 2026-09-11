@@ -124,8 +124,30 @@ impl MiniCpm5MetalSession {
         Ok(Self { context, config, weights, layers, output_head, tokenizer, detokenizer, cache_spec, rope, kv_f16, max_seq_len, eos_token_id, im_end_token_id, token_readback, logits_graveyard: Mutex::new(Vec::new()), embedding_source })
     }
 
+    /// DSpark 推测解码评测的直达件（engine::dspark_eval 使用）。
+    pub(crate) fn config(&self) -> &minicpm5::MiniCpm5Config { &self.config }
+    pub(crate) fn layers(&self) -> &[minicpm5::MiniCpm5TextLayer<MetalWeight>] { &self.layers }
+    pub(crate) fn weights(&self) -> &crate::weight::model::minicpm5::MiniCpm5Weights { &self.weights }
+    pub(crate) fn output_head(&self) -> &MiniCpm5OutputHead<MetalWeight> { &self.output_head }
+    pub(crate) fn allocate_cache(&self) -> Result<MetalKvCache, String> {
+        if self.kv_f16 {
+            MetalKvCache::new_f16(&self.context, self.cache_spec.clone(), self.config.layer_count, self.max_seq_len)
+        } else {
+            MetalKvCache::new(&self.context, self.cache_spec.clone(), self.config.layer_count, self.max_seq_len)
+        }
+        .map_err(|error| format!("MiniCPM5 KV cache 分配: {error}"))
+    }
+
     pub fn context(&self) -> &MetalContext {
         &self.context
+    }
+
+    /// 录制 decode 重放命令表（engine 在首个满足条件的请求上调用一次，
+    /// 之后跨请求复用并按请求重绑 KV cache）。
+    #[cfg(target_os = "macos")]
+    pub(crate) fn record_decode_replay(&self, cache: &MetalKvCache) -> Result<super::metal_replay::Minicpm5ReplayEngine, String> {
+        let embedding = self.embedding_source.as_ref().ok_or("MiniCPM5 replay 缺少设备端 embedding 来源")?;
+        super::metal_replay::Minicpm5ReplayEngine::record(&self.context, cache, &self.config, &self.layers, &self.rope, &self.output_head, embedding, self.max_seq_len).map_err(|error| format!("{error:?}"))
     }
     pub fn model_bytes(&self) -> u64 {
         self.weights.reader().file_len()
@@ -152,7 +174,7 @@ impl MiniCpm5MetalSession {
         self.tokenizer.tokenize(text.as_bytes())
     }
     pub fn decode_bytes(&self, token: u32) -> Result<Vec<u8>, String> {
-        self.detokenizer.decode_bytes(&[token], true).map_err(|error| format!("MiniCPM5 detokenize {token}: {error}"))
+        crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| format!("MiniCPM5 detokenize {token}: {error}"))
     }
     pub fn is_eos(&self, token: u32) -> bool {
         token == self.eos_token_id || self.im_end_token_id == Some(token)

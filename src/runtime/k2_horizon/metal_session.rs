@@ -101,7 +101,7 @@ impl K2MetalSession {
         self.tokenizer.tokenize(text.as_bytes())
     }
     pub fn decode_bytes(&self, token: u32) -> Result<Vec<u8>, String> {
-        self.detokenizer.decode_bytes(&[token], true).map_err(|error| format!("K2-Horizon detokenize {token}: {error}"))
+        crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| format!("K2-Horizon detokenize {token}: {error}"))
     }
     pub fn is_eos(&self, token: u32) -> bool {
         token == self.config.eos_token_id

@@ -1,4 +1,5 @@
 pub(super) const QUANT_SOURCE: &str = include_str!("../gguf_quant.hip");
+pub(super) const K_DECODE_SOURCE: &str = include_str!("gguf_k_decode.hip");
 pub(super) const SOURCE: &str = include_str!("gguf/source.hip");
 
 use super::*;
@@ -506,7 +507,7 @@ mod tests {
         assert!(diff == 0, "perm 码本应与常量表逐位一致");
     }
 
-    fn assert_grouped_wmma_matches_cpu(tokens: usize, top_k: usize, expert_count: usize, route_ids_host: &[u32], route_weights_host: &[f32]) {
+    fn assert_grouped_wmma_matches_cpu(tokens: usize, top_k: usize, expert_count: usize, route_ids_host: &[u32], route_weights_host: &[f32], types: [u32; 3]) {
         use half::bf16;
 
         const DEVICE: i32 = 0;
@@ -517,21 +518,25 @@ mod tests {
 
         let input_bits: Vec<u16> = (0..tokens * HIDDEN).map(|index| bf16::from_f32(((index * 17 % 43) as f32 - 21.0) / 128.0).to_bits()).collect();
         let input_values: Vec<f32> = input_bits.iter().map(|&bits| bf16::from_bits(bits).to_f32()).collect();
-        let gate_host = iq_rows(21, INTERMEDIATE, HIDDEN, 1);
-        let up_host = iq_rows(21, INTERMEDIATE, HIDDEN, 2);
-        let down_host = iq_rows(23, HIDDEN, INTERMEDIATE, 3);
-        let gate_values = crate::weight::codec::ggml::dequantize(21, &gate_host, INTERMEDIATE * HIDDEN).unwrap();
-        let up_values = crate::weight::codec::ggml::dequantize(21, &up_host, INTERMEDIATE * HIDDEN).unwrap();
-        let down_values = crate::weight::codec::ggml::dequantize(23, &down_host, HIDDEN * INTERMEDIATE).unwrap();
+        let gate_host = iq_rows(types[0], INTERMEDIATE, HIDDEN, 1);
+        let up_host = iq_rows(types[1], INTERMEDIATE, HIDDEN, 2);
+        // 不同 expert 使用不同 down 权重，防止错误的紧凑槽映射被相同权重掩盖。
+        let down_host = (0..expert_count).map(|expert| iq_rows(types[2], HIDDEN, INTERMEDIATE, 3 + expert)).collect::<Vec<_>>();
+        let gate_values = crate::weight::codec::ggml::dequantize(types[0], &gate_host, INTERMEDIATE * HIDDEN).unwrap();
+        let up_values = crate::weight::codec::ggml::dequantize(types[1], &up_host, INTERMEDIATE * HIDDEN).unwrap();
+        let down_values = down_host.iter().map(|packed| crate::weight::codec::ggml::dequantize(types[2], packed, HIDDEN * INTERMEDIATE).unwrap()).collect::<Vec<_>>();
 
         let input = super::DeviceBuffer::upload(DEVICE, bytes(&input_bits)).unwrap();
         let gate = super::DeviceBuffer::upload(DEVICE, &gate_host).unwrap();
         let up = super::DeviceBuffer::upload(DEVICE, &up_host).unwrap();
-        let down = super::DeviceBuffer::upload(DEVICE, &down_host).unwrap();
+        let down = down_host.iter().map(|packed| super::DeviceBuffer::upload(DEVICE, packed).unwrap()).collect::<Vec<_>>();
         let route_ids = super::DeviceBuffer::upload(DEVICE, bytes(route_ids_host)).unwrap();
         let route_weights = super::DeviceBuffer::upload(DEVICE, bytes(route_weights_host)).unwrap();
-        let meta = super::GgufGroupedExpertMeta { gate: gate.device_pointer() as u64, up: up.device_pointer() as u64, down: down.device_pointer() as u64, gate_type: 21, up_type: 21, down_type: 23 };
-        let metas = super::resident_gguf_grouped_metas(DEVICE, &vec![meta; expert_count]).unwrap();
+        let metas = down
+            .iter()
+            .map(|down| super::GgufGroupedExpertMeta { gate: gate.device_pointer() as u64, up: up.device_pointer() as u64, down: down.device_pointer() as u64, gate_type: types[0], up_type: types[1], down_type: types[2] })
+            .collect::<Vec<_>>();
+        let metas = super::resident_gguf_grouped_metas(DEVICE, &metas).unwrap();
         let mut actual = vec![0.0_f32; tokens * HIDDEN];
         let mut first_bits = None;
         let rounds = if top_k > 1 { 8 } else { 1 };
@@ -557,66 +562,335 @@ mod tests {
                 let up = up_row.iter().zip(input_row).map(|(weight, input)| bf16::from_f32(*weight).to_f32() * input).sum::<f32>();
                 activated[row] = bf16::from_f32(gate / (1.0 + (-gate).exp()) * up).to_f32();
             }
-            let route_scale = route_weights_host[token * top_k..(token + 1) * top_k].iter().sum::<f32>();
             for row in 0..HIDDEN {
-                let down_row = &down_values[row * INTERMEDIATE..(row + 1) * INTERMEDIATE];
-                expected[token * HIDDEN + row] = down_row.iter().zip(&activated).map(|(weight, value)| bf16::from_f32(*weight).to_f32() * value).sum::<f32>() * route_scale;
+                for route in token * top_k..(token + 1) * top_k {
+                    let down_values = &down_values[route_ids_host[route] as usize];
+                    let down_row = &down_values[row * INTERMEDIATE..(row + 1) * INTERMEDIATE];
+                    expected[token * HIDDEN + row] += down_row.iter().zip(&activated).map(|(weight, value)| bf16::from_f32(*weight).to_f32() * value).sum::<f32>() * route_weights_host[route];
+                }
             }
         }
         let mut max_abs = 0.0_f32;
         for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
             assert!(actual.is_finite(), "index={index} actual={actual}");
             max_abs = max_abs.max((actual - expected).abs());
-            let tolerance = 0.02 * expected.abs().max(1.0);
+            let tolerance = 0.00002 * expected.abs().max(1.0);
             assert!((actual - expected).abs() <= tolerance, "index={index} actual={actual} expected={expected} tolerance={tolerance}");
         }
-        eprintln!("[glm53-iq-grouped-wmma-oracle] max_abs={max_abs:.6e}");
+        eprintln!("[gguf-grouped-wmma-oracle] types={types:?} max_abs={max_abs:.6e}");
     }
 
-    #[test]
-    #[ignore = "需要 ROCm GPU"]
-    fn glm53_iq_grouped_wmma_matches_cpu() {
-        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
-        let routed_ids = (0..9).flat_map(|_| [1_u32, 0_u32]).collect::<Vec<_>>();
-        let routed_weights = (0..9).flat_map(|_| [0.25_f32, 0.5_f32]).collect::<Vec<_>>();
-        assert_grouped_wmma_matches_cpu(9, 2, 2, &routed_ids, &routed_weights);
 
-        // 8 个 expert 同时贡献同一 token，覆盖旧浮点 atomicAdd 的竞争形态。
-        let routed_ids = (0..17).flat_map(|token| (0..8).map(move |slot| ((token * 3 + slot * 5) % 8) as u32)).collect::<Vec<_>>();
-        let routed_weights = (0..17).flat_map(|_| (1..=8).map(|slot| slot as f32 / 64.0)).collect::<Vec<_>>();
-        assert_grouped_wmma_matches_cpu(17, 8, 8, &routed_ids, &routed_weights);
 
-        // 超过一个 128-row tile，覆盖 shared expert 的多 y block 路径。
-        let shared_ids = vec![0_u32; 129];
-        let shared_weights = vec![1.0_f32; 129];
-        assert_grouped_wmma_matches_cpu(129, 1, 1, &shared_ids, &shared_weights);
-    }
 
-    fn assert_rows2_gate_up_matches_token_major(tensor_type: u32) {
+    fn assert_k4_k5_rows2_gate_up_matches_generic(tensor_type: u32, routes: &[u32]) {
         use half::bf16;
 
         const DEVICE: i32 = 0;
         const HIDDEN: usize = 256;
         const INTERMEDIATE: usize = 256;
         const TOP_K: usize = 4;
-        const EXPERTS: usize = 6;
+        const EXPERTS: usize = 8;
+        assert!(routes.len().is_multiple_of(TOP_K));
+        let tokens = routes.len() / TOP_K;
+        let input_bits = (0..tokens * HIDDEN).map(|index| bf16::from_f32(((index * 17 % 47) as f32 - 23.0) / 128.0).to_bits()).collect::<Vec<_>>();
+        let input = super::DeviceBuffer::upload(DEVICE, bytes(&input_bits)).unwrap();
+        let mut metas_host = Vec::with_capacity(EXPERTS);
+        let mut weights = Vec::with_capacity(EXPERTS);
+        for expert in 0..EXPERTS {
+            let varied_scales = |seed| {
+                let mut packed = iq_rows(tensor_type, INTERMEDIATE, HIDDEN, seed);
+                if matches!(tensor_type, 12 | 13) {
+                    // 覆盖零、subnormal 边界、非二次幂和符号，避免只测固定 scale 的偶合。
+                    let scales = [0_u16, 1, 0x03ff, 0x0400, 0x0401, 0x13ff, 0x17ff, 0x8401];
+                    let block_bytes = crate::weight::codec::ggml::block_layout(tensor_type).unwrap().1;
+                    for (index, block) in packed.chunks_exact_mut(block_bytes).enumerate() {
+                        block[..2].copy_from_slice(&scales[(index + seed) % scales.len()].to_le_bytes());
+                        block[2..4].copy_from_slice(&scales[(index * 3 + seed) % scales.len()].to_le_bytes());
+                    }
+                }
+                packed
+            };
+            let gate = super::DeviceBuffer::upload(DEVICE, &varied_scales(7 + expert)).unwrap();
+            let up = super::DeviceBuffer::upload(DEVICE, &varied_scales(37 + expert)).unwrap();
+            metas_host.push(super::GgufGroupedExpertMeta { gate: gate.device_pointer() as u64, up: up.device_pointer() as u64, down: gate.device_pointer() as u64, gate_type: tensor_type, up_type: tensor_type, down_type: tensor_type });
+            weights.push((gate, up));
+        }
+        let metas = super::resident_gguf_grouped_metas(DEVICE, &metas_host).unwrap();
+        let route_ids = super::DeviceBuffer::upload(DEVICE, bytes(routes)).unwrap();
+        let token_major = super::DeviceBuffer::upload(DEVICE, bytes(&vec![bf16::NAN.to_bits(); tokens * TOP_K * INTERMEDIATE])).unwrap();
+        let shared = super::DeviceBuffer::upload(DEVICE, bytes(&vec![bf16::NAN.to_bits(); tokens * TOP_K * INTERMEDIATE])).unwrap();
+        let functions = super::super::ct_quantized_functions(DEVICE).unwrap();
+        let (token_major_function, shared_function) =
+            match tensor_type {
+                12 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q4_k),
+                13 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q5_k),
+                21 => (functions.gguf_fused_gate_up_iq3s_wide, functions.gguf_fused_gate_up_iq3s_wide_rows2),
+                _ => (functions.gguf_fused_gate_up_iq4xs, functions.gguf_fused_gate_up_iq4xs_rows2),
+            };
+        let launch = |function: usize, output: &super::DeviceBuffer| {
+            let (outputs, threads) = if function == functions.gguf_fused_gate_up_q4_k || function == functions.gguf_fused_gate_up_q5_k { (8, 64) } else if function == functions.gguf_fused_gate_up { (16, 256) } else { (32, 256) };
+            let mut input_pointer = input.pointer;
+            let mut metas_pointer = metas.buffer.pointer;
+            let mut route_ids_pointer = route_ids.pointer;
+            let mut output_pointer = output.pointer as usize;
+            let mut assignments = (tokens * TOP_K) as u32;
+            let mut top_k = TOP_K as u32;
+            let mut hidden = HIDDEN as u32;
+            let mut intermediate = INTERMEDIATE as u32;
+            let mut input_is_bf16 = 1_u32;
+            let mut arguments = [
+                (&mut input_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut metas_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut route_ids_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut route_ids_pointer as *mut *mut std::ffi::c_void).cast(),
+                (&mut output_pointer as *mut usize).cast(),
+                (&mut assignments as *mut u32).cast(),
+                (&mut top_k as *mut u32).cast(),
+                (&mut hidden as *mut u32).cast(),
+                (&mut intermediate as *mut u32).cast(),
+                (&mut input_is_bf16 as *mut u32).cast(),
+            ];
+            let status = unsafe {
+                crate::kernel::rocm::hip::kernel_launch_trampoline(
+                    function as *mut std::ffi::c_void,
+                    (INTERMEDIATE / outputs) as u32,
+                    (tokens * TOP_K) as u32,
+                    1,
+                    threads,
+                    1,
+                    1,
+                    0,
+                    crate::kernel::rocm::hip::active_compute_stream(),
+                    arguments.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, crate::kernel::rocm::hip::HIP_SUCCESS);
+        };
+        launch(token_major_function, &token_major);
+        launch(shared_function, &shared);
+        super::super::synchronize_device(DEVICE, "GGUF rows2 gate/up 共享 oracle").unwrap();
+        let mut token_major_host = vec![0_u16; tokens * TOP_K * INTERMEDIATE];
+        let mut shared_host = vec![0_u16; tokens * TOP_K * INTERMEDIATE];
+        token_major.copy_to_host(bytes_mut(&mut token_major_host)).unwrap();
+        shared.copy_to_host(bytes_mut(&mut shared_host)).unwrap();
+        assert!(shared_host.iter().all(|&bits| bf16::from_bits(bits).is_finite()), "共享 kernel 存在未写入或非有限输出");
+        assert_eq!(shared_host, token_major_host, "tensor_type={tensor_type} rows2 共享权重改变 activation");
+    }
+
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn q4_k_q5_k_adjacent_pairs_gate_up_match_generic_bits() {
+        for tensor_type in [12, 13] {
+            for tokens in [3, 4, 6, 8] {
+                for pattern in 0..3 {
+                    let routes = (0..tokens).flat_map(|row| {
+                        (0..4).map(move |k| match pattern {
+                            0 => ((row % 2) * 4 + k) as u32,
+                            1 => ((row * 3 + k) % 8) as u32,
+                            _ => ((row + 3 * k) % 4) as u32,
+                        })
+                    }).collect::<Vec<_>>();
+                    assert_k4_k5_rows2_gate_up_matches_generic(tensor_type, &routes);
+                }
+            }
+        }
+    }
+
+    fn assert_grouped_routes_stable() {
+        use super::DeviceBuffer;
+        use std::ffi::c_void;
+        let functions = super::super::ct_quantized_functions(0).unwrap();
+        // 大批量、空 expert、单热门 expert、非整 warp 尾部；逐项验证稳定排序。
+        for (count, experts, hot) in [(33_usize, 1_usize, false), (8192, 256, false), (32771, 256, true)] {
+            let ids = (0..count).map(|route| if hot && route % 3 != 0 { 255 } else { (route * 37 % experts) as u32 }).collect::<Vec<_>>();
+            let weights = (0..count).map(|route| route as f32 / 32768.0).collect::<Vec<_>>();
+            let host_metas = (0..experts).map(|expert| super::GgufGroupedExpertMeta { gate: expert as u64, up: 0, down: 0, gate_type: 21, up_type: 21, down_type: 23 }).collect::<Vec<_>>();
+            let ids_device = DeviceBuffer::upload(0, bytes(&ids)).unwrap();
+            let weights_device = DeviceBuffer::upload(0, bytes(&weights)).unwrap();
+            let metas_device = DeviceBuffer::upload(0, bytes(&host_metas)).unwrap();
+            let tokens = DeviceBuffer::allocate(0, count * 4).unwrap();
+            let grouped_weights = DeviceBuffer::allocate(0, count * 4).unwrap();
+            let inverse = DeviceBuffer::allocate(0, count * 4).unwrap();
+            let offsets = DeviceBuffer::allocate(0, (experts + 1) * 4).unwrap();
+            let tiles = DeviceBuffer::allocate(0, (experts + 1) * 4).unwrap();
+            let metas = DeviceBuffer::allocate(0, std::mem::size_of_val(host_metas.as_slice())).unwrap();
+            let mut id_ptr = ids_device.pointer;
+            let mut weight_ptr = weights_device.pointer;
+            let mut meta_ptr = metas_device.pointer;
+            let mut token_ptr = tokens.pointer;
+            let mut grouped_weight_ptr = grouped_weights.pointer;
+            let mut inverse_ptr = inverse.pointer;
+            let mut offset_ptr = offsets.pointer;
+            let mut grouped_meta_ptr = metas.pointer;
+            let mut tile_ptr = tiles.pointer;
+            let mut route_count = count as u32;
+            let mut top_k = 8_u32;
+            let mut expert_count = experts as u32;
+            let mut tile_rows = 128_u32;
+            let mut header_args = [
+                (&mut id_ptr as *mut *mut c_void).cast(),
+                (&mut weight_ptr as *mut *mut c_void).cast(),
+                (&mut meta_ptr as *mut *mut c_void).cast(),
+                (&mut token_ptr as *mut *mut c_void).cast(),
+                (&mut grouped_weight_ptr as *mut *mut c_void).cast(),
+                (&mut inverse_ptr as *mut *mut c_void).cast(),
+                (&mut offset_ptr as *mut *mut c_void).cast(),
+                (&mut grouped_meta_ptr as *mut *mut c_void).cast(),
+                (&mut tile_ptr as *mut *mut c_void).cast(),
+                (&mut route_count as *mut u32).cast(),
+                (&mut top_k as *mut u32).cast(),
+                (&mut expert_count as *mut u32).cast(),
+                (&mut expert_count as *mut u32).cast(),
+                (&mut tile_rows as *mut u32).cast(),
+            ];
+            let mut scatter_args = [
+                (&mut id_ptr as *mut *mut c_void).cast(),
+                (&mut weight_ptr as *mut *mut c_void).cast(),
+                (&mut offset_ptr as *mut *mut c_void).cast(),
+                (&mut token_ptr as *mut *mut c_void).cast(),
+                (&mut grouped_weight_ptr as *mut *mut c_void).cast(),
+                (&mut inverse_ptr as *mut *mut c_void).cast(),
+                (&mut route_count as *mut u32).cast(),
+                (&mut top_k as *mut u32).cast(),
+            ];
+            for _ in 0..4 {
+                for (function, grid, args) in [(functions.gguf_routes, 1, &mut header_args[..]), (functions.gguf_scatter_grouped_routes, expert_count, &mut scatter_args[..])] {
+                    if function == functions.gguf_scatter_grouped_routes && experts == 1 {
+                        continue;
+                    }
+                    let status = unsafe { crate::kernel::rocm::hip::kernel_launch_trampoline(function as *mut c_void, grid, 1, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), args.as_mut_ptr(), std::ptr::null_mut()) };
+                    assert_eq!(status, 0);
+                }
+                let mut actual_tokens = vec![0_u32; count];
+                let mut actual_weights = vec![0_f32; count];
+                let mut actual_inverse = vec![0_u32; count];
+                let mut actual_offsets = vec![0_u32; experts + 1];
+                let mut actual_tiles = vec![0_u32; experts + 1];
+                tokens.copy_to_host(bytes_mut(&mut actual_tokens)).unwrap();
+                grouped_weights.copy_to_host(bytes_mut(&mut actual_weights)).unwrap();
+                inverse.copy_to_host(bytes_mut(&mut actual_inverse)).unwrap();
+                offsets.copy_to_host(bytes_mut(&mut actual_offsets)).unwrap();
+                tiles.copy_to_host(bytes_mut(&mut actual_tiles)).unwrap();
+                let mut grouped = 0_usize;
+                let mut tile_count = 0_usize;
+                for expert in 0..experts {
+                    assert_eq!(actual_offsets[expert], grouped as u32);
+                    assert_eq!(actual_tiles[expert], tile_count as u32);
+                    let begin = grouped;
+                    for route in (0..count).filter(|&route| ids[route] == expert as u32) {
+                        assert_eq!(actual_tokens[grouped], route as u32 / top_k);
+                        assert_eq!(actual_weights[grouped].to_bits(), weights[route].to_bits());
+                        assert_eq!(actual_inverse[route], grouped as u32);
+                        grouped += 1;
+                    }
+                    tile_count += (grouped - begin).div_ceil(tile_rows as usize);
+                }
+                assert_eq!(actual_offsets[experts], count as u32);
+                assert_eq!(actual_tiles[experts], tile_count as u32);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn glm53_iq_grouped_wmma_matches_cpu() {
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+        assert_grouped_routes_stable();
+        let routed_ids = (0..9).flat_map(|_| [1_u32, 0_u32]).collect::<Vec<_>>();
+        let routed_weights = (0..9).flat_map(|_| [0.25_f32, 0.5_f32]).collect::<Vec<_>>();
+        assert_grouped_wmma_matches_cpu(9, 2, 2, &routed_ids, &routed_weights, [21, 21, 23]);
+        assert_grouped_wmma_matches_cpu(9, 2, 2, &routed_ids, &routed_weights, [23, 23, 13]);
+        assert_grouped_wmma_matches_cpu(9, 2, 2, &routed_ids, &routed_weights, [21, 21, 14]);
+        assert_grouped_wmma_matches_cpu(9, 2, 2, &routed_ids, &routed_weights, [21, 23, 23]);
+        assert_grouped_wmma_matches_cpu(9, 2, 2, &routed_ids, &routed_weights, [23, 21, 23]);
+
+        // 8 个 expert 同时贡献同一 token，覆盖旧浮点 atomicAdd 的竞争形态。
+        let routed_ids = (0..17).flat_map(|token| (0..8).map(move |slot| ((token * 3 + slot * 5) % 8) as u32)).collect::<Vec<_>>();
+        let routed_weights = (0..17).flat_map(|_| (1..=8).map(|slot| slot as f32 / 64.0)).collect::<Vec<_>>();
+        assert_grouped_wmma_matches_cpu(17, 8, 8, &routed_ids, &routed_weights, [21, 21, 23]);
+
+        // routed 每个 expert 跨越 128-row tile，覆盖并行 tile 与尾部。
+        let routed_ids = (0..129).flat_map(|_| [1_u32, 0_u32]).collect::<Vec<_>>();
+        let routed_weights = (0..129).flat_map(|_| [0.25_f32, 0.5_f32]).collect::<Vec<_>>();
+        assert_grouped_wmma_matches_cpu(129, 2, 2, &routed_ids, &routed_weights, [21, 21, 23]);
+
+        // 中间六个 expert 没有 token，紧凑前缀不能把尾部空槽映射到有效 tile。
+        let routed_ids = (0..129).flat_map(|_| [7_u32, 0_u32]).collect::<Vec<_>>();
+        assert_grouped_wmma_matches_cpu(129, 2, 8, &routed_ids, &routed_weights, [21, 21, 23]);
+        assert_grouped_wmma_matches_cpu(129, 2, 8, &routed_ids, &routed_weights, [23, 23, 13]);
+
+        // 热门 expert 跨两个 128-row tile，其余 expert 各自只有不足一个 tile 的行。
+        let routed_ids = (0..129).flat_map(|token| [0_u32, (1 + token % 7) as u32]).collect::<Vec<_>>();
+        assert_grouped_wmma_matches_cpu(129, 2, 8, &routed_ids, &routed_weights, [21, 21, 23]);
+        assert_grouped_wmma_matches_cpu(129, 2, 8, &routed_ids, &routed_weights, [23, 23, 13]);
+
+        // 超过一个 128-row tile，覆盖 shared expert 的多 y block 路径。
+        let shared_ids = vec![0_u32; 129];
+        let shared_weights = vec![1.0_f32; 129];
+        assert_grouped_wmma_matches_cpu(129, 1, 1, &shared_ids, &shared_weights, [21, 21, 23]);
+        assert_grouped_wmma_matches_cpu(129, 1, 1, &shared_ids, &shared_weights, [8, 8, 8]);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn q4_k_q5_k_grouped_wmma_matches_cpu() {
+        for types in [[12, 12, 13], [13, 13, 13], [12, 12, 14]] {
+            for tokens in [9, 129] {
+                let ids = (0..tokens).flat_map(|_| [1_u32, 0_u32]).collect::<Vec<_>>();
+                let weights = (0..tokens).flat_map(|_| [0.25_f32, 0.5_f32]).collect::<Vec<_>>();
+                assert_grouped_wmma_matches_cpu(tokens, 2, 2, &ids, &weights, types);
+            }
+        }
+    }
+
+    fn assert_rows2_gate_up_matches_token_major(tensor_type: u32, routes: &[u32; 8]) {
+        use half::bf16;
+
+        const DEVICE: i32 = 0;
+        const HIDDEN: usize = 256;
+        const INTERMEDIATE: usize = 256;
+        const TOP_K: usize = 4;
+        const EXPERTS: usize = 8;
         let input_bits = (0..2 * HIDDEN).map(|index| bf16::from_f32(((index * 17 % 47) as f32 - 23.0) / 128.0).to_bits()).collect::<Vec<_>>();
         let input = super::DeviceBuffer::upload(DEVICE, bytes(&input_bits)).unwrap();
         let mut metas_host = Vec::with_capacity(EXPERTS);
+        let mut weights = Vec::with_capacity(EXPERTS);
         for expert in 0..EXPERTS {
-            let gate = super::DeviceBuffer::upload(DEVICE, &iq_rows(tensor_type, INTERMEDIATE, HIDDEN, 7 + expert)).unwrap();
-            let up = super::DeviceBuffer::upload(DEVICE, &iq_rows(tensor_type, INTERMEDIATE, HIDDEN, 37 + expert)).unwrap();
+            let varied_scales = |seed| {
+                let mut packed = iq_rows(tensor_type, INTERMEDIATE, HIDDEN, seed);
+                if matches!(tensor_type, 12 | 13) {
+                    // 覆盖零、subnormal 边界、非二次幂和符号，避免只测固定 scale 的偶合。
+                    let scales = [0_u16, 1, 0x03ff, 0x0400, 0x0401, 0x13ff, 0x17ff, 0x8401];
+                    let block_bytes = crate::weight::codec::ggml::block_layout(tensor_type).unwrap().1;
+                    for (index, block) in packed.chunks_exact_mut(block_bytes).enumerate() {
+                        block[..2].copy_from_slice(&scales[(index + seed) % scales.len()].to_le_bytes());
+                        block[2..4].copy_from_slice(&scales[(index * 3 + seed) % scales.len()].to_le_bytes());
+                    }
+                }
+                packed
+            };
+            let gate = super::DeviceBuffer::upload(DEVICE, &varied_scales(7 + expert)).unwrap();
+            let up = super::DeviceBuffer::upload(DEVICE, &varied_scales(37 + expert)).unwrap();
             metas_host.push(super::GgufGroupedExpertMeta { gate: gate.device_pointer() as u64, up: up.device_pointer() as u64, down: gate.device_pointer() as u64, gate_type: tensor_type, up_type: tensor_type, down_type: tensor_type });
-            std::mem::forget((gate, up));
+            weights.push((gate, up));
         }
         let metas = super::resident_gguf_grouped_metas(DEVICE, &metas_host).unwrap();
-        let route_ids = super::DeviceBuffer::upload(DEVICE, bytes(&[0_u32, 1, 2, 3, 4, 1, 5, 3])).unwrap();
-        let token_major = super::DeviceBuffer::allocate(DEVICE, 2 * TOP_K * INTERMEDIATE * 2).unwrap();
-        let shared = super::DeviceBuffer::allocate(DEVICE, 2 * TOP_K * INTERMEDIATE * 2).unwrap();
+        let route_ids = super::DeviceBuffer::upload(DEVICE, bytes(routes)).unwrap();
+        let token_major = super::DeviceBuffer::upload(DEVICE, bytes(&vec![bf16::NAN.to_bits(); 2 * TOP_K * INTERMEDIATE])).unwrap();
+        let shared = super::DeviceBuffer::upload(DEVICE, bytes(&vec![bf16::NAN.to_bits(); 2 * TOP_K * INTERMEDIATE])).unwrap();
         let functions = super::super::ct_quantized_functions(DEVICE).unwrap();
         let (token_major_function, shared_function) =
-            if tensor_type == 21 { (functions.gguf_fused_gate_up_iq3s_wide, functions.gguf_fused_gate_up_iq3s_wide_rows2) } else { (functions.gguf_fused_gate_up_iq4xs, functions.gguf_fused_gate_up_iq4xs_rows2) };
+            match tensor_type {
+                12 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q4_k),
+                13 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q5_k),
+                21 => (functions.gguf_fused_gate_up_iq3s_wide, functions.gguf_fused_gate_up_iq3s_wide_rows2),
+                _ => (functions.gguf_fused_gate_up_iq4xs, functions.gguf_fused_gate_up_iq4xs_rows2),
+            };
         let launch = |function: usize, output: &super::DeviceBuffer| {
+            let (outputs, threads) = if function == functions.gguf_fused_gate_up_q4_k || function == functions.gguf_fused_gate_up_q5_k { (8, 64) } else if function == functions.gguf_fused_gate_up { (16, 256) } else { (32, 256) };
             let mut input_pointer = input.pointer;
             let mut metas_pointer = metas.buffer.pointer;
             let mut route_ids_pointer = route_ids.pointer;
@@ -641,10 +915,10 @@ mod tests {
             let status = unsafe {
                 crate::kernel::rocm::hip::kernel_launch_trampoline(
                     function as *mut std::ffi::c_void,
-                    (INTERMEDIATE / 32) as u32,
+                    (INTERMEDIATE / outputs) as u32,
                     (2 * TOP_K) as u32,
                     1,
-                    256,
+                    threads,
                     1,
                     1,
                     0,
@@ -662,6 +936,7 @@ mod tests {
         let mut shared_host = vec![0_u16; 2 * TOP_K * INTERMEDIATE];
         token_major.copy_to_host(bytes_mut(&mut token_major_host)).unwrap();
         shared.copy_to_host(bytes_mut(&mut shared_host)).unwrap();
+        assert!(shared_host.iter().all(|&bits| bf16::from_bits(bits).is_finite()), "共享 kernel 存在未写入或非有限输出");
         assert_eq!(shared_host, token_major_host, "tensor_type={tensor_type} rows2 共享权重改变 activation");
     }
 
@@ -669,8 +944,19 @@ mod tests {
     #[ignore = "需要 ROCm GPU"]
     fn glm53_rows2_gate_up_weight_sharing_matches_token_major() {
         super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
-        assert_rows2_gate_up_matches_token_major(21);
-        assert_rows2_gate_up_matches_token_major(23);
+        assert_rows2_gate_up_matches_token_major(21, &[0, 1, 2, 3, 4, 1, 5, 3]);
+        assert_rows2_gate_up_matches_token_major(23, &[0, 1, 2, 3, 4, 1, 5, 3]);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn q4_k_q5_k_rows2_gate_up_matches_generic_bits() {
+        // 不重叠、部分重叠及乱序完全重叠，防止共享分支漏写第二行。
+        for tensor_type in [12, 13] {
+            for routes in [[0, 1, 2, 3, 4, 5, 6, 7], [0, 1, 2, 3, 4, 3, 5, 1], [0, 1, 2, 3, 3, 1, 0, 2]] {
+                assert_rows2_gate_up_matches_token_major(tensor_type, &routes);
+            }
+        }
     }
 
     fn assert_rowsn_gate_up_matches_token_major(tensor_type: u32) {
@@ -884,6 +1170,15 @@ mod tests {
 
     #[test]
     #[ignore = "需要 ROCm GPU"]
+    fn q4_k_q5_k_fused_decode_matches_cpu() {
+        // UD-Q4_K_XL 的主干、末段和少数高精度层都必须覆盖 CPU oracle。
+        for types in [[12, 12, 13], [12, 12, 14], [13, 13, 13], [13, 13, 14]] {
+            assert_fused_decode_matches_generic(types, true);
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
     fn glm53_q3k_q4k_fused_decode_matches_generic_bits() {
         assert_fused_decode_matches_generic([11, 11, 12], true);
     }
@@ -937,6 +1232,8 @@ fn try_gguf_fused_decode_experts_with_workspace(
     let input_is_bf16 = input.bytes == input_bytes_bf16;
     let iq3s_gate_up = input_is_bf16 && matches!(uniform_types, Some([21, 21, _]));
     let iq4xs_gate_up = input_is_bf16 && matches!(uniform_types, Some([23, 23, _]));
+    let q4_k_gate_up = input_is_bf16 && matches!(uniform_types, Some([12, 12, _]));
+    let q5_k_gate_up = input_is_bf16 && matches!(uniform_types, Some([13, 13, _]));
     let q3_k_gate_up = input_is_bf16 && matches!(uniform_types, Some([11, 11, _]));
     let q8_0_gate_up = input_is_bf16 && matches!(uniform_types, Some([8, 8, _]));
     let iq4xs_down = intermediate_size.is_multiple_of(256) && matches!(uniform_types, Some([_, _, 23]));
@@ -1003,7 +1300,7 @@ fn try_gguf_fused_decode_experts_with_workspace(
             (&mut intermediate as *mut u32).cast(),
             (&mut is_bf16 as *mut u32).cast(),
         ];
-        let outputs_per_block = if iq3s_gate_up || iq4xs_gate_up || q3_k_gate_up { 32 } else { 16 };
+        let outputs_per_block = if q4_k_gate_up || q5_k_gate_up { 8 } else if iq3s_gate_up || iq4xs_gate_up || q3_k_gate_up { 32 } else { 16 };
         let grid_x = u32::try_from(intermediate_size.div_ceil(outputs_per_block)).map_err(|_| "GGUF fused grid 超过 u32".to_owned())?;
         let grid_y = u32::try_from(route_count).map_err(|_| "GGUF fused grid 超过 u32".to_owned())?;
         let function = if iq3s_gate_up {
@@ -1026,6 +1323,10 @@ fn try_gguf_fused_decode_experts_with_workspace(
             } else {
                 functions.gguf_fused_gate_up_iq4xs
             }
+        } else if q4_k_gate_up {
+            functions.gguf_fused_gate_up_q4_k
+        } else if q5_k_gate_up {
+            functions.gguf_fused_gate_up_q5_k
         } else if q3_k_gate_up {
             functions.gguf_fused_gate_up_q3_k
         } else if q8_0_gate_up && single_expert_rows2 {
@@ -1036,7 +1337,7 @@ fn try_gguf_fused_decode_experts_with_workspace(
             functions.gguf_fused_gate_up
         };
         let status = unsafe {
-            module_launch(function as *mut c_void, grid_x, if q8_0_gate_up && single_expert_rows2 { 1 } else { grid_y }, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut())
+            module_launch(function as *mut c_void, grid_x, if q8_0_gate_up && single_expert_rows2 { 1 } else { grid_y }, 1, if q4_k_gate_up || q5_k_gate_up { 64 } else { 256 }, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut())
         };
         if status != HIP_SUCCESS {
             return Err(runtime.hip_error(status, "hipModuleLaunchKernel GGUF fused gate_up"));
@@ -1073,7 +1374,7 @@ fn try_gguf_fused_decode_experts_with_workspace(
             (&mut hidden as *mut u32).cast(),
             (&mut intermediate as *mut u32).cast(),
         ];
-        let outputs_per_block = if iq4xs_down || q4_k_down { 32 } else { 16 };
+        let outputs_per_block = if iq4xs_down || q4_k_down || q5_k_down { 32 } else { 16 };
         let grid_x = u32::try_from(hidden_size.div_ceil(outputs_per_block)).map_err(|_| "GGUF fused grid 超过 u32".to_owned())?;
         let function = if iq4xs_down {
             functions.gguf_fused_down_iq4xs

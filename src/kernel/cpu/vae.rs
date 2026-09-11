@@ -974,3 +974,118 @@ pub fn snake_beta(input: &[f32], alpha: &[f32], beta: &[f32], up_filter: &[f32],
     }
     Ok(output)
 }
+
+/// 逐通道一维卷积（depthwise，stride=1，无 dilation/bias）。
+///
+/// 输入/输出布局 `[rows=时间步, cols=channels]`；weight 布局 `[kernel][channels]`
+/// （tap 主序，通道连续），时间轴两侧按 left/right padding 零填充，输出行数不变：
+/// `out[r][c] = Σ_t w[t][c] · x_pad[r+t][c]`。通道维连续，走 f32x8。
+pub fn depthwise_conv1d(input: &[f32], weight: &[f32], rows: usize, channels: usize, kernel: usize, left_padding: usize, right_padding: usize) -> Result<Vec<f32>, String> {
+    if channels == 0 || kernel == 0 {
+        return Err(format!("depthwise conv1d channels={channels} kernel={kernel} 必须非零"));
+    }
+    if input.len() != rows * channels {
+        return Err(format!("depthwise conv1d input len={}，期望 rows({rows})*channels({channels})", input.len()));
+    }
+    if weight.len() != kernel * channels {
+        return Err(format!("depthwise conv1d weight len={}，期望 kernel({kernel})*channels({channels})", weight.len()));
+    }
+    let _ = right_padding;
+    let mut output = vec![0.0f32; rows * channels];
+    for row in 0..rows {
+        let target = row * channels;
+        let mut lane = 0;
+        while lane + SIMD_LANES <= channels {
+            let mut accumulate = f32x8::splat(0.0);
+            for tap in 0..kernel {
+                // x_pad[r+t] 对应原始 x[r+t-left_padding]；越界 tap 是零填充，直接跳过。
+                let source = row + tap;
+                if source < left_padding || source >= left_padding + rows {
+                    continue;
+                }
+                let base = (source - left_padding) * channels + lane;
+                let values = f32x8::from(<[f32; SIMD_LANES]>::try_from(&input[base..base + SIMD_LANES]).unwrap());
+                let weights = f32x8::from(<[f32; SIMD_LANES]>::try_from(&weight[tap * channels + lane..tap * channels + lane + SIMD_LANES]).unwrap());
+                accumulate += values * weights;
+            }
+            let values: [f32; SIMD_LANES] = accumulate.into();
+            output[target + lane..target + lane + SIMD_LANES].copy_from_slice(&values);
+            lane += SIMD_LANES;
+        }
+        while lane < channels {
+            let mut value = 0.0;
+            for tap in 0..kernel {
+                let source = row + tap;
+                if source < left_padding || source >= left_padding + rows {
+                    continue;
+                }
+                value += input[(source - left_padding) * channels + lane] * weight[tap * channels + lane];
+            }
+            output[target + lane] = value;
+            lane += 1;
+        }
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod depthwise_conv1d_tests {
+    use super::depthwise_conv1d;
+
+    /// 简单确定性伪随机，避免引入 rand 依赖。
+    fn lcg(seed: u64) -> impl FnMut() -> f32 {
+        let mut state = seed;
+        move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (u32::MAX >> 1) as f32) - 1.0
+        }
+    }
+
+    fn scalar(input: &[f32], weight: &[f32], rows: usize, channels: usize, kernel: usize, left_padding: usize, right_padding: usize) -> Vec<f32> {
+        let mut output = vec![0.0f32; rows * channels];
+        for row in 0..rows {
+            for channel in 0..channels {
+                let mut value = 0.0;
+                for tap in 0..kernel {
+                    let source = row + tap;
+                    if source < left_padding || source >= left_padding + rows {
+                        continue;
+                    }
+                    value += input[(source - left_padding) * channels + channel] * weight[tap * channels + channel];
+                }
+                output[row * channels + channel] = value;
+            }
+        }
+        let _ = right_padding;
+        output
+    }
+
+    #[test]
+    fn depthwise_conv1d_matches_scalar() {
+        let (rows, channels, kernel, left, right) = (37usize, 20usize, 11usize, 5usize, 5usize);
+        let mut random = lcg(0x5EED);
+        let input: Vec<f32> = (0..rows * channels).map(|_| random()).collect();
+        let weight: Vec<f32> = (0..kernel * channels).map(|_| random()).collect();
+        let output = depthwise_conv1d(&input, &weight, rows, channels, kernel, left, right).unwrap();
+        let expected = scalar(&input, &weight, rows, channels, kernel, left, right);
+        for (index, (actual, expected)) in output.iter().zip(&expected).enumerate() {
+            assert!((actual - expected).abs() < 1e-5, "index={index} actual={actual} expected={expected}");
+        }
+    }
+
+    #[test]
+    fn depthwise_conv1d_identity_center_tap() {
+        let (rows, channels, kernel, left, right) = (13usize, 16usize, 11usize, 5usize, 5usize);
+        let mut random = lcg(0xC0FFEE);
+        let input: Vec<f32> = (0..rows * channels).map(|_| random()).collect();
+        // 中心 tap 置 1、其余置 0 → 输出与输入完全一致。
+        let mut weight = vec![0.0f32; kernel * channels];
+        for channel in 0..channels {
+            weight[5 * channels + channel] = 1.0;
+        }
+        let output = depthwise_conv1d(&input, &weight, rows, channels, kernel, left, right).unwrap();
+        for (actual, expected) in output.iter().zip(&input) {
+            assert_eq!(actual, expected);
+        }
+    }
+}

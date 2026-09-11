@@ -53,9 +53,11 @@ fn load(device_id: i32) -> Result<(usize, PagedMlaFunctions), String> {
         (unsafe { get(&mut handle, module, name.as_ptr()) }) == HIP_SUCCESS
     };
     let dense_wmma = supports("zllm_paged_dense_wmma_marker");
+    let prefill_wmma_q8_heads32 = if dense_wmma { function("mla_paged_prefill_q8_wmma_heads32_f32")? } else { 0 };
     let decode_partial_wmma_q8 = if dense_wmma { function("mla_paged_decode_partial_q8_wmma_f32")? } else { 0 };
     let decode_partial_wmma_q8_colpar = if dense_wmma { function("mla_paged_decode_partial_q8_wmma_f32_colpar")? } else { 0 };
     let decode_partial_wmma_q8_colpar512 = if dense_wmma { function("mla_paged_decode_partial_q8_wmma_f32_colpar512")? } else { 0 };
+    let decode_partial_wmma_q8_colpar512_shared = if dense_wmma { function("mla_paged_decode_partial_q8_wmma_f32_colpar512_shared")? } else { 0 };
     let decode_partial_wmma_q8_colpar512_abl = if dense_wmma { function("mla_paged_decode_partial_q8_wmma_f32_colpar512_abl")? } else { 0 };
     Ok((
         module as usize,
@@ -77,6 +79,9 @@ fn load(device_id: i32) -> Result<(usize, PagedMlaFunctions), String> {
             dsa_clear: function("dsa_clear_u32")?,
             dsa_gather_selection_scores: function("dsa_gather_selection_scores")?,
             mla_gather_selected_q8: function("mla_gather_selected_q8")?,
+            mla_gpu_hot_gather_q8: function("mla_gpu_hot_gather_q8")?,
+            mla_gpu_hot_pin: function("mla_gpu_hot_pin")?,
+            mla_gpu_hot_invalidate: function("mla_gpu_hot_invalidate")?,
             dsa_merge_sequence_shards: function("dsa_merge_sequence_shard_topk")?,
             dsa_score: function("dsa_score_tiles_q8")?,
             dsa_quantize_query_i8: function("dsa_quantize_query_hadamard_i8")?,
@@ -108,8 +113,10 @@ fn load(device_id: i32) -> Result<(usize, PagedMlaFunctions), String> {
             decode_attention: function("mla_paged_decode_latent_f32")?,
             decode_partial: function("mla_paged_decode_partial_f32")?,
             decode_partial_wmma_q8,
+            prefill_wmma_q8_heads32,
             decode_partial_wmma_q8_colpar,
             decode_partial_wmma_q8_colpar512,
+            decode_partial_wmma_q8_colpar512_shared,
             decode_partial_wmma_q8_colpar512_abl,
             split_merge: function("mla_paged_split_merge_f32")?,
             split_merge_pl: function("mla_paged_split_merge_f32_pl")?,

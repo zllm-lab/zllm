@@ -3244,6 +3244,324 @@ kernel void gguf_gemm_iq4nl_mpp_f16(
     auto destination = tensor(output, dextents<int32_t, 2>(int(weight_rows), int(input_rows)), array<int, 2>({1, int(weight_rows)}));
     accumulator.store(destination.slice(weight_base, input_base));
 }
+
+// IQ4_XS 的 cooperative tensor 版：tile/累加结构完全复用 iq4nl_mpp，只换
+// stage 反量化——每线程负责一个权重行的半个 ib32(16 值)。IQ4_XS 的元素排布
+// 是"16 字节 quants 的低 nibble 串出元素 0-15、高 nibble 串出 16-31"，两线程
+// 各取一个 nibble 面；6 位子块 scale 由块头 d + scales_h/scales_l 组合解出。
+kernel void gguf_gemm_iq4xs_mpp_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *weight [[buffer(1)]],
+    device const ulong *iq2s_grid [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant uint &input_rows [[buffer(4)]],
+    constant uint &weight_rows [[buffer(5)]],
+    constant uint &K [[buffer(6)]],
+    constant uint &row_bytes [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    constexpr int TILE_WEIGHT_ROWS = 64;
+    constexpr int TILE_INPUT_ROWS = 128;
+    constexpr int TILE_K = 32;
+    constexpr int SIMD_GROUPS = 4;
+    threadgroup half stage_weight[TILE_WEIGHT_ROWS * TILE_K];
+    const int weight_base = int(group.y) * TILE_WEIGHT_ROWS;
+    const int input_base = int(group.x) * TILE_INPUT_ROWS;
+
+    auto staged = tensor(stage_weight, dextents<int32_t, 2>(TILE_K, TILE_WEIGHT_ROWS));
+    device half *input_mut = const_cast<device half *>(input);
+    auto input_tensor = tensor(input_mut, dextents<int32_t, 2>(int(K), int(input_rows)), array<int, 2>({1, int(K)}));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            TILE_INPUT_ROWS,
+            TILE_WEIGHT_ROWS,
+            static_cast<int>(dynamic_extent),
+            false,
+            true,
+            true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<SIMD_GROUPS>> multiply;
+    // 目标类型 float:half 累加器实测 ~10% 误差(K=5120 逐 32 块舍入累积),
+    // half 目的的隐式转换 store 则被 MSL4 拒绝编译;两条捷径均证伪,保持
+    // pooled F32 + 独立 cast 的往返开销(~34ms/42-token prefill)。
+    auto accumulator = multiply.get_destination_cooperative_tensor<decltype(input_tensor), decltype(staged), float>();
+
+    for (int k_base = 0; k_base < int(K); k_base += TILE_K) {
+        // 128 线程：每线程负责一个权重行的半个 IQ4_XS ib32(16 值)。
+        const int local_weight_row = int(thread_index) >> 1;
+        const int half_block = int(thread_index) & 1;
+        const int out_row = weight_base + local_weight_row;
+        const int local_k = half_block * 16;
+        if (out_row < int(weight_rows)) {
+            device const uchar *block = weight + ulong(out_row) * row_bytes + ulong(k_base >> 8) * 136;
+            const uint sub = uint(k_base >> 5) & 7;
+            const float d = float(as_type<half>(*(device const ushort *)block));
+            const ushort scales_h = ushort(block[2]) | (ushort(block[3]) << 8);
+            const uchar scales_l = block[4 + (sub >> 1)];
+            const uint low = (sub & 1) != 0 ? scales_l >> 4 : scales_l & 0x0f;
+            const uint ls = low | (((scales_h >> (2 * sub)) & 0x03) << 4);
+            const float dl = d * (float(ls) - 32.0f);
+            device const uchar *quants = block + 8 + sub * 16;
+            for (int i = 0; i < 16; ++i) {
+                const uint code = half_block == 0 ? quants[i] & 15 : quants[i] >> 4;
+                stage_weight[local_weight_row * TILE_K + local_k + i] = half(dl * float(kvalues_iq4nl[code]));
+            }
+        } else {
+            for (int i = 0; i < 16; ++i) {
+                stage_weight[local_weight_row * TILE_K + local_k + i] = 0.0h;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int k_extent = min(TILE_K, int(K) - k_base);
+        auto weight_tile = tensor(stage_weight, dextents<int32_t, 2>(k_extent, TILE_WEIGHT_ROWS), array<int, 2>({1, TILE_K}));
+        auto input_tile = tensor(input_mut + k_base + ulong(input_base) * K, dextents<int32_t, 2>(k_extent, int(input_rows) - input_base), array<int, 2>({1, int(K)}));
+        multiply.run(input_tile, weight_tile, accumulator);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    auto destination = tensor(output, dextents<int32_t, 2>(int(weight_rows), int(input_rows)), array<int, 2>({1, int(weight_rows)}));
+    accumulator.store(destination.slice(weight_base, input_base));
+}
+
+// IQ3_S 的 cooperative tensor 版：同 tile/累加结构，stage 反量化每线程处理
+// 一个权重行的两个 t 段(2×2 次 grid 查表共 16 值)；iq3s_grid 是编译期常量表，
+// buffer(2) 仅保持与共享 dispatch 的绑定布局一致，本 kernel 不读它。
+kernel void gguf_gemm_iq3s_mpp_f16(
+    device const half *input [[buffer(0)]],
+    device const uchar *weight [[buffer(1)]],
+    device const ulong *iq2s_grid [[buffer(2)]],
+    device float *output [[buffer(3)]],
+    constant uint &input_rows [[buffer(4)]],
+    constant uint &weight_rows [[buffer(5)]],
+    constant uint &K [[buffer(6)]],
+    constant uint &row_bytes [[buffer(7)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]])
+{
+    constexpr int TILE_WEIGHT_ROWS = 64;
+    constexpr int TILE_INPUT_ROWS = 128;
+    constexpr int TILE_K = 32;
+    constexpr int SIMD_GROUPS = 4;
+    threadgroup half stage_weight[TILE_WEIGHT_ROWS * TILE_K];
+    const int weight_base = int(group.y) * TILE_WEIGHT_ROWS;
+    const int input_base = int(group.x) * TILE_INPUT_ROWS;
+
+    auto staged = tensor(stage_weight, dextents<int32_t, 2>(TILE_K, TILE_WEIGHT_ROWS));
+    device half *input_mut = const_cast<device half *>(input);
+    auto input_tensor = tensor(input_mut, dextents<int32_t, 2>(int(K), int(input_rows)), array<int, 2>({1, int(K)}));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            TILE_INPUT_ROWS,
+            TILE_WEIGHT_ROWS,
+            static_cast<int>(dynamic_extent),
+            false,
+            true,
+            true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<SIMD_GROUPS>> multiply;
+    // 目标类型 float：同 iq4xs_mpp（half 累加/转换 store 均证伪）。
+    auto accumulator = multiply.get_destination_cooperative_tensor<decltype(input_tensor), decltype(staged), float>();
+
+    for (int k_base = 0; k_base < int(K); k_base += TILE_K) {
+        // 128 线程：每线程负责一个权重行的两个 t 段(共 16 值)。
+        const int local_weight_row = int(thread_index) >> 1;
+        const int half_block = int(thread_index) & 1;
+        const int out_row = weight_base + local_weight_row;
+        if (out_row < int(weight_rows)) {
+            device const uchar *block = weight + ulong(out_row) * row_bytes + ulong(k_base >> 8) * 110;
+            const uint g = uint(k_base >> 5) & 7;
+            const float d = float(as_type<half>(*(device const ushort *)block));
+            const uchar scale = block[106 + (g >> 1)];
+            const float db = d * (1.0f + 2.0f * float(g & 1 ? scale >> 4 : scale & 0x0f));
+            const uint qh = block[66 + g];
+            device const uchar *qs = block + 2 + g * 8;
+            device const uchar *signs = block + 74 + g * 4;
+            for (uint j = 0; j < 2; ++j) {
+                const uint t = uint(half_block) * 2 + j;
+                const uint i0 = uint(qs[t * 2]) | ((qh << (8 - 2 * t)) & 256u);
+                const uint i1 = uint(qs[t * 2 + 1]) | ((qh << (7 - 2 * t)) & 256u);
+                const uint w0 = iq3s_grid[i0];
+                const uint w1 = iq3s_grid[i1];
+                const uchar sg = signs[t];
+                #pragma unroll
+                for (uint e = 0; e < 4; ++e) {
+                    stage_weight[local_weight_row * TILE_K + int(t) * 8 + int(e)] = half(db * float((w0 >> (8 * e)) & 0xff) * ((sg & (1u << e)) == 0 ? 1.0 : -1.0));
+                    stage_weight[local_weight_row * TILE_K + int(t) * 8 + 4 + int(e)] = half(db * float((w1 >> (8 * e)) & 0xff) * ((sg & (16u << e)) == 0 ? 1.0 : -1.0));
+                }
+            }
+        } else {
+            for (int i = 0; i < 32; ++i) {
+                stage_weight[local_weight_row * TILE_K + i] = 0.0h;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int k_extent = min(TILE_K, int(K) - k_base);
+        auto weight_tile = tensor(stage_weight, dextents<int32_t, 2>(k_extent, TILE_WEIGHT_ROWS), array<int, 2>({1, TILE_K}));
+        auto input_tile = tensor(input_mut + k_base + ulong(input_base) * K, dextents<int32_t, 2>(k_extent, int(input_rows) - input_base), array<int, 2>({1, int(K)}));
+        multiply.run(input_tile, weight_tile, accumulator);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    auto destination = tensor(output, dextents<int32_t, 2>(int(weight_rows), int(input_rows)), array<int, 2>({1, int(weight_rows)}));
+    accumulator.store(destination.slice(weight_base, input_base));
+}
+
+// skinny 变体:42-token 级 prefill 被 128-token tile padding,86% MMA FLOP
+// 浪费在填充行(896-token 零 padding 实测 6.78ms/token vs 15.5ms/token)。
+// TILE_INPUT_ROWS 缩到 64/32 后 descriptor M 随之缩小,权重读放大 2/4 倍
+// 但带宽余量充足;大 M 仍用 128 版避免权重重读。
+#define GGUF_MPP_IQ4XS_SKINNY(kernel_name, TILE_M) \
+kernel void kernel_name( \
+    device const half *input [[buffer(0)]], \
+    device const uchar *weight [[buffer(1)]], \
+    device const ulong *iq2s_grid [[buffer(2)]], \
+    device float *output [[buffer(3)]], \
+    constant uint &input_rows [[buffer(4)]], \
+    constant uint &weight_rows [[buffer(5)]], \
+    constant uint &K [[buffer(6)]], \
+    constant uint &row_bytes [[buffer(7)]], \
+    uint2 group [[threadgroup_position_in_grid]], \
+    uint thread_index [[thread_index_in_threadgroup]]) \
+{ \
+    constexpr int TILE_WEIGHT_ROWS = 64; \
+    constexpr int TILE_INPUT_ROWS = TILE_M; \
+    constexpr int TILE_K = 32; \
+    constexpr int SIMD_GROUPS = 4; \
+    threadgroup half stage_weight[TILE_WEIGHT_ROWS * TILE_K]; \
+    const int weight_base = int(group.y) * TILE_WEIGHT_ROWS; \
+    const int input_base = int(group.x) * TILE_INPUT_ROWS; \
+    auto staged = tensor(stage_weight, dextents<int32_t, 2>(TILE_K, TILE_WEIGHT_ROWS)); \
+    device half *input_mut = const_cast<device half *>(input); \
+    auto input_tensor = tensor(input_mut, dextents<int32_t, 2>(int(K), int(input_rows)), array<int, 2>({1, int(K)})); \
+    mpp::tensor_ops::matmul2d< \
+        mpp::tensor_ops::matmul2d_descriptor( \
+            TILE_INPUT_ROWS, \
+            TILE_WEIGHT_ROWS, \
+            static_cast<int>(dynamic_extent), \
+            false, \
+            true, \
+            true, \
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), \
+        execution_simdgroups<SIMD_GROUPS>> multiply; \
+    auto accumulator = multiply.get_destination_cooperative_tensor<decltype(input_tensor), decltype(staged), float>(); \
+    for (int k_base = 0; k_base < int(K); k_base += TILE_K) { \
+        const int local_weight_row = int(thread_index) >> 1; \
+        const int half_block = int(thread_index) & 1; \
+        const int out_row = weight_base + local_weight_row; \
+        const int local_k = half_block * 16; \
+        if (out_row < int(weight_rows)) { \
+            device const uchar *block = weight + ulong(out_row) * row_bytes + ulong(k_base >> 8) * 136; \
+            const uint sub = uint(k_base >> 5) & 7; \
+            const float d = float(as_type<half>(*(device const ushort *)block)); \
+            const ushort scales_h = ushort(block[2]) | (ushort(block[3]) << 8); \
+            const uchar scales_l = block[4 + (sub >> 1)]; \
+            const uint low = (sub & 1) != 0 ? scales_l >> 4 : scales_l & 0x0f; \
+            const uint ls = low | (((scales_h >> (2 * sub)) & 0x03) << 4); \
+            const float dl = d * (float(ls) - 32.0f); \
+            device const uchar *quants = block + 8 + sub * 16; \
+            for (int i = 0; i < 16; ++i) { \
+                const uint code = half_block == 0 ? quants[i] & 15 : quants[i] >> 4; \
+                stage_weight[local_weight_row * TILE_K + local_k + i] = half(dl * float(kvalues_iq4nl[code])); \
+            } \
+        } else { \
+            for (int i = 0; i < 16; ++i) { \
+                stage_weight[local_weight_row * TILE_K + local_k + i] = 0.0h; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        const int k_extent = min(TILE_K, int(K) - k_base); \
+        auto weight_tile = tensor(stage_weight, dextents<int32_t, 2>(k_extent, TILE_WEIGHT_ROWS), array<int, 2>({1, TILE_K})); \
+        auto input_tile = tensor(input_mut + k_base + ulong(input_base) * K, dextents<int32_t, 2>(k_extent, int(input_rows) - input_base), array<int, 2>({1, int(K)})); \
+        multiply.run(input_tile, weight_tile, accumulator); \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    auto destination = tensor(output, dextents<int32_t, 2>(int(weight_rows), int(input_rows)), array<int, 2>({1, int(weight_rows)})); \
+    accumulator.store(destination.slice(weight_base, input_base)); \
+}
+
+#define GGUF_MPP_IQ3S_SKINNY(kernel_name, TILE_M) \
+kernel void kernel_name( \
+    device const half *input [[buffer(0)]], \
+    device const uchar *weight [[buffer(1)]], \
+    device const ulong *iq2s_grid [[buffer(2)]], \
+    device float *output [[buffer(3)]], \
+    constant uint &input_rows [[buffer(4)]], \
+    constant uint &weight_rows [[buffer(5)]], \
+    constant uint &K [[buffer(6)]], \
+    constant uint &row_bytes [[buffer(7)]], \
+    uint2 group [[threadgroup_position_in_grid]], \
+    uint thread_index [[thread_index_in_threadgroup]]) \
+{ \
+    constexpr int TILE_WEIGHT_ROWS = 64; \
+    constexpr int TILE_INPUT_ROWS = TILE_M; \
+    constexpr int TILE_K = 32; \
+    constexpr int SIMD_GROUPS = 4; \
+    threadgroup half stage_weight[TILE_WEIGHT_ROWS * TILE_K]; \
+    const int weight_base = int(group.y) * TILE_WEIGHT_ROWS; \
+    const int input_base = int(group.x) * TILE_INPUT_ROWS; \
+    auto staged = tensor(stage_weight, dextents<int32_t, 2>(TILE_K, TILE_WEIGHT_ROWS)); \
+    device half *input_mut = const_cast<device half *>(input); \
+    auto input_tensor = tensor(input_mut, dextents<int32_t, 2>(int(K), int(input_rows)), array<int, 2>({1, int(K)})); \
+    mpp::tensor_ops::matmul2d< \
+        mpp::tensor_ops::matmul2d_descriptor( \
+            TILE_INPUT_ROWS, \
+            TILE_WEIGHT_ROWS, \
+            static_cast<int>(dynamic_extent), \
+            false, \
+            true, \
+            true, \
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate), \
+        execution_simdgroups<SIMD_GROUPS>> multiply; \
+    auto accumulator = multiply.get_destination_cooperative_tensor<decltype(input_tensor), decltype(staged), float>(); \
+    for (int k_base = 0; k_base < int(K); k_base += TILE_K) { \
+        const int local_weight_row = int(thread_index) >> 1; \
+        const int half_block = int(thread_index) & 1; \
+        const int out_row = weight_base + local_weight_row; \
+        if (out_row < int(weight_rows)) { \
+            device const uchar *block = weight + ulong(out_row) * row_bytes + ulong(k_base >> 8) * 110; \
+            const uint g = uint(k_base >> 5) & 7; \
+            const float d = float(as_type<half>(*(device const ushort *)block)); \
+            const uchar scale = block[106 + (g >> 1)]; \
+            const float db = d * (1.0f + 2.0f * float(g & 1 ? scale >> 4 : scale & 0x0f)); \
+            const uint qh = block[66 + g]; \
+            device const uchar *qs = block + 2 + g * 8; \
+            device const uchar *signs = block + 74 + g * 4; \
+            for (uint j = 0; j < 2; ++j) { \
+                const uint t = uint(half_block) * 2 + j; \
+                const uint i0 = uint(qs[t * 2]) | ((qh << (8 - 2 * t)) & 256u); \
+                const uint i1 = uint(qs[t * 2 + 1]) | ((qh << (7 - 2 * t)) & 256u); \
+                const uint w0 = iq3s_grid[i0]; \
+                const uint w1 = iq3s_grid[i1]; \
+                const uchar sg = signs[t]; \
+                _Pragma("unroll") \
+                for (uint e = 0; e < 4; ++e) { \
+                    stage_weight[local_weight_row * TILE_K + int(t) * 8 + int(e)] = half(db * float((w0 >> (8 * e)) & 0xff) * ((sg & (1u << e)) == 0 ? 1.0 : -1.0)); \
+                    stage_weight[local_weight_row * TILE_K + int(t) * 8 + 4 + int(e)] = half(db * float((w1 >> (8 * e)) & 0xff) * ((sg & (16u << e)) == 0 ? 1.0 : -1.0)); \
+                } \
+            } \
+        } else { \
+            for (int i = 0; i < 32; ++i) { \
+                stage_weight[local_weight_row * TILE_K + i] = 0.0h; \
+            } \
+        } \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        const int k_extent = min(TILE_K, int(K) - k_base); \
+        auto weight_tile = tensor(stage_weight, dextents<int32_t, 2>(k_extent, TILE_WEIGHT_ROWS), array<int, 2>({1, TILE_K})); \
+        auto input_tile = tensor(input_mut + k_base + ulong(input_base) * K, dextents<int32_t, 2>(k_extent, int(input_rows) - input_base), array<int, 2>({1, int(K)})); \
+        multiply.run(input_tile, weight_tile, accumulator); \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+    } \
+    auto destination = tensor(output, dextents<int32_t, 2>(int(weight_rows), int(input_rows)), array<int, 2>({1, int(weight_rows)})); \
+    accumulator.store(destination.slice(weight_base, input_base)); \
+}
+
+GGUF_MPP_IQ4XS_SKINNY(gguf_gemm_iq4xs_mpp64_f16, 64)
+GGUF_MPP_IQ4XS_SKINNY(gguf_gemm_iq4xs_mpp32_f16, 32)
+GGUF_MPP_IQ3S_SKINNY(gguf_gemm_iq3s_mpp64_f16, 64)
+GGUF_MPP_IQ3S_SKINNY(gguf_gemm_iq3s_mpp32_f16, 32)
 #endif
 
 kernel void gguf_gemm_iq4nl_fused_f16(

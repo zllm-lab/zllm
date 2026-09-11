@@ -435,6 +435,48 @@ fn native_error(error: &NativeError) -> String {
     unsafe { CStr::from_ptr(error.message.as_ptr()) }.to_string_lossy().into_owned()
 }
 
+/// 设备侧 HTP 引擎入口。C++ 源码(`htp_trace.cpp`、`runtime/minicpm5/qnn_*.cpp`、
+/// `runtime/sensevoice/qnn_asr.cpp`)在 with-qnn 下由 build.rs 编入静态库;这里把
+/// 进程 argv 直通给引擎 main,bin 只负责调一个函数并透传返回码。
+#[cfg(feature = "with-qnn")]
+pub mod engine {
+    unsafe extern "C" {
+        fn zllm_qnn_trace_main(argc: i32, argv: *const *const std::ffi::c_char) -> i32;
+        fn zllm_qnn_decode_main(argc: i32, argv: *const *const std::ffi::c_char) -> i32;
+        fn zllm_qnn_prefill_main(argc: i32, argv: *const *const std::ffi::c_char) -> i32;
+        fn zllm_qnn_asr_main(argc: i32, argv: *const *const std::ffi::c_char) -> i32;
+    }
+
+    fn dispatch(entry: unsafe extern "C" fn(i32, *const *const std::ffi::c_char) -> i32) -> i32 {
+        let owned: Vec<std::ffi::CString> = std::env::args_os()
+            .map(|argument| unsafe { std::ffi::CString::from_vec_unchecked(argument.into_encoded_bytes()) })
+            .collect();
+        let mut argv: Vec<*const std::ffi::c_char> = owned.iter().map(|argument| argument.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        unsafe { entry((argv.len() - 1) as i32, argv.as_ptr()) }
+    }
+
+    /// trace 驱动的图构建/执行引擎(1B 验收与 SenseVoice 融合段)。
+    pub fn trace() -> i32 {
+        dispatch(zllm_qnn_trace_main)
+    }
+
+    /// App 常驻 LLM 引擎(decode/prefill/KV checkpoint/DSpark/--server)。
+    pub fn decode() -> i32 {
+        dispatch(zllm_qnn_decode_main)
+    }
+
+    /// 一次性 prefill 引擎(建立 KV 与首 token 状态)。
+    pub fn prefill() -> i32 {
+        dispatch(zllm_qnn_prefill_main)
+    }
+
+    /// SenseVoice 常驻 ASR 引擎(分段图链,逐帧 token id)。
+    pub fn asr() -> i32 {
+        dispatch(zllm_qnn_asr_main)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

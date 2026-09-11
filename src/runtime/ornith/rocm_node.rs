@@ -361,7 +361,7 @@ impl OrnithRocmEngine {
                     break;
                 }
                 pending_token = Some(token);
-                let bytes = self.detokenizer.decode_bytes(&[token], true).map_err(|error| format!("Ornith detokenize {token}: {error}"))?;
+                let bytes = crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| format!("Ornith detokenize {token}: {error}"))?;
                 if !output.push(&bytes, |chunk| emit_request_tool_chunk(&mut tool_stream, token, &chunk, &mut response_text, on_token)) {
                     if output.finish_reason() == "stop" {
                         pending_token = None;

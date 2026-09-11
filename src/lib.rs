@@ -1,7 +1,10 @@
 //! zLLM:跨平台、跨模型、高性能 LLM 推理引擎。
 
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod artifact;
 pub mod attention;
+pub mod audio;
 pub mod backend;
 pub mod config;
 pub mod diffusion;

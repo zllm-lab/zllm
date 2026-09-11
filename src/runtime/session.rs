@@ -117,10 +117,18 @@ pub struct RuntimeStatus {
 }
 
 impl RuntimeStatus {
-    pub const MAX_SCHEDULING_PRESSURE: usize = 22;
+    pub const MAX_SCHEDULING_PRESSURE: usize = 10;
+    pub const APPEND_DECODE_LIMIT: usize = 13;
+    // 13 路 decode 仍可接入一路 append，转入 decode 后最多占 14 个槽位。
+    pub const MAX_CONCURRENT_SESSIONS: usize = Self::APPEND_DECODE_LIMIT + 1;
+
+    pub fn can_admit_prefill(&self, append: bool) -> bool {
+        self.new_prefill == 0 && self.append_prefill == 0
+            && if append { self.decode <= Self::APPEND_DECODE_LIMIT } else { self.decode.saturating_add(4) <= Self::MAX_SCHEDULING_PRESSURE }
+    }
 
     pub fn scheduling_pressure(&self) -> usize {
-        self.new_prefill.saturating_mul(4).saturating_add(self.append_prefill).saturating_add(self.decode)
+        self.new_prefill.saturating_add(self.append_prefill).saturating_mul(4).saturating_add(self.decode)
     }
 }
 
@@ -134,8 +142,8 @@ pub fn effective_mtp_draft_tokens(configured: usize, decode: usize, prefill: usi
     configured.min(match load {
         0 => 0,
         1..=3 => 5,
-        4..=7 => 3,
-        _ => 2,
+        4..=5 => 3,
+        _ => 1,
     })
 }
 
@@ -503,6 +511,45 @@ pub fn with_content_parts<T>(pieces: &[ContentPiece], run: impl FnOnce(&[crate::
     run(&parts)
 }
 
+/// API 输出共用的思考边界解析器。保留跨 delta 的半个标签，避免 special
+/// token 恢复后单独的结束标签或转义标签泄漏到正文；角色/EOS 由 decoder 过滤。
+pub struct ReasoningStream {
+    in_reasoning: bool,
+    pending: String,
+}
+
+impl ReasoningStream {
+    pub fn new(in_reasoning: bool) -> Self {
+        Self { in_reasoning, pending: String::new() }
+    }
+
+    pub fn push(&mut self, text: &str) -> (String, String) {
+        const TAGS: [&str; 4] = ["\\<think>", "\\</think>", "<think>", "</think>"];
+        self.pending.push_str(text);
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        loop {
+            if let Some((start, tag)) = TAGS.iter().filter_map(|tag| self.pending.find(tag).map(|start| (start, *tag))).min_by_key(|(start, _)| *start) {
+                if self.in_reasoning { reasoning.push_str(&self.pending[..start]); } else { content.push_str(&self.pending[..start]); }
+                self.pending.drain(..start + tag.len());
+                self.in_reasoning = !tag.contains("/think");
+                continue;
+            }
+            let hold = (1..TAGS.iter().map(|tag| tag.len()).max().unwrap()).rev().find(|&n| TAGS.iter().any(|tag| n < tag.len() && self.pending.ends_with(&tag[..n]))).unwrap_or(0);
+            let end = self.pending.len() - hold;
+            if self.in_reasoning { reasoning.push_str(&self.pending[..end]); } else { content.push_str(&self.pending[..end]); }
+            self.pending.drain(..end);
+            break;
+        }
+        (reasoning, content)
+    }
+
+    pub fn finish(&mut self) -> (String, String) {
+        let tail = std::mem::take(&mut self.pending);
+        if self.in_reasoning { (tail, String::new()) } else { (String::new(), tail) }
+    }
+}
+
 pub fn parse_stops(value: Option<&Value>) -> Result<Vec<String>, String> {
     match value {
         None | Some(Value::Null) => Ok(Vec::new()),
@@ -705,9 +752,16 @@ pub fn terminal_cache_id(request: &Value, response: &str, tool_calls: &[ToolCall
     Ok(scoped_cache_id(request.get("_zllm_cache_namespace").and_then(Value::as_str), &cache_id))
 }
 
-pub fn client_replayable_response<'a>(request: &Value, response: &'a str) -> &'a str {
-    let split_reasoning = request.get("reasoning_effort").is_some_and(|value| !value.is_null()) || request.get("thinking_token_budget").is_some_and(|value| !value.is_null());
-    if split_reasoning { response.split_once("</think>").map_or("", |(_, visible)| visible) } else { response }
+pub fn client_replayable_response(request: &Value, response: &str) -> String {
+    let split_reasoning = request.get("reasoning_effort").is_some_and(|value| !value.is_null())
+        || request.get("thinking_token_budget").is_some_and(|value| !value.is_null())
+        || request.get("thinking").and_then(|value| value.get("type")).and_then(Value::as_str) == Some("enabled");
+    // 缓存边界必须与 HTTP 实际发给客户端的正文一致；独立去标签会在
+    // 转义、未显式开启 reasoning 或多段边界时再次生成不同的会话 hash。
+    let mut stream = ReasoningStream::new(split_reasoning);
+    let (_, mut visible) = stream.push(response);
+    visible.push_str(&stream.finish().1);
+    visible
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -804,6 +858,55 @@ pub fn activate_terminal_append<S: crate::kv_cache::terminal_cache::TerminalSnap
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn terminal_cache_matches_http_filtered_reasoning_boundaries() {
+        for raw in ["分析</think>正文", "分析\\</think>正文", "<think>分析</think>正文"] {
+            let request = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "问题"}]});
+            let mut http = super::ReasoningStream::new(false);
+            let (_, mut visible) = http.push(raw);
+            visible.push_str(&http.finish().1);
+            let id = super::terminal_cache_id(&request, raw, &[]).unwrap();
+            let next = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "问题"}, {"role": "assistant", "content": visible}, {"role": "user", "content": "继续"}]});
+            assert_eq!(id, super::request_resume_boundary(&next).unwrap().unwrap().0, "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn reasoning_boundaries_are_hidden_at_every_chunk_split() {
+        for raw in ["<think>reason</think>answer", "<think>reason\\</think>answer"] {
+            for split in 0..=raw.len() {
+                let mut stream = super::ReasoningStream::new(false);
+                let (r1, c1) = stream.push(&raw[..split]);
+                let (r2, c2) = stream.push(&raw[split..]);
+                let (r3, c3) = stream.finish();
+                assert_eq!(r1 + &r2 + &r3, "reason", "split={split}");
+                assert_eq!(c1 + &c2 + &c3, "answer", "split={split}");
+            }
+        }
+        for initial in [false, true] {
+            let mut stream = super::ReasoningStream::new(initial);
+            assert_eq!(stream.push("</thi"), (String::new(), String::new()));
+            assert_eq!(stream.push("nk>answer"), (String::new(), "answer".to_owned()));
+        }
+        let mut stream = super::ReasoningStream::new(false);
+        assert_eq!(stream.push("a <"), (String::new(), "a ".to_owned()));
+        assert_eq!(stream.finish(), (String::new(), "<".to_owned()));
+    }
+
+    #[test]
+    fn prefill_admission_preserves_decode_and_allows_append_at_thirteen() {
+        for decode in 0..=14 {
+            let runtime = super::RuntimeStatus { decode, ..Default::default() };
+            assert_eq!(runtime.can_admit_prefill(false), decode <= 6, "new decode={decode}");
+            assert_eq!(runtime.can_admit_prefill(true), decode <= 13, "append decode={decode}");
+            for (new_prefill, append_prefill) in [(1, 0), (0, 1)] {
+                let runtime = super::RuntimeStatus { new_prefill, append_prefill, decode, ..Default::default() };
+                assert!(!runtime.can_admit_prefill(false));
+                assert!(!runtime.can_admit_prefill(true));
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -889,11 +992,22 @@ mod tests {
         assert_eq!(effective_mtp_draft_tokens(5, 1, 0), 5);
         assert_eq!(effective_mtp_draft_tokens(5, 3, 0), 5);
         assert_eq!(effective_mtp_draft_tokens(5, 4, 0), 3);
-        assert_eq!(effective_mtp_draft_tokens(5, 7, 0), 3);
-        assert_eq!(effective_mtp_draft_tokens(5, 8, 0), 2);
-        assert_eq!(effective_mtp_draft_tokens(5, 12, 0), 2);
+        assert_eq!(effective_mtp_draft_tokens(5, 5, 0), 3);
+        assert_eq!(effective_mtp_draft_tokens(5, 6, 0), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 7, 0), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 8, 0), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 9, 0), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 12, 0), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 14, 0), 1);
         assert_eq!(effective_mtp_draft_tokens(5, 0, 1), 3);
-        assert_eq!(effective_mtp_draft_tokens(5, 4, 1), 2);
+        assert_eq!(effective_mtp_draft_tokens(5, 1, 1), 3);
+        assert_eq!(effective_mtp_draft_tokens(5, 2, 1), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 3, 1), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 4, 1), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 5, 1), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 8, 1), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 9, 1), 1);
+        assert_eq!(effective_mtp_draft_tokens(0, 7, 0), 0);
         assert_eq!(effective_mtp_draft_tokens(3, 1, 0), 3);
         assert_eq!(effective_mtp_draft_tokens(2, 1, 0), 2);
     }

@@ -180,7 +180,24 @@ pub(super) fn sparse_attention(
     let mut block_scores = ctx.buffer_uninit_f32(rows * n_blocks).map_err(op)?;
     let mut selected = ctx.stream().alloc_zeros::<u32>(rows * width).map_err(|e| op(format!("selected 分配: {e:?}")))?;
     let mut selected_count = ctx.stream().alloc_zeros::<u32>(rows).map_err(|e| op(format!("count 分配: {e:?}")))?;
-    crate::kernel::cuda::qsa::qsa_score_select(ctx, &qsa_layer.pooled, &index_query, &mut block_scores, &mut selected, &mut selected_count, rows, n_cells, dead_block, position, ratio, cfg.indexer.top_k, cfg.indexer.head_count, head_dim, width).map_err(op)?;
+    crate::kernel::cuda::qsa::qsa_score_select(
+        ctx,
+        &qsa_layer.pooled,
+        &index_query,
+        &mut block_scores,
+        &mut selected,
+        &mut selected_count,
+        rows,
+        n_cells,
+        dead_block,
+        position,
+        ratio,
+        cfg.indexer.top_k,
+        cfg.indexer.head_count,
+        head_dim,
+        width,
+    )
+    .map_err(op)?;
     // 掩码 GQA:按缓存形态分流(Q8G64 / F16)
     let kv_layer = cache.layer(layer)?;
     let attended = if let Some(q8) = kv_layer.q8.as_ref() {
@@ -377,14 +394,7 @@ pub fn run(path: &Path, prompt: &str, options: CudaOptions) -> Result<(), Box<dy
     }
     let tokens = source.tokenizer()?.tokenize(prompt.as_bytes());
     if tokens.is_empty() || tokens.len().saturating_add(options.decode_steps) > options.max_seq_len || options.prefill_chunk_size == 0 {
-        return Err(format!(
-            "Qwen4-Exp CUDA 要求 0 < prompt+decode <= max_seq_len,实际 prompt={} decode={} max_seq_len={} chunk={}",
-            tokens.len(),
-            options.decode_steps,
-            options.max_seq_len,
-            options.prefill_chunk_size
-        )
-        .into());
+        return Err(format!("Qwen4-Exp CUDA 要求 0 < prompt+decode <= max_seq_len,实际 prompt={} decode={} max_seq_len={} chunk={}", tokens.len(), options.decode_steps, options.max_seq_len, options.prefill_chunk_size).into());
     }
     let host_bytes: usize = source.reader().tensors().iter().filter(|t| t.name.contains("_exps.weight")).map(|t| t.bytes).sum();
     // 启动时拒绝任何会落入 F16 专家展开的格式,使这条路线始终保持原始 packed 编码。
@@ -412,8 +422,15 @@ pub fn run(path: &Path, prompt: &str, options: CudaOptions) -> Result<(), Box<dy
     let started = Instant::now();
     let ctx = CudaContext::new_default()?;
     if options.pin_experts {
-        // 驱动自有 pinned 驻留(与 node 同路径);MTP 草稿专家保持堆驻留。
-        let bytes = source.make_experts_resident_extern(&mut |len| ctx.alloc_pinned_source_bytes(len))?;
+        // 驱动自有 pinned 驻留:单块分配 + 游标切片(逐矩阵分配的驱动
+        // 调用开销曾占加载耗时 3/4)。
+        let block = ctx.alloc_pinned_source_block(host_bytes)?;
+        let mut cursor = 0usize;
+        let bytes = source.make_experts_resident_extern(&mut |len| {
+            let builder = block.view_builder(cursor, len)?;
+            cursor += len;
+            Ok(builder)
+        })?;
         for backing in source.resident_extern_backings() {
             ctx.retain_pinned_source(&backing)?;
         }
@@ -424,14 +441,26 @@ pub fn run(path: &Path, prompt: &str, options: CudaOptions) -> Result<(), Box<dy
     let source = Arc::new(source);
     eprintln!("[qwen4exp-resident-ready] bytes={host_bytes} wall={:.3}s", started.elapsed().as_secs_f64());
     let mut mtp_source = options.mtp_weights.as_ref().map(|path| super::cuda_mtp::MtpSource::open(path, &cfg).map(Arc::new)).transpose()?;
-    if options.pin_experts && let Some(source) = mtp_source.as_mut().and_then(Arc::get_mut) {
+    if options.pin_experts
+        && let Some(source) = mtp_source.as_mut().and_then(Arc::get_mut)
+    {
         // 草稿专家同样走驱动 pinned 驻留:草稿 forward 的 miss 上传
         // DMA 直读,免槽环 memcpy(draft_wall 主要构成)。
-        let bytes = source.make_experts_resident_extern(&mut |len| ctx.alloc_pinned_source_bytes(len))?;
+        let draft_bytes: usize = source.experts.iter().flat_map(|weights| [&weights.gate, &weights.up, &weights.down]).map(|matrix| matrix.storage_len()).sum();
+        let block = ctx.alloc_pinned_source_block(draft_bytes)?;
+        let mut cursor = 0usize;
+        let bytes = source.make_experts_resident_extern(&mut |len| {
+            let builder = block.view_builder(cursor, len)?;
+            cursor += len;
+            Ok(builder)
+        })?;
         for backing in source.resident_extern_backings() {
             ctx.retain_pinned_source(&backing)?;
         }
+        ctx.finalize_pinned_sources()?;
         eprintln!("[qwen4exp-mtp-pinned] bytes={bytes}");
+    } else if options.pin_experts {
+        ctx.finalize_pinned_sources()?;
     }
     if mtp_source.is_some() && (options.mtp_steps == 0 || options.mtp_steps > 8 || !options.mtp_min_confidence.is_finite() || !(0.0..=1.0).contains(&options.mtp_min_confidence)) {
         return Err("MTP 草稿长度要求 1..=8, confidence 要求 0..=1".into());

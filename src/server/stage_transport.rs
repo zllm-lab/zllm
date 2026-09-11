@@ -217,6 +217,8 @@ pub enum StageMessage {
         devices: Vec<StageDeviceMemory>,
         /// 下游可同时容纳的 resident pipeline session。旧端不报告时为 None。
         session_capacity: Option<usize>,
+        /// 主机 MemAvailable 快照；旧端未上报时为空。
+        host_available_bytes: Option<u64>,
     },
 }
 
@@ -643,6 +645,13 @@ impl StageTransport {
     }
 
     pub fn send_device_memory(&mut self, devices: &[StageDeviceMemory], session_capacity: Option<usize>) -> Result<(), String> {
+        self.send_device_memory_with_host(devices, session_capacity, None)
+    }
+
+    pub fn send_device_memory_with_host(&mut self, devices: &[StageDeviceMemory], session_capacity: Option<usize>, host_available_bytes: Option<u64>) -> Result<(), String> {
+        if host_available_bytes == Some(0) {
+            return Err("stage host available bytes 必须大于 0".to_owned());
+        }
         if devices.is_empty() {
             return Err("stage device memory 不能为空".to_owned());
         }
@@ -650,7 +659,9 @@ impl StageTransport {
             return Err("stage session capacity 必须大于 0".to_owned());
         }
         let payload = encode_device_memory(devices)?;
-        self.send_frame(RequestId([0; 16]), DEVICE_MEMORY, devices.len(), session_capacity.unwrap_or(0), 0, 0, &payload)
+        // DEVICE_MEMORY 的 cols/value 旧端忽略；沿用24字节设备记录，兼容旧收发端。
+        let host = host_available_bytes.unwrap_or(0);
+        self.send_frame(RequestId([0; 16]), DEVICE_MEMORY, devices.len(), session_capacity.unwrap_or(0), host as u32 as usize, (host >> 32) as u32, &payload)
     }
 
     pub fn recv(&mut self) -> Result<StageFrame, String> {
@@ -973,9 +984,14 @@ async fn receive_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<StageFrame,
         READY if payload_len == 0 => Ok(StageFrame { request_id, message: StageMessage::Ready { cached_tokens: position } }),
         PERSIST if payload_len == 0 => Ok(StageFrame { request_id, message: StageMessage::Persist }),
         SHUTDOWN if payload_len == 0 && position <= 1 => Ok(StageFrame { request_id, message: StageMessage::Shutdown { persist: position != 0 } }),
-        DEVICE_MEMORY if payload_len == position.checked_mul(24).ok_or("stage device memory 数量溢出")? => {
-            Ok(StageFrame { request_id, message: StageMessage::DeviceMemory { devices: decode_device_memory(&payload)?, session_capacity: (rows != 0).then_some(rows) } })
-        }
+        DEVICE_MEMORY if payload_len == position.checked_mul(24).ok_or("stage device memory 数量溢出")? => Ok(StageFrame {
+            request_id,
+            message: StageMessage::DeviceMemory {
+                devices: decode_device_memory(&payload)?,
+                session_capacity: (rows != 0).then_some(rows),
+                host_available_bytes: ((cols as u64 | ((value as u64) << 32)) != 0).then_some(cols as u64 | ((value as u64) << 32)),
+            },
+        }),
         _ => Err(format!("未知 stage frame kind={kind} payload={payload_len}")),
     }
 }
@@ -1175,7 +1191,7 @@ mod tests {
         assert!(server.recv().unwrap_err().contains("读取 stage header"));
         server.accept_reconnect().unwrap();
         server.send_device_memory(&[StageDeviceMemory { device: 0, model_units: 40, available_bytes: 17, total_bytes: 48 }], Some(8)).unwrap();
-        assert!(matches!(client.recv().unwrap().message, StageMessage::DeviceMemory { devices, session_capacity: Some(8) } if devices.len() == 1 && devices[0].model_units == 40));
+        assert!(matches!(client.recv().unwrap().message, StageMessage::DeviceMemory { devices, session_capacity: Some(8), host_available_bytes: None } if devices.len() == 1 && devices[0].model_units == 40));
     }
 
     #[test]
@@ -1280,7 +1296,7 @@ mod tests {
         let error = server.recv().unwrap_err();
         assert!(error.contains("新上游连接") || error.contains("connection lost"), "{error}");
         server.accept_reconnect().unwrap();
-        server.send_device_memory(&[StageDeviceMemory { device: 0, model_units: 40, available_bytes: 17, total_bytes: 48 }], Some(16)).unwrap();
-        assert!(matches!(client.recv().unwrap().message, StageMessage::DeviceMemory { devices, session_capacity: Some(16) } if devices.len() == 1 && devices[0].model_units == 40));
+        server.send_device_memory_with_host(&[StageDeviceMemory { device: 0, model_units: 40, available_bytes: 17, total_bytes: 48 }], Some(16), Some(700_000_000_123)).unwrap();
+        assert!(matches!(client.recv().unwrap().message, StageMessage::DeviceMemory { devices, session_capacity: Some(16), host_available_bytes: Some(700_000_000_123) } if devices.len() == 1 && devices[0].model_units == 40));
     }
 }

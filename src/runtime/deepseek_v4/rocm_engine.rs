@@ -1581,7 +1581,7 @@ impl RocmDeepSeekV4Engine {
 }
 
 fn token_text(detokenizer: &Detokenizer, token: u32) -> Result<String, String> {
-    detokenizer.decode_bytes(&[token], true).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).map_err(|error| format!("detokenize {token}: {error}"))
+    crate::runtime::tool::decode_output_token(&detokenizer, token).map(|bytes| String::from_utf8_lossy(&bytes).into_owned()).map_err(|error| format!("detokenize {token}: {error}"))
 }
 
 fn task_fence(task: &BatchTask) -> TokenFence {

@@ -87,6 +87,17 @@ impl CpuWeight {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CpuContext;
 
+impl crate::backend::BlockConvolutionBackend for CpuContext {
+    fn grouped_block_conv(&self, input: &CpuTensor, delta: &CpuTensor, base: &CpuWeight, block_size: usize, group_size: usize, taps: usize, side: usize) -> Result<CpuTensor, BackendError> {
+        let delta_columns = input.cols.checked_div(group_size).and_then(|groups| taps.checked_mul(2)?.checked_mul(groups));
+        if delta.rows != input.rows || Some(delta.cols) != delta_columns || Some(base.rows) != taps.checked_mul(2) || base.cols != input.cols {
+            return Err(compute(format!("grouped block conv tensor shape: input={}x{} delta={}x{} base={}x{}", input.rows, input.cols, delta.rows, delta.cols, base.rows, base.cols)));
+        }
+        let data = crate::kernel::cpu::block_conv::grouped_block_conv(&input.data, &delta.data, &base.data, input.rows, input.cols, block_size, group_size, taps, side).map_err(compute)?;
+        Ok(CpuTensor { data, rows: input.rows, cols: input.cols })
+    }
+}
+
 impl BackendResources for CpuContext {
     type Tensor = CpuTensor;
     type Weight = CpuWeight;
@@ -306,6 +317,16 @@ impl Backend for CpuContext {
 
     fn layernorm_bias(&self, input: &CpuTensor, weight: &CpuWeight, bias: &CpuWeight, eps: f32) -> Result<CpuTensor, BackendError> {
         let data = crate::kernel::cpu::vae::layer_norm(&input.data, &weight.data, &bias.data, input.cols, eps).map_err(compute)?;
+        Ok(CpuTensor { data, rows: input.rows, cols: input.cols })
+    }
+
+    fn relu(&self, input: &CpuTensor) -> Result<CpuTensor, BackendError> {
+        let data = input.data.iter().map(|&value| value.max(0.0)).collect();
+        Ok(CpuTensor { data, rows: input.rows, cols: input.cols })
+    }
+
+    fn depthwise_conv1d(&self, input: &CpuTensor, weight: &CpuWeight, kernel: usize, left_padding: usize, right_padding: usize) -> Result<CpuTensor, BackendError> {
+        let data = crate::kernel::cpu::vae::depthwise_conv1d(&input.data, weight.data(), input.rows, input.cols, kernel, left_padding, right_padding).map_err(compute)?;
         Ok(CpuTensor { data, rows: input.rows, cols: input.cols })
     }
 

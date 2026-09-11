@@ -171,6 +171,7 @@ pub enum CtLinearWeight {
 }
 
 impl CtLinearWeight {
+    #[cfg(test)]
     pub(crate) fn split_rows(&self, boundary: usize) -> Result<[Self; 2], String> {
         let rows = match self {
             Self::Quantized(matrix) => matrix.rows(),

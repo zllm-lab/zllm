@@ -265,8 +265,3 @@ extern "C" __global__ void convrot_int8_matmul_wmma_tiled256(
         logical_rows, input_columns, output_rows,
         input_shared, weight_shared);
 }
-
-// ===== GGUF K-quant grouped decode experts(WMMA gate/up + 确定性 down) =====
-// 布局与 ct_grouped_* 一致：按 expert 分组的紧凑 route；activated 为 grouped 序 bf16。
-
-struct GgufKqMeta {

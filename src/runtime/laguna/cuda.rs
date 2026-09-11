@@ -123,7 +123,7 @@ pub fn generate(
             output.stop();
             break;
         }
-        let bytes = detokenizer.decode_bytes(&[token], true)?;
+        let bytes = crate::runtime::tool::decode_output_token(&detokenizer, token)?;
         if !output.push(&bytes, |chunk| on_token(token, chunk)) {
             break;
         }

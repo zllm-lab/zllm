@@ -2,6 +2,7 @@ use super::*;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::thread::ThreadId;
 
 const DETAIL_SAMPLE_STRIDE: u64 = 16;
 
@@ -50,14 +51,16 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 // latency submission 负责 flush，其他 stage 等它完成后再提交 decode，
 // 避免边界两侧的 scope event 交叉计入。
 static DECODE_BOUNDARY: AtomicU8 = AtomicU8::new(0);
-static TIMELINES: OnceLock<Mutex<HashMap<i32, DeviceTimeline>>> = OnceLock::new();
-static SCOPE_TIMELINES: OnceLock<Mutex<HashMap<i32, DeviceTimeline>>> = OnceLock::new();
+// 同一设备可由 stage、MTP 与 peer worker 同时提交；区间属于提交线程，
+// 不能把另一线程的 begin 当作嵌套，或把它的 event 接入当前区间。
+static TIMELINES: OnceLock<Mutex<HashMap<(i32, ThreadId), DeviceTimeline>>> = OnceLock::new();
+static SCOPE_TIMELINES: OnceLock<Mutex<HashMap<(i32, ThreadId), DeviceTimeline>>> = OnceLock::new();
 
-fn timelines() -> &'static Mutex<HashMap<i32, DeviceTimeline>> {
+fn timelines() -> &'static Mutex<HashMap<(i32, ThreadId), DeviceTimeline>> {
     TIMELINES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn scope_timelines() -> &'static Mutex<HashMap<i32, DeviceTimeline>> {
+fn scope_timelines() -> &'static Mutex<HashMap<(i32, ThreadId), DeviceTimeline>> {
     SCOPE_TIMELINES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -141,7 +144,7 @@ fn record_locked(device_id: i32, timeline: &mut DeviceTimeline, label: &'static 
 pub(crate) fn device_profile_stage_begin(device_id: i32, detailed_eligible: bool) -> Result<(), String> {
     ENABLED.store(true, Ordering::Release);
     let mut timelines = timelines().lock().map_err(|_| "ROCm device profile mutex 已损坏".to_owned())?;
-    let timeline = timelines.entry(device_id).or_default();
+    let timeline = timelines.entry((device_id, std::thread::current().id())).or_default();
     timeline.stage_batches += 1;
     timeline.detailed = detailed_eligible && timeline.stage_batches % DETAIL_SAMPLE_STRIDE == 1;
     let label = if timeline.detailed { "handoff" } else { "stage_total" };
@@ -153,7 +156,7 @@ pub(crate) fn device_profile_operator(device_id: i32, label: &'static str) -> Re
         return Ok(());
     }
     let mut timelines = timelines().lock().map_err(|_| "ROCm device profile mutex 已损坏".to_owned())?;
-    let Some(timeline) = timelines.get_mut(&device_id) else {
+    let Some(timeline) = timelines.get_mut(&(device_id, std::thread::current().id())) else {
         return Ok(());
     };
     if !timeline.detailed {
@@ -164,7 +167,7 @@ pub(crate) fn device_profile_operator(device_id: i32, label: &'static str) -> Re
 
 pub(crate) fn device_profile_stage_end(device_id: i32) -> Result<(), String> {
     let mut timelines = timelines().lock().map_err(|_| "ROCm device profile mutex 已损坏".to_owned())?;
-    let timeline = timelines.get_mut(&device_id).ok_or_else(|| format!("ROCm device={device_id} profile stage 尚未开始"))?;
+    let timeline = timelines.get_mut(&(device_id, std::thread::current().id())).ok_or_else(|| format!("ROCm device={device_id} profile stage 尚未开始"))?;
     record_locked(device_id, timeline, "pipeline_idle")?;
     timeline.detailed = false;
     timeline.stage_ends += 1;
@@ -175,7 +178,7 @@ pub(crate) fn device_profile_stage_end(device_id: i32) -> Result<(), String> {
 pub(crate) fn device_profile_scope_begin(device_id: i32, label: &'static str) -> Result<(), String> {
     ENABLED.store(true, Ordering::Release);
     let mut timelines = scope_timelines().lock().map_err(|_| "ROCm device scope profile mutex 已损坏".to_owned())?;
-    let timeline = timelines.entry(device_id).or_default();
+    let timeline = timelines.entry((device_id, std::thread::current().id())).or_default();
     if timeline.detailed {
         return Err(format!("ROCm device={device_id} profile scope 不允许嵌套"));
     }
@@ -191,7 +194,7 @@ pub(crate) fn device_profile_scope_operator(device_id: i32, label: &'static str)
         return Ok(());
     }
     let mut timelines = scope_timelines().lock().map_err(|_| "ROCm device scope profile mutex 已损坏".to_owned())?;
-    let timeline = timelines.get_mut(&device_id).ok_or_else(|| format!("ROCm device={device_id} profile scope 尚未开始"))?;
+    let timeline = timelines.get_mut(&(device_id, std::thread::current().id())).ok_or_else(|| format!("ROCm device={device_id} profile scope 尚未开始"))?;
     if !timeline.detailed {
         return Err(format!("ROCm device={device_id} profile scope 已结束"));
     }
@@ -200,7 +203,7 @@ pub(crate) fn device_profile_scope_operator(device_id: i32, label: &'static str)
 
 pub(crate) fn device_profile_scope_end(device_id: i32) -> Result<(), String> {
     let mut timelines = scope_timelines().lock().map_err(|_| "ROCm device scope profile mutex 已损坏".to_owned())?;
-    let timeline = timelines.get_mut(&device_id).ok_or_else(|| format!("ROCm device={device_id} profile scope 尚未开始"))?;
+    let timeline = timelines.get_mut(&(device_id, std::thread::current().id())).ok_or_else(|| format!("ROCm device={device_id} profile scope 尚未开始"))?;
     if !timeline.detailed {
         return Err(format!("ROCm device={device_id} profile scope 已结束"));
     }
@@ -223,9 +226,9 @@ pub(crate) fn report_device_profiles(rounds: usize, active: usize) {
         return;
     };
     let mut devices = timelines.keys().copied().collect::<Vec<_>>();
-    devices.sort_unstable();
-    for device_id in devices {
-        let timeline = timelines.get_mut(&device_id).expect("device profile 存在");
+    devices.sort_unstable_by_key(|(device, thread)| (*device, format!("{thread:?}")));
+    for (device_id, thread_id) in devices {
+        let timeline = timelines.get_mut(&(device_id, thread_id)).expect("device profile 存在");
         let result = set_device(device_id).and_then(|()| RocmRuntime::open().and_then(|runtime| drain_completed(device_id, timeline, runtime)));
         if let Err(error) = result {
             eprintln!("[device-profile-error] device={device_id} error={error}");
@@ -241,7 +244,7 @@ pub(crate) fn report_device_profiles(rounds: usize, active: usize) {
         let stages = timeline.stage_ends.saturating_sub(timeline.reported_stage_ends);
         let avg = |label| stat_delta(timeline, label).average_ms();
         eprintln!(
-            "[device-profile] rounds={rounds} active={active} device={device_id} stages={stages} busy_ms={busy_ms:.3} idle_ms={:.3} bubble_pct={bubble_pct:.2} stage_avg_ms={:.3} handoff_ms={:.3} handoff_copy_ms={:.3} input_expand_ms={:.3} attention_hc_ms={:.3} attn_qkv_ms={:.3} attn_compress_ms={:.3} attn_index_ms={:.3} attn_csa_ms={:.3} attn_out_ms={:.3} attention_merge_ms={:.3} ffn_hc_ms={:.3} moe_hash_ms={:.3} moe_score_ms={:.3} ffn_merge_hash_ms={:.3} ffn_merge_score_ms={:.3} layer_compact_ms={:.3} stage_stabilize_ms={:.3} stage_captures_ms={:.3} stage_tail_ms={:.3} glm_attention_ms={:.3} glm_attn_query_ms={:.3} glm_index_key_ms={:.3} glm_index_query_ms={:.3} glm_index_select_ms={:.3} glm_attn_kv_ms={:.3} glm_attn_mla_ms={:.3} glm_attn_out_ms={:.3} glm_ffn_ms={:.3} glm_dense_gate_up_ms={:.3} glm_dense_down_ms={:.3} glm_dense_residual_ms={:.3} moe_shared_ms={:.3} moe_routed_ms={:.3} moe_experts_ms={:.3} moe_epilogue_ms={:.3} glm_layer_tail_ms={:.3}",
+            "[device-profile] rounds={rounds} active={active} device={device_id} thread={thread_id:?} stages={stages} busy_ms={busy_ms:.3} idle_ms={:.3} bubble_pct={bubble_pct:.2} stage_avg_ms={:.3} handoff_ms={:.3} handoff_copy_ms={:.3} input_expand_ms={:.3} attention_hc_ms={:.3} attn_qkv_ms={:.3} attn_compress_ms={:.3} attn_index_ms={:.3} attn_csa_ms={:.3} attn_out_ms={:.3} attention_merge_ms={:.3} ffn_hc_ms={:.3} moe_hash_ms={:.3} moe_score_ms={:.3} ffn_merge_hash_ms={:.3} ffn_merge_score_ms={:.3} layer_compact_ms={:.3} stage_stabilize_ms={:.3} stage_captures_ms={:.3} stage_tail_ms={:.3} glm_attention_ms={:.3} glm_attn_query_ms={:.3} glm_index_key_ms={:.3} glm_index_query_ms={:.3} glm_index_select_ms={:.3} glm_attn_kv_ms={:.3} glm_attn_mla_ms={:.3} glm_attn_out_ms={:.3} glm_ffn_ms={:.3} glm_dense_gate_up_ms={:.3} glm_dense_down_ms={:.3} glm_dense_residual_ms={:.3} moe_shared_ms={:.3} moe_routed_ms={:.3} moe_experts_ms={:.3} moe_epilogue_ms={:.3} glm_layer_tail_ms={:.3}",
             idle.total_ms,
             if stages == 0 { 0.0 } else { busy_ms / stages as f64 },
             avg("handoff"),
@@ -295,9 +298,9 @@ fn report_scope_profiles(rounds: usize, active: usize) {
         return;
     };
     let mut devices = timelines.keys().copied().collect::<Vec<_>>();
-    devices.sort_unstable();
-    for device_id in devices {
-        let timeline = timelines.get_mut(&device_id).expect("device scope profile 存在");
+    devices.sort_unstable_by_key(|(device, thread)| (*device, format!("{thread:?}")));
+    for (device_id, thread_id) in devices {
+        let timeline = timelines.get_mut(&(device_id, thread_id)).expect("device scope profile 存在");
         let result = set_device(device_id).and_then(|()| RocmRuntime::open().and_then(|runtime| drain_completed(device_id, timeline, runtime)));
         if let Err(error) = result {
             eprintln!("[device-scope-profile-error] device={device_id} error={error}");
@@ -310,9 +313,66 @@ fn report_scope_profiles(rounds: usize, active: usize) {
             if stat.count == 0 {
                 continue;
             }
-            eprintln!("[device-scope-profile] rounds={rounds} active={active} device={device_id} label={label} count={} total_ms={:.3} avg_ms={:.3} max_ms={:.3}", stat.count, stat.total_ms, stat.average_ms(), stat.max_ms,);
+            eprintln!(
+                "[device-scope-profile] rounds={rounds} active={active} device={device_id} thread={thread_id:?} label={label} count={} total_ms={:.3} avg_ms={:.3} max_ms={:.3}",
+                stat.count,
+                stat.total_ms,
+                stat.average_ms(),
+                stat.max_ms,
+            );
         }
         timeline.reported = timeline.stats.clone();
         timeline.reported_stage_ends = timeline.stage_ends;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn overlapping_profile_scopes_on_one_device_keep_thread_intervals_separate() {
+        enable_device_profile();
+        let barrier = std::sync::Barrier::new(2);
+        let ids = std::thread::scope(|scope| {
+            let handles = [("profile_a", "profile_a_tail"), ("profile_b", "profile_b_tail")]
+                .into_iter()
+                .map(|(label, tail)| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        let started = activate_compute_stream(0, 0).and_then(|()| device_profile_stage_begin(0, true)).and_then(|()| device_profile_scope_begin(0, label));
+                        // 两个 begin 必须都发生在任一 end 之前；即使旧实现拒绝第二个
+                        // begin，也先过 barrier，再失败，避免回归测试挂死。
+                        barrier.wait();
+                        started.unwrap();
+                        device_profile_scope_operator(0, tail).unwrap();
+                        device_profile_operator(0, tail).unwrap();
+                        device_profile_scope_end(0).unwrap();
+                        device_profile_stage_end(0).unwrap();
+                        (std::thread::current().id(), label, tail)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>()
+        });
+        super::super::synchronize_device(0, "profile overlap test").unwrap();
+        let runtime = RocmRuntime::open().unwrap();
+        for (id, label, tail) in ids {
+            let mut scopes = scope_timelines().lock().unwrap();
+            let timeline = scopes.get_mut(&(0, id)).unwrap();
+            drain_completed(0, timeline, runtime).unwrap();
+            assert_eq!(timeline.stats[label].count, 1);
+            assert_eq!(timeline.stats[tail].count, 1);
+            assert_eq!(timeline.stage_ends, 1);
+            assert!(!timeline.detailed);
+            drop(scopes);
+            let mut stages = timelines().lock().unwrap();
+            let timeline = stages.get_mut(&(0, id)).unwrap();
+            drain_completed(0, timeline, runtime).unwrap();
+            assert_eq!(timeline.stats[tail].count, 1);
+            assert_eq!(timeline.stage_ends, 1);
+        }
+        ENABLED.store(false, Ordering::Release);
     }
 }

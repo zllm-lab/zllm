@@ -19,12 +19,13 @@ pub type RocmDsparkDraftBatch<'a> = Glm52DsparkDraftBatch<'a, RocmContext>;
 
 /// GPU proposal 保留完整 runtime；CPU proposal 只保留 aux norm 与 target K/V
 /// projector，避免同一份 drafter 的 Q/O/FFN/head 同时常驻 CPU 和 GPU。
-pub enum RocmDsparkRuntime {
+pub enum RocmGlmDraftRuntime {
     Full(Glm52DsparkRuntime<RocmContext>),
     Cache(Glm52DsparkCacheRuntime<RocmContext>),
+    Dflash2(super::dflash2_rocm::RocmDflash2Runtime),
 }
 
-impl RocmDsparkRuntime {
+impl RocmGlmDraftRuntime {
     pub fn load(
         backend: &RocmContext,
         root: &Path,
@@ -45,6 +46,7 @@ impl RocmDsparkRuntime {
         match self {
             Self::Full(runtime) => runtime.capture_count(),
             Self::Cache(runtime) => runtime.capture_count(),
+            Self::Dflash2(runtime) => runtime.model.config().target_layer_ids.len(),
         }
     }
 
@@ -52,6 +54,7 @@ impl RocmDsparkRuntime {
         match self {
             Self::Full(runtime) => runtime.target_history_window(),
             Self::Cache(runtime) => runtime.target_history_window(),
+            Self::Dflash2(runtime) => Some(runtime.model.config().sliding_window),
         }
     }
 
@@ -59,6 +62,7 @@ impl RocmDsparkRuntime {
         match self {
             Self::Full(runtime) => runtime.target_layer_count(),
             Self::Cache(runtime) => runtime.target_layer_count(),
+            Self::Dflash2(runtime) => runtime.model.config().layer_count,
         }
     }
 
@@ -66,6 +70,7 @@ impl RocmDsparkRuntime {
         match self {
             Self::Full(runtime) => runtime.target_columns(),
             Self::Cache(runtime) => runtime.target_columns(),
+            Self::Dflash2(runtime) => runtime.model.config().kv_head_count * runtime.model.config().head_dim,
         }
     }
 
@@ -73,6 +78,7 @@ impl RocmDsparkRuntime {
         match self {
             Self::Full(runtime) => runtime.normalize_aux_hidden(backend, projected),
             Self::Cache(runtime) => runtime.normalize_aux_hidden(backend, projected),
+            Self::Dflash2(runtime) => runtime.model.normalize_target(backend, projected),
         }
     }
 
@@ -80,12 +86,14 @@ impl RocmDsparkRuntime {
         match self {
             Self::Full(runtime) => runtime.warm_target_cache(backend, cache, target_hidden, target_position),
             Self::Cache(runtime) => runtime.warm_target_cache(backend, cache, target_hidden, target_position),
+            Self::Dflash2(runtime) => runtime.warm_target_cache(backend, cache, target_hidden, target_position),
         }
     }
 
-    pub fn draft_batch(&self, backend: &RocmContext, batch: &mut [RocmDsparkDraftBatch<'_>]) -> Result<(), BackendError> {
+    pub fn draft_batch(&self, backend: &RocmContext, batch: &mut [RocmDsparkDraftBatch<'_>], embedding: Option<&Arc<crate::kernel::rocm::hip::DeviceBuffer>>, lm_head: &RocmWeight) -> Result<(), BackendError> {
         match self {
             Self::Full(runtime) => runtime.draft_batch(backend, batch),
+            Self::Dflash2(runtime) => runtime.draft_batch(backend, batch, embedding.ok_or_else(|| compute("DFlash2 缺少 target resident embedding"))?, lm_head),
             Self::Cache(_) => Err(BackendError::Compute { msg: "CPU DSpark cache runtime 不能执行 GPU proposal".to_owned() }),
         }
     }
@@ -142,7 +150,7 @@ pub fn attach_dspark_projections_reusing(
 
 pub struct RocmDsparkProjection {
     pub boundary: usize,
-    weight: RocmWeight,
+    pub(super) weight: RocmWeight,
 }
 
 impl RocmDsparkProjection {

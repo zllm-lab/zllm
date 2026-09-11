@@ -800,6 +800,7 @@ pub struct Bf16DsaWorkspace {
 }
 
 impl Bf16DsaWorkspace {
+    #[cfg(feature = "with-rocm")]
     pub(crate) fn scores(&self) -> &[u32] {
         &self.scores
     }

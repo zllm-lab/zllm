@@ -20,10 +20,10 @@ pub mod attention;
 pub mod diffusion;
 pub mod fp8;
 pub mod grouped;
-pub mod qsa;
 pub mod linear;
 pub mod mlx_affine;
 pub mod nvfp4;
+pub mod qsa;
 pub mod routing;
 pub mod tensor;
 pub mod vae;
@@ -44,8 +44,22 @@ static KERNELS: OnceLock<String> = OnceLock::new();
 /// 每个模块自己负责自己的 SHADERS const(代码就近原则),这里只是把它们
 /// 拼起来给 `CudaContext::new` 用。原 `kernels.rs` 已被删除。
 pub fn kernels_source() -> &'static str {
-    let parts: [&str; 14] =
-        [PREAMBLE_SHADERS, attention::SHADERS, diffusion::SHADERS, fp8::SHADERS, grouped::SHADERS, qsa::SHADERS, linear::SHADERS, mlx_affine::SHADERS, nvfp4::SHADERS, routing::SHADERS, tensor::SHADERS, vae::SHADERS, w4a16::SHADERS, w8a16::SHADERS];
+    let parts: [&str; 14] = [
+        PREAMBLE_SHADERS,
+        attention::SHADERS,
+        diffusion::SHADERS,
+        fp8::SHADERS,
+        grouped::SHADERS,
+        qsa::SHADERS,
+        linear::SHADERS,
+        mlx_affine::SHADERS,
+        nvfp4::SHADERS,
+        routing::SHADERS,
+        tensor::SHADERS,
+        vae::SHADERS,
+        w4a16::SHADERS,
+        w8a16::SHADERS,
+    ];
     KERNELS
         .get_or_init(|| {
             let total: usize = parts.iter().map(|s| s.len()).sum();

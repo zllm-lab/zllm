@@ -1485,13 +1485,14 @@ impl ExpertPrefillBackend for RocmContext {
             crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
         };
         let peer_device = operator.context.device_id;
+        let peer_stream = operator.context.compute_stream;
         let local_routed = experts.gguf_routed_grouped(self.device_id, layer)?.clone();
         let remote_routed = experts.gguf_routed_grouped(peer_device, layer)?.clone();
         let remote_shared = experts.gguf_grouped.get(&(peer_device, layer)).and_then(|layer| layer.shared.as_ref()).cloned().ok_or_else(|| compute_error(format!("L{layer} operator pair peer shared metas 缺失")))?;
         // hidden replica 是上一算子的输出；peer stream 完成本层前必须保活，不能
         // 依赖 owner 线程何时丢弃 RocmTensor 外壳。
         worker.retain_for_stage(vec![replica.device.clone()])?;
-        let (local_partial, peer_partial) = if rows == 1 {
+        let (local_partial, peer_partial) = if rows == 1 || rows >= 16 {
             // shared 不依赖 router。peer 只生成专家所需的 BF16 norm，并先在
             // shared stream 排完整 shared expert；owner 同时完成唯一一份 router。
             let peer_shared_ticket = worker.submit(move |peer| {
@@ -1525,8 +1526,8 @@ impl ExpertPrefillBackend for RocmContext {
             let route_weights = Arc::new(route.weights);
             let (peer_input, peer_main_stream, peer_shared_stream, peer_shared) = peer_shared_ticket.wait()?;
 
-            // route 表每层只有 top-k 个 id/weight。显式指定 peer worker 的 main
-            // stream，令 tiny P2P 在 owner routed 与 peer shared 之间穿过，不引入
+            // route 表只传每行 top-k 个 id/weight，prefill 也无需在 peer 重算
+            // router。显式指定 peer worker 的 main stream，使 P2P 与 shared 重叠，不引入
             // host/device 同步，也不依赖 owner 线程残留的跨卡 TLS stream 映射。
             let owner_stream = ops::hip::active_compute_stream() as usize;
             ops::hip::activate_compute_stream(peer_device, peer_main_stream).map_err(compute_error)?;
@@ -1536,20 +1537,32 @@ impl ExpertPrefillBackend for RocmContext {
                 ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&route_sources, peer_device, self.device_id).map_err(|error| compute_error(format!("L{layer} operator route owner->peer: {error}")))?;
             ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
 
-            let local_output = ops::hip::DeviceBuffer::allocate_reusable(self.device_id, rows * cols * std::mem::size_of::<f32>()).map_err(compute_error)?;
-            ops::hip::try_gguf_fused_decode_experts(self.device_id, &expert_input, rows, cols, half_intermediate, top_k, &route_ids, &route_weights, route_count, &local_routed, &local_output).map_err(compute_error)?;
-            let local_output = if local_output.is_async_allocated() { local_output.copy_to_stable_deferred().map_err(compute_error)? } else { local_output };
-
+            // peer routed 与 owner routed 没有数据依赖。先投递 peer，避免
+            // owner 等待 grouped workspace 槽位时，peer 只跑完 shared 后空等。
             let peer_ticket = worker.submit(move |peer| {
                 peer.activate().map_err(compute_error)?;
                 let [peer_route_ids, peer_route_weights]: [ops::hip::DeviceBuffer; 2] = peer_routes.try_into().map_err(|_| compute_error(format!("L{layer} operator peer route 数量异常")))?;
-                let routed = ops::hip::DeviceBuffer::allocate_reusable(peer.device_id, rows * cols * std::mem::size_of::<f32>()).map_err(compute_error)?;
-                ops::hip::try_gguf_fused_decode_experts(peer.device_id, &peer_input, rows, cols, half_intermediate, top_k, &peer_route_ids, &peer_route_weights, route_count, &remote_routed, &routed).map_err(compute_error)?;
+                let routed = if route_count <= 64 {
+                    let output = ops::hip::DeviceBuffer::allocate_reusable(peer.device_id, rows * cols * std::mem::size_of::<f32>()).map_err(compute_error)?;
+                    ops::hip::try_gguf_fused_decode_experts(peer.device_id, &peer_input, rows, cols, half_intermediate, top_k, &peer_route_ids, &peer_route_weights, route_count, &remote_routed, &output).map_err(compute_error)?;
+                    output
+                } else {
+                    ops::hip::try_gguf_grouped_wmma_experts(peer.device_id, &peer_input, rows, cols, half_intermediate, top_k, &peer_route_ids, &peer_route_weights, route_count, &remote_routed, num_experts).map_err(compute_error)?
+                };
                 ops::hip::order_stream_after(peer.device_id, peer_shared_stream, peer_main_stream).map_err(compute_error)?;
                 let combined = ops::hip::try_add_resident_f32(peer.device_id, &routed, &peer_shared, rows * cols, 1.0).map_err(compute_error)?;
                 let combined = if combined.is_async_allocated() { combined.copy_to_stable_deferred().map_err(compute_error)? } else { combined };
                 Ok(Arc::new(combined))
             })?;
+            let local_output = if route_count <= 64 {
+                let output = ops::hip::DeviceBuffer::allocate_reusable(self.device_id, rows * cols * std::mem::size_of::<f32>()).map_err(compute_error)?;
+                ops::hip::try_gguf_fused_decode_experts(self.device_id, &expert_input, rows, cols, half_intermediate, top_k, &route_ids, &route_weights, route_count, &local_routed, &output).map_err(compute_error)?;
+                output
+            } else {
+                ops::hip::try_gguf_grouped_wmma_experts(self.device_id, &expert_input, rows, cols, half_intermediate, top_k, &route_ids, &route_weights, route_count, &local_routed, num_experts).map_err(compute_error)?
+            };
+            let local_output = if local_output.is_async_allocated() { local_output.copy_to_stable_deferred().map_err(compute_error)? } else { local_output };
+
             worker.retain_for_stage(route_sources)?;
             (Arc::new(local_output), peer_ticket.wait()?)
         } else {
@@ -1581,6 +1594,21 @@ impl ExpertPrefillBackend for RocmContext {
             let local_partial = self.operator_gguf_moe_partial(layer, &route_input, &expert_input, weights.router, weights.bias, &local_routed, None, rows, cols, half_intermediate, num_experts, top_k, scoring, scaling)?;
             (local_partial, peer_ticket.wait()?)
         };
+        if (rows * cols).is_multiple_of(4) {
+            let residual = hidden.device.as_deref().ok_or_else(|| compute_error(format!("L{layer} operator owner residual 缺失")))?;
+            let owner_stream = ops::hip::active_compute_stream() as usize;
+            ops::hip::activate_compute_stream(peer_device, peer_stream).map_err(compute_error)?;
+            ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
+            // 两边 producer 都已提交；沿用双向 event 保序，直接读对端 partial，
+            // 不再物化 P2P 副本，也不为归并再往返一次 peer worker。
+            let (owner_output, peer_output) = ops::hip::DeviceBuffer::join_peer_partials_residual_ordered_async_retained_by(
+                &local_partial, &peer_partial, residual, &peer_residual, rows * cols, self.device_id,
+            ).map_err(|error| compute_error(format!("L{layer} operator MoE direct join: {error}")))?;
+            worker.retain_for_stage(vec![local_partial, peer_partial])?;
+            let mut output = device_tensor_f32(owner_output, rows, cols);
+            output.replica = Some(RocmTensorReplica { device_id: peer_device, dtype: RocmTensorDType::F32, device: Arc::new(peer_output) });
+            return Ok(Some(output));
+        }
         let (mut owner_on_peer, mut peer_on_owner) = ops::hip::DeviceBuffer::exchange_stable_groups_ordered_async_retained_by(&[local_partial.clone()], &[peer_partial.clone()], self.device_id)
             .map_err(|error| compute_error(format!("L{layer} operator pair MoE partial exchange: {error}")))?;
         let owner_on_peer = owner_on_peer.pop().ok_or_else(|| compute_error(format!("L{layer} operator pair MoE owner partial->peer 缺失")))?;
@@ -1589,23 +1617,14 @@ impl ExpertPrefillBackend for RocmContext {
         let peer_partial_for_join = peer_partial.clone();
         let peer_join = worker.submit(move |peer| {
             peer.activate().map_err(compute_error)?;
-            // partial 已落本卡；融合归并只省中间 sum，原跨卡事件不变。
-            let output = if (rows * cols).is_multiple_of(4) {
-                ops::hip::try_peer_join_residual_f32(peer.device_id, &peer_partial_for_join, &owner_on_peer, &peer_residual, rows * cols).map_err(compute_error)?
-            } else {
-                let sum = ops::hip::try_add_resident_f32(peer.device_id, &peer_partial_for_join, &owner_on_peer, rows * cols, 1.0).map_err(compute_error)?;
-                ops::hip::try_add_resident_f32(peer.device_id, &sum, &peer_residual, rows * cols, 1.0).map_err(compute_error)?
-            };
+            let sum = ops::hip::try_add_resident_f32(peer.device_id, &peer_partial_for_join, &owner_on_peer, rows * cols, 1.0).map_err(compute_error)?;
+            let output = ops::hip::try_add_resident_f32(peer.device_id, &sum, &peer_residual, rows * cols, 1.0).map_err(compute_error)?;
             Ok(Arc::new(output))
         })?;
         let residual = f32_tensor(self, hidden)?;
         let residual = residual.device.as_deref().ok_or_else(|| compute_error(format!("L{layer} operator pair owner residual 缺失")))?;
-        let owner_output = if (rows * cols).is_multiple_of(4) {
-            ops::hip::try_peer_join_residual_f32(self.device_id, &local_partial, &peer_on_owner, residual, rows * cols).map_err(compute_error)?
-        } else {
-            let owner_sum = ops::hip::try_add_resident_f32(self.device_id, &local_partial, &peer_on_owner, rows * cols, 1.0).map_err(compute_error)?;
-            ops::hip::try_add_resident_f32(self.device_id, &owner_sum, residual, rows * cols, 1.0).map_err(compute_error)?
-        };
+        let owner_sum = ops::hip::try_add_resident_f32(self.device_id, &local_partial, &peer_on_owner, rows * cols, 1.0).map_err(compute_error)?;
+        let owner_output = ops::hip::try_add_resident_f32(self.device_id, &owner_sum, residual, rows * cols, 1.0).map_err(compute_error)?;
         let mut output = device_tensor_f32(owner_output, rows, cols);
         output.replica = Some(RocmTensorReplica { device_id: peer_device, dtype: RocmTensorDType::F32, device: peer_join.wait()? });
         Ok(Some(output))
@@ -1629,14 +1648,28 @@ impl ExpertPrefillBackend for RocmContext {
         sine: &[f32],
         spec: &crate::attention::dsa::DsaSpec,
     ) -> Result<bool, BackendError> {
-        if spec.kpool != 0 || !self.supports_cooperative_mla_prefill(layer, experts) || !super::attention::supports_dsa_fused_prologue(state, keys, norm_weight, norm_bias) {
+        if spec.kpool != 0 || !super::attention::supports_dsa_fused_prologue(state, keys, norm_weight, norm_bias) {
             return Ok(false);
         }
         let Some(norm_weight) = norm_weight.resident().map(Arc::as_ref) else { return Ok(false) };
         let Some(norm_bias) = norm_bias.resident().map(Arc::as_ref) else { return Ok(false) };
-        let (peer, _) = experts.cooperative_mla_layer(layer)?;
-        state.append_cooperative_layernorm_rope(self, &peer, layer, position, keys, norm_weight, norm_bias, eps, spec.rope_dim, spec.rotary_layout, cosine, sine)?;
-        Ok(true)
+        if self.supports_cooperative_mla_prefill(layer, experts) {
+            let (peer, _) = experts.cooperative_mla_layer(layer)?;
+            state.append_cooperative_layernorm_rope(self, &peer, layer, position, keys, norm_weight, norm_bias, eps, spec.rope_dim, spec.rotary_layout, cosine, sine)?;
+            return Ok(true);
+        }
+        // parallel operator pair:DSA key 按 block 奇偶分半到 owner/peer(BlockParity),
+        // 让 select 在两张卡各扫一半历史再归并,复用 peer 等待 selection 的空闲窗口。
+        if self.supports_parallel_mla_prefill(layer, experts) {
+            let (operator, _) = experts.operator_mla_layer(layer)?;
+            let peer = operator.context;
+            state.ensure_sequence_shard_peer(self, &peer, layer)?;
+            // 注入 pair worker:decode 侧 BlockParity select 需要它提交 peer kernel。
+            state.bind_sequence_shard_worker(operator.worker.clone());
+            state.append_cooperative_layernorm_rope(self, &peer, layer, position, keys, norm_weight, norm_bias, eps, spec.rope_dim, spec.rotary_layout, cosine, sine)?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn cooperative_dsa_select_prefill(
@@ -1648,11 +1681,20 @@ impl ExpertPrefillBackend for RocmContext {
         head_weights: &Self::Tensor,
         spec: &crate::attention::dsa::DsaSpec,
     ) -> Result<bool, BackendError> {
-        if spec.kpool != 0 || !self.supports_cooperative_mla_prefill(layer, experts) {
+        if spec.kpool != 0 {
             return Ok(false);
         }
-        let (peer, _) = experts.cooperative_mla_layer(layer)?;
-        state.select_prefill_cooperative(self, &peer, layer, query, head_weights)
+        if self.supports_cooperative_mla_prefill(layer, experts) {
+            let (peer, _) = experts.cooperative_mla_layer(layer)?;
+            return state.select_prefill_cooperative(self, &peer, layer, query, head_weights);
+        }
+        // parallel operator pair:peer 的 select kernel 必须经 pair worker 线程,
+        // 走 select_sequence_sharded_parallel(owner/peer 各扫一半历史后归并)。
+        if self.supports_parallel_mla_prefill(layer, experts) {
+            let (operator, _) = experts.operator_mla_layer(layer)?;
+            return state.select_sequence_sharded_parallel(self, operator, layer, query, head_weights);
+        }
+        Ok(false)
     }
 
     fn cooperative_dsa_project_select_prefill(
@@ -2867,7 +2909,7 @@ pub struct RocmPrefillExperts {
     /// 按输入列拆；与 sequence-parallel cooperative 权重完全分开。
     operator_mla: HashMap<usize, RocmOperatorMlaWeights>,
     /// peer 独立执行 post-attention RMSNorm/router 所需的小权重。
-    operator_moe: HashMap<usize, RocmOperatorMoeWeights>,
+    operator_moe: HashMap<usize, Arc<RocmOperatorMoeWeights>>,
     /// dense MLP 沿中间维拆分后的 gate/up/down，以及 peer 侧 norm。
     operator_dense: HashMap<usize, RocmOperatorDenseWeights>,
     /// sequence-parallel attention 的 q_b/kv_b/o_proj 在两卡完整驻留。两边
@@ -2896,6 +2938,15 @@ pub(super) struct RocmOperatorPendingQuery {
     pub(super) owner_query_stream: usize,
 }
 
+#[cfg(test)]
+impl RocmOperatorPeer {
+    /// 仅测试:绕过 GGUF/CT archive,直接以 peer context + pair worker 构造,
+    /// 供 DSA sequence-shard 并行 select 的双卡单元测试使用。
+    pub(super) fn for_tests(context: RocmContext) -> Result<Self, BackendError> {
+        Ok(Self { context, worker: super::RocmPairWorker::new(context)?, pending_queries: Arc::new(std::sync::Mutex::new(HashMap::new())) })
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct RocmOperatorMlaWeights {
     pub(super) owner_q_b: RocmWeight,
@@ -2906,7 +2957,6 @@ pub(super) struct RocmOperatorMlaWeights {
     pub(super) peer_o: RocmWeight,
 }
 
-#[derive(Clone)]
 pub(super) struct RocmOperatorMoeWeights {
     pub(super) post_attn_norm: RocmWeight,
     pub(super) router: RocmWeight,
@@ -3185,11 +3235,12 @@ impl RocmPrefillExperts {
         if self.operator_peer.is_none() {
             return Err(compute_error(format!("L{layer} operator MoE 缺少 peer")));
         }
-        self.operator_moe.insert(layer, RocmOperatorMoeWeights { post_attn_norm, router, bias });
+        // worker 只读这组常驻权重；逐次 clone Dense router 会复制整张 host 矩阵。
+        self.operator_moe.insert(layer, Arc::new(RocmOperatorMoeWeights { post_attn_norm, router, bias }));
         Ok(())
     }
 
-    pub(super) fn operator_moe_layer(&self, layer: usize) -> Result<(&RocmOperatorPeer, &RocmOperatorMoeWeights), BackendError> {
+    pub(super) fn operator_moe_layer(&self, layer: usize) -> Result<(&RocmOperatorPeer, &Arc<RocmOperatorMoeWeights>), BackendError> {
         let peer = self.operator_peer()?;
         let weights = self.operator_moe.get(&layer).ok_or_else(|| compute_error(format!("L{layer} operator MoE 权重缺失")))?;
         Ok((peer, weights))

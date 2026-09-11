@@ -58,14 +58,14 @@ pub struct DsparkTargetProjector<W> {
     pub rms_eps: f32,
 }
 
-struct DsparkLayerTargetCache<T> {
-    start_position: usize,
-    key: T,
-    value: T,
+pub(crate) struct DsparkLayerTargetCache<T> {
+    pub(crate) start_position: usize,
+    pub(crate) key: T,
+    pub(crate) value: T,
 }
 
 pub struct DsparkTargetCache<T> {
-    layers: Vec<Option<DsparkLayerTargetCache<T>>>,
+    pub(crate) layers: Vec<Option<DsparkLayerTargetCache<T>>>,
 }
 
 /// 设备无关的 target cache 快照；具体 tensor 编码由持久化边界决定。
@@ -448,7 +448,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn update_target_cache_weights<B>(
+pub(crate) fn update_target_cache_weights<B>(
     backend: &B,
     k_proj: &B::Weight,
     k_norm: &B::Weight,

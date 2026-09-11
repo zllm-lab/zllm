@@ -3,6 +3,8 @@
 use std::time::Instant;
 
 pub mod cpu;
+#[cfg(all(target_os = "linux", feature = "with-rocm"))]
+pub mod dflash2_rocm;
 pub mod dspark;
 #[cfg(any(test, all(target_os = "linux", feature = "with-rocm")))]
 #[cfg_attr(test, allow(dead_code))]

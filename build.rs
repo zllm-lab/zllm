@@ -39,5 +39,20 @@ fn main() {
     // 若要对接手机系统自带旧 QAIRT(≤2.29,core 2.22),用该环境变量降级。
     let minor = env::var("ZLLM_QNN_CORE_API_MINOR").unwrap_or_else(|_| "28".to_owned());
     copy_qnn_headers(&source, &out, &minor);
-    cc::Build::new().cpp(true).std("c++17").include(out).file("src/backend/qnn/qnn_linear.cpp").flag_if_supported("-fno-exceptions").compile("zllm_qnn");
+    cc::Build::new().cpp(true).std("c++17").include(&out).file("src/backend/qnn/qnn_linear.cpp").flag_if_supported("-fno-exceptions").compile("zllm_qnn");
+    // 设备侧 HTP 引擎(trace 解释器 / decode / prefill / ASR):源码使用 C++ 异常,
+    // 与上面的 no-exceptions FFI shim 分开编译。引擎只依赖 QNN header,架构差异
+    // (V73/V75/V79)全部由运行期配置与部署产物承载,不进入编译期。
+    let engine = [
+        "src/backend/qnn/htp_trace.cpp",
+        "src/runtime/minicpm5/qnn_decode.cpp",
+        "src/runtime/minicpm5/qnn_prefill.cpp",
+        "src/runtime/sensevoice/qnn_asr.cpp",
+    ];
+    for file in &engine {
+        println!("cargo:rerun-if-changed={file}");
+    }
+    let mut build = cc::Build::new();
+    build.cpp(true).std("c++17").include(out).include("src/backend/qnn").files(engine);
+    build.compile("zllm_qnn_htp");
 }

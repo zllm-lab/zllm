@@ -195,6 +195,7 @@ where
     let layers = &state.layers;
     let cache = &mut state.cache;
     let dsa = &mut state.dsa;
+    backend.set_stage_cache_decode(cache, state.decode_active)?;
     let mut experts = state.experts.lock().map_err(|_| BackendError::Compute { msg: format!("distributed stage {} expert 锁中毒", backend.stage_label()) })?;
     let projectors = &state.hidden_projectors;
     let setup_micros = total_started.map_or(0, |started| started.elapsed().as_micros());
@@ -421,6 +422,7 @@ where
         if state.backend.stage_label() != backend_label || state.layer_start != layer_start || state.layers.len() != layers.len() {
             return Err(BackendError::Compute { msg: format!("GLM stage microbatch session={session} placement 不一致") });
         }
+        backend.set_stage_cache_decode(&mut state.cache, value.decode || value.verify)?;
         if let Some(rows) = value.truncate_to {
             state.backend.truncate_stage_state(&mut state.cache, &mut state.dsa, rows).map_err(|error| BackendError::Compute { msg: format!("GLM batch stage={stage} session={session} position={position} truncate={rows}: {error:?}") })?;
         }

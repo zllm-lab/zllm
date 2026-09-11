@@ -131,7 +131,7 @@ impl MiniCpm5CpuEngine {
                 output.stop();
                 break;
             }
-            let bytes = self.detokenizer.decode_bytes(&[token], true).map_err(|error| format!("MiniCPM5 detokenize {token}: {error}"))?;
+            let bytes = crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| format!("MiniCPM5 detokenize {token}: {error}"))?;
             if !output.push(&bytes, |chunk| on_token(token, chunk)) {
                 break;
             }

@@ -6,16 +6,23 @@
 //! 层真正持有 KV,显存预算由 expert_cache_gib 让位(默认 4GiB)。
 
 use crate::{
-    backend::{Backend, cuda::{CudaContext, CudaContextOptions, CudaPrefillExperts, CudaTensor, CudaWeight}},
+    backend::{
+        Backend,
+        cuda::{CudaContext, CudaContextOptions, CudaPrefillExperts, CudaTensor, CudaWeight},
+    },
     config::{CudaBackendConfig, Qwen4ExpNodeModelConfig},
     kv_cache::terminal_cache::TerminalInfo,
-    moe::{expert_predictor::{ExpertPredictorConfig, ExpertPredictorWeights}, prefill::prefill_experts_untraced, topk_moe::{MoeFfnRef, SharedExpertRef}},
-    weight::expert_source::ExpertSourceProvider,
+    moe::{
+        expert_predictor::{ExpertPredictorConfig, ExpertPredictorWeights},
+        prefill::prefill_experts_untraced,
+        topk_moe::{MoeFfnRef, SharedExpertRef},
+    },
     runtime::{
         expert_pipeline::{ExpertDecodePipeline, ExpertDecodeRequest},
         qwen4exp::{Qwen4ExpGguf, Qwen4ExpHyperConnection, Qwen4ExpLayer},
         session::{AtomicCounterU64, GenerationOutput, GenerationSummary, NodeCapabilities, RuntimeStatus},
     },
+    weight::expert_source::ExpertSourceProvider,
 };
 
 fn moe_ref(weights: &Qwen4ExpLayer<CudaWeight>) -> SharedExpertRef<'_, CudaWeight> {
@@ -23,7 +30,10 @@ fn moe_ref(weights: &Qwen4ExpLayer<CudaWeight>) -> SharedExpertRef<'_, CudaWeigh
 }
 use half::f16;
 use serde_json::Value;
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 pub async fn run(model: Qwen4ExpNodeModelConfig, cuda: CudaBackendConfig, config: crate::server::node::NodeConfig) -> Result<(), crate::server::node::DynError> {
     let factory = Box::new(move |runtime, compute_steps| Qwen4ExpCudaEngine::load(model.clone(), &cuda, runtime, compute_steps).map(|engine| Box::new(engine) as Box<dyn crate::server::node::NodeEngine>));
@@ -76,13 +86,22 @@ impl Qwen4ExpCudaEngine {
         }
         let started = std::time::Instant::now();
         if model.execution.pin_experts {
-            // 驱动自有 pinned 驻留:文件直读进 cuMemAllocHost 内存,上传 DMA
-            // 直读零 memcpy。替代已移除的 cuMemHostRegister 注册堆直读快路
-            // (该快路被驱动侧写坏 glibc 堆,见 upload_u8_pinned 教训注释)。
-            let bytes = source.make_experts_resident_extern(&mut |len| backend.alloc_pinned_source_bytes(len))?;
+            // 驱动自有 pinned 驻留:单块分配 + 游标切片,上传 DMA 直读零
+            // memcpy。替代已移除的 cuMemHostRegister 注册堆直读快路(该快
+            // 路被驱动侧写坏 glibc 堆,见 upload_u8_pinned 教训注释);逐矩阵
+            // 分配的驱动调用开销曾占加载耗时 3/4。
+            let host_bytes: usize = source.reader().tensors().iter().filter(|t| t.name.contains("_exps.weight")).map(|t| t.bytes).sum();
+            let block = backend.alloc_pinned_source_block(host_bytes)?;
+            let mut cursor = 0usize;
+            let bytes = source.make_experts_resident_extern(&mut |len| {
+                let builder = block.view_builder(cursor, len)?;
+                cursor += len;
+                Ok(builder)
+            })?;
             for backing in source.resident_extern_backings() {
                 backend.retain_pinned_source(&backing)?;
             }
+            backend.finalize_pinned_sources()?;
             eprintln!("[qwen4exp-host-pinned] bytes={bytes}");
         } else {
             source.make_experts_resident()?;
@@ -168,7 +187,7 @@ impl Qwen4ExpCudaEngine {
         let mut anchor = target_sample(&hidden)?;
         let mut generated = 0usize;
         {
-            let bytes = self.detokenizer.decode_bytes(&[anchor], true).map_err(|error| format!("detokenize {anchor}: {error}"))?;
+            let bytes = crate::runtime::tool::decode_output_token(&self.detokenizer, anchor).map_err(|error| format!("detokenize {anchor}: {error}"))?;
             generated += 1;
             output.push(&bytes, |chunk| on_token(anchor, chunk));
         }
@@ -210,13 +229,15 @@ impl Qwen4ExpCudaEngine {
             let mut inputs = vec![anchor];
             inputs.extend_from_slice(&candidates);
             let verified = if inputs.len() == 1 {
-                state.forward(&self.backend, &self.cfg, &self.source, &self.layers, &self.rope, false, &inputs, position, &mut |layer, input| {
-                    let weights = &self.layers[layer];
-                    let shared = [SharedExpertRef { gate: &weights.moe.shared_gate, up: &weights.moe.shared_up, down: &weights.moe.shared_down, output_gate: Some(&weights.moe.shared_output_gate) }];
-                    let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
-                    let next = (layer + 1 < self.cfg.num_layers).then(|| self.source.source(layer + 1).map(|source| (layer + 1, source))).transpose().map_err(crate::backend::BackendError::ExpertLoad)?;
-                    experts.decode(&self.backend, &spec, &reference, ExpertDecodeRequest { layer, source: self.source.source(layer).map_err(crate::backend::BackendError::ExpertLoad)?, position, next }, input)
-                }).map_err(|error| error.to_string())?
+                state
+                    .forward(&self.backend, &self.cfg, &self.source, &self.layers, &self.rope, false, &inputs, position, &mut |layer, input| {
+                        let weights = &self.layers[layer];
+                        let shared = [SharedExpertRef { gate: &weights.moe.shared_gate, up: &weights.moe.shared_up, down: &weights.moe.shared_down, output_gate: Some(&weights.moe.shared_output_gate) }];
+                        let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
+                        let next = (layer + 1 < self.cfg.num_layers).then(|| self.source.source(layer + 1).map(|source| (layer + 1, source))).transpose().map_err(crate::backend::BackendError::ExpertLoad)?;
+                        experts.decode(&self.backend, &spec, &reference, ExpertDecodeRequest { layer, source: self.source.source(layer).map_err(crate::backend::BackendError::ExpertLoad)?, position, next }, input)
+                    })
+                    .map_err(|error| error.to_string())?
             } else {
                 verify_experts.swap_decode_state(experts.backend_state_mut());
                 let result = state.forward(&self.backend, &self.cfg, &self.source, &self.layers, &self.rope, false, &inputs, position, &mut |layer, input| {
@@ -240,7 +261,7 @@ impl Qwen4ExpCudaEngine {
             }
             hidden = self.backend.select_row(&verified, verification.retained_rows - 1).map_err(|error| error.to_string())?;
             for &token in &verification.tokens {
-                let bytes = self.detokenizer.decode_bytes(&[token], true).map_err(|error| format!("detokenize {token}: {error}"))?;
+                let bytes = crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| format!("detokenize {token}: {error}"))?;
                 generated += 1;
                 if !output.push(&bytes, |chunk| on_token(token, chunk)) {
                     return Ok(GenerationSummary { finish_reason: output.finish_reason().to_owned(), prompt_tokens: tokens.len(), completion_tokens: generated, cache: None, tool_calls: Vec::new() });
@@ -310,16 +331,33 @@ impl crate::server::node::NodeEngine for Qwen4ExpCudaEngine {
         // MTP 草稿每请求重建(与 bench 同生命周期):Mtp::new 仅组装
         // 权重引用与分配 KV arena;常驻 Mtp 的跨请求状态截断后仍有
         // arena/LRU 残留(实测二请求起 token probability 越界)。
-        let mut request_mtp = self.mtp_source.as_ref().map(|source| super::cuda_mtp::Mtp::new(&self.backend, source.clone(), self.model.max_sequence_length, self.model.execution.mtp_cache_gib as usize * 1024 * 1024 * 1024).map_err(|error| error.to_string())).transpose()?;
-        let mut mtp_previous = if request_mtp.is_some() { Some(CudaTensor::new_f32_residual(self.backend.stream().alloc_zeros::<f32>(self.cfg.hc_dim()).map_err(|e| format!("MTP 预热 hidden: {e:?}"))?, self.backend.placeholder_f16().map_err(|e| format!("MTP 占位: {e:?}"))?, 1, self.cfg.hc_dim())) } else { None };
+        let mut request_mtp = self
+            .mtp_source
+            .as_ref()
+            .map(|source| super::cuda_mtp::Mtp::new(&self.backend, source.clone(), self.model.max_sequence_length, self.model.execution.mtp_cache_gib as usize * 1024 * 1024 * 1024).map_err(|error| error.to_string()))
+            .transpose()?;
+        let mut mtp_previous = if request_mtp.is_some() {
+            Some(CudaTensor::new_f32_residual(
+                self.backend.stream().alloc_zeros::<f32>(self.cfg.hc_dim()).map_err(|e| format!("MTP 预热 hidden: {e:?}"))?,
+                self.backend.placeholder_f16().map_err(|e| format!("MTP 占位: {e:?}"))?,
+                1,
+                self.cfg.hc_dim(),
+            ))
+        } else {
+            None
+        };
         let mut residual = None;
         for (chunk_index, chunk) in tokens.chunks(chunk_size).enumerate() {
-            residual = Some(state.forward(&self.backend, &self.cfg, &self.source, &self.layers, &self.rope, false, chunk, chunk_index * chunk_size, &mut |layer, input| {
-                let weights = &self.layers[layer];
-                let shared = [moe_ref(weights)];
-                let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
-                prefill_experts_untraced(&self.backend, &spec, &reference, layer, &mut prefill_experts, input, None)
-            }).map_err(|error| error.to_string())?);
+            residual = Some(
+                state
+                    .forward(&self.backend, &self.cfg, &self.source, &self.layers, &self.rope, false, chunk, chunk_index * chunk_size, &mut |layer, input| {
+                        let weights = &self.layers[layer];
+                        let shared = [moe_ref(weights)];
+                        let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
+                        prefill_experts_untraced(&self.backend, &spec, &reference, layer, &mut prefill_experts, input, None)
+                    })
+                    .map_err(|error| error.to_string())?,
+            );
             if request_mtp.is_some() {
                 let mtp = request_mtp.as_mut().expect("checked");
                 let previous = mtp_previous.as_mut().expect("checked");
@@ -332,7 +370,14 @@ impl crate::server::node::NodeEngine for Qwen4ExpCudaEngine {
         }
         let mut experts = ExpertDecodePipeline::new(
             prefill_experts.into_decode_state(),
-            ExpertPredictorConfig { first_layer: 0, layer_count: self.cfg.num_layers, expert_count: self.cfg.num_experts, routed_top_k: self.cfg.num_experts_per_tok, prefetch_count: self.model.execution.expert_prefetch_count, weights: ExpertPredictorWeights::default() },
+            ExpertPredictorConfig {
+                first_layer: 0,
+                layer_count: self.cfg.num_layers,
+                expert_count: self.cfg.num_experts,
+                routed_top_k: self.cfg.num_experts_per_tok,
+                prefetch_count: self.model.execution.expert_prefetch_count,
+                weights: ExpertPredictorWeights::default(),
+            },
         )
         .map_err(|error| error.to_string())?;
         let residual = residual.expect("prefill 产出 residual");
@@ -350,7 +395,7 @@ impl crate::server::node::NodeEngine for Qwen4ExpCudaEngine {
             let (mixed, _) = super::cuda::hc_mix(&self.backend, &self.cfg, &hidden, &self.output_hc).map_err(|error| error.to_string())?;
             let logits = self.backend.linear(&mixed, &self.lm_head).map_err(|error| error.to_string())?;
             let token = self.backend.argmax(&logits).map_err(|error| error.to_string())?;
-            let bytes = self.detokenizer.decode_bytes(&[token], true).map_err(|error| format!("detokenize {token}: {error}"))?;
+            let bytes = crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| format!("detokenize {token}: {error}"))?;
             last_token = token;
             generated += 1;
             if !output.push(&bytes, |chunk| on_token(token, chunk)) {
@@ -364,17 +409,18 @@ impl crate::server::node::NodeEngine for Qwen4ExpCudaEngine {
                 break;
             }
             let position = tokens.len() + generated - 1;
-            let residual = state.forward(&self.backend, &self.cfg, &self.source, &self.layers, &self.rope, false, &[token], position, &mut |layer, input| {
-                let weights = &self.layers[layer];
-                let shared = [moe_ref(weights)];
-                let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
-                let next = (layer + 1 < self.cfg.num_layers).then(|| self.source.source(layer + 1).map(|source| (layer + 1, source))).transpose().map_err(crate::backend::BackendError::ExpertLoad)?;
-                experts.decode(&self.backend, &spec, &reference, ExpertDecodeRequest { layer, source: self.source.source(layer).map_err(crate::backend::BackendError::ExpertLoad)?, position, next }, input)
-            }).map_err(|error| error.to_string())?;
+            let residual = state
+                .forward(&self.backend, &self.cfg, &self.source, &self.layers, &self.rope, false, &[token], position, &mut |layer, input| {
+                    let weights = &self.layers[layer];
+                    let shared = [moe_ref(weights)];
+                    let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
+                    let next = (layer + 1 < self.cfg.num_layers).then(|| self.source.source(layer + 1).map(|source| (layer + 1, source))).transpose().map_err(crate::backend::BackendError::ExpertLoad)?;
+                    experts.decode(&self.backend, &spec, &reference, ExpertDecodeRequest { layer, source: self.source.source(layer).map_err(crate::backend::BackendError::ExpertLoad)?, position, next }, input)
+                })
+                .map_err(|error| error.to_string())?;
             hidden = self.backend.select_row(&residual, residual.rows - 1).map_err(|error| error.to_string())?;
         }
         output.finish(|chunk| on_token(last_token, chunk));
         Ok(GenerationSummary { finish_reason: output.finish_reason().to_owned(), prompt_tokens: tokens.len(), completion_tokens: generated, cache: None, tool_calls: Vec::new() })
     }
-
 }

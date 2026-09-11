@@ -164,7 +164,7 @@ impl Glm53FlashNodeEngine {
                             stop = true;
                             break;
                         }
-                        let bytes = self.detokenizer.decode_bytes(&[token], true).map_err(|error| format!("detokenize {token}: {error}"))?;
+                        let bytes = crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| format!("detokenize {token}: {error}"))?;
                         if !output.push(&bytes, |text| on_token(&request.request_id, token, text)) {
                             stop = true;
                             break;
@@ -213,7 +213,7 @@ impl Glm53FlashNodeEngine {
                         output.stop();
                         break;
                     }
-                    let bytes = self.detokenizer.decode_bytes(&[token.0], true).map_err(|error| format!("detokenize {}: {error}", token.0))?;
+                    let bytes = crate::runtime::tool::decode_output_token(&self.detokenizer, token.0).map_err(|error| format!("detokenize {}: {error}", token.0))?;
                     if !output.push(&bytes, |text| on_token(&request.request_id, token.0, text)) {
                         break;
                     }

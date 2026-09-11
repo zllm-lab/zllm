@@ -84,6 +84,8 @@ pub struct MetalContext {
     decode_batch_max_operations: AtomicU64,
     deferred_batch_max_operations: AtomicU64,
     decode_batch: Mutex<Option<DecodeCommandBatch>>,
+    /// 转录期复用的 scratch command buffer:从不提交,只为 encoder 创建提供宿主。
+    transcribe_command: Mutex<Option<CommandBuffer>>,
     /// 自上次 CB 提交以来分配的临时 buffer;flush 时移交 PendingMetalProfile,
     /// 在该 CB 完成前保持存活(防止 driver 在 CB 在飞时复用页面污染在飞读)。
     batch_keep_alive: Mutex<Vec<Buffer>>,
@@ -103,6 +105,8 @@ pub struct MetalContext {
     // decode CPU 成本打点:tensor 分配与提交路径的累计纳秒(原子,~ns 级开销)
     decode_alloc_nanoseconds: AtomicU64,
     decode_commit_nanoseconds: AtomicU64,
+    cb_nanoseconds: AtomicU64,
+    cb_new_nanoseconds: AtomicU64,
     submit_wait_nanoseconds: AtomicU64,
     gpu_nanoseconds: AtomicU64,
     inter_command_gap_nanoseconds: AtomicU64,
@@ -214,6 +218,7 @@ impl MetalContext {
             decode_batch_max_operations: AtomicU64::new(DECODE_BATCH_MAX_OPERATIONS),
             deferred_batch_max_operations: AtomicU64::new(DECODE_BATCH_MAX_OPERATIONS),
             decode_batch: Mutex::new(None),
+            transcribe_command: Mutex::new(None),
             batch_keep_alive: Mutex::new(Vec::new()),
             pending_profiles: Mutex::new(Vec::new()),
             resident_f16_weights: Mutex::new(HashMap::new()),
@@ -226,6 +231,8 @@ impl MetalContext {
             scratch_pool: Mutex::new(HashMap::new()),
             decode_alloc_nanoseconds: AtomicU64::new(0),
             decode_commit_nanoseconds: AtomicU64::new(0),
+            cb_nanoseconds: AtomicU64::new(0),
+            cb_new_nanoseconds: AtomicU64::new(0),
             submit_wait_nanoseconds: AtomicU64::new(0),
             gpu_nanoseconds: AtomicU64::new(0),
             inter_command_gap_nanoseconds: AtomicU64::new(0),
@@ -651,14 +658,37 @@ impl MetalContext {
 
     /// Decode 模式复用当前 batch；普通模式返回独立 command buffer。
     pub fn command_buffer(&self) -> CommandBuffer {
+        let started = std::time::Instant::now();
+        let result = self.command_buffer_inner();
+        self.cb_nanoseconds.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        result
+    }
+
+    fn command_buffer_inner(&self) -> CommandBuffer {
+        // 转录期不创建真 CB:逐算子创建+提交会在 IOGPU 槽位池上耗尽/卡死
+        // (真机复现于 minicpm5 replay 录制,~68 个 CB 后 new_command_buffer
+        // 永久阻塞)。复用一个从不提交的 scratch CB 承载 encoder 生命周期,
+        // 编码调用已被 Transcriber 拦截,不会有真实 GPU 工作。
+        if crate::backend::metal::api::Transcriber::is_active() {
+            let mut scratch = self.transcribe_command.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            return scratch.get_or_insert_with(|| self.queue.new_command_buffer().to_owned()).clone();
+        }
         if !self.defer_waits.load(Ordering::Acquire) {
             return self.queue.new_command_buffer().to_owned();
         }
         let mut batch = self.decode_batch.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if batch.is_none() {
-            *batch = Some(DecodeCommandBatch { command: self.queue.new_command_buffer().to_owned(), operations: 0, estimated_read_bytes: 0, estimated_write_bytes: 0, last_operator: String::new(), last_shape: String::new() });
+            let started = std::time::Instant::now();
+            let command = self.queue.new_command_buffer().to_owned();
+            self.cb_new_nanoseconds.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            *batch = Some(DecodeCommandBatch { command, operations: 0, estimated_read_bytes: 0, estimated_write_bytes: 0, last_operator: String::new(), last_shape: String::new() });
         }
         batch.as_ref().expect("decode batch 已创建").command.to_owned()
+    }
+
+    /// 诊断:command_buffer() 调用累计纳秒。
+    pub fn command_buffer_nanoseconds(&self) -> (u64, u64) {
+        (self.cb_nanoseconds.load(Ordering::Relaxed), self.cb_new_nanoseconds.load(Ordering::Relaxed))
     }
 
     /// Decode 的 GPU-only 算子按 queue 顺序提交，只在 router/最终 logits 的 CPU 读回边界等待。
@@ -758,6 +788,10 @@ impl MetalContext {
     }
 
     fn submit_profiled(&self, command: &CommandBufferRef, operator: &str, shape: &str, estimated_read_bytes: u64, estimated_write_bytes: u64) {
+        // 转录期没有真实 GPU 工作可提交;scratch CB 也不可重复提交。
+        if crate::backend::metal::api::Transcriber::is_active() {
+            return;
+        }
         // queue 按 FIFO 完成。提交新工作前无阻塞地回收队首已完成 CB，及时释放其
         // activation 保活引用；不能把这些 buffer 一直拖到整段 prefill 末尾。
         let completed = {
@@ -880,6 +914,18 @@ impl MetalContext {
 
     pub fn reset_gpu_stats(&self) {
         self.synchronize();
+        self.reset_gpu_stats_inner();
+        self.detailed_gpu_profiles.store(true, Ordering::Release);
+    }
+
+    /// 与 reset_gpu_stats 相同的计数清零,但不打开 detailed(那会让 begin_batch
+    /// 强制 1 op/CB 的诊断节奏)。生产节奏的 CB/gap 记账用它,避免测量改变
+    /// 被测系统。
+    pub fn reset_gpu_stats_preserve_mode(&self) {
+        self.reset_gpu_stats_inner();
+    }
+
+    fn reset_gpu_stats_inner(&self) {
         self.submit_wait_nanoseconds.store(0, Ordering::Relaxed);
         self.gpu_nanoseconds.store(0, Ordering::Relaxed);
         self.inter_command_gap_nanoseconds.store(0, Ordering::Relaxed);
@@ -887,7 +933,6 @@ impl MetalContext {
         self.completion_tail_nanoseconds.store(0, Ordering::Relaxed);
         self.command_buffers.store(0, Ordering::Relaxed);
         self.gpu_profiles.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
-        self.detailed_gpu_profiles.store(true, Ordering::Release);
     }
 
     pub fn gpu_stats(&self) -> MetalGpuStats {
@@ -937,5 +982,77 @@ impl crate::backend::MemoryPool for MetalContext {
 
     fn memory_bytes(&self, memory: &Self::Memory) -> u64 {
         memory.length()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MetalContext;
+
+    /// 诊断:decode 每 op 的 CPU 编码成本分解(encoder 创建/结束、pipeline 查找、
+    /// set_buffer、dispatch、shape format!)。`cargo test --release --lib metal_context_cpu_op_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn metal_context_cpu_op_cost() {
+        let ctx = MetalContext::new_default().unwrap();
+        let pipeline = ctx.pipeline("rms_norm_f16_in_f32_weight_f16").unwrap();
+        let buffer = ctx.shared_buffer_zeros(1536 * 2);
+        const N: usize = 2000;
+        // encoder 创建/结束
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let command = ctx.command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            encoder.end_encoding();
+        }
+        let encoder_pair = started.elapsed().as_nanos() as f64 / N as f64 / 1e3;
+        // 完整一次 dispatch(pipeline set + 4 buffer + dispatch + end)
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let command = ctx.command_buffer();
+            let encoder = command.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&pipeline);
+            for index in 0..4u64 {
+                encoder.set_buffer(index, Some(&buffer), 0);
+            }
+            encoder.dispatch_thread_groups(crate::backend::metal::api::MTLSize::new(1, 1, 1), crate::backend::metal::api::MTLSize::new(32, 1, 1));
+            encoder.end_encoding();
+        }
+        let full_encode = started.elapsed().as_nanos() as f64 / N as f64 / 1e3;
+        // pipeline 名字查找
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = ctx.pipeline("rms_norm_f16_in_f32_weight_f16").unwrap();
+        }
+        let pipeline_lookup = started.elapsed().as_nanos() as f64 / N as f64 / 1e3;
+        // shape 字符串构造(gemv dispatch 每 op 一次)
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = format!("input=[{},{}],weight=[{},{}],type={}", 1, 1536, 256, 1536, 12);
+        }
+        let shape_format = started.elapsed().as_nanos() as f64 / N as f64 / 1e3;
+        eprintln!(
+            "cpu/op(µs): encoder_new_end={encoder_pair:.2} full_encode={full_encode:.2} pipeline_lookup={pipeline_lookup:.2} shape_format={shape_format:.2}"
+        );
+        // deferred decode batch 模式下的 command_buffer() 复用路径
+        ctx.set_deferred_waits(true);
+        ctx.set_deferred_batch_max_operations(16);
+        let pipeline = ctx.pipeline("rms_norm_f16_in_f32_weight_f16").unwrap();
+        let started = std::time::Instant::now();
+        for step in 0..N {
+            let encoder = ctx.command_buffer().new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&pipeline);
+            encoder.set_buffer(0, Some(&buffer), 0);
+            encoder.dispatch_thread_groups(crate::backend::metal::api::MTLSize::new(1, 1, 1), crate::backend::metal::api::MTLSize::new(32, 1, 1));
+            encoder.end_encoding();
+            if step % 16 == 15 {
+                ctx.submit_batch();
+            }
+        }
+        ctx.submit_batch();
+        ctx.set_deferred_waits(false);
+        let deferred_full = started.elapsed().as_nanos() as f64 / N as f64 / 1e3;
+        let cb = ctx.command_buffer_nanoseconds().0 as f64 / N as f64 / 1e3;
+        eprintln!("cpu/op(deferred, µs): full={deferred_full:.2} command_buffer={cb:.2}");
     }
 }

@@ -90,7 +90,7 @@ mod real_weight_tests {
         let path = std::path::PathBuf::from(std::env::var("LAGUNA_GGUF").expect("LAGUNA_GGUF 指向 shard1 路径"));
         let reader = crate::weight::container::gguf::GgufReader::open(&path).expect("打开 GGUF");
         let template = reader.metadata("tokenizer.chat_template").and_then(crate::weight::container::gguf::GgufValue::as_str).expect("chat template");
-        let mut compiled = crate::runtime::chat_template::ChatTemplate::new(template).expect("编译模板");
+        let compiled = crate::runtime::chat_template::ChatTemplate::new(template).expect("编译模板");
         let prompt = compiled.render(&serde_json::json!({"messages": [{"role": "user", "content": "Write a Rust function that reverses a string."}], "enable_thinking": false})).expect("渲染 prompt");
         run(&path, &prompt, 4096, 10, LagunaRuntimeOptions::default()).expect("CPU 前向");
     }

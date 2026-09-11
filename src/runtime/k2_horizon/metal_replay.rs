@@ -196,7 +196,7 @@ fn attention_projection(
             metal_attention::gqa_kv_append_position_tensor(ctx, &view, &key, &value, decode_state, state_offset).map_err(compute_error)?;
             metal_attention::gqa_decode_attention_position_tensor(ctx, &query, &view, &config.gqa_spec(), decode_state, state_offset).map_err(compute_error)?
         }
-        crate::kv_cache::KvCacheFormat::Int8 => metal_attention::gqa_decode_attention_append_adaptive_q8_position_tensor(ctx, &query, &key, &value, &view, &config.gqa_spec(), decode_state, state_offset).map_err(compute_error)?,
+        crate::kv_cache::KvCacheFormat::Int8 => metal_attention::gqa_decode_attention_append_adaptive_q8_position_tensor(ctx, &query, &key, &value, &view, &config.gqa_spec(), decode_state, state_offset, 4).map_err(compute_error)?,
     };
     let gated = crate::kernel::metal::tensor::softplus_gate_scaled_tensor(ctx, &attended, &gate, std::f32::consts::LN_2, std::f32::consts::LOG2_E).map_err(compute_error)?;
     ctx.linear(&gated, &weights.output)

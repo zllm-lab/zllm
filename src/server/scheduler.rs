@@ -50,15 +50,37 @@ pub enum NodeMessage {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SchedulerMessage {
-    Registered { node_id: String, heartbeat_seconds: u64, task_ids: Vec<String> },
-    NewPrefill { request_id: String, model: String, request: Value },
-    Cancel { request_id: String },
-    NewTask { task_id: String, model: String, task_kind: String, request: Value },
-    ArtifactCommitted { task_id: String, artifact_id: String },
+    Registered {
+        node_id: String,
+        heartbeat_seconds: u64,
+        task_ids: Vec<String>,
+    },
+    NewPrefill {
+        request_id: String,
+        model: String,
+        request: Value,
+    },
+    Cancel {
+        request_id: String,
+    },
+    NewTask {
+        task_id: String,
+        model: String,
+        task_kind: String,
+        request: Value,
+    },
+    ArtifactCommitted {
+        task_id: String,
+        artifact_id: String,
+    },
     /// append 请求在 owner 满载排队期间 pin 终点 cache,节点换出循环跳过被 pin
     /// 条目,排到队时命中内存而不是 swap 慢路径;`UnpinCache` 解除。
-    PinCache { cache_id: String },
-    UnpinCache { cache_id: String },
+    PinCache {
+        cache_id: String,
+    },
+    UnpinCache {
+        cache_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -520,6 +542,8 @@ impl Scheduler {
             }
             let cached_nodes = cache_id
                 .map_or_else(Vec::new, |cache_id| state.nodes.iter().filter(|(_, node)| node.view.model == model && node.view.caches.iter().any(|cache| cache.cache_id == cache_id)).map(|(node_id, _)| node_id.clone()).collect::<Vec<_>>());
+            // 已有 cache 的 append 使用独立准入，节点再次检查真实命中；
+            // miss 重建仍走新 prompt 的四份预算，不能只凭客户端 cache_id 放行。
             let admission_pressure = if cached_nodes.is_empty() { 4 } else { 1 };
             // cache 已存在时只在持有者中选择：内存优先于本机 SSD；全部满载则排队，
             // 不 fallback 到无 cache 节点重算并制造第二个 writer。
@@ -606,14 +630,7 @@ impl Scheduler {
 
     /// 查 `cache_id` 的全部持有者节点及命令通道(`cache_owner` 只返回最早一个)。
     async fn cache_holders(&self, cache_id: &str) -> Vec<(String, NodeCommands)> {
-        self.state
-            .lock()
-            .await
-            .nodes
-            .iter()
-            .filter(|(_, node)| node.view.caches.iter().any(|cache| cache.cache_id == cache_id))
-            .map(|(node_id, node)| (node_id.clone(), node.commands.clone()))
-            .collect()
+        self.state.lock().await.nodes.iter().filter(|(_, node)| node.view.caches.iter().any(|cache| cache.cache_id == cache_id)).map(|(node_id, node)| (node_id.clone(), node.commands.clone())).collect()
     }
 
     /// 节点真实并发槽位暂满时等待流式 runtime 释放容量；模型未注册则立即返回。
@@ -626,8 +643,14 @@ impl Scheduler {
         let result = loop {
             match self.dispatch(request_id.clone(), model.clone(), cache_id, request.clone()).await {
                 Err(DispatchError::NoAvailableNode(_)) => {
-                    let model_registered = self.state.lock().await.nodes.values().any(|node| node.view.model == model);
-                    if !model_registered || tokio::time::Instant::now() >= deadline {
+                    let (model_registered, cache_hit) = {
+                        let state = self.state.lock().await;
+                        let mut nodes = state.nodes.values().filter(|node| node.view.model == model).peekable();
+                        let registered = nodes.peek().is_some();
+                        (registered, nodes.any(|node| cache_id.is_some_and(|id| node.view.caches.iter().any(|cache| cache.cache_id == id))))
+                    };
+                    // 命中请求等待持有节点释放槽位；未命中仍按配置超时返回 503。
+                    if !model_registered || !cache_hit && tokio::time::Instant::now() >= deadline {
                         break Err(DispatchError::NoAvailableNode(model));
                     }
                     if pinned.is_empty()
@@ -641,7 +664,9 @@ impl Scheduler {
                 result => break result,
             }
         };
-        if !pinned.is_empty() && let Some(cache_id) = cache_id {
+        if !pinned.is_empty()
+            && let Some(cache_id) = cache_id
+        {
             // 解 pin 对象覆盖 pin 时刻与退出时刻持有者的并集:窗口内持有者变化时
             // 多发的 unpin 在节点侧是无害 no-op。
             let mut targets = self.cache_holders(cache_id).await;
@@ -1035,7 +1060,7 @@ impl Scheduler {
 }
 
 fn registered_max_concurrency(requested: usize, capabilities: &NodeCapabilities) -> usize {
-    let requested = requested.clamp(1, NodeRuntime::MAX_SCHEDULING_PRESSURE);
+    let requested = requested.clamp(1, NodeRuntime::MAX_CONCURRENT_SESSIONS);
     if capabilities.kv_cache_devices.is_empty() {
         return requested;
     }
@@ -1045,7 +1070,12 @@ fn registered_max_concurrency(requested: usize, capabilities: &NodeCapabilities)
 }
 
 fn node_has_capacity(node: &RegisteredNode, additional: usize) -> bool {
-    node.view.active_requests < node.view.max_concurrency && node.view.runtime.scheduling_pressure().saturating_add(node.pending_pressure).saturating_add(additional) <= NodeRuntime::MAX_SCHEDULING_PRESSURE
+    node.view.active_requests < node.view.max_concurrency
+        && if additional == 1 {
+            node.view.runtime.decode.saturating_add(node.pending_pressure) <= NodeRuntime::APPEND_DECODE_LIMIT
+        } else {
+            node.view.runtime.scheduling_pressure().saturating_add(node.pending_pressure).saturating_add(additional) <= NodeRuntime::MAX_SCHEDULING_PRESSURE
+        }
 }
 
 /// 节点断连时 video_generation 等持久化任务会置回 queued 等待原节点恢复；若原
@@ -1438,7 +1468,7 @@ mod tests {
         });
         assert!(matches!(request_terminal_resume(&next).unwrap(), TerminalResume::Match { .. }));
         assert_eq!(client_replayable_response(&previous, "未结束的私有推理"), "");
-        assert_eq!(client_replayable_response(&json!({}), "原始输出</think>正文"), "原始输出</think>正文");
+        assert_eq!(client_replayable_response(&json!({}), "原始输出</think>正文"), "原始输出正文");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1494,7 +1524,7 @@ mod tests {
 
         // cancel 只给旧 writer 发撤销信号(订阅者清零才发);同 cache_id 的重试
         // 请求即时合并到现有事件流(tee),不排队、不占节点执行槽。
-        let mut cancelled_events = scheduler.dispatch("req_cancelled_writer".to_owned(), "ornith".to_owned(), Some("retry-cache"), json!({"model":"ornith"})).await.unwrap();
+        let cancelled_events = scheduler.dispatch("req_cancelled_writer".to_owned(), "ornith".to_owned(), Some("retry-cache"), json!({"model":"ornith"})).await.unwrap();
         assert!(matches!(read_json_line::<_, SchedulerMessage>(&mut reader).await.unwrap(), SchedulerMessage::NewPrefill { ref request_id, .. } if request_id == "req_cancelled_writer"));
         scheduler.cancel("req_cancelled_writer").await;
         assert!(matches!(read_json_line::<_, SchedulerMessage>(&mut reader).await.unwrap(), SchedulerMessage::Cancel { ref request_id } if request_id == "req_cancelled_writer"));
@@ -1632,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_uses_kv_capacity_but_caps_node_at_twenty_two_sessions() {
+    fn registration_uses_kv_capacity_but_caps_node_at_fourteen_sessions() {
         let capabilities = NodeCapabilities {
             kv_cache_devices: vec![
                 KvCacheDeviceCapacity { device: "gpu0".to_owned(), available_bytes: 8 << 30, bytes_per_token: 4096, token_capacity: 2_097_152 },
@@ -1641,15 +1671,15 @@ mod tests {
             kv_reservation_page_tokens: 1024,
             ..NodeCapabilities::default()
         };
-        assert_eq!(registered_max_concurrency(1024, &capabilities), 22);
-        assert_eq!(registered_max_concurrency(128, &capabilities), 22);
-        assert_eq!(registered_max_concurrency(128, &NodeCapabilities::default()), 22);
+        assert_eq!(registered_max_concurrency(1024, &capabilities), 14);
+        assert_eq!(registered_max_concurrency(128, &capabilities), 14);
+        assert_eq!(registered_max_concurrency(128, &NodeCapabilities::default()), 14);
     }
 
     #[test]
     fn runtime_pressure_uses_prefill_four_to_one_ratio() {
         let runtime = NodeRuntime { new_prefill: 2, append_prefill: 3, decode: 5, ..NodeRuntime::default() };
-        assert_eq!(runtime.scheduling_pressure(), 16);
+        assert_eq!(runtime.scheduling_pressure(), 25);
     }
 
     #[test]
@@ -1707,16 +1737,38 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn new_prefill按四点压力在二十二上限排队() {
+    async fn new_prefill按四点压力在十上限排队() {
         let scheduler = Scheduler::default();
         let _node = register_local_node(&scheduler, "node", "glm-5.2", 22, Vec::new()).await;
         let mut receivers = Vec::new();
-        for index in 0..5 {
+        for index in 0..2 {
             receivers.push(scheduler.dispatch(format!("req-{index}"), "glm-5.2".to_owned(), None, json!({"model":"glm-5.2"})).await.unwrap());
         }
-        assert!(matches!(scheduler.dispatch("req-5".to_owned(), "glm-5.2".to_owned(), None, json!({"model":"glm-5.2"})).await, Err(DispatchError::NoAvailableNode(_))));
-        assert_eq!(scheduler.nodes().await[0].active_requests, 5);
+        assert!(matches!(scheduler.dispatch("req-2".to_owned(), "glm-5.2".to_owned(), None, json!({"model":"glm-5.2"})).await, Err(DispatchError::NoAvailableNode(_))));
+        assert_eq!(scheduler.nodes().await[0].active_requests, 2);
         drop(receivers);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn append_admission_at_thirteen_does_not_bypass_new_prompt_limit() {
+        let scheduler = Scheduler::default();
+        let cache = CacheInfo { cache_id: "session-a".to_owned(), model_key: "glm-5.2".to_owned(), cache_format: "mla".to_owned(), last_layer: 77, prompt_tokens: 4096, bytes: 4096, modified_unix: 1 };
+        let _node = register_local_node(&scheduler, "node", "glm-5.2", 14, vec![cache]).await;
+        {
+            let mut state = scheduler.state.lock().await;
+            let node = state.nodes.get_mut("node").unwrap();
+            node.view.runtime.decode = 13;
+            node.view.active_requests = 13;
+        }
+        assert!(matches!(scheduler.dispatch("new".to_owned(), "glm-5.2".to_owned(), None, json!({})).await, Err(DispatchError::NoAvailableNode(_))));
+        assert!(matches!(scheduler.dispatch("missing".to_owned(), "glm-5.2".to_owned(), Some("missing"), json!({})).await, Err(DispatchError::NoAvailableNode(_))));
+        let _events = scheduler.dispatch("append".to_owned(), "glm-5.2".to_owned(), Some("session-a"), json!({})).await.unwrap();
+        assert_eq!(scheduler.nodes().await[0].active_requests, 14);
+        // 新的 cache_id 不会被同 writer 合流掩盖容量边界。
+        let mut state = scheduler.state.lock().await;
+        let node = state.nodes.get_mut("node").unwrap();
+        node.view.runtime.decode = 14;
+        assert!(!node_has_capacity(node, 1));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1772,24 +1824,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn append排队期间pin持有者cache() {
-        // owner 满载时 dispatch_wait 排队:进入等待即 PinCache 持有者,超时退出即
-        // UnpinCache——排队等的是槽位,不能让 LRU 把等待目标换出到 SSD。
-        let scheduler = Scheduler::new(&SchedulerConfig { dispatch_wait: Duration::from_millis(150), ..SchedulerConfig::default() });
+    async fn append排队超过未命中超时仍等待持有者() {
+        let scheduler = Scheduler::new(&SchedulerConfig { dispatch_wait: Duration::from_millis(30), ..SchedulerConfig::default() });
         let cache = CacheInfo { cache_id: "session-a".to_owned(), model_key: "glm-5.2".to_owned(), cache_format: "mla".to_owned(), last_layer: 77, prompt_tokens: 128, bytes: 4096, modified_unix: 1 };
         let mut owner = register_local_node(&scheduler, "owner", "glm-5.2", 1, vec![cache]).await;
+        let mut idle = register_local_node(&scheduler, "idle", "glm-5.2", 1, Vec::new()).await;
         scheduler.state.lock().await.nodes.get_mut("owner").unwrap().view.active_requests = 1;
+        let waiting = scheduler.dispatch_wait("req-queued".to_owned(), "glm-5.2".to_owned(), Some("session-a"), json!({}));
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut waiting).await.is_err());
+        assert!(matches!(owner.commands.try_recv(), Ok(LocalNodeCommand::Wire(SchedulerMessage::PinCache { cache_id })) if cache_id == "session-a"));
+        assert!(idle.commands.try_recv().is_err(), "命中请求不能分派到无缓存的空闲节点");
+        scheduler.state.lock().await.nodes.get_mut("owner").unwrap().view.active_requests = 0;
+        let _events = tokio::time::timeout(Duration::from_secs(1), waiting).await.unwrap().unwrap();
+        assert!(matches!(owner.commands.try_recv(), Ok(LocalNodeCommand::NewPrefill { .. })));
+        assert!(matches!(owner.commands.try_recv(), Ok(LocalNodeCommand::Wire(SchedulerMessage::UnpinCache { cache_id })) if cache_id == "session-a"));
+    }
 
-        let result = scheduler.dispatch_wait("req-queued".to_owned(), "glm-5.2".to_owned(), Some("session-a"), json!({"model":"glm-5.2"})).await;
+    #[tokio::test(flavor = "multi_thread")]
+    async fn 未命中且容量满仍按配置超时() {
+        let scheduler = Scheduler::new(&SchedulerConfig { dispatch_wait: Duration::from_millis(30), ..SchedulerConfig::default() });
+        let _owner = register_local_node(&scheduler, "owner", "glm-5.2", 1, Vec::new()).await;
+        scheduler.state.lock().await.nodes.get_mut("owner").unwrap().view.active_requests = 1;
+        let result = tokio::time::timeout(Duration::from_secs(1), scheduler.dispatch_wait("miss".to_owned(), "glm-5.2".to_owned(), Some("absent"), json!({}))).await.unwrap();
         assert!(matches!(result, Err(DispatchError::NoAvailableNode(_))));
-        match tokio::time::timeout(Duration::from_secs(1), owner.commands.recv()).await {
-            Ok(Some(LocalNodeCommand::Wire(SchedulerMessage::PinCache { ref cache_id }))) if cache_id == "session-a" => {}
-            other => panic!("排队期间节点应收到 PinCache: {other:?}"),
-        }
-        match tokio::time::timeout(Duration::from_secs(1), owner.commands.recv()).await {
-            Ok(Some(LocalNodeCommand::Wire(SchedulerMessage::UnpinCache { ref cache_id }))) if cache_id == "session-a" => {}
-            other => panic!("排队结束节点应收到 UnpinCache: {other:?}"),
-        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

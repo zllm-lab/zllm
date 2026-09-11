@@ -59,7 +59,7 @@ impl Glm52SingleEngine {
         runtime: Arc<Mutex<RuntimeStatus>>,
         compute_steps: Arc<AtomicCounterU64>,
     ) -> Result<Self, DynError> {
-        if options.mtp || options.dspark_directory.is_some() || options.cooperative_expert_pairs || options.parallel_operator_pairs {
+        if options.mtp || options.dspark_directory.is_some() || options.dflash2_directory.is_some() || options.cooperative_expert_pairs || options.parallel_operator_pairs {
             return Err("GLM-Dsa 单进程首版要求关闭 MTP、DSpark 与双卡算子".into());
         }
         weights.validate_glm_dsa_gguf_types().map_err(|error| -> DynError { error.into() })?;
@@ -184,7 +184,7 @@ impl Glm52SingleEngine {
                 finish_reason = "cancelled".to_owned();
                 break;
             }
-            let text = utf8.push(&self.detokenizer.decode_bytes(&[next], true).map_err(|error| format!("detokenize: {error}"))?);
+            let text = utf8.push(&crate::runtime::tool::decode_output_token(&self.detokenizer, next).map_err(|error| format!("detokenize: {error}"))?);
             completion += 1;
             self.compute_steps.fetch_add(1);
             if !on_token(next, text) {

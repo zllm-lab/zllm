@@ -19,7 +19,8 @@ pub(super) struct Glm52BatchTask {
     pub(super) tail_prefill_position: usize,
     pub(super) prefill_suffix_start: usize,
     pub(super) prefill_policy: AdaptiveChunkPolicy,
-    pub(super) open_ready_tokens: Option<usize>,
+    /// 下游拒绝已有缓存时，保留原采样配置以便按完整 prefill 重新排队。
+    pub(super) open_cache: Option<(String, SamplingConfig)>,
     pub(super) response_text: String,
     pub(super) utf8: Utf8StreamDecoder,
     pub(super) think_filter: ThinkTagFilter,
@@ -30,6 +31,8 @@ pub(super) struct Glm52BatchTask {
     pub(super) thinking_end_token: Option<u32>,
     pub(super) thinking_token_budget: Option<usize>,
     pub(super) finish_reason: String,
+    /// 最后一次生成结束的时刻，不使用后续 SSD 写入或重新插入缓存的时间。
+    pub(super) decode_finished_at: Option<SystemTime>,
     pub(super) sampling: SamplingState,
     pub(super) token_fence: GenerationGuard<Glm52ToolFence>,
     pub(super) mtp: Option<RocmMtpSession>,
@@ -54,6 +57,11 @@ pub(super) struct Glm52BatchTask {
     pub(super) dspark_verify_aux: Vec<RocmTensor>,
     pub(super) dspark_target_rounds: usize,
     pub(super) dspark_verify_rounds: usize,
+    /// 仅 GPU 草稿路径的主机墙钟；不插入设备事件或额外同步。
+    pub(super) dspark_verify_started: Option<Instant>,
+    pub(super) dspark_verify_micros: u128,
+    pub(super) dspark_draft_micros: u128,
+    pub(super) dspark_draft_batches: usize,
     pub(super) dspark_verified_drafts: usize,
     pub(super) dspark_accepted_drafts: usize,
     pub(super) dspark_verified_by_depth: Vec<usize>,
@@ -137,6 +145,8 @@ pub(super) struct Glm52PendingTask {
     pub(super) thinking_end_token: Option<u32>,
     pub(super) thinking_token_budget: Option<usize>,
     pub(super) swap_prefetch: Glm52SwapPrefetch,
+    /// 两端缓存不完整时只重建一次，不再命中同一份残缺快照。
+    pub(super) force_new: bool,
 }
 
 pub(super) type Glm52SwapPrefetchResult = Result<Option<(Glm52CacheSnapshot, Option<usize>)>, String>;

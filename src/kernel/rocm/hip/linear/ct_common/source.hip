@@ -220,7 +220,6 @@ extern "C" __global__ void dense_matmul_bf16_dsa_query_wmma(
 }
 
 // compressed-tensors W4A16/W8A16：压缩权重原地解码，每个 block 同时计算十六个 token row。
-typedef unsigned short __attribute__((ext_vector_type(2))) zllm_ct_bf16x2;
 
 // int8 到 BF16 的完整映射常驻常量缓存，避免 decode 热路径逐元素转换。
 __device__ __constant__ unsigned short zllm_ct_i8_bf16[256] = {

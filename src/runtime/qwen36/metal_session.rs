@@ -374,7 +374,7 @@ impl Qwen36MetalSession {
     }
 
     pub fn decode_bytes(&self, token: u32) -> Result<Vec<u8>, String> {
-        self.detokenizer.decode_bytes(&[token], true).map_err(|error| format!("Qwen3.6 detokenize {token}: {error}"))
+        crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| format!("Qwen3.6 detokenize {token}: {error}"))
     }
 
     pub fn is_eos(&self, token: u32) -> bool {
@@ -477,8 +477,16 @@ impl Qwen36MetalSession {
             let chunk_offset = offset + range.start;
             let chunk = &suffix[range];
             let profile_prefill = std::env::var_os("ZLLM_QWEN36_PROFILE").is_some();
+            // STATS 与 PROFILE 的区别:不 reset_gpu_stats(那会强制 1 op/CB 的
+            // 诊断节奏,改变被测系统),读取的是生产节奏下的真实 CB/gap 构成;
+            // 读后手动清零计数,detailed 状态经 gpu_profile() 归位为 false。
+            let stats_prefill = std::env::var_os("ZLLM_QWEN36_STATS").is_some();
             if profile_prefill {
                 self.context.reset_gpu_stats();
+            } else if stats_prefill {
+                // chunk 前清零且不动 detailed:本 chunk 的 CB/gap 记账不混入
+                // 上一请求的 decode,也保持生产提交节奏。
+                self.context.reset_gpu_stats_preserve_mode();
             }
             let started = std::time::Instant::now();
             crate::backend::BackendResources::begin_batch(self.context());
@@ -503,6 +511,21 @@ impl Qwen36MetalSession {
             }
             *hidden = self.context.select_row(&output, chunk.len() - 1).map_err(|error| format!("Qwen3.6 选择最后 token: {error:?}"))?;
             tokens.extend_from_slice(chunk);
+            if stats_prefill {
+                self.context.synchronize();
+                let gpu = self.context.gpu_stats();
+                eprintln!(
+                    "[qwen36-node-prefill-stats] tokens={} wall={:.3}s gpu={:.3}s commands={} submit_wait={:.3}s gaps={:.3}s tail={:.3}s",
+                    chunk.len(),
+                    started.elapsed().as_secs_f64(),
+                    gpu.seconds,
+                    gpu.command_buffers,
+                    gpu.submit_wait_seconds,
+                    gpu.inter_command_gap_seconds,
+                    gpu.completion_tail_seconds
+                );
+                // 清零职责已移至 chunk 前(preserve_mode),这里不再动计数器。
+            }
             if profile_prefill {
                 self.context.synchronize();
                 let gpu = self.context.gpu_stats();

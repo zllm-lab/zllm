@@ -859,6 +859,7 @@ where
             let batch_class = &batch_class;
             let stage_flow_worker = std::sync::Arc::clone(&stage_flow);
             workers.push(scope.spawn(move || {
+                backend.pin_submission_thread();
                 let mut decode_queue = VecDeque::<(Option<QueuedGroup>, usize, usize, T, Instant)>::new();
                 let mut prefill_queue = VecDeque::<(Option<QueuedGroup>, usize, usize, T, Instant)>::new();
                 let mut active_sessions = states.iter().filter(|state| state.is_some()).count();
@@ -2927,6 +2928,74 @@ mod tests {
                 }
                 for _ in 0..10_000 {
                     assert_eq!(dispatches.lock().unwrap().len(), 1, "前一 completion 未完成时不应继续排入 latency stream");
+                    std::thread::yield_now();
+                }
+                ready.store(true, Ordering::Release);
+                let mut work = 0;
+                while work < 2 {
+                    assert!(std::time::Instant::now() < deadline, "等待 decode completion 超时");
+                    match scheduler.try_recv()? {
+                        Some(StageSchedulerOutput::Work { .. }) => work += 1,
+                        Some(StageSchedulerOutput::Opened { .. } | StageSchedulerOutput::Closed { .. }) | None => std::thread::yield_now(),
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(remaining, vec![Some(vec![1]), Some(vec![12])]);
+        assert_eq!(*dispatches.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn backend_latency上限为二时允许两份decode在途() {
+        let ready = Arc::new(AtomicBool::new(false));
+        let dispatches = Mutex::new(Vec::<i32>::new());
+        let config = StageSchedulerConfig {
+            session_capacity: 2,
+            batch_work_limit: 1,
+            execution_slots: 1,
+            decode_execution_slots: 4,
+            pipeline_work_window: 2,
+            prefill_admission_burst: 1,
+            decode_batch_limit: 1,
+            prefill_batch_limit: 1,
+            profile_completion: false,
+        };
+        struct DualInFlightTestBackend(TestBackend);
+        impl StageExecutionBackend for DualInFlightTestBackend {
+            type Completion = TestCompletion;
+            fn stage_available_bytes(&self) -> Result<usize, BackendError> {
+                self.0.stage_available_bytes()
+            }
+            fn max_queued_latency_submissions(&self) -> usize {
+                2
+            }
+            fn record_stage_completion(&self) -> Result<Self::Completion, BackendError> {
+                self.0.record_stage_completion()
+            }
+            fn stage_completion_ready(&self, completion: &Self::Completion) -> Result<bool, BackendError> {
+                self.0.stage_completion_ready(completion)
+            }
+        }
+        let ((), remaining) = drive_stage_scheduler(
+            vec![DualInFlightTestBackend(TestBackend { ready: ready.clone(), poll_allowed: true })],
+            vec![vec![0_i32], vec![10_i32]],
+            config,
+            |_| 1,
+            |value: &(StageWorkKind, i32)| value.0,
+            |_, states, _, batch| {
+                let (session, _, value) = batch[0];
+                dispatches.lock().unwrap().push(value.1);
+                *states[session].as_mut().unwrap() += value.1;
+                Ok(batch)
+            },
+            |scheduler| {
+                scheduler.submit(0, 0, (StageWorkKind::Decode, 1))?;
+                scheduler.submit(1, 0, (StageWorkKind::Decode, 2))?;
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                while dispatches.lock().unwrap().len() < 2 {
+                    assert!(std::time::Instant::now() < deadline, "cap=2 时第二份 decode 应在前一份 completion 前提交");
                     std::thread::yield_now();
                 }
                 ready.store(true, Ordering::Release);

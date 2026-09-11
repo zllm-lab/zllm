@@ -328,10 +328,14 @@ mod gguf_fused_gemm_tests {
 
     #[test]
     fn iq4xs_fused_gemm_matches_dequantized_matmul() {
-        // 58 行:64 行 tile 的边界(6 行填充),覆盖 fused 路径的 M/N 越界守卫;
-        // 权重行也取 70 覆盖 N 方向的第二 tile 与不满块。
+        // 58 行走 mpp64 tile 边界(6 行填充);32 行是 mpp32 阶梯切换点。
+        iq4xs_mpp_case(58);
+        iq4xs_mpp_case(32);
+    }
+
+    fn iq4xs_mpp_case(m: usize) {
+        // 权重行取 70 覆盖 N 方向的第二 tile 与不满块。
         let ctx = MetalContext::new_default().unwrap();
-        let m = 58;
         let columns = 512;
         let n_rows = 70;
         let row_bytes = 272; // 512 / 256 * 136
@@ -368,17 +372,22 @@ mod gguf_fused_gemm_tests {
                 let err = (actual_val - expected).abs();
                 error_squared += err * err;
                 reference_squared += expected * expected;
-                assert!(err <= 0.05 + expected.abs() * 0.01, "fused iq4xs m={mi} n={ni} actual={actual_val} expected={expected} err={err}");
+                assert!(err <= 0.05 + expected.abs() * 0.01, "iq4xs m={mi} n={ni} actual={actual_val} expected={expected} err={err}");
             }
         }
-        println!("[iq4xs-fused-oracle] rel_l2={}", (error_squared / reference_squared).sqrt());
+        println!("[iq4xs-mpp-oracle m={m}] rel_l2={}", (error_squared / reference_squared).sqrt());
     }
 
     #[test]
     fn iq3s_fused_gemm_matches_dequantized_matmul() {
-        // 58 行覆盖 64 行 tile 的 M 边界;权重 70 行覆盖 N 方向第二 tile。
+        // 58 行走 mpp64 tile 边界;32 行是 mpp32 阶梯切换点。
+        iq3s_mpp_case(58);
+        iq3s_mpp_case(32);
+    }
+
+    fn iq3s_mpp_case(m: usize) {
+        // 权重 70 行覆盖 N 方向第二 tile。
         let ctx = MetalContext::new_default().unwrap();
-        let m = 58;
         let columns = 512;
         let n_rows = 70;
         let row_bytes = 220; // 512 / 256 * 110
@@ -414,10 +423,27 @@ mod gguf_fused_gemm_tests {
                 let err = (actual_val - expected).abs();
                 error_squared += err * err;
                 reference_squared += expected * expected;
-                assert!(err <= 0.05 + expected.abs() * 0.01, "fused iq3s m={mi} n={ni} actual={actual_val} expected={expected} err={err}");
+                assert!(err <= 0.05 + expected.abs() * 0.01, "iq3s m={mi} n={ni} actual={actual_val} expected={expected} err={err}");
             }
         }
-        println!("[iq3s-fused-oracle] rel_l2={}", (error_squared / reference_squared).sqrt());
+        println!("[iq3s-mpp-oracle m={m}] rel_l2={}", (error_squared / reference_squared).sqrt());
+    }
+
+    /// Metal4 可用时 mpp 变体必须真的编进了 MSL4 library:源码编译失败会让
+    /// MetalContext 静默回退旧版 MSL,上面的 oracle 测试改走 fused 路径仍然
+    /// 全绿,坏掉的 mpp kernel 不会被发现。此测试把该风险钉死。
+    #[test]
+    fn metal4_mpp_pipelines_compile() {
+        let ctx = MetalContext::new_default().unwrap();
+        if !ctx.metal4_available() {
+            return; // 非 Metal4 设备没有 mpp 路径,不适用
+        }
+        ctx.pipeline("gguf_gemm_iq4xs_mpp_f16").expect("IQ4_XS mpp kernel 应在 MSL4 library 中可用");
+        ctx.pipeline("gguf_gemm_iq3s_mpp_f16").expect("IQ3_S mpp kernel 应在 MSL4 library 中可用");
+        ctx.pipeline("gguf_gemm_iq4xs_mpp64_f16").expect("IQ4_XS mpp64 skinny kernel 应在 MSL4 library 中可用");
+        ctx.pipeline("gguf_gemm_iq4xs_mpp32_f16").expect("IQ4_XS mpp32 skinny kernel 应在 MSL4 library 中可用");
+        ctx.pipeline("gguf_gemm_iq3s_mpp64_f16").expect("IQ3_S mpp64 skinny kernel 应在 MSL4 library 中可用");
+        ctx.pipeline("gguf_gemm_iq3s_mpp32_f16").expect("IQ3_S mpp32 skinny kernel 应在 MSL4 library 中可用");
     }
 
     #[test]

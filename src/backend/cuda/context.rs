@@ -178,6 +178,65 @@ impl crate::weight::container::gguf::HostBytesBuilder for CudaPinnedSourceBytes 
     }
 }
 
+/// 一次性大块驱动 pinned 内存(默认 cacheable,flags=0):驻留构建期由
+/// 游标顺序切出每矩阵子区间。单块分配取代逐矩阵 cuMemAllocHost——
+/// 后者每次调用 ~2.8ms 驱动开销,72k 矩阵曾把 77GB 加载拖到 4 分钟
+/// (glibc+整块 register 只需 65-90s,其中注册仅 ~3s)。
+pub struct CudaPinnedSourceBlock {
+    ctx: Arc<CudaCtx>,
+    base: *mut u8,
+    len: usize,
+}
+
+impl Drop for CudaPinnedSourceBlock {
+    fn drop(&mut self) {
+        let _ = self.ctx.synchronize();
+        let _ = unsafe { cudarc::driver::sys::cuMemFreeHost(self.base.cast()) }.result();
+    }
+}
+
+// 大块地址在 Drop 前稳定;驻留构建为单线程顺序填充,此后视图只读。
+unsafe impl Send for CudaPinnedSourceBlock {}
+unsafe impl Sync for CudaPinnedSourceBlock {}
+
+/// 大块的只读子区间视图;父块由 Arc 钉住生命周期。
+struct CudaPinnedSourceView {
+    parent: Arc<CudaPinnedSourceBlock>,
+    offset: usize,
+    len: usize,
+}
+
+impl crate::weight::container::gguf::HostBytes for CudaPinnedSourceView {
+    fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.parent.base.add(self.offset), self.len) }
+    }
+}
+
+impl CudaPinnedSourceBlock {
+    /// 在 offset 处切出 len 字节的构建器;offset+len 越界即拒绝。
+    pub fn view_builder(self: &Arc<Self>, offset: usize, len: usize) -> Result<Box<dyn crate::weight::container::gguf::HostBytesBuilder>, String> {
+        if offset.checked_add(len).ok_or("CUDA pinned block 区间溢出")? > self.len {
+            return Err(format!("CUDA pinned block 切片 {offset}+{len} > {}", self.len));
+        }
+        Ok(Box::new(CudaPinnedSourceBuilder { parent: self.clone(), offset, len }))
+    }
+}
+
+struct CudaPinnedSourceBuilder {
+    parent: Arc<CudaPinnedSourceBlock>,
+    offset: usize,
+    len: usize,
+}
+
+impl crate::weight::container::gguf::HostBytesBuilder for CudaPinnedSourceBuilder {
+    fn as_mut(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.parent.base.add(self.offset), self.len) }
+    }
+    fn finish(self: Box<Self>) -> Arc<dyn crate::weight::container::gguf::HostBytes> {
+        Arc::new(CudaPinnedSourceView { parent: self.parent, offset: self.offset, len: self.len })
+    }
+}
+
 /// 驱动 pinned 驻留源注册表:ranges 升序用于上传二分命中,owners
 /// 钉住锁页内存生命周期(与 context 同寿,不随矩阵释放)。
 #[derive(Default)]
@@ -709,17 +768,37 @@ impl CudaContext {
         Ok(Box::new(CudaPinnedSourceBytes { pinned }))
     }
 
-    /// 登记一段已完成的驱动 pinned 背书:区间入升序表供上传直读命中,
-    /// owners 持有 Arc 保证锁页内存与 context 同生命周期。驻留构建完成后
-    /// 对每个矩阵的 extern 背书调用一次。
+    /// 一次性分配 cacheable(flags=0)驱动 pinned 大块;驻留构建用游标顺序
+    /// view_builder 切片,消除逐矩阵分配的驱动调用开销。与 WC 块的解码
+    /// 差异在运行噪声带内(±3%),而 pread 写 WC 会使加载慢 ~2.5 倍。
+    pub fn alloc_pinned_source_block(&self, total: usize) -> Result<Arc<CudaPinnedSourceBlock>, String> {
+        if total == 0 {
+            return Err("CUDA pinned block 不支持 0 字节".to_owned());
+        }
+        self.ctx.bind_to_thread().map_err(|e| format!("绑定 CUDA context 失败: {e:?}"))?;
+        let mut pointer: *mut std::ffi::c_void = std::ptr::null_mut();
+        unsafe { cudarc::driver::sys::cuMemHostAlloc(&mut pointer, total, 0) }.result().map_err(|e| format!("CUDA pinned block alloc {total}B: {e:?}"))?;
+        Ok(Arc::new(CudaPinnedSourceBlock { ctx: self.ctx.clone(), base: pointer as *mut u8, len: total }))
+    }
+
+    /// 登记一段已完成的驱动 pinned 背书:驻留构建期只 push,构建完成后
+    /// 必须调用 finalize_pinned_sources 一次做排序(上传二分命中依赖升序)。
+    /// owners 持有 Arc 保证锁页内存与 context 同生命周期。
     pub fn retain_pinned_source(&self, source: &Arc<dyn crate::weight::container::gguf::HostBytes>) -> Result<(), String> {
         let bytes = source.as_bytes();
         let start = bytes.as_ptr() as usize;
         let end = start.checked_add(bytes.len()).ok_or("CUDA pinned source 区间溢出")?;
         let mut sources = self.pinned_sources.lock().map_err(|_| "CUDA pinned sources 锁已中毒".to_owned())?;
-        let at = sources.ranges.partition_point(|&(address, _)| address < start);
-        sources.ranges.insert(at, (start, end));
+        sources.ranges.push((start, end));
         sources.owners.push(source.clone());
+        Ok(())
+    }
+
+    /// 驻留构建收尾:区间排序去重;此后上传直读查询生效。
+    pub fn finalize_pinned_sources(&self) -> Result<(), String> {
+        let mut sources = self.pinned_sources.lock().map_err(|_| "CUDA pinned sources 锁已中毒".to_owned())?;
+        sources.ranges.sort_unstable();
+        sources.ranges.dedup();
         Ok(())
     }
 

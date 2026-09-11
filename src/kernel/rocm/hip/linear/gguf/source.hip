@@ -1,56 +1,7 @@
-    unsigned long long gate;
-    unsigned long long up;
-    unsigned long long down;
-    unsigned int gate_type;
-    unsigned int up_type;
-    unsigned int down_type;
-};
-
 union GgufWmmaScratch {
     unsigned short lut[8][16 * 32];
     float output[8][16 * 16];
 };
-
-__device__ __forceinline__ float gguf_kq_f16(const unsigned char* bytes)
-{
-    const unsigned int bits = unsigned(bytes[0]) | (unsigned(bytes[1]) << 8);
-    const unsigned int sign = (bits & 0x8000) << 16;
-    unsigned int exponent = (bits >> 10) & 0x1f;
-    unsigned int mantissa = bits & 0x03ff;
-    unsigned int value;
-    if (exponent == 0) {
-        if (mantissa == 0) {
-            value = sign;
-        } else {
-            exponent = 113;
-            while ((mantissa & 0x0400) == 0) {
-                mantissa <<= 1;
-                --exponent;
-            }
-            value = sign | (exponent << 23) | ((mantissa & 0x03ff) << 13);
-        }
-    } else if (exponent == 31) {
-        value = sign | 0x7f800000 | (mantissa << 13);
-    } else {
-        value = sign | ((exponent + 112) << 23) | (mantissa << 13);
-    }
-    union { unsigned int bits; float number; } converted;
-    converted.bits = value;
-    return converted.number;
-}
-
-__device__ __forceinline__ unsigned int gguf_kq_block_bytes(const unsigned int tensor_type)
-{
-    return zllm_gguf_block_bytes(tensor_type);
-}
-
-__device__ __forceinline__ const unsigned char* gguf_kq_row(
-    const unsigned long long weight, const unsigned int tensor_type,
-    const unsigned int row, const unsigned int columns)
-{
-    return (const unsigned char*)weight
-        + (unsigned long long)row * (columns >> 8) * gguf_kq_block_bytes(tensor_type);
-}
 
 // 行基址已知时的块内解码(fused kernel 逐行循环复用基址)。
 __device__ __forceinline__ float gguf_kq_value_at(
@@ -710,27 +661,6 @@ __device__ __forceinline__ void gguf_kq_fill_lut(
 // ===== GGUF fused decode experts(小批次：route_count×top_k ≤ 64) =====
 // 对应 CT 的 decode fused 路径：token-major，无路由分组 kernel，activated 常驻 workspace。
 
-// rows=2 时只需在两个 top-k 小数组之间配对，无需引入通用排序 kernel。
-// 返回 >=0 表示第一行 assignment 对应的第二行 assignment，-1 表示不重复，
-// -2 表示当前第二行 assignment 已由第一行负责。
-__device__ __forceinline__ int gguf_rows2_peer_assignment(
-    const unsigned int* route_slots,
-    const unsigned int assignment,
-    const unsigned int top_k)
-{
-    const unsigned int expert = route_slots[assignment];
-    if (assignment < top_k) {
-        for (unsigned int index = top_k; index < top_k * 2u; ++index) {
-            if (route_slots[index] == expert) return (int)index;
-        }
-        return -1;
-    }
-    for (unsigned int index = 0u; index < top_k; ++index) {
-        if (route_slots[index] == expert) return -2;
-    }
-    return -1;
-}
-
 // rows-N（verify 多行）专家分组：收集与 assignment 同专家的全部 assignment 索引
 // （含自身），返回成员数；存在更小索引的同专家 assignment 时返回 -1——本块让位，
 // 输出由 leader 块代写。每行 top_k 内专家互异 ⇒ 同专家成员数 ≤ 行数 ≤ 8
@@ -789,49 +719,6 @@ __device__ __forceinline__ zllm_ct_bf16x2 gguf_q3k_pair_bf16(
             d * (float)group_scale * (float)first_quant),
         zllm_f32_to_bf16(
             d * (float)group_scale * (float)second_quant)
-    };
-}
-
-__device__ __forceinline__ void gguf_k4_group_scale_min(
-    const unsigned char* block,
-    const unsigned int group,
-    unsigned int& group_scale,
-    unsigned int& minimum)
-{
-    const unsigned char* scales = block + 4u;
-    if (group < 4u) {
-        group_scale = scales[group] & 63u;
-        minimum = scales[group + 4u] & 63u;
-    } else {
-        group_scale = (scales[group + 4u] & 15u)
-            | ((scales[group - 4u] >> 6u) << 4u);
-        minimum = (scales[group + 4u] >> 4u)
-            | ((scales[group] >> 6u) << 4u);
-    }
-}
-
-__device__ __forceinline__ zllm_ct_bf16x2 gguf_q4k_pair_bf16(
-    const unsigned char* block,
-    const unsigned int group,
-    const unsigned int within,
-    const float d,
-    const float dmin,
-    const unsigned int group_scale,
-    const unsigned int minimum)
-{
-    const unsigned int shift = 4u * (group & 1u);
-    const unsigned int packed_pair = *(const unsigned short*)(
-        block + 16u + (group >> 1u) * 32u + within);
-    const unsigned int first_quant = (packed_pair >> shift) & 15u;
-    const unsigned int second_quant
-        = (packed_pair >> (8u + shift)) & 15u;
-    return {
-        zllm_f32_to_bf16(
-            d * (float)(group_scale * first_quant)
-                - dmin * (float)minimum),
-        zllm_f32_to_bf16(
-            d * (float)(group_scale * second_quant)
-                - dmin * (float)minimum)
     };
 }
 
@@ -1056,87 +943,6 @@ extern "C" __global__ void gguf_fused_down_f32(
         output[(unsigned long long)token * hidden + output_row] = sum;
 }
 
-// Q4_K down 同样以两个 accumulator 模拟原 16-lane 归约的 offset=8，
-// 同一组 d/scale/min 只解析一次，同时把每个 block 的输出行数翻倍。
-extern "C" __global__ void gguf_fused_down_q4_k_f32(
-    const unsigned short* activated,
-    const GgufKqMeta* metas,
-    const unsigned int* route_ids,
-    const unsigned int* route_slots,
-    const float* route_weights,
-    float* output,
-    const unsigned int tokens,
-    const unsigned int top_k,
-    const unsigned int hidden,
-    const unsigned int intermediate)
-{
-    (void)route_ids;
-    const unsigned int token = blockIdx.y;
-    if (token >= tokens) return;
-    const unsigned int lane = threadIdx.x & 7u;
-    const unsigned int subgroup = threadIdx.x >> 3u;
-    const unsigned int output_row = blockIdx.x * 32u + subgroup;
-    if (output_row >= hidden) return;
-    const unsigned int within = lane * 2u;
-    float sum0 = 0.0f;
-    float sum1 = 0.0f;
-    for (unsigned int k = 0u; k < top_k; ++k) {
-        const unsigned int assignment = token * top_k + k;
-        const GgufKqMeta meta = metas[route_slots[assignment]];
-        const unsigned char* down_row = gguf_kq_row(
-            meta.down, 12u, output_row, intermediate);
-        const unsigned short* input = activated
-            + (unsigned long long)assignment * intermediate;
-        const float route_weight = route_weights[assignment];
-        for (unsigned int block_index = 0u;
-             block_index < intermediate / 256u;
-             ++block_index) {
-            const unsigned char* block
-                = down_row + (unsigned long long)block_index * 144u;
-            float d = lane == 0u ? gguf_kq_f16(block) : 0.0f;
-            float dmin = lane == 0u ? gguf_kq_f16(block + 2u) : 0.0f;
-            d = __shfl(d, 0, 8);
-            dmin = __shfl(dmin, 0, 8);
-            const unsigned short* block_input
-                = input + block_index * 256u;
-            #pragma unroll
-            for (unsigned int group = 0u; group < 8u; ++group) {
-                unsigned int group_scale = 0u;
-                unsigned int minimum = 0u;
-                if (lane == 0u) {
-                    gguf_k4_group_scale_min(
-                        block, group, group_scale, minimum);
-                }
-                group_scale = __shfl(group_scale, 0, 8);
-                minimum = __shfl(minimum, 0, 8);
-                const unsigned int column0 = group * 32u + within;
-                const unsigned int column1 = column0 + 16u;
-                const zllm_ct_bf16x2 input0 = {
-                    block_input[column0], block_input[column0 + 1u]
-                };
-                const zllm_ct_bf16x2 input1 = {
-                    block_input[column1], block_input[column1 + 1u]
-                };
-                sum0 += __builtin_amdgcn_fdot2_f32_bf16(
-                    input0, gguf_q4k_pair_bf16(
-                        block, group, within, d, dmin,
-                        group_scale, minimum),
-                    0.0f, false) * route_weight;
-                sum1 += __builtin_amdgcn_fdot2_f32_bf16(
-                    input1, gguf_q4k_pair_bf16(
-                        block, group, within + 16u, d, dmin,
-                        group_scale, minimum),
-                    0.0f, false) * route_weight;
-            }
-        }
-    }
-    sum0 += sum1;
-    for (unsigned int offset = 4u; offset; offset >>= 1u)
-        sum0 += __shfl_down(sum0, offset, 8);
-    if (lane == 0u)
-        output[(unsigned long long)token * hidden + output_row] = sum0;
-}
-
 template <unsigned int TensorType>
 __device__ __forceinline__ void gguf_fused_down_k_f32_impl(
     const unsigned short* activated,
@@ -1267,24 +1073,6 @@ __device__ __forceinline__ void gguf_fused_down_k_f32_impl(
         sum += __shfl_down(sum, offset, 16);
     if (lane == 0u)
         output[(unsigned long long)token * hidden + output_row] = sum;
-}
-
-extern "C" __global__ void gguf_fused_down_q5_k_f32(
-    const unsigned short* activated,
-    const GgufKqMeta* metas,
-    const unsigned int* route_ids,
-    const unsigned int* route_slots,
-    const float* route_weights,
-    float* output,
-    const unsigned int tokens,
-    const unsigned int top_k,
-    const unsigned int hidden,
-    const unsigned int intermediate)
-{
-    (void)route_ids;
-    gguf_fused_down_k_f32_impl<13u>(
-        activated, metas, route_slots, route_weights, output,
-        tokens, top_k, hidden, intermediate);
 }
 
 extern "C" __global__ void gguf_fused_down_q6_k_f32(
@@ -1779,6 +1567,88 @@ __device__ __forceinline__ uint2 gguf_q8_0_load8(
     };
 }
 
+// Q8_0 直接生成 WMMA 的原生 B fragment，省去逐行 shuffle、LDS
+// 转置和回读；沿用标准 32 元素 block 的 scale 与 BF16 舍入。
+template <typename Fragment>
+__device__ __forceinline__ void gguf_q8_0_fragment8_bf16(
+    Fragment& fragment, const unsigned char* row, unsigned int column)
+{
+    const unsigned char* block = row + (unsigned long long)(column / 32u) * 34u;
+    const float scale = gguf_kq_f16(block);
+    const uint2 words = gguf_q8_0_load8(block + 2u + column % 32u);
+    #pragma unroll
+    for (unsigned int element = 0u; element < 8u; ++element) {
+        const unsigned int word = element < 4u ? words.x : words.y;
+        const signed char code = (signed char)(word >> ((element & 3u) * 8u));
+        fragment[element].data = zllm_f32_to_bf16(scale * (float)code);
+    }
+}
+
+// IQ4_XS 的八个连续权重共享 scale 与一组 packed 字节，直接填充 B fragment。
+template <typename Fragment>
+__device__ __forceinline__ void gguf_iq4xs_fragment8_bf16(
+    Fragment& fragment, const unsigned char* row, unsigned int column)
+{
+    const unsigned char* block = row + (unsigned long long)(column >> 8u) * 136u;
+    const unsigned int group = (column & 255u) >> 5u;
+    const float scale = gguf_iq4xs_group_scale(block, group);
+    const unsigned long long packed = *reinterpret_cast<const unsigned long long*>(
+        block + 8u + group * 16u + (column & 15u));
+    const unsigned int shift = (column & 16u) != 0u ? 4u : 0u;
+    #pragma unroll
+    for (unsigned int element = 0u; element < 8u; ++element) {
+        const unsigned int code = (packed >> (element * 8u + shift)) & 15u;
+        fragment[element].data = zllm_f32_to_bf16(scale * (float)zllm_iq4nl[code]);
+    }
+}
+
+// K 格式也直接填充原生 fragment；每个 lane 的连续 8 个权重共用
+// scale/min 和 packed 字节，保持与原逐元素路径相同的乘加、BF16 舍入。
+template <unsigned int Type, typename Fragment>
+__device__ __forceinline__ void gguf_k_fragment8_bf16(
+    Fragment& fragment, const unsigned char* row, unsigned int column)
+{
+    const unsigned char* block = row
+        + (unsigned long long)(column >> 8u) * gguf_kq_block_bytes(Type);
+    const unsigned int local = column & 255u;
+    if constexpr (Type == 14u) {
+        const unsigned int half = local >> 7u;
+        const unsigned int slot = (local & 127u) >> 5u;
+        const unsigned int index = local & 31u;
+        const float scale = gguf_kq_f16(block + 208u)
+            * (float)(signed char)block[192u + half * 8u + (index >> 4u) + slot * 2u];
+        const uint2 lows = gguf_q8_0_load8(block + half * 64u + index + (slot & 1u) * 32u);
+        const uint2 highs = gguf_q8_0_load8(block + 128u + half * 32u + index);
+        #pragma unroll
+        for (unsigned int element = 0u; element < 8u; ++element) {
+            const unsigned int shift = (element & 3u) * 8u;
+            const unsigned int low = ((element < 4u ? lows.x : lows.y) >> shift) & 255u;
+            const unsigned int high = ((element < 4u ? highs.x : highs.y) >> (shift + slot * 2u)) & 3u;
+            const unsigned int nibble = slot < 2u ? low & 15u : low >> 4u;
+            fragment[element].data = zllm_f32_to_bf16(scale * (float)((int)(nibble | (high << 4u)) - 32));
+        }
+    } else {
+        const unsigned int group = local >> 5u;
+        const unsigned char* scales = block + 4u;
+        const unsigned int scale = group < 4u ? scales[group] & 63u
+            : (scales[group + 4u] & 15u) | ((scales[group - 4u] >> 6u) << 4u);
+        const unsigned int minimum = group < 4u ? scales[group + 4u] & 63u
+            : (scales[group + 4u] >> 4u) | ((scales[group] >> 6u) << 4u);
+        const float d = gguf_kq_f16(block) * (float)scale;
+        const float dmin = gguf_kq_f16(block + 2u) * (float)minimum;
+        const uint2 lows = gguf_q8_0_load8(block + 48u + (group >> 1u) * 32u + (local & 31u));
+        const uint2 highs = gguf_q8_0_load8(block + 16u + (local & 31u));
+        #pragma unroll
+        for (unsigned int element = 0u; element < 8u; ++element) {
+            const unsigned int shift = (element & 3u) * 8u;
+            const unsigned int low = ((element < 4u ? lows.x : lows.y) >> shift) & 255u;
+            const unsigned int high = ((element < 4u ? highs.x : highs.y) >> (shift + group)) & 1u;
+            const unsigned int quant = ((group & 1u) == 0u ? low & 15u : low >> 4u) | (high << 4u);
+            fragment[element].data = zllm_f32_to_bf16(d * (float)quant - dmin);
+        }
+    }
+}
+
 __device__ __forceinline__ float gguf_q8_0_word8_dot(
     const unsigned short* input,
     const uint2 words,
@@ -1959,73 +1829,134 @@ extern "C" __global__ void gguf_group_decode_routes(
     unsigned int* route_to_grouped,
     unsigned int* grouped_offsets,
     GgufKqMeta* grouped_metas,
-    unsigned int* grouped_experts,
+    unsigned int* gate_tile_offsets,
     unsigned int route_count,
     unsigned int top_k,
     unsigned int expert_count,
-    unsigned int slot_count)
+    unsigned int slot_count,
+    unsigned int gate_tile_rows)
 {
-    __shared__ unsigned int counts[256];
-    __shared__ unsigned int expert_slots[256];
-    __shared__ unsigned int cursors[256];
-    const unsigned int lane = threadIdx.x;
-    if (lane < 256u) {
-        counts[lane] = 0u;
-        expert_slots[lane] = 0xffffffffu;
-        cursors[lane] = 0u;
+    const unsigned int thread = threadIdx.x;
+    // shared expert 无需排序；直接复用同一组 workspace 写出连续行。
+    if (expert_count == 1u) {
+        if (thread == 0u) {
+            grouped_offsets[0] = 0u;
+            grouped_offsets[1] = route_count;
+            gate_tile_offsets[0] = 0u;
+            gate_tile_offsets[1] = (route_count + gate_tile_rows - 1u) / gate_tile_rows;
+            grouped_metas[0] = expert_metas[0];
+        }
+        for (unsigned int route = thread; route < route_count; route += blockDim.x) {
+            grouped_tokens[route] = route / top_k;
+            grouped_weights[route] = route_weights[route];
+            route_to_grouped[route] = route;
+        }
+        return;
     }
+    __shared__ unsigned int counts[256];
+    counts[thread] = 0u;
     __syncthreads();
-    for (unsigned int route = lane; route < route_count; route += blockDim.x) {
+    for (unsigned int route = thread; route < route_count; route += blockDim.x) {
         const unsigned int expert = route_ids[route];
         if (expert < expert_count) atomicAdd(&counts[expert], 1u);
     }
     __syncthreads();
-    if (lane == 0u) {
-        unsigned int active = 0u;
+    if (thread == 0u) {
         unsigned int offset = 0u;
+        unsigned int tiles = 0u;
+        // 空 expert 保留零长度区间，后续可直接以 expert id 并行分组；
+        // gate/up 仍以有效 tile 前缀紧凑发射，不增加空 expert 的矩阵运算。
         for (unsigned int expert = 0u; expert < expert_count; ++expert) {
-            const unsigned int count = counts[expert];
-            if (count == 0u) continue;
-            expert_slots[expert] = active;
-            grouped_offsets[active] = offset;
-            grouped_metas[active] = expert_metas[expert];
-            cursors[active] = offset;
-            offset += count;
-            ++active;
-        }
-        for (unsigned int slot = active; slot < slot_count; ++slot) {
-            grouped_offsets[slot] = offset;
-            grouped_metas[slot] = expert_metas[0];
-            cursors[slot] = offset;
+            grouped_offsets[expert] = offset;
+            gate_tile_offsets[expert] = tiles;
+            grouped_metas[expert] = expert_metas[expert];
+            offset += counts[expert];
+            tiles += (counts[expert] + gate_tile_rows - 1u) / gate_tile_rows;
         }
         grouped_offsets[slot_count] = offset;
+        gate_tile_offsets[slot_count] = tiles;
     }
-    __syncthreads();
-    for (unsigned int expert = lane; expert < expert_count; expert += blockDim.x) {
-        const unsigned int slot = expert_slots[expert];
-        if (slot == 0xffffffffu) continue;
-        unsigned int grouped = grouped_offsets[slot];
-        for (unsigned int route = 0u; route < route_count; ++route) {
-            if (route_ids[route] != expert) continue;
+}
+
+extern "C" __global__ void gguf_scatter_grouped_routes(
+    const unsigned int* route_ids,
+    const float* route_weights,
+    const unsigned int* grouped_offsets,
+    unsigned int* grouped_tokens,
+    float* grouped_weights,
+    unsigned int* route_to_grouped,
+    unsigned int route_count,
+    unsigned int top_k)
+{
+    const unsigned int expert = blockIdx.x;
+    unsigned int base = grouped_offsets[expert];
+    if (base == grouped_offsets[expert + 1u]) return;
+    const unsigned int thread = threadIdx.x;
+    const unsigned int lane = thread % warpSize;
+    const unsigned int wave = thread / warpSize;
+    const unsigned int waves = blockDim.x / warpSize;
+    __shared__ unsigned int wave_counts[8];
+    // 一 expert 一 CTA，warp ballot 保持 token-major route 的稳定次序。
+    // 不用 atomic 游标分配输出位置，避免分组顺序随 block 调度变化。
+    for (unsigned int start = 0u; start < route_count; start += blockDim.x) {
+        const unsigned int route = start + thread;
+        const bool selected = route < route_count && route_ids[route] == expert;
+        const unsigned long long mask = __ballot(selected);
+        if (lane == 0u) wave_counts[wave] = __popcll(mask);
+        __syncthreads();
+        unsigned int before = 0u;
+        unsigned int total = 0u;
+        for (unsigned int index = 0u; index < waves; ++index) {
+            const unsigned int count = wave_counts[index];
+            if (index < wave) before += count;
+            total += count;
+        }
+        if (selected) {
+            const unsigned int grouped = base + before
+                + __popcll(mask & ((1ull << lane) - 1ull));
             grouped_tokens[grouped] = route / top_k;
             grouped_weights[grouped] = route_weights[route];
             route_to_grouped[route] = grouped;
-            grouped_experts[grouped] = slot;
-            ++grouped;
         }
+        base += total;
+        __syncthreads();
     }
 }
 
 // gate/up 融合 WMMA：结构对齐 ct_grouped_gate_up_wmma_bf16，仅权重解码换成 GGUF LUT。
-extern "C" __global__ void gguf_gate_up_wmma_bf16(
+// 每个 lane 直接解出 B fragment 的八列，避免逐行 LDS 中转与重复解包。
+template <typename Fragment>
+__device__ __forceinline__ void gguf_k4_wmma_fragment(Fragment& fragment, unsigned long long weight, unsigned int type, unsigned int row, unsigned int columns, unsigned int column, bool valid) {
+    if (!valid) {
+        #pragma unroll
+        for(unsigned int element=0; element<8u; ++element) fragment[element].data=0;
+        return;
+    }
+    const unsigned char* block=gguf_kq_row(weight,type,row,columns)+(unsigned long long)(column>>8u)*(type==12u?144u:176u);
+    const unsigned int group=(column&255u)>>5u;
+    unsigned int scale, minimum;gguf_k4_group_scale_min(block,group,scale,minimum);
+    const float d=gguf_kq_f16(block)*(float)scale;
+    const float dmin=gguf_kq_f16(block+2u)*(float)minimum;
+    const unsigned int within=column&31u;
+    const unsigned long long low=*(const unsigned long long*)(block+(type==12u?16u:48u)+(group>>1u)*32u+within);
+    const unsigned long long high=type==13u?*(const unsigned long long*)(block+16u+within):0u;
+    #pragma unroll
+    for(unsigned int element=0; element<8u; ++element) {
+        const unsigned int quant=((low>>(element*8u+4u*(group&1u)))&15u)+(((high>>(element*8u+group))&1u)<<4u);
+        fragment[element].data=zllm_f32_to_bf16(d*(float)quant-dmin);
+    }
+}
+
+template <unsigned int Tiles, unsigned int WeightType = 0u>
+__device__ __forceinline__ void gguf_gate_up_wmma_impl(
     const unsigned short* input,
     const unsigned int* token_ids,
     const GgufKqMeta* experts,
     const unsigned int* route_offsets,
+    const unsigned int* tile_offsets,
     unsigned short* activated,
     unsigned int input_columns,
     unsigned int output_rows,
-    unsigned int expert_base,
     unsigned int expert_count)
 {
     using namespace rocwmma;
@@ -2033,48 +1964,54 @@ extern "C" __global__ void gguf_gate_up_wmma_bf16(
     using BFragment = fragment<matrix_b, 16, 16, 16, bfloat16_t, col_major>;
     using CFragment = fragment<accumulator, 16, 16, 16, float>;
     static_assert(BFragment::num_elements == 8, "GFX11 GGUF gate/up B fragment lane layout 已改变");
-    const unsigned int expert = expert_base + blockIdx.z;
+    // 同一 expert 的 routes 已合并为连续矩阵；每个 CTA 只处理一个
+    // 行 tile。紧凑 tile 前缀避免按 expert × 最大行数发射大量空 block。
+    const unsigned int tile_index = blockIdx.y;
+    if (tile_index >= tile_offsets[expert_count]) return;
+    unsigned int expert = 0u;
+    unsigned int upper = expert_count;
+    while (expert + 1u < upper) {
+        const unsigned int middle = (expert + upper) / 2u;
+        if (tile_offsets[middle] <= tile_index) expert = middle;
+        else upper = middle;
+    }
     const unsigned int lane = threadIdx.x % warpSize;
     const unsigned int wave = threadIdx.x / warpSize;
     const unsigned int projection = wave >> 2;
     const unsigned int tile_wave = wave & 3u;
-    const unsigned int first_input_base = blockIdx.y * 128;
+    const unsigned int input_base = (tile_index - tile_offsets[expert]) * (Tiles * 16u);
     const unsigned int output_base = (blockIdx.x * 4 + tile_wave) * 16;
-    if (blockIdx.z >= expert_count || wave >= 8u) return;
+    if (wave >= 8u) return;
     const unsigned int route_begin = route_offsets[expert];
     const unsigned int input_rows = route_offsets[expert + 1] - route_begin;
     // 与 CT 不同：不设 input_rows>=4 门槛——不足 16 行由 staging 零填充，
     // 单 token(MTP draft)与稀疏 expert 也必须产出 activated，否则 down 读到未初始化内存。
-    if (first_input_base >= input_rows) return;
+    if (input_base >= input_rows) return;
     const GgufKqMeta& meta = experts[expert];
     const unsigned long long weight = projection == 0u ? meta.gate : meta.up;
-    const unsigned int tensor_type = projection == 0u ? meta.gate_type : meta.up_type;
-    __shared__ unsigned short input_tiles[16][16 * 16];
-    __shared__ unsigned short weight_tiles[8][16 * 16];
+    const unsigned int tensor_type = WeightType != 0u ? WeightType : (projection == 0u ? meta.gate_type : meta.up_type);
+    __shared__ unsigned short input_tiles[2 * Tiles][16 * 16];
+    __shared__ unsigned short weight_tiles[WeightType == 8u || WeightType == 23u ? 1 : 8][16 * 16];
     __shared__ GgufWmmaScratch scratch;
-    // route 数只有设备侧 compact 后才知道。与 CT grouped kernel 相同，host
-    // 只发一个 y tile，由同一个 expert/output tile 顺序覆盖全部 route。
-    for (unsigned int input_base = first_input_base;
-         input_base < input_rows;
-         input_base += gridDim.y * 128u) {
-    CFragment accumulator_fragments[8];
+    // 同一行块复用解码后的权重，每行 K 维累加次序保持不变。
+    CFragment accumulator_fragments[Tiles];
     #pragma unroll
-    for (unsigned int tile = 0; tile < 8; ++tile) {
+    for (unsigned int tile = 0; tile < Tiles; ++tile) {
         if (input_base + tile * 16 < input_rows)
             fill_fragment(accumulator_fragments[tile], 0.0f);
     }
     const unsigned int stage_row = (threadIdx.x >> 2) & 15u;
     const unsigned int stage_chunk = threadIdx.x & 3u;
     const unsigned int stage_group = threadIdx.x >> 6;
-    uint2 stage_data[4];
-    unsigned int stage_valid[4] = {0u, 0u, 0u, 0u};
+    uint2 stage_data[Tiles / 2];
+    unsigned int stage_valid[Tiles / 2] = {};
     auto stage_prefetch = [&](unsigned int prefetch_base) {
         #pragma unroll
-        for (unsigned int half = 0; half < 4; ++half) {
+        for (unsigned int half = 0; half < Tiles / 2; ++half) {
             const unsigned int tile = stage_group + half * 4;
-            const unsigned int column_offset = (half >> 1u) * 16u;
+            const unsigned int column_offset = (tile / Tiles) * 16u;
             const unsigned int route_row
-                = input_base + (tile & 7u) * 16u + stage_row;
+                = input_base + (tile % Tiles) * 16u + stage_row;
             stage_valid[half] = route_row < input_rows ? 1u : 0u;
             const unsigned int token = stage_valid[half]
                 ? token_ids[route_begin + route_row] : 0u;
@@ -2088,7 +2025,7 @@ extern "C" __global__ void gguf_gate_up_wmma_bf16(
     stage_prefetch(0);
     for (unsigned int column_base = 0; column_base < input_columns; column_base += 32u) {
         #pragma unroll
-        for (unsigned int half = 0; half < 4; ++half) {
+        for (unsigned int half = 0; half < Tiles / 2; ++half) {
             const unsigned int tile = stage_group + half * 4u;
             if (stage_valid[half]) {
                 *reinterpret_cast<uint2*>(
@@ -2105,7 +2042,33 @@ extern "C" __global__ void gguf_gate_up_wmma_bf16(
             if (segment_column_base >= input_columns) break;
             BFragment weight_fragment;
             const unsigned int lane16 = lane & 15u;
-            if (tensor_type == 21u) {
+            if constexpr (WeightType == 23u) {
+                const unsigned int output_row = output_base + lane16;
+                if (output_row < output_rows) {
+                    gguf_iq4xs_fragment8_bf16(weight_fragment,
+                        gguf_kq_row(weight, tensor_type, output_row, input_columns),
+                        segment_column_base + (lane >> 4u) * 8u);
+                } else {
+                    #pragma unroll
+                    for (unsigned int element = 0u; element < 8u; ++element)
+                        weight_fragment[element].data = 0u;
+                }
+            } else if (tensor_type == 8u) {
+                const unsigned int output_row = output_base + lane16;
+                if (output_row < output_rows) {
+                    gguf_q8_0_fragment8_bf16(weight_fragment,
+                        gguf_kq_row(weight, tensor_type, output_row, input_columns),
+                        segment_column_base + (lane >> 4u) * 8u);
+                } else {
+                    #pragma unroll
+                    for (unsigned int element = 0u; element < 8u; ++element)
+                        weight_fragment[element].data = 0u;
+                }
+            } else if (tensor_type == 12u || tensor_type == 13u) {
+                const unsigned int output_row = output_base + lane16;
+                gguf_k4_wmma_fragment(weight_fragment, weight, tensor_type, output_row,
+                    input_columns, segment_column_base + (lane >> 4u) * 8u, output_row < output_rows);
+            } else if (tensor_type == 21u) {
                 const unsigned int output_row = output_base + lane16;
                 if (output_row < output_rows) {
                     const unsigned int column
@@ -2185,12 +2148,12 @@ extern "C" __global__ void gguf_gate_up_wmma_bf16(
                     weight_fragment, (const bfloat16_t*)weight_tiles[wave], 16);
             }
             #pragma unroll
-            for (unsigned int tile = 0; tile < 8u; ++tile) {
+            for (unsigned int tile = 0; tile < Tiles; ++tile) {
                 if (input_base + tile * 16u < input_rows) {
                     AFragment input_fragment;
                     load_matrix_sync(
                         input_fragment,
-                        (const bfloat16_t*)input_tiles[segment * 8u + tile], 16);
+                        (const bfloat16_t*)input_tiles[segment * Tiles + tile], 16);
                     mma_sync(
                         accumulator_fragments[tile], input_fragment,
                         weight_fragment, accumulator_fragments[tile]);
@@ -2200,7 +2163,7 @@ extern "C" __global__ void gguf_gate_up_wmma_bf16(
         __syncthreads();
     }
     #pragma unroll
-    for (unsigned int tile = 0; tile < 8; ++tile) {
+    for (unsigned int tile = 0; tile < Tiles; ++tile) {
         if (input_base + tile * 16 < input_rows)
             store_matrix_sync(
                 scratch.output[wave], accumulator_fragments[tile], 16, mem_row_major);
@@ -2221,14 +2184,58 @@ extern "C" __global__ void gguf_gate_up_wmma_bf16(
         }
         __syncthreads();
     }
-    }
+}
+
+extern "C" __global__ void gguf_gate_up_wmma_bf16(
+    const unsigned short* input,
+    const unsigned int* token_ids,
+    const GgufKqMeta* experts,
+    const unsigned int* route_offsets,
+    const unsigned int* tile_offsets,
+    unsigned short* activated,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int expert_count)
+{
+    gguf_gate_up_wmma_impl<8>(input, token_ids, experts, route_offsets, tile_offsets, activated,
+        input_columns, output_rows, expert_count);
+}
+
+extern "C" __global__ void gguf_gate_up_wmma_q8_0_bf16(
+    const unsigned short* input,
+    const unsigned int* token_ids,
+    const GgufKqMeta* experts,
+    const unsigned int* route_offsets,
+    const unsigned int* tile_offsets,
+    unsigned short* activated,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int expert_count)
+{
+    gguf_gate_up_wmma_impl<8, 8u>(input, token_ids, experts, route_offsets, tile_offsets, activated,
+        input_columns, output_rows, expert_count);
+}
+
+extern "C" __global__ void gguf_gate_up_wmma_iq4xs_bf16(
+    const unsigned short* input,
+    const unsigned int* token_ids,
+    const GgufKqMeta* experts,
+    const unsigned int* route_offsets,
+    const unsigned int* tile_offsets,
+    unsigned short* activated,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int expert_count)
+{
+    gguf_gate_up_wmma_impl<8, 23u>(input, token_ids, experts, route_offsets, tile_offsets, activated,
+        input_columns, output_rows, expert_count);
 }
 
 // 多行 prefill down 复用 CT grouped WMMA 的执行结构：每个 active expert/output
 // tile 只启动一个 block，block 内顺序覆盖该 expert 的全部 route。各 route 先写
 // 独立 contribution，再由固定 token-major top-k 顺序归约，避免跨 expert 的浮点
 // atomicAdd 让 prompt 末态随 block 调度漂移。
-template <bool Iq4Xs>
+template <unsigned int DownType>
 __device__ __forceinline__ void gguf_grouped_down_impl(
     const unsigned short* activated,
     const unsigned int* token_ids,
@@ -2259,9 +2266,9 @@ __device__ __forceinline__ void gguf_grouped_down_impl(
     if (input_rows == 0u) return;
     const GgufKqMeta& meta = experts[expert];
     const unsigned long long weight = meta.down;
-    const unsigned int tensor_type = Iq4Xs ? 23u : meta.down_type;
+    const unsigned int tensor_type = DownType != 0u ? DownType : meta.down_type;
     __shared__ unsigned short input_tiles[16][16 * 16];
-    __shared__ unsigned short weight_tiles[Iq4Xs ? 1 : 8][16 * 16];
+    __shared__ unsigned short weight_tiles[DownType != 0u ? 1 : 8][16 * 16];
     __shared__ GgufWmmaScratch scratch;
 
     for (unsigned int input_base = 0u; input_base < input_rows; input_base += 128u) {
@@ -2306,7 +2313,23 @@ __device__ __forceinline__ void gguf_grouped_down_impl(
                 stage_prefetch(column_base + 32u);
             __syncthreads();
             const unsigned int lane16 = lane & 15u;
-            if (Iq4Xs || tensor_type == 23u) {
+            if (tensor_type == 12u || tensor_type == 13u) {
+                #pragma unroll
+                for(unsigned int segment=0; segment<2u; ++segment) {
+                    BFragment weight_fragment;
+                    const unsigned int output_delta=output_delta_base+lane16;
+                    const unsigned int output_row=output_row_base+output_delta;
+                    gguf_k4_wmma_fragment(weight_fragment,weight,tensor_type,output_row,input_columns,column_base+segment*16u+(lane>>4u)*8u,output_delta<output_slice_rows && output_row<output_rows);
+                    #pragma unroll
+                    for(unsigned int tile=0; tile<8u; ++tile) {
+                        if(input_base+tile*16u<input_rows) {
+                            AFragment input_fragment;
+                            load_matrix_sync(input_fragment,(const bfloat16_t*)input_tiles[segment*8u+tile],16);
+                            mma_sync(accumulator_fragments[tile],input_fragment,weight_fragment,accumulator_fragments[tile]);
+                        }
+                    }
+                }
+            } else if (tensor_type == 23u) {
                 const unsigned int output_delta = output_delta_base + lane16;
                 const unsigned int output_row = output_row_base + output_delta;
                 const unsigned int lane_column = (lane >> 4u) * 8u;
@@ -2348,6 +2371,37 @@ __device__ __forceinline__ void gguf_grouped_down_impl(
                                 (const bfloat16_t*)input_tiles[segment * 8u + tile], 16);
                             mma_sync(
                                 accumulator_fragments[tile], input_fragment,
+                                weight_fragment, accumulator_fragments[tile]);
+                        }
+                    }
+                }
+            } else if (tensor_type == 8u || tensor_type == 13u || tensor_type == 14u) {
+                const unsigned int output_delta = output_delta_base + lane16;
+                const unsigned int output_row = output_row_base + output_delta;
+                #pragma unroll
+                for (unsigned int segment = 0u; segment < 2u; ++segment) {
+                    BFragment weight_fragment;
+                    if (output_delta < output_slice_rows && output_row < output_rows) {
+                        const unsigned char* row = gguf_kq_row(weight, tensor_type, output_row, input_columns);
+                        const unsigned int column = column_base + segment * 16u + (lane >> 4u) * 8u;
+                        if (tensor_type == 8u)
+                            gguf_q8_0_fragment8_bf16(weight_fragment, row, column);
+                        else if (tensor_type == 14u)
+                            gguf_k_fragment8_bf16<14u>(weight_fragment, row, column);
+                        else
+                            gguf_k_fragment8_bf16<13u>(weight_fragment, row, column);
+                    } else {
+                        #pragma unroll
+                        for (unsigned int element = 0u; element < 8u; ++element)
+                            weight_fragment[element].data = 0u;
+                    }
+                    #pragma unroll
+                    for (unsigned int tile = 0u; tile < 8u; ++tile) {
+                        if (input_base + tile * 16u < input_rows) {
+                            AFragment input_fragment;
+                            load_matrix_sync(input_fragment,
+                                (const bfloat16_t*)input_tiles[segment * 8u + tile], 16);
+                            mma_sync(accumulator_fragments[tile], input_fragment,
                                 weight_fragment, accumulator_fragments[tile]);
                         }
                     }
@@ -2425,7 +2479,7 @@ extern "C" __global__ void gguf_grouped_down_f32(
     unsigned int output_row_base,
     unsigned int output_slice_rows)
 {
-    gguf_grouped_down_impl<false>(activated, token_ids, grouped_weights,
+    gguf_grouped_down_impl<0u>(activated, token_ids, grouped_weights,
         experts, route_offsets, output, input_columns, output_rows,
         expert_base, expert_count, output_row_base, output_slice_rows);
 }
@@ -2444,7 +2498,67 @@ extern "C" __global__ void gguf_grouped_down_iq4xs_f32(
     unsigned int output_row_base,
     unsigned int output_slice_rows)
 {
-    gguf_grouped_down_impl<true>(activated, token_ids, grouped_weights,
+    gguf_grouped_down_impl<23u>(activated, token_ids, grouped_weights,
+        experts, route_offsets, output, input_columns, output_rows,
+        expert_base, expert_count, output_row_base, output_slice_rows);
+}
+
+
+extern "C" __global__ void gguf_grouped_down_q8_0_f32(
+    const unsigned short* activated,
+    const unsigned int* token_ids,
+    const float* grouped_weights,
+    const GgufKqMeta* experts,
+    const unsigned int* route_offsets,
+    float* output,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int expert_base,
+    unsigned int expert_count,
+    unsigned int output_row_base,
+    unsigned int output_slice_rows)
+{
+    gguf_grouped_down_impl<8u>(activated, token_ids, grouped_weights,
+        experts, route_offsets, output, input_columns, output_rows,
+        expert_base, expert_count, output_row_base, output_slice_rows);
+}
+
+
+extern "C" __global__ void gguf_grouped_down_q5_k_f32(
+    const unsigned short* activated,
+    const unsigned int* token_ids,
+    const float* grouped_weights,
+    const GgufKqMeta* experts,
+    const unsigned int* route_offsets,
+    float* output,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int expert_base,
+    unsigned int expert_count,
+    unsigned int output_row_base,
+    unsigned int output_slice_rows)
+{
+    gguf_grouped_down_impl<13u>(activated, token_ids, grouped_weights,
+        experts, route_offsets, output, input_columns, output_rows,
+        expert_base, expert_count, output_row_base, output_slice_rows);
+}
+
+
+extern "C" __global__ void gguf_grouped_down_q6_k_f32(
+    const unsigned short* activated,
+    const unsigned int* token_ids,
+    const float* grouped_weights,
+    const GgufKqMeta* experts,
+    const unsigned int* route_offsets,
+    float* output,
+    unsigned int input_columns,
+    unsigned int output_rows,
+    unsigned int expert_base,
+    unsigned int expert_count,
+    unsigned int output_row_base,
+    unsigned int output_slice_rows)
+{
+    gguf_grouped_down_impl<14u>(activated, token_ids, grouped_weights,
         experts, route_offsets, output, input_columns, output_rows,
         expert_base, expert_count, output_row_base, output_slice_rows);
 }

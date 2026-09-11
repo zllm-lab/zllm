@@ -96,7 +96,9 @@ enum EngineInner {
     K2Horizon(Box<crate::runtime::k2_horizon::node::K2Engine>),
     /// 复用 runtime::node 的直装分发（CUDA/ROCm 组合）。这类 engine 走
     /// NodeEngine 单请求接口；KV 驻留统计与 SSD snapshot 按 NodeEngine
-    /// 实际能力透传，不支持的字段以占位值返回。
+    /// 实际能力透传，不支持的字段以占位值返回。仅在启用对应 backend
+    /// feature 时才存在构造点。
+    #[cfg_attr(not(any(feature = "with-cuda", all(target_os = "linux", feature = "with-rocm"))), allow(dead_code))]
     Direct(Box<dyn crate::server::node::NodeEngine>),
 }
 

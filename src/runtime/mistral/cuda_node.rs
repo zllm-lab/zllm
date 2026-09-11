@@ -138,7 +138,7 @@ impl NodeEngine for MistralCudaEngine {
                 output.stop();
                 break;
             }
-            let bytes = self.detokenizer.decode_bytes(&[token], true).map_err(|error| error.to_string())?;
+            let bytes = crate::runtime::tool::decode_output_token(&self.detokenizer, token).map_err(|error| error.to_string())?;
             if !output.push(&bytes, |chunk| on_token(token, chunk)) {
                 break;
             }

@@ -5,6 +5,7 @@
 
 pub mod chat_template;
 pub mod deepseek_v4;
+pub mod dflash2;
 pub mod dspark;
 pub mod expert_pipeline;
 pub mod gemma4;
@@ -44,6 +45,7 @@ pub mod qwen3_vl;
 pub mod qwen4exp;
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
 pub mod rocm_chain;
+pub mod sensevoice;
 pub mod session;
 pub mod speculative;
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]

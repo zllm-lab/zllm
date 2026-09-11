@@ -106,4 +106,11 @@ impl DualReplay {
         let command = self.plans[parity].submit(ctx);
         Ok(ReplayStep { command, parity })
     }
+
+    /// 同 [`Self::submit`],但按 `keep` 过滤命令(如 Q8 短/长上下文双路径二选一)。
+    /// 两份 parity 的过滤谓词必须一致,否则交替重放的数值语义不成立。
+    pub fn submit_filtered(&self, ctx: &MetalContext, parity: usize, keep: &dyn Fn(&RecordedComputeOp) -> bool) -> Result<ReplayStep, BackendError> {
+        let command = self.plans[parity].submit_filtered(ctx, keep);
+        Ok(ReplayStep { command, parity })
+    }
 }

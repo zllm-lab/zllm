@@ -35,17 +35,7 @@ use crate::runtime::tool::ToolDialect;
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use serde::Serialize;
 
-/// 把推理流里的 `<think>...</think>` 拆成 (reasoning, answer) 段;和 chat 路径同款,
-/// 这里要求 caller 自行用 `request.reasoning` / `request.thinking_token_budget` 判定
-/// `in_reasoning` 初值。
-fn split_reasoning_delta<'a>(text: &'a str, in_reasoning: &mut bool) -> (&'a str, &'a str) {
-    if !*in_reasoning {
-        return ("", text);
-    }
-    let Some(end) = text.find("</think>") else { return (text, "") };
-    *in_reasoning = false;
-    (&text[..end], &text[end + "</think>".len()..])
-}
+use crate::runtime::session::ReasoningStream;
 
 fn reasoning_enabled(request: &ResponsesRequest) -> bool {
     request.reasoning.as_ref().and_then(|reasoning| reasoning.get("effort")).is_some_and(|effort| !effort.is_null()) || request.thinking_token_budget.is_some()
@@ -664,7 +654,7 @@ fn spawn_response_producer(
         // Responses 协议:thinking 必须以独立 `output[type=reasoning]` item 暴露,
         // Codex / ZCode 才渲染 <think> 标签。GLM-5.2 在 reasoning 开启时一定从 <think>
         // 开始,所以和 chat 路径一样,request 显式 opt-in 时进入拆分支。
-        let mut in_reasoning = reasoning_enabled(&request);
+        let mut in_reasoning = ReasoningStream::new(reasoning_enabled(&request));
         let mut tool_calls = Vec::<ToolCall>::new();
         let mut streamed_tools = HashMap::<usize, (usize, ToolCall)>::new();
         let mut message_started = false;
@@ -712,8 +702,8 @@ fn spawn_response_producer(
                 InferenceEvent::Token { text: delta, .. } => {
                     // 先把 thinking 拆出去: reasoning 部分累积到 reasoning_text,
                     // 留给完成时插入 output[type=reasoning] item; text 部分继续走 message。
-                    let (reasoning_delta, text_delta) = split_reasoning_delta(&delta, &mut in_reasoning);
-                    reasoning_text.push_str(reasoning_delta);
+                    let (reasoning_delta, text_delta) = in_reasoning.push(&delta);
+                    reasoning_text.push_str(&reasoning_delta);
                     if text_delta.is_empty() {
                         continue;
                     }
@@ -723,7 +713,7 @@ fn spawn_response_producer(
                         }
                         message_started = true;
                     }
-                    text.push_str(text_delta);
+                    text.push_str(&text_delta);
                     if !send_response_event(
                         &mut tx,
                         "response.output_text.delta",
@@ -797,6 +787,16 @@ fn spawn_response_producer(
                 }
                 InferenceEvent::Completed { finish_reason, prompt_tokens, completion_tokens } => {
                     producer_cancellation.disarm();
+                    let (reasoning_tail, text_tail) = in_reasoning.finish();
+                    reasoning_text.push_str(&reasoning_tail);
+                    if !text_tail.is_empty() {
+                        if !message_started {
+                            if !start_response_message(&mut tx, &message_id, output.len()).await { break 'inference; }
+                            message_started = true;
+                        }
+                        text.push_str(&text_tail);
+                        if !send_response_event(&mut tx, "response.output_text.delta", json!({"type": "response.output_text.delta", "item_id": message_id, "output_index": output.len(), "content_index": 0, "delta": text_tail})).await { break 'inference; }
+                    }
                     let (text, parsed_tool_calls) = ToolDialect::Auto.split_output(&text, &tool_schemas);
                     let native_tool_count = tool_calls.len();
                     tool_calls.extend(parsed_tool_calls.into_iter().enumerate().map(|(index, call)| parsed_tool_call(&response_id, index, call)));
@@ -896,19 +896,22 @@ pub(super) async fn collect_response_api(
     let mut text = String::new();
     let mut reasoning_text = String::new();
     // 非流式: 与流式保持一致,request 显式 opt-in reasoning 时才拆 <think>。
-    let mut in_reasoning = reasoning_enabled(&request);
+    let mut in_reasoning = ReasoningStream::new(reasoning_enabled(&request));
     let mut tool_calls = Vec::<ToolCall>::new();
     while let Some(event) = events.recv().await {
         match event {
             InferenceEvent::Token { text: delta, .. } => {
-                let (reasoning_delta, text_delta) = split_reasoning_delta(&delta, &mut in_reasoning);
-                reasoning_text.push_str(reasoning_delta);
-                text.push_str(text_delta);
+                let (reasoning_delta, text_delta) = in_reasoning.push(&delta);
+                reasoning_text.push_str(&reasoning_delta);
+                text.push_str(&text_delta);
             }
             InferenceEvent::ToolCallDelta { .. } => {}
             InferenceEvent::ToolCall { tool_call, .. } => tool_calls.push(tool_call),
             InferenceEvent::Completed { finish_reason, prompt_tokens, completion_tokens } => {
                 lease.disarm();
+                let (reasoning_tail, text_tail) = in_reasoning.finish();
+                reasoning_text.push_str(&reasoning_tail);
+                text.push_str(&text_tail);
                 let tool_schemas = tool_argument_schemas(&response_tools_to_chat(request.tools.as_deref().unwrap_or_default()));
                 let (text, parsed_tool_calls) = ToolDialect::Auto.split_output(&text, &tool_schemas);
                 tool_calls.extend(parsed_tool_calls.into_iter().enumerate().map(|(index, call)| parsed_tool_call(&request_id, index, call)));
@@ -1250,30 +1253,27 @@ mod tests {
     /// 见 </think> 后切换到 text;跨多个 delta 调用要能正确切。
     #[test]
     fn split_reasoning_delta_keeps_think_then_text() {
-        let mut in_reasoning = true;
-        let (reasoning, text) = split_reasoning_delta("让我想想", &mut in_reasoning);
+        let mut in_reasoning = ReasoningStream::new(true);
+        let (reasoning, text) = in_reasoning.push("让我想想");
         assert_eq!(reasoning, "让我想想");
         assert_eq!(text, "");
-        assert!(in_reasoning);
 
-        let (reasoning, text) = split_reasoning_delta("</think>答案是42", &mut in_reasoning);
+        let (reasoning, text) = in_reasoning.push("</think>答案是42");
         assert_eq!(reasoning, "");
         assert_eq!(text, "答案是42");
-        assert!(!in_reasoning);
 
-        let (reasoning, text) = split_reasoning_delta("再补一句", &mut in_reasoning);
+        let (reasoning, text) = in_reasoning.push("再补一句");
         assert_eq!(reasoning, "");
         assert_eq!(text, "再补一句");
     }
 
-    /// request 没 opt-in reasoning 时 (in_reasoning=false) 整段都走 text,
-    /// 不会误把内容吞进 reasoning_text。
+    /// 未显式启用推理时，实际出现的协议标记仍须被消费。
     #[test]
-    fn split_reasoning_delta_bypassed_when_request_did_not_opt_in() {
-        let mut in_reasoning = false;
-        let (reasoning, text) = split_reasoning_delta("<think>内容</think>答案", &mut in_reasoning);
-        assert_eq!(reasoning, "");
-        assert_eq!(text, "<think>内容</think>答案");
+    fn explicit_thinking_tags_are_consumed_without_request_opt_in() {
+        let mut in_reasoning = ReasoningStream::new(false);
+        let (reasoning, text) = in_reasoning.push("<think>内容</think>答案");
+        assert_eq!(reasoning, "内容");
+        assert_eq!(text, "答案");
     }
 
     /// `response_reasoning_item` 必须严格按 OpenAI Responses 标准 shape,

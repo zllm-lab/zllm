@@ -28,6 +28,8 @@ pub struct QnnContext {
     /// 按层序累计 INT8 副本字节,超预算的层直接不量化,省 host 内存并避免
     /// finalize+abort 试错(大模型下试错一次就是一个权重一份 CPU 校准)。
     int8_resident_bytes: AtomicU64,
+    /// GGUF 量化字节常驻总量,装载日志用。
+    gguf_resident_bytes: AtomicU64,
 }
 
 /// HTP 静态权重预算上限,留 ~100MB 余量覆盖图结构与中间缓冲。
@@ -77,7 +79,12 @@ fn is_execute_aborted(msg: &str) -> bool {
 
 impl QnnContext {
     pub fn new(backend: impl AsRef<Path>) -> Result<Self, String> {
-        Ok(Self { cpu: CpuContext, backend: backend.as_ref().to_owned(), graph_capacity_available: AtomicBool::new(true), int8_resident_bytes: AtomicU64::new(0) })
+        Ok(Self { cpu: CpuContext, backend: backend.as_ref().to_owned(), graph_capacity_available: AtomicBool::new(true), int8_resident_bytes: AtomicU64::new(0), gguf_resident_bytes: AtomicU64::new(0) })
+    }
+
+    /// 装载统计：INT8 进 HTP 的字节数与 GGUF 常驻字节数。
+    pub fn resident_stats(&self) -> (u64, u64) {
+        (self.int8_resident_bytes.load(Ordering::Relaxed), self.gguf_resident_bytes.load(Ordering::Relaxed))
     }
 
     fn cpu_weight<'a>(&self, weight: &'a QnnWeight) -> &'a crate::backend::cpu::CpuWeight {
@@ -127,7 +134,14 @@ impl BackendResources for QnnContext {
         let elements = rows.checked_mul(cols).ok_or_else(|| BackendError::Compute { msg: "QNN 权重 shape 溢出".to_owned() })?;
         let element_bytes = u64::try_from(elements).map_err(|_| BackendError::Compute { msg: "QNN 权重 shape 溢出".to_owned() })?;
         let needs_int8 = rows > 1 && self.int8_resident_bytes.load(Ordering::Relaxed) + element_bytes <= HTP_INT8_BUDGET_BYTES;
-        let needs_f32_head = rows > 8192 && element_bytes * 4 <= CPU_F32_HEAD_LIMIT_BYTES;
+        // 宽 FFN 也会超过 8192 行，不能仅凭行数把压缩权重误当输出头展开。
+        // 仅为原本就是浮点的权重保留 F32 快路径，量化矩阵始终保留压缩形态。
+        let floating_weight = match weight {
+            LinearWeight::Quantized(crate::weight::format::quantization::QuantizedMatrixRef::Gguf(matrix)) => matches!(matrix.tensor_type.0, 0 | 1 | 30),
+            LinearWeight::Quantized(_) => false,
+            _ => true,
+        };
+        let needs_f32_head = floating_weight && rows > 8192 && element_bytes * 4 <= CPU_F32_HEAD_LIMIT_BYTES;
         let decoded = (needs_int8 || needs_f32_head)
             .then(|| match weight {
                 LinearWeight::F32(values) => Ok(values.to_vec()),
@@ -146,7 +160,14 @@ impl BackendResources for QnnContext {
         let cpu = if needs_f32_head {
             self.cpu.prepare_f32(decoded.as_deref().expect("needs_f32_head 时 decoded 已生成"), rows, cols)?
         } else {
-            self.cpu.prepare_weight(weight, rows, cols)?
+            let mut cpu = self.cpu.prepare_weight(weight, rows, cols)?;
+            // GGUF 量化矩阵一次读入常驻:CPU 路径每次 matvec 都 read_bytes() 重读文件,
+            // E4B 级模型每 chunk 15GB IO,prefill/decode 都不可行。常驻换 IO。
+            let resident = cpu.make_gguf_resident().map_err(|msg| BackendError::Compute { msg })?;
+            if resident > 0 {
+                self.gguf_resident_bytes.fetch_add(resident as u64, Ordering::Relaxed);
+            }
+            cpu
         };
         Ok(QnnWeight { cpu, q: quantized, decode: Mutex::new(None), dual_decode: Mutex::new(None), triple_decode: Mutex::new(None), mlp: Mutex::new(None) })
     }
@@ -341,6 +362,10 @@ impl Backend for QnnContext {
     fn argmax(&self, input: &CpuTensor) -> Result<u32, BackendError> {
         self.cpu.argmax(input)
     }
+
+    fn argmax_excluding(&self, input: &CpuTensor, excluded: &[u32]) -> Result<u32, BackendError> {
+        self.cpu.argmax_excluding(input, excluded)
+    }
     fn sample_top_p(&self, input: &CpuTensor, temperature: f32, top_p: f32, random: f32) -> Result<u32, BackendError> {
         self.cpu.sample_top_p(input, temperature, top_p, random)
     }
@@ -435,5 +460,52 @@ impl GqaPrefillBackend for QnnContext {
     }
     fn gqa_prefill_attention_cached_from(&self, cache: &CpuKvCache, layer: usize, position: usize, query: &CpuTensor, spec: &GqaSpec) -> Result<CpuTensor, BackendError> {
         self.cpu.gqa_prefill_attention_cached_from(cache, layer, position, query, spec)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::weight::{container::gguf::GgufReader, format::quantization::QuantizedMatrixRef};
+
+    #[test]
+    fn excluded_tokens_are_not_selected() {
+        let ctx = QnnContext::new("unused-in-cpu-test").unwrap();
+        let logits = CpuTensor { data: vec![1.0, 9.0, 3.0], rows: 1, cols: 3 };
+        assert_eq!(ctx.argmax_excluding(&logits, &[1]).unwrap(), 2);
+        assert!(ctx.argmax_excluding(&logits, &[0, 1, 2]).is_err());
+    }
+
+    #[test]
+    fn wide_quantized_matrix_stays_packed_after_htp_budget_is_exhausted() {
+        // 超过旧输出头阈值的 Q4_K FFN，不能隐式常驻成 F32。
+        let rows = 8193usize;
+        let cols = 256usize;
+        let name = b"wide.weight";
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3u32.to_le_bytes());
+        bytes.extend(1u64.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.extend((name.len() as u64).to_le_bytes());
+        bytes.extend(name);
+        bytes.extend(2u32.to_le_bytes());
+        bytes.extend((cols as u64).to_le_bytes());
+        bytes.extend((rows as u64).to_le_bytes());
+        bytes.extend(12u32.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.resize(bytes.len().next_multiple_of(32) + rows * 144, 0);
+        let path = std::env::temp_dir().join(format!("zllm-qnn-wide-{}.gguf", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let reader = GgufReader::open(&path).unwrap();
+        let matrix = reader.read_matrix("wide.weight").unwrap();
+        let ctx = QnnContext::new("unused-in-cpu-test").unwrap();
+        ctx.int8_resident_bytes.store(HTP_INT8_BUDGET_BYTES, Ordering::Relaxed);
+        let weight = ctx.prepare_weight(LinearWeight::Quantized(QuantizedMatrixRef::Gguf(&matrix)), rows, cols).unwrap();
+        assert!(weight.q.is_none());
+        assert!(weight.cpu.data.is_empty());
+        assert!(weight.cpu.gguf.is_some());
+        let output = ctx.linear(&CpuTensor { data: vec![1.0; cols], rows: 1, cols }, &weight).unwrap();
+        assert_eq!(output.data, vec![0.0; rows]);
+        std::fs::remove_file(path).unwrap();
     }
 }

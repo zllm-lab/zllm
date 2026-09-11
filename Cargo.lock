@@ -3463,6 +3463,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "safetensors"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "172dd94c5a87b5c79f945c863da53b2ebc7ccef4eca24ac63cca66a41aab2178"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5248,7 +5258,7 @@ dependencies = [
 
 [[package]]
 name = "zllm"
-version = "0.8.9"
+version = "0.8.10"
 dependencies = [
  "axum",
  "blake3",
@@ -5272,6 +5282,7 @@ dependencies = [
  "rayon",
  "regex-automata",
  "rustyline",
+ "safetensors",
  "serde",
  "serde_json",
  "serde_yaml",

@@ -567,7 +567,7 @@ impl Transcriber {
         TRANSCRIBER.with(|cell| cell.borrow_mut().take())
     }
 
-    fn is_active() -> bool {
+    pub(crate) fn is_active() -> bool {
         TRANSCRIBER.with(|cell| cell.borrow().is_some())
     }
 

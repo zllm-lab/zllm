@@ -378,7 +378,9 @@ impl Backend for RocmContext {
     }
 
     fn rmsnorm_quantized(&self, input: &Self::Tensor, weight: &Self::Weight, eps: f32) -> Result<Self::Tensor, BackendError> {
-        if input.rows > 1
+        // 两行 verify 保留与单行相同的 F32 精度；BF16 权重的 GEMV
+        // 直接消费输入精度，提前舍入会改变后续投影及选集边界。
+        if input.rows > 2
             && let Some(input_device) = input.device.as_deref()
         {
             let weight_device = weight.resident().map(Arc::as_ref).ok_or_else(|| compute_error("ROCm quantized RMSNorm weight 缺少 resident buffer"))?;
@@ -842,6 +844,38 @@ mod tests {
         assert_eq!(sharded.len(), 2);
         for (index, (&actual, &expected)) in sharded.iter().zip(&full[2..]).enumerate() {
             assert!((actual - expected).abs() <= 1.0e-5, "row={index} actual={actual} expected={expected}");
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm device 0"]
+    fn quantized_rmsnorm_rows2_preserves_single_row_precision() {
+        let context = RocmContext::new(0).unwrap();
+        let cols = 6144;
+        let values = (0..2 * cols).map(|i| ((i * 73 % 2017) as f32 - 1008.0) / 379.0).collect::<Vec<_>>();
+        let weights = (0..cols).map(|i| 1.0 + ((i * 41 % 113) as f32 - 56.0) / 1024.0).collect::<Vec<_>>();
+        let weight = context.prepare_f32(&weights, 1, cols).unwrap();
+        for bf16_input in [false, true] {
+            let input = context.tensor_from_f32(values.clone(), 2, cols).unwrap();
+            let input = if bf16_input { context.tensor_as_bf16(input).unwrap() } else { input };
+            let effective = context.tensor_to_f32(&input).unwrap();
+            let output = context.rmsnorm_quantized(&input, &weight, 1.0e-6).unwrap();
+            assert_eq!(output.dtype, super::RocmTensorDType::F32);
+            let actual = context.tensor_to_f32(&output).unwrap();
+            assert!(actual.iter().any(|value| value.to_bits() & 0xffff != 0));
+            for row in 0..2 {
+                let values = &effective[row * cols..(row + 1) * cols];
+                let single = context.tensor_from_f32(values.to_vec(), 1, cols).unwrap();
+                let single = if bf16_input { context.tensor_as_bf16(single).unwrap() } else { single };
+                let expected = context.tensor_to_f32(&context.rmsnorm_quantized(&single, &weight, 1.0e-6).unwrap()).unwrap();
+                let inv = 1.0 / (values.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>() / cols as f64 + 1.0e-6).sqrt();
+                for column in 0..cols {
+                    let value = actual[row * cols + column];
+                    assert_eq!(value.to_bits(), expected[column].to_bits(), "bf16={bf16_input} row={row} col={column}");
+                    let reference = f64::from(values[column]) * inv * f64::from(weights[column]);
+                    assert!((f64::from(value) - reference).abs() <= 1.0e-5 * (1.0 + reference.abs()), "bf16={bf16_input} row={row} col={column} actual={value} reference={reference}");
+                }
+            }
         }
     }
 }

@@ -89,6 +89,8 @@ mod linear;
 mod moe;
 mod peer_copy;
 mod radix_topk;
+mod speculative;
+pub(crate) use speculative::{candidate_greedy, grouped_block_conv};
 mod tensor;
 
 pub use attention::*;

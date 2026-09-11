@@ -310,6 +310,134 @@ mod tests {
 }
 
 #[cfg(test)]
+mod layer_chain_tests {
+    /// 整层 graph go/no-go 探针（设计稿 rocm-glm53-stage-graph-design-20260910 §6）：
+    /// 用生产形状（GLM-5.3 单层 owner 侧 rows=2 的 kernel 混合代表：rmsnorm +
+    /// 4 个带宽级 GEMV + 5 个 elementwise）构造 10 层链，量化 eager vs 整段
+    /// graph replay 的设备时间线跨度与 host 提交耗时，并逐位对照输出。
+    /// `cargo test --release --features with-rocm stage_layer_chain_gap_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn stage_layer_chain_gap_probe() {
+        use super::super::*;
+        use super::StaticGraphRecorder;
+        let device_id = 0;
+        set_device(device_id).expect("set device");
+        const LAYERS: usize = 10;
+        const ROWS: usize = 2;
+        const HIDDEN: usize = 5120;
+        const W_A_OUT: usize = 2048;
+        const W_B_OUT: usize = 1024;
+        const W_C_OUT: usize = 4096;
+        // 权重字节量按生产每层 owner 侧投影/MoE 读取量级设置（F32 模拟,不代表生产 dtype）。
+        let norm_w = DeviceBuffer::upload_f32(device_id, &vec![1.0f32; HIDDEN]).expect("upload norm");
+        let w_a = DeviceBuffer::upload_f32(device_id, &vec![0.001f32; HIDDEN * W_A_OUT]).expect("upload w_a");
+        let w_b = DeviceBuffer::upload_f32(device_id, &vec![0.001f32; HIDDEN * W_B_OUT]).expect("upload w_b");
+        let w_c = DeviceBuffer::upload_f32(device_id, &vec![0.0005f32; HIDDEN * W_C_OUT]).expect("upload w_c");
+        let w_d = DeviceBuffer::upload_f32(device_id, &vec![0.0005f32; W_C_OUT * HIDDEN]).expect("upload w_d");
+        let w_o = DeviceBuffer::upload_f32(device_id, &vec![0.0005f32; W_A_OUT * HIDDEN]).expect("upload w_o");
+        let input = DeviceBuffer::upload_f32(device_id, &vec![0.25f32; ROWS * HIDDEN]).expect("upload input");
+
+        // 一层 = 生产 MoE 层 owner 侧 kernel 数/带宽混合代表(9 kernel/层):
+        // rmsnorm → q_b 投影 → kv 投影 → gate/up → down → o_proj → 两次残差 add。
+        // 返回(输出, 本层中间 buffer);调用方必须持有中间 buffer 直到 graph 销毁。
+        let one_layer = |hidden: &DeviceBuffer, keep: &mut Vec<DeviceBuffer>| -> Result<DeviceBuffer, String> {
+            let normed = try_rmsnorm_resident_weight_to_f32(device_id, hidden, &norm_w, ROWS, HIDDEN, 1e-5, false)?;
+            let a = try_f32_gemv_resident_f32(device_id, &normed, &w_a, ROWS, HIDDEN, W_A_OUT)?;
+            let b = try_f32_gemv_resident_f32(device_id, &normed, &w_b, ROWS, HIDDEN, W_B_OUT)?;
+            let c = try_f32_gemv_resident_f32(device_id, &normed, &w_c, ROWS, HIDDEN, W_C_OUT)?;
+            let d = try_f32_gemv_resident_f32(device_id, &c, &w_d, ROWS, W_C_OUT, HIDDEN)?;
+            let attn = try_f32_gemv_resident_f32(device_id, &a, &w_o, ROWS, W_A_OUT, HIDDEN)?;
+            let x = try_add_resident_f32(device_id, hidden, &attn, ROWS * HIDDEN, 1.0)?;
+            let x = try_add_resident_f32(device_id, &x, &d, ROWS * HIDDEN, 1.0)?;
+            keep.push(a);
+            keep.push(b);
+            keep.push(c);
+            keep.push(d);
+            keep.push(attn);
+            keep.push(normed);
+            Ok(x)
+        };
+
+        let runtime = RocmRuntime::open().expect("runtime");
+        let create: Symbol<HipEventCreateWithFlags> = runtime.symbol(&runtime.hip, b"hipEventCreateWithFlags\0").expect("event create symbol");
+        let record: Symbol<HipEventRecord> = runtime.symbol(&runtime.hip, b"hipEventRecord\0").expect("event record symbol");
+        let sync: Symbol<HipEventSynchronize> = runtime.symbol(&runtime.hip, b"hipEventSynchronize\0").expect("event sync symbol");
+        let elapsed: Symbol<HipEventElapsedTime> = runtime.symbol(&runtime.hip, b"hipEventElapsedTime\0").expect("event elapsed symbol");
+        let elapsed_ms = |label: &str, run: &mut dyn FnMut()| {
+            let mut begin = ptr::null_mut();
+            let mut end = ptr::null_mut();
+            unsafe {
+                assert_eq!(create(&mut begin, 0), HIP_SUCCESS);
+                assert_eq!(create(&mut end, 0), HIP_SUCCESS);
+                assert_eq!(record(begin, active_compute_stream()), HIP_SUCCESS);
+            }
+            let wall_started = std::time::Instant::now();
+            run();
+            let wall_ms = wall_started.elapsed().as_secs_f64() * 1000.0;
+            unsafe {
+                assert_eq!(record(end, active_compute_stream()), HIP_SUCCESS);
+                assert_eq!(sync(end), HIP_SUCCESS);
+                let mut ms = 0.0f32;
+                assert_eq!(elapsed(&mut ms, begin, end), HIP_SUCCESS);
+                eprintln!("[stage-layer-probe] {label} device_ms={ms:.3} host_wall_ms={wall_ms:.3}");
+            }
+        };
+
+        // eager 参照输出(录制不执行 kernel,必须先 eager 一遍)
+        let run_chain = |keep: &mut Vec<DeviceBuffer>| -> Result<DeviceBuffer, String> {
+            let mut hidden = one_layer(&input, keep)?;
+            for _ in 1..LAYERS {
+                hidden = one_layer(&hidden, keep)?;
+            }
+            Ok(hidden)
+        };
+        let mut eager_keep = Vec::new();
+        let hidden = run_chain(&mut eager_keep).expect("eager reference");
+        let reference = hidden.download_f32(ROWS * HIDDEN).expect("download reference");
+        eager_keep.push(hidden);
+
+        const EAGER_ROUNDS: usize = 30;
+        elapsed_ms("eager 10层x30轮", &mut || {
+            let mut keep = Vec::new();
+            for _ in 0..EAGER_ROUNDS {
+                let out = run_chain(&mut keep).expect("eager timed chain");
+                keep.push(out);
+            }
+            std::mem::forget(keep);
+        });
+
+        // graph 录制(只录不跑,录制期分配的中间 buffer 全部由图生命周期持有)
+        let stream = active_compute_stream();
+        let mut graph_keep = Vec::new();
+        let graph = {
+            let recorder = StaticGraphRecorder::begin(device_id, stream).expect("begin recording");
+            let hidden = run_chain(&mut graph_keep).expect("record chain");
+            let graph = recorder.finish().expect("finish").expect("graph 非空");
+            graph_keep.push(hidden);
+            graph
+        };
+        eprintln!("[stage-layer-probe] nodes={} (10层)", graph.node_count());
+        const REPLAYS: usize = 100;
+        elapsed_ms("graph 10层x100轮", &mut || {
+            for _ in 0..REPLAYS {
+                graph.launch(device_id, stream).expect("graph replay");
+            }
+        });
+        // replay 一次后读最终输出,与 eager 参照逐位对照
+        graph.launch(device_id, stream).expect("graph replay verify");
+        synchronize_device(device_id, "probe verify").expect("sync");
+        let actual = graph_keep.last().expect("graph output").download_f32(ROWS * HIDDEN).expect("download graph output");
+        let mismatch = reference.iter().zip(actual.iter()).enumerate().filter(|(_, (a, b))| a.to_bits() != b.to_bits()).count();
+        eprintln!("[stage-layer-probe] 输出逐位对照: mismatch={mismatch}/{}", reference.len());
+        assert_eq!(mismatch, 0, "graph replay 与 eager 输出必须逐位一致");
+        drop(graph);
+        drop(graph_keep);
+        drop(eager_keep);
+    }
+}
+
+#[cfg(test)]
 mod p2p_tests {
     /// P2P 握手延迟探针：pair decode 每层 4-6 次跨卡握手的单次成本标定。
     /// `cargo test --release --features with-rocm p2p_handshake_latency_probe -- --ignored --nocapture`

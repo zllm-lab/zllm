@@ -1,6 +1,6 @@
 [package]
 name = "zllm"
-version = "0.8.9"
+version = "0.8.10"
 edition = "2024"
 description = "跨平台跨模型的高性能 LLM 推理引擎"
 license = "Apache-2.0"
@@ -15,7 +15,7 @@ autobins = false
 resolver = "3"
 
 [lib]
-crate-type = ["rlib", "staticlib"]
+crate-type = ["rlib", "staticlib", "cdylib"]
 
 [features]
 default = []
@@ -44,6 +44,7 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 half = "2"
+safetensors = "0.6"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 rayon = "1"
 regex-automata = "0.4"
@@ -127,3 +128,8 @@ required-features = ["with-rocm"]
 name = "zllm-rt-vulkan"
 path = "src/bin/runtime/vulkan.rs"
 required-features = ["with-vulkan"]
+
+[[bin]]
+name = "zllm-rt-qnn"
+path = "src/bin/runtime/qnn.rs"
+required-features = ["with-qnn"]

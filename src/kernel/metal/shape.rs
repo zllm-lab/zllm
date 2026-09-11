@@ -192,6 +192,17 @@ kernel void apply_rope_prefix_position_f16(
     apply_rope_f16_impl(input, output, rows, columns, head_count, rotary_dim, decode_state[0], cos_data, sin_data, idx, false, false);
 }
 
+// Interleaved 布局(MiniCPM5/llama 系)的 decode 重放变体:position 由 decode_state[0] 提供。
+kernel void apply_rope_interleaved_prefix_position_f16(
+    device const half *input [[buffer(0)]], device half *output [[buffer(1)]],
+    constant uint &rows [[buffer(2)]], constant uint &columns [[buffer(3)]],
+    constant uint &head_count [[buffer(4)]], constant uint &rotary_dim [[buffer(5)]],
+    constant uint *decode_state [[buffer(6)]], device const half *cos_data [[buffer(7)]],
+    device const half *sin_data [[buffer(8)]], uint idx [[thread_position_in_grid]])
+{
+    apply_rope_f16_impl(input, output, rows, columns, head_count, rotary_dim, decode_state[0], cos_data, sin_data, idx, true, false);
+}
+
 kernel void apply_rope_interleaved_prefix_f16(
     device const half *input [[buffer(0)]], device half *output [[buffer(1)]],
     constant uint &rows [[buffer(2)]], constant uint &columns [[buffer(3)]],
@@ -739,6 +750,40 @@ pub fn apply_rope_position_tensor(
     if x.dtype != MetalTensorDType::F16 || x.rows != 1 || layout != crate::attention::rope::RotaryLayout::SplitHalf {
         return Err(format!("decode RoPE position 只支持单行 F16 SplitHalf，实际 {:?}[{},{}]", x.dtype, x.rows, x.cols));
     }
+    rope_position_launch(ctx, x, head_count, rotary_dim, cos_f16, sin_f16, max_positions, decode_state, state_offset, "apply_rope_prefix_f16")
+}
+
+/// Interleaved 布局(MiniCPM5)的 decode 重放 RoPE:position 从 `decode_state[state_offset..]` 读取,
+/// 命令表与 position 无关。
+pub fn apply_rope_interleaved_position_tensor(
+    ctx: &MetalContext,
+    x: &MetalTensor,
+    head_count: usize,
+    rotary_dim: usize,
+    cos_f16: &metal::Buffer,
+    sin_f16: &metal::Buffer,
+    max_positions: usize,
+    decode_state: &metal::Buffer,
+    state_offset: u64,
+) -> Result<MetalTensor, String> {
+    if x.dtype != MetalTensorDType::F16 || x.rows != 1 {
+        return Err(format!("Interleaved decode RoPE position 只支持单行 F16，实际 {:?}[{},{}]", x.dtype, x.rows, x.cols));
+    }
+    rope_position_launch(ctx, x, head_count, rotary_dim, cos_f16, sin_f16, max_positions, decode_state, state_offset, "apply_rope_interleaved_prefix_position_f16")
+}
+
+fn rope_position_launch(
+    ctx: &MetalContext,
+    x: &MetalTensor,
+    head_count: usize,
+    rotary_dim: usize,
+    cos_f16: &metal::Buffer,
+    sin_f16: &metal::Buffer,
+    max_positions: usize,
+    decode_state: &metal::Buffer,
+    state_offset: u64,
+    pipeline_name: &str,
+) -> Result<MetalTensor, String> {
     if head_count == 0 || !x.cols.is_multiple_of(head_count) || rotary_dim == 0 || !rotary_dim.is_multiple_of(2) || rotary_dim > x.cols / head_count {
         return Err("decode RoPE position shape 非法".to_owned());
     }
@@ -753,7 +798,7 @@ pub fn apply_rope_position_tensor(
     let head_count = validate_u32("decode rope head_count", head_count)?;
     let rotary_dim = validate_u32("decode rope rotary_dim", rotary_dim)?;
     let shape = format!("columns={columns},heads={head_count},rotary_dim={rotary_dim}");
-    launch_1d(ctx, "apply_rope_prefix_f16", &shape, x.len(), x.buffer.length() + cos_f16.length() + sin_f16.length(), output.buffer.length(), |encoder| {
+    launch_1d(ctx, pipeline_name, &shape, x.len(), x.buffer.length() + cos_f16.length() + sin_f16.length(), output.buffer.length(), |encoder| {
         encoder.set_buffer(0, Some(&x.buffer), 0);
         encoder.set_buffer(1, Some(&output.buffer), 0);
         set_bytes(encoder, 2, &rows);
@@ -807,6 +852,44 @@ mod position_tests {
         let replay = ctx.read_f16_to_f32(&replay.buffer, heads * head_dim);
         for (index, (left, right)) in legacy.iter().zip(&replay).enumerate() {
             assert!((left - right).abs() < 1.0e-3, "rope d={index}: legacy={left} position={right}");
+        }
+    }
+
+    /// Interleaved decode RoPE position 版(MiniCPM5 重放用)与 legacy 切片行对拍。
+    #[test]
+    fn rope_interleaved_position_matches_prefix_row() {
+        if metal::Device::system_default().is_none() {
+            return;
+        }
+        let (heads, head_dim, rotary_dim) = (4usize, 64usize, 64usize);
+        let half_dim = rotary_dim / 2;
+        let max_positions = 16usize;
+        let position = 5usize;
+        let mut rng: u32 = 1717;
+        let mut next = || {
+            rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((rng >> 8) as f32 / 8388608.0 - 1.0) * 0.5
+        };
+        let cos: Vec<f32> = (0..max_positions * half_dim).map(|index| ((index as f32 * 0.11) % std::f32::consts::TAU).cos()).collect();
+        let sin: Vec<f32> = (0..max_positions * half_dim).map(|index| ((index as f32 * 0.23) % std::f32::consts::TAU).sin()).collect();
+        let input: Vec<f32> = (0..heads * head_dim).map(|_| next()).collect();
+        let ctx = MetalContext::new_default().unwrap();
+        let x = ctx.tensor_from_f32(&input, 1, heads * head_dim).unwrap();
+        let legacy = apply_rope_prefix_tensor(&ctx, &x, heads, rotary_dim, crate::attention::rope::RotaryLayout::Interleaved, position, &cos, &sin).unwrap();
+
+        let f16_bytes = |values: &[f16]| unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 2) };
+        let cos_f16: Vec<f16> = cos.iter().map(|&value| f16::from_f32(value)).collect();
+        let sin_f16: Vec<f16> = sin.iter().map(|&value| f16::from_f32(value)).collect();
+        let cos_buffer = ctx.shared_buffer(f16_bytes(&cos_f16));
+        let sin_buffer = ctx.shared_buffer(f16_bytes(&sin_f16));
+        let state = [position as u32];
+        let state_buffer = ctx.shared_buffer(unsafe { std::slice::from_raw_parts(state.as_ptr().cast::<u8>(), 4) });
+        let replay = apply_rope_interleaved_position_tensor(&ctx, &x, heads, rotary_dim, &cos_buffer, &sin_buffer, max_positions, &state_buffer, 0).unwrap();
+
+        let legacy = ctx.read_f16_to_f32(&legacy.buffer, heads * head_dim);
+        let replay = ctx.read_f16_to_f32(&replay.buffer, heads * head_dim);
+        for (index, (left, right)) in legacy.iter().zip(&replay).enumerate() {
+            assert!((left - right).abs() < 1.0e-3, "interleaved rope d={index}: legacy={left} position={right}");
         }
     }
 }

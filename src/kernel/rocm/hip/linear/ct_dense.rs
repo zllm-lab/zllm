@@ -388,7 +388,10 @@ fn try_ct_quantized_matmul_bf16_epilogue(
     let use_w4_g128_wmma = use_wmma && bits == 4 && group_size == 128 && scale_dtype == 0 && functions.wavefront_size == 32;
     let use_w8 = !use_wmma && bits == 8 && group_size % 4 == 0 && input_columns % 4 == 0;
     let g32_rows_shared_occupancy_limited = group_size == 32 && input_columns / group_size >= 128 && output_rows >= 8192;
-    let use_w8_rows_shared = use_w8 && matches!(input_rows, 4 | 6 | 8) && functions.wavefront_size == 32 && (group_size == 32 && !g32_rows_shared_occupancy_limited || group_size == 128 && input_columns / group_size >= 32);
+    // 合批和 verify 尾组也会产生奇数行；G128 大矩阵共享权重读取，保持逐行累加次序。
+    let use_w8_rows_shared = use_w8
+        && functions.wavefront_size == 32
+        && (group_size == 32 && matches!(input_rows, 4 | 6 | 8) && !g32_rows_shared_occupancy_limited || group_size == 128 && (3..=8).contains(&input_rows) && input_columns / group_size >= 32);
     let use_w8_row_pairs = use_w8 && !use_w8_rows_shared && matches!(input_rows, 2 | 4 | 6 | 8) && matches!(group_size, 32 | 128) && functions.wavefront_size == 32;
     let use_w4_rows_shared = !use_wmma && bits == 4 && (2..=8).contains(&input_rows) && group_size == 128 && functions.wavefront_size == 32;
     if let Some(residual) = residual {
@@ -496,8 +499,11 @@ fn try_ct_quantized_matmul_bf16_epilogue(
                         (32, 4) => functions.w8_g32_rows4,
                         (32, 6) => functions.w8_g32_rows6,
                         (32, 8) => functions.w8_g32_rows8,
+                        (128, 3) => functions.w8_rows3,
                         (128, 4) => functions.w8_rows4,
+                        (128, 5) => functions.w8_rows5,
                         (128, 6) => functions.w8_rows6,
+                        (128, 7) => functions.w8_rows7,
                         (128, 8) => functions.w8_rows8,
                         _ => unreachable!(),
                     }
@@ -1212,6 +1218,18 @@ mod tests {
         assert_w8_rows_real_shape::<6>(128, 6_144, 2_048, 576, 0, 1);
         assert_w8_rows_real_shape::<6>(128, 2_048, 16_384, 4_096, 1, 0);
         assert_w8_rows_real_shape::<8>(128, 2_048, 16_384, 4_096, 1, 0);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn rocm_w8_g128_rows357_are_bit_exact() {
+        super::super::configure(crate::kernel::rocm::hip::RocmOptions::default()).unwrap();
+        assert_w8_rows_real_shape::<3>(128, 6_144, 8_192, 257, 0, 1);
+        assert_w8_rows_real_shape::<5>(128, 6_144, 8_192, 257, 1, 0);
+        assert_w8_rows_real_shape::<7>(128, 6_144, 8_192, 257, 0, 1);
+        assert_w8_rows_real_shape::<3>(128, 4_096, 2_048, 257, 1, 0);
+        assert_w8_rows_real_shape::<5>(128, 4_096, 2_048, 257, 0, 1);
+        assert_w8_rows_real_shape::<7>(128, 4_096, 2_048, 257, 1, 0);
     }
 
     /// W8 G32 GEMV 全形状微基准：attention 投影各真实形状的带宽利用率。

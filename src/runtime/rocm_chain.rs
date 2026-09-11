@@ -91,3 +91,9 @@ pub fn node_capabilities(contexts: &[RocmContext], max_seq_len: usize, kv_cache_
         crate::runtime::node::SessionDescriptor { model_format: &model_format, model_bytes, max_seq_len, kv_cache_format, input_modalities: &["text"] },
     )
 }
+
+/// 每台机器独立读取可供新增会话使用的主机内存，不能由链头替下游估算。
+pub fn host_available_bytes() -> Result<u64, String> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").map_err(|error| format!("读取 /proc/meminfo: {error}"))?;
+    meminfo.lines().find_map(|line| line.strip_prefix("MemAvailable:")?.split_whitespace().next()?.parse::<u64>().ok()?.checked_mul(1024)).filter(|&bytes| bytes != 0).ok_or_else(|| "无法解析非零 MemAvailable".to_owned())
+}

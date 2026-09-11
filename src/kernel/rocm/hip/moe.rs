@@ -57,6 +57,7 @@ pub(crate) struct Fp8GroupedExpertMeta {
 pub(super) struct MoePrefillFunctions {
     router_logits_decode: usize,
     router_logits_precise: usize,
+    router_logits_precise_rows4: usize,
     router_logits: usize,
     router_topk_256: usize,
     zero: usize,
@@ -112,6 +113,7 @@ pub(super) fn moe_prefill_functions(device_id: i32) -> Result<MoePrefillFunction
             MoePrefillFunctions {
                 router_logits_decode: function("moe_router_logits_decode_f32")?,
                 router_logits_precise: function("moe_router_logits_precise_f32")?,
+                router_logits_precise_rows4: function("moe_router_logits_precise_rows4_f32")?,
                 router_logits: function("moe_router_logits_f32")?,
                 router_topk_256: function("moe_router_topk_256_f32")?,
                 zero: function("moe_zero_f32")?,
@@ -275,7 +277,8 @@ fn launch_moe_route_resident_device_f32(
     ];
     let logits_started = options().kernel_profile.then(std::time::Instant::now);
     if precise {
-        launch_moe_kernel(functions.router_logits_precise, experts_u32, rows_u32, 256, 0, &mut logits_arguments, "HIP MoE precise F32 router logits")?;
+        let (function, grid_rows) = if rows >= 16 { (functions.router_logits_precise_rows4, rows_u32.div_ceil(4)) } else { (functions.router_logits_precise, rows_u32) };
+        launch_moe_kernel(function, experts_u32, grid_rows, 256, 0, &mut logits_arguments, "HIP MoE precise F32 router logits")?;
     } else if rows == 1 {
         let mut decode_arguments =
             [(&mut d_input as *mut *mut c_void).cast(), (&mut d_weight as *mut *mut c_void).cast(), (&mut d_logits as *mut *mut c_void).cast(), (&mut columns_u32 as *mut u32).cast(), (&mut experts_u32 as *mut u32).cast()];
@@ -1503,6 +1506,53 @@ mod tests {
         assert_eq!(actual.len(), expected.weights.len());
         for (index, (actual, expected)) in actual.iter().zip(expected.weights.iter()).enumerate() {
             assert!((actual - expected).abs() <= 1.0e-5 + expected.abs() * 1.0e-4, "index={index} actual={actual} expected={expected}");
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn precise_router_rows4_matches_scalar_bits_and_cpu() {
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        let device = 0;
+        let functions = moe_prefill_functions(device).unwrap();
+        for (rows, columns, experts) in [(1, 257, 5), (3, 512, 17), (4, 511, 16), (5, 6144, 33), (17, 6144, 256), (1024, 6144, 256)] {
+            let mut input = (0..rows * columns).map(|i| ((i * 17 % 251) as f32 - 125.0) / 127.0).collect::<Vec<_>>();
+            let mut weight = (0..experts * columns).map(|i| ((i * 31 % 257) as f32 - 128.0) / 521.0).collect::<Vec<_>>();
+            // 非有限值沿用逐行版本的置零语义，尾行和非整齐列也需逐位一致。
+            input[0] = f32::NAN;
+            weight[columns - 1] = f32::INFINITY;
+            let input_device = DeviceBuffer::upload_f32(device, &input).unwrap();
+            let weight_device = DeviceBuffer::upload_f32(device, &weight).unwrap();
+            let reference = DeviceBuffer::allocate(device, rows * experts * 4).unwrap();
+            let actual = DeviceBuffer::allocate(device, rows * experts * 4).unwrap();
+            for (function, grid_y, output) in [(functions.router_logits_precise, rows, &reference), (functions.router_logits_precise_rows4, rows.div_ceil(4), &actual)] {
+                let mut x = input_device.pointer;
+                let mut w = weight_device.pointer;
+                let mut y = output.pointer;
+                let mut m = rows as u32;
+                let mut k = columns as u32;
+                let mut n = experts as u32;
+                let mut args = [(&mut x as *mut *mut c_void).cast(), (&mut w as *mut *mut c_void).cast(), (&mut y as *mut *mut c_void).cast(), (&mut m as *mut u32).cast(), (&mut k as *mut u32).cast(), (&mut n as *mut u32).cast()];
+                launch_moe_kernel(function, experts as u32, grid_y as u32, 256, 0, &mut args, "precise router rows4 oracle").unwrap();
+            }
+            let reference = reference.download_f32(rows * experts).unwrap();
+            let actual = actual.download_f32(rows * experts).unwrap();
+            for (index, (&actual, &reference)) in actual.iter().zip(&reference).enumerate() {
+                assert_eq!(actual.to_bits(), reference.to_bits(), "rows={rows} columns={columns} experts={experts} index={index}");
+            }
+            for row in [0, rows / 2, rows - 1] {
+                for expert in [0, experts / 2, experts - 1] {
+                    let expected = (0..columns)
+                        .map(|col| {
+                            let x = input[row * columns + col];
+                            let w = weight[expert * columns + col];
+                            if x.is_finite() && w.is_finite() { f64::from(x) * f64::from(w) } else { 0.0 }
+                        })
+                        .sum::<f64>();
+                    let actual = f64::from(actual[row * experts + expert]);
+                    assert!((actual - expected).abs() <= 1e-3 + expected.abs() * 2e-5, "rows={rows} columns={columns} row={row} expert={expert} actual={actual} expected={expected}");
+                }
+            }
         }
     }
 

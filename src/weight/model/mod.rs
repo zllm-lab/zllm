@@ -2,6 +2,7 @@
 
 pub mod deepseek_v4;
 pub mod deepseek_v4_dspark;
+pub mod dflash2;
 pub mod gemma4;
 pub mod glm52;
 pub mod glm52_dspark;
@@ -16,4 +17,5 @@ pub mod qwen3;
 pub mod qwen36;
 pub mod qwen36_dspark;
 pub mod qwen3_vl;
+pub mod sensevoice;
 pub mod vision;

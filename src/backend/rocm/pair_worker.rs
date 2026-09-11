@@ -48,6 +48,7 @@ impl RocmPairWorker {
         let handle = thread::Builder::new()
             .name(format!("zllm-rocm-pair-dev{}", context.device_id()))
             .spawn(move || {
+                context.pin_submission_thread_to_configured_cpus();
                 let mut stage_active = false;
                 let mut stage_retained = Vec::new();
                 while let Ok(command) = receiver.recv() {

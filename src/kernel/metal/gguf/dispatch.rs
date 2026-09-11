@@ -43,6 +43,10 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
     // 服务 gated dual 的分解路径)。
     let use_iq4xs_fused = input.dtype == MetalTensorDType::F16 && input.rows >= gguf_prefill_mps_rows() && tensor_type == 23;
     let use_iq3s_fused = input.dtype == MetalTensorDType::F16 && input.rows >= gguf_prefill_mps_rows() && tensor_type == 21;
+    // Metal4 cooperative tensor 可用时 IQ4_XS/IQ3_S 与 IQ4_NL 一样优先走 mpp
+    // 变体(同 64×128 tile + matmul2d 累加);fused 保留为非 Metal4 设备回退。
+    let use_iq4xs_mpp = use_iq4xs_fused && ctx.metal4_available();
+    let use_iq3s_mpp = use_iq3s_fused && ctx.metal4_available();
     if use_q3k_fused || use_q6k_fused || use_iq4nl_fused || use_iq4xs_fused || use_iq3s_fused {
         // fused 路径不依赖 caller 的 dtype guard, 显式用 input dtype (F16)
         let m = validate_u32("GGUF M", input.rows)?;
@@ -54,8 +58,13 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
             "gguf_gemm_q3k_fused_f16"
         } else if use_q6k_fused {
             "gguf_gemm_q6k_fused_f16"
+        } else if use_iq4xs_mpp {
+            // skinny M 换小 tile:M=42 填充到 128 会浪费 86% MMA FLOP。
+            if input.rows <= 32 { "gguf_gemm_iq4xs_mpp32_f16" } else if input.rows <= 64 { "gguf_gemm_iq4xs_mpp64_f16" } else { "gguf_gemm_iq4xs_mpp_f16" }
         } else if use_iq4xs_fused {
             "gguf_gemm_iq4xs_fused_f16"
+        } else if use_iq3s_mpp {
+            if input.rows <= 32 { "gguf_gemm_iq3s_mpp32_f16" } else if input.rows <= 64 { "gguf_gemm_iq3s_mpp64_f16" } else { "gguf_gemm_iq3s_mpp_f16" }
         } else if use_iq3s_fused {
             "gguf_gemm_iq3s_fused_f16"
         } else if ctx.metal4_available() {
@@ -63,7 +72,16 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
         } else {
             "gguf_gemm_iq4nl_fused_f16"
         };
-        let output = if kernel_name == "gguf_gemm_iq4nl_mpp_f16" { ctx.tensor_pooled_f32("gguf_iq4nl_mpp_f32", input.rows, weight_rows) } else { ctx.tensor_kernel_output(input.rows, weight_rows) };
+        let use_mpp = use_iq4xs_mpp || use_iq3s_mpp || kernel_name == "gguf_gemm_iq4nl_mpp_f16";
+        // mpp 以 float cooperative tensor 目标落 pooled F32 scratch,再独立 cast
+        // 回 F16。half 累加器与"float 累加 + half 目的隐式转换 store"两条消除
+        // cast 的捷径均已被证伪(见 kernel 注释与 docs 追记)。
+        let output = if use_mpp {
+            let pool_tag = if use_iq4xs_mpp { "gguf_iq4xs_mpp_f32" } else if use_iq3s_mpp { "gguf_iq3s_mpp_f32" } else { "gguf_iq4nl_mpp_f32" };
+            ctx.tensor_pooled_f32(pool_tag, input.rows, weight_rows)
+        } else {
+            ctx.tensor_kernel_output(input.rows, weight_rows)
+        };
         let pipeline = ctx.pipeline(kernel_name)?;
         let threads: usize = 128;
         if pipeline.max_total_threads_per_threadgroup() < threads as u64 {
@@ -80,8 +98,9 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
         set_bytes(&encoder, 5, &n);
         set_bytes(&encoder, 6, &k);
         set_bytes(&encoder, 7, &row_bytes_u32);
-        let groups = if kernel_name == "gguf_gemm_iq4nl_mpp_f16" {
-            MTLSize::new(input.rows.div_ceil(128) as u64, weight_rows.div_ceil(64) as u64, 1)
+        let mpp_tile_rows: usize = if kernel_name.ends_with("mpp32_f16") { 32 } else if kernel_name.ends_with("mpp64_f16") { 64 } else { 128 };
+        let groups = if use_mpp {
+            MTLSize::new(input.rows.div_ceil(mpp_tile_rows) as u64, weight_rows.div_ceil(64) as u64, 1)
         } else if use_iq4nl_fused || use_iq4xs_fused || use_iq3s_fused {
             // iq4nl 是 64×64 tile;iq4xs/iq3s 是 32×32 tile(MLX qmm 同款,
             // 小布局换并发 TG)。

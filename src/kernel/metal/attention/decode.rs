@@ -395,6 +395,12 @@ pub fn gqa_decode_attention_split_kv_buffers(
     set_bytes(&encoder, 17, &group_size);
     set_bytes(&encoder, 18, &groups_per_head);
     set_bytes(&encoder, 19, &q8_flag);
+    if !use_flash_q8 && !bf16 {
+        // gqa_decode_split_kv 的分块模式:动态路径固定 0(按 block_tokens 步长),
+        // 重放路径由 mod.rs 的 position 录制传 1(区间按 source_rows 均分)。
+        let dynamic_blocks = 0u32;
+        set_bytes(&encoder, 20, &dynamic_blocks);
+    }
     let split_height = kv_head_count * (head_count / kv_head_count).div_ceil(4);
     encoder.dispatch_thread_groups(MTLSize::new(block_count as u64, split_height as u64, 1), MTLSize::new(THREADS as u64, 1, 1));
     encoder.end_encoding();

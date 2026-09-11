@@ -14,4 +14,7 @@ pub(super) struct Glm52HeadState {
     pub(super) dspark_target_cache: DsparkTargetCache<RocmTensor>,
     pub(super) cache_namespace: Option<String>,
     pub(super) info: CacheInfo,
+    pub(super) decode_finished_at: SystemTime,
+    /// 当前轮输入长度，不用包含生成结果的 KV 水位决定短 prompt 是否落盘。
+    pub(super) prompt_tokens: usize,
 }

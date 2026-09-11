@@ -241,6 +241,9 @@ pub trait StageExecutionBackend {
     fn finish_stage_session(&self) -> Result<(), BackendError> {
         Ok(())
     }
+    /// stage worker 线程启动时调用一次；设备 backend 可据此把提交线程绑到
+    /// 靠近设备的 CPU（MMIO/doorbell 延迟对 NUMA 敏感）。默认不动。
+    fn pin_submission_thread(&self) {}
 }
 
 /// stage 间张量迁移与紧凑表示能力。runtime 只描述边界，不接触设备指针。
@@ -269,6 +272,10 @@ pub trait DsaStageBackend: DsaPrefillBackend + StageTensorBackend {
     /// 不改变数学语义的 dispatch hint；默认实现保持原路径。
     fn set_stage_decode_parallelism(&self, dsa: &mut Self::DsaState, sessions: usize) {
         let _ = (dsa, sessions);
+    }
+    /// 区分 prefill 尾块与 decode/verify；行数相同也可能需要不同的 KV 驻留方式。
+    fn set_stage_cache_decode(&self, _cache: &mut Self::Cache, _decode: bool) -> Result<(), BackendError> {
+        Ok(())
     }
     /// 在下一份工作开始前原地回退 session 的逻辑长度；已分配设备页保持不变。
     fn truncate_stage_state(&self, cache: &mut Self::Cache, dsa: &mut Self::DsaState, rows: usize) -> Result<(), BackendError>;
@@ -645,6 +652,19 @@ pub trait Backend: BackendResources {
         if excluded.is_empty() { self.sample_top_p(input, temperature, top_p, random) } else { Err(BackendError::Compute { msg: "当前 backend 不支持带禁止 token 的 top-p".to_owned() }) }
     }
     fn gated_activation(&self, gate: &Self::Tensor, up: &Self::Tensor, activation: &Activation) -> Result<Self::Tensor, BackendError>;
+
+    /// 逐元素 ReLU。
+    fn relu(&self, _input: &Self::Tensor) -> Result<Self::Tensor, BackendError> {
+        Err(BackendError::Compute { msg: "当前 backend 不支持 ReLU".to_owned() })
+    }
+
+    /// 逐通道一维卷积（depthwise，stride=1，无 dilation/bias）。输入/输出 shape
+    /// 同为 `[rows=时间步, cols=channels]`；weight 布局 `[kernel][channels]`
+    /// （tap 主序，通道连续），时间轴两侧按 left/right padding 零填充，行数不变。
+    /// SenseVoice SAN-M 的 FSMN 记忆分支使用（kernel=11，对称 padding 5/5）。
+    fn depthwise_conv1d(&self, _input: &Self::Tensor, _weight: &Self::Weight, _kernel: usize, _left_padding: usize, _right_padding: usize) -> Result<Self::Tensor, BackendError> {
+        Err(BackendError::Compute { msg: "当前 backend 不支持 depthwise conv1d".to_owned() })
+    }
 }
 
 /// Host 权重视图，只在 decode layer 准备阶段使用。
@@ -1523,6 +1543,13 @@ pub trait BlockAttentionBackend: Backend {
         let value = self.concat_token_rows(&[prefix_value, suffix_value])?;
         self.block_attention(query, &key, &value, spec)
     }
+}
+
+/// 分组动态卷积的 delta 按 [rows, 2, taps, groups] 排列，base 为 [2*taps, columns]。
+/// side=0/1 分别取输入/输出侧，两侧复用同一次投影，block 之间不读取历史。
+pub trait BlockConvolutionBackend: Backend {
+    #[allow(clippy::too_many_arguments)]
+    fn grouped_block_conv(&self, input: &Self::Tensor, delta: &Self::Tensor, base: &Self::Weight, block_size: usize, group_size: usize, taps: usize, side: usize) -> Result<Self::Tensor, BackendError>;
 }
 
 /// MoE prefill 的通用张量编排能力；专家权重的加载策略由 runtime closure 决定。

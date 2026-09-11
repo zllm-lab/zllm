@@ -119,6 +119,7 @@ impl W4A16Matrix {
         Ok(out)
     }
 
+    #[cfg(test)]
     pub(crate) fn slice_rows(&self, range: std::ops::Range<usize>) -> Result<Self, String> {
         slice_groupwise_rows(self.packed(), self.scales(), self.scale_dtype, self.group_size, self.rows, self.cols, 4, range).and_then(|(packed, scales, rows)| Self::new(packed, scales, self.scale_dtype, self.group_size, rows, self.cols))
     }

@@ -83,6 +83,56 @@ extern "C" __global__ void moe_router_logits_precise_f32(
     }
 }
 
+// 四行共享一次 router 权重读取；每行仍按原 256-thread 步长累加，再按
+// 相同 wave/CTA 顺序归约，避免路由边界附近因精度变化选中不同 expert。
+extern "C" __global__ void moe_router_logits_precise_rows4_f32(
+    const float* input,
+    const float* weight,
+    float* logits,
+    unsigned int rows,
+    unsigned int columns,
+    unsigned int experts)
+{
+    const unsigned int row_base = blockIdx.y * 4U;
+    const unsigned int expert = blockIdx.x;
+    if (row_base >= rows || expert >= experts) return;
+    const unsigned int lane = threadIdx.x % warpSize;
+    const unsigned int wave = threadIdx.x / warpSize;
+    const unsigned int wave_count = blockDim.x / warpSize;
+    const float* expert_weight = weight + (unsigned long long)expert * columns;
+    float sums[4] = {0.0F, 0.0F, 0.0F, 0.0F};
+    for (unsigned int column = threadIdx.x; column < columns; column += blockDim.x) {
+        float w = expert_weight[column];
+        if (!isfinite(w)) w = 0.0F;
+        #pragma unroll
+        for (unsigned int r = 0; r < 4U; ++r) {
+            float x = row_base + r < rows
+                ? input[(unsigned long long)(row_base + r) * columns + column] : 0.0F;
+            if (!isfinite(x)) x = 0.0F;
+            sums[r] = fmaf(x, w, sums[r]);
+        }
+    }
+    __shared__ float wave_sums[4][8];
+    #pragma unroll
+    for (unsigned int r = 0; r < 4U; ++r) {
+        for (unsigned int offset = warpSize >> 1; offset > 0U; offset >>= 1)
+            sums[r] += __shfl_down(sums[r], offset);
+        if (lane == 0U) wave_sums[r][wave] = sums[r];
+    }
+    __syncthreads();
+    if (wave == 0U) {
+        #pragma unroll
+        for (unsigned int r = 0; r < 4U; ++r) {
+            float sum = lane < wave_count ? wave_sums[r][lane] : 0.0F;
+            for (unsigned int offset = warpSize >> 1; offset > 0U; offset >>= 1)
+                sum += __shfl_down(sum, offset);
+            if (lane == 0U && row_base + r < rows)
+                logits[(unsigned long long)(row_base + r) * experts + expert]
+                    = isfinite(sum) ? sum : 0.0F;
+        }
+    }
+}
+
 extern "C" __global__ void moe_router_logits_f32(
     const float* input,
     const unsigned short* weight,

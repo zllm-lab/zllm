@@ -40,6 +40,17 @@ impl RocmContext {
     pub(crate) fn profile_scope_end(&self) -> Result<(), BackendError> {
         ops::hip::device_profile_scope_end(self.device_id).map_err(compute_error)
     }
+
+    /// 提交线程绑定到 `ZLLM_ROCM_SUBMIT_CPUS` 指定的 CPU 列表（一次设置）。
+    /// gfx1100 实测跨 NUMA 节点的 hipLaunchKernel 约 2.4µs、本节点约 1.0µs；
+    /// 目标 8-GPU 机器上全部以 NUMA0(0-31,64-95) 最快。未设置时完全不动。
+    pub(crate) fn pin_submission_thread_to_configured_cpus(&self) {
+        static CPUS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let Some(cpus) = CPUS.get_or_init(|| std::env::var("ZLLM_ROCM_SUBMIT_CPUS").ok().filter(|value| !value.trim().is_empty())) else { return };
+        if let Err(error) = crate::kernel::cpu::set_current_thread_affinity(cpus) {
+            eprintln!("[rocm-submit-affinity] device={} 绑定 {cpus} 失败: {error}", self.device_id);
+        }
+    }
 }
 
 impl crate::backend::StageExecutionBackend for RocmContext {
@@ -97,10 +108,20 @@ impl crate::backend::StageExecutionBackend for RocmContext {
         self.compute_stream == 0
     }
 
+    fn pin_submission_thread(&self) {
+        self.pin_submission_thread_to_configured_cpus();
+    }
+
     fn max_queued_latency_submissions(&self) -> usize {
-        // latency work 共用一条有序 compute stream。提前塞入多份 work 不会增加
-        // GPU 并行度，反而会让 completion 成簇并把空泡逐级传到流水线尾部。
-        1
+        // latency work 共用一条有序 compute stream。默认仍只允许一份在途；C6+
+        // 诊断显示 stage 墙钟占用已约 90% 但每批 submit→complete 里约一半是
+        // 主机提交，第二份在途可以把下一批的主机提交叠到本批 GPU 尾部之下。
+        // 回收批次/完成事件均按提交顺序在每批 record 时切分，两份在途不共享
+        // 可写 scratch；>2 没有证据支持，先封顶 4 只做实验对照。
+        static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            std::env::var("ZLLM_ROCM_DECODE_IN_FLIGHT").ok().and_then(|value| value.parse::<usize>().ok()).filter(|&value| (1..=4).contains(&value)).unwrap_or(1)
+        })
     }
 
     fn begin_stage_submission(&self) -> Result<(), BackendError> {
@@ -196,6 +217,10 @@ impl crate::backend::DsaStageBackend for RocmContext {
 
     fn set_stage_decode_parallelism(&self, dsa: &mut Self::DsaState, sessions: usize) {
         dsa.decode_parallelism = sessions.max(1);
+    }
+
+    fn set_stage_cache_decode(&self, cache: &mut Self::Cache, decode: bool) -> Result<(), BackendError> {
+        cache.set_stage_decode(decode)
     }
 
     fn truncate_stage_state(&self, cache: &mut Self::Cache, dsa: &mut Self::DsaState, rows: usize) -> Result<(), BackendError> {

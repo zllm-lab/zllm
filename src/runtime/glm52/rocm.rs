@@ -333,7 +333,7 @@ pub(super) struct RocmMtpSession {
     pub(super) dsa: RocmDsaState,
     /// 已提交到 MTP cache 的逻辑行数，恒等于 target position - 1。
     pub(super) position: usize,
-    /// target 最后一行真实 hidden，下一次移位 catch-up/draft 使用。
+    /// target 最后一行 final norm 后的 F32 hidden，下一次移位 catch-up/draft 使用。
     pub(super) pending_hidden: Option<RocmTensor>,
     pub(super) prompt_tokens: Vec<u32>,
     pub(super) max_decode: usize,
@@ -393,6 +393,13 @@ impl RocmMtpSession {
         Ok(())
     }
 
+    pub(super) fn set_terminal_hidden(&mut self, context: &RocmContext, cfg: &Glm52Config, head: &Glm52OutputHead<RocmWeight>, hidden: &RocmTensor) -> Result<(), crate::backend::BackendError> {
+        // terminal/取消回退保存的是 stage 残差，必须与 catch-up 的 NextN 输入一致。
+        // 直接保存 BF16 残差既漏掉 final norm，也无法与下次多行 F32 hidden 拼接。
+        self.pending_hidden = Some(glm52_normalize_target_hidden(context, cfg, head, hidden)?);
+        Ok(())
+    }
+
     /// 只允许在 terminal 边界保存；本轮 draft/verify 临时态由下一请求重建。
     pub(super) fn snapshot(&self, context: &RocmContext) -> Result<Glm52MtpCache, String> {
         if self.active {
@@ -409,7 +416,7 @@ impl RocmMtpSession {
         })
     }
 
-    pub(super) fn restore(snapshot: Glm52MtpCache, context: &RocmContext, cfg: &Glm52Config, max_seq_len: usize, reserved_rows: usize) -> Result<Self, String> {
+    pub(super) fn restore(snapshot: Glm52MtpCache, context: &RocmContext, cfg: &Glm52Config, max_seq_len: usize, reserved_rows: usize, head: &Glm52OutputHead<RocmWeight>, terminal_hidden: &RocmTensor) -> Result<Self, String> {
         let layers = cfg.layer_count + cfg.mtp_layer_count;
         if snapshot.pending_hidden.len() != cfg.hidden_size || snapshot.kv.len() > layers || snapshot.dsa.len() > layers {
             return Err(format!("MTP snapshot shape 非法: hidden={}/{} kv={}/{} dsa={}/{}", snapshot.pending_hidden.len(), cfg.hidden_size, snapshot.kv.len(), layers, snapshot.dsa.len(), layers));
@@ -420,10 +427,58 @@ impl RocmMtpSession {
         session.cache.upload_layers(context, &snapshot.kv, reserved_rows).map_err(|error| format!("恢复 MTP KV: {error:?}"))?;
         session.dsa.upload_layers(context, &snapshot.dsa, reserved_rows, interleaved_pair).map_err(|error| format!("恢复 MTP DSA: {error:?}"))?;
         session.position = snapshot.position;
-        session.pending_hidden = Some(context.tensor_from_bf16_bits(snapshot.pending_hidden, 1, cfg.hidden_size).map_err(|error| format!("恢复 MTP pending hidden: {error:?}"))?);
+        // 旧 terminal 文件误存过未归一化的 pending hidden。以同一位置的 target
+        // 残差重新计算，兼容两类旧值，也避免 normalized hidden 的 BF16 往返误差。
+        session.set_terminal_hidden(context, cfg, head, terminal_hidden).map_err(|error| format!("恢复 MTP pending hidden: {error:?}"))?;
         session.prompt_tokens = snapshot.prompt_tokens;
         session.deactivate();
         Ok(session)
+    }
+}
+
+#[cfg(test)]
+mod mtp_session_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "需要 ROCm device 0"]
+    fn mtp_terminal_hidden_normalized_and_restored_for_large_append() {
+        let context = RocmContext::new(0).unwrap();
+        let mut cfg = Glm52Config::standard();
+        cfg.hidden_size = 128;
+        cfg.vocab_size = 16;
+        let norm = (0..cfg.hidden_size).map(|i| 0.5 + (i % 7) as f32 / 8.0).collect::<Vec<_>>();
+        let head = prepare_glm52_output_head(&context, &cfg, &norm, LinearWeight::F32(&vec![0.0; cfg.vocab_size * cfg.hidden_size])).unwrap();
+        let mut session = RocmMtpSession::fresh(&cfg, 4096).unwrap();
+        // 两个不同 terminal 模拟正常收尾与取消后回退，检查保存值而不只检查 shape。
+        for offset in [1.0, -2.0] {
+            let raw = (0..cfg.hidden_size).map(|i| offset + (i % 13) as f32 / 4.0).collect::<Vec<_>>();
+            let bits = raw.iter().map(|&v| half::bf16::from_f32(v).to_bits()).collect();
+            let hidden = context.tensor_from_bf16_bits(bits, 1, cfg.hidden_size).unwrap();
+            session.set_terminal_hidden(&context, &cfg, &head, &hidden).unwrap();
+            let inverse = (raw.iter().map(|v| v * v).sum::<f32>() / cfg.hidden_size as f32 + cfg.rms_eps).sqrt().recip();
+            let expected = raw.iter().zip(&norm).map(|(v, w)| v * inverse * w).collect::<Vec<_>>();
+            let actual = context.tensor_to_f32(session.pending_hidden.as_ref().unwrap()).unwrap();
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert!((actual - expected).abs() < 1e-5, "actual={actual} expected={expected}");
+            }
+            let mut snapshot = session.snapshot(&context).unwrap();
+            if offset < 0.0 {
+                // 旧文件写入 raw BF16；恢复仍须由 target 残差得到同一 normalized 值。
+                snapshot.pending_hidden = context.tensor_to_bf16_bits(&hidden).unwrap();
+            }
+            let restored = RocmMtpSession::restore(snapshot, &context, &cfg, 4096, 0, &head, &hidden).unwrap();
+            let prefix = context.tensor_from_f32(vec![0.25; 2047 * cfg.hidden_size], 2047, cfg.hidden_size).unwrap();
+            for pending in [session.pending_hidden.as_ref().unwrap(), restored.pending_hidden.as_ref().unwrap()] {
+                let appended = context.concat_token_rows(&[pending, &prefix]).unwrap();
+                let values = context.tensor_to_f32(&appended).unwrap();
+                assert_eq!(appended.rows, 2048);
+                for (actual, expected) in values[..cfg.hidden_size].iter().zip(&expected) {
+                    assert!((actual - expected).abs() < 0.01, "actual={actual} expected={expected}");
+                }
+                assert!(values[cfg.hidden_size..].iter().all(|&value| value == 0.25));
+            }
+        }
     }
 }
 
@@ -452,6 +507,7 @@ struct RocmEntry {
     kv_cache_format: KvCacheFormat,
     mtp_enabled: bool,
     dspark_directory: Option<PathBuf>,
+    dflash2_directory: Option<PathBuf>,
     dspark_weight_quantization: ResidentWeightQuantization,
     scheduling: crate::config::Glm52SchedulingConfig,
     alternate_layer_ends: Vec<Vec<usize>>,
@@ -510,6 +566,7 @@ impl RocmEntry {
                         kv_cache_format: execution.kv_cache_format,
                         mtp_enabled: execution.mtp,
                         dspark_directory: execution.dspark_directory,
+                        dflash2_directory: execution.dflash2_directory,
                         dspark_weight_quantization: execution.dspark_weight_quantization,
                         scheduling: execution.scheduling,
                         alternate_layer_ends,
@@ -541,6 +598,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         kv_cache_format,
         mtp_enabled,
         dspark_directory,
+        dflash2_directory,
         dspark_weight_quantization,
         scheduling,
         alternate_layer_ends,
@@ -836,7 +894,9 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
     }
     if distributed {
         let mut states = build_glm52_stage_states(&prefill_contexts, &prefill_layer_ends, stage_start, &cfg, prefill_layers, prefill_experts, args.max_seq_len).map_err(|error| format!("构造 GLM stage states: {error:?}"))?;
-        if let Some(root) = dspark_directory.as_deref() {
+        if let Some(root) = dflash2_directory.as_deref() {
+            super::dflash2_rocm::attach_dflash2_projections(&mut states, &[], root, &cfg).map_err(|e| format!("加载 stage DFlash2 projections: {e:?}"))?;
+        } else if let Some(root) = dspark_directory.as_deref() {
             attach_dspark_projections(&mut states, root, cfg.layer_count, dspark_weight_quantization).map_err(|error| format!("加载 stage DSpark projections: {error:?}"))?;
         }
         if stage_start == 0 {
@@ -947,7 +1007,9 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                 next_layer = layer_end + 1;
                 alternate.push(state);
             }
-            if let Some(root) = dspark_directory.as_deref() {
+            if let Some(root) = dflash2_directory.as_deref() {
+                super::dflash2_rocm::attach_dflash2_projections(&mut alternate, &templates[0], root, &cfg).map_err(|e| format!("加载备用 stage DFlash2 projections: {e:?}"))?;
+            } else if let Some(root) = dspark_directory.as_deref() {
                 attach_dspark_projections_reusing(&mut alternate, &templates[0], root, cfg.layer_count, dspark_weight_quantization).map_err(|error| format!("加载备用 placement DSpark projections: {error:?}"))?;
             }
             eprintln!("[glm52-session-placement] plan={plan_index} layer_ends={plan:?}");
@@ -979,7 +1041,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
             }
         }
         let cache_dir = args.cache_dir.as_ref().ok_or("GLM decode 后继必须设置 model.cache_directory")?;
-        let cache_identity = Glm52CacheIdentity::new(&weights, kv_cache_format, stage_start, stage_end, false, args.max_seq_len, dspark_directory.as_deref());
+        let cache_identity = Glm52CacheIdentity::new(&weights, kv_cache_format, stage_start, stage_end, false, args.max_seq_len, dflash2_directory.as_deref().or(dspark_directory.as_deref())).with_dflash2(dflash2_directory.as_deref())?;
         let swap = Arc::new(Glm52SwapStore::open(cache_dir.join("glm52").join(format!("stage-{stage_start}-{stage_end}")), &cache_identity)?);
         let mut link = if let Some(listener) = stage_listener {
             listener.accept().map_err(|error| format!("接受 stage peer: {error}"))?
@@ -988,7 +1050,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         } else {
             return Err("distributed stage 缺少 transport".into());
         };
-        link.send_device_memory(&device_memory, Some(max_concurrency))?;
+        link.send_device_memory_with_host(&device_memory, Some(max_concurrency), Some(crate::runtime::rocm_chain::host_available_bytes()?))?;
         let mut active = HashMap::<RequestId, TailSession>::new();
         let mut resident = HashMap::<RequestId, TailResident>::new();
         let mut pending_opens = Vec::<TailPendingOpen>::new();
@@ -1008,7 +1070,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                         while let Err(reconnect) = link.accept_reconnect() {
                             eprintln!("[stage-reconnect-wait] 上游尚未就绪，继续等待: {reconnect}");
                         }
-                        link.send_device_memory(&device_memory, Some(max_concurrency))?;
+                        link.send_device_memory_with_host(&device_memory, Some(max_concurrency), Some(crate::runtime::rocm_chain::host_available_bytes()?))?;
                     }
                 }
             };
@@ -1529,8 +1591,9 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                     std::process::exit(0);
                 }
                 StageMessage::Delete => {
-                    // 非 continuous 模式 Delete 不需要 ACK,丢弃返回的 position。
-                    let _ = tail_stage_delete(&mut active, &mut resident, &swap, request_id)?;
+                    // 初始 Open 的缓存重建和空闲期淘汰也等待释放完成，与 continuous 保持一致。
+                    let position = tail_stage_delete(&mut active, &mut resident, &swap, request_id)?;
+                    link.send_ready(request_id, position)?;
                     eprintln!("[stage-delete] request_id={request_id} active={} resident={}", active.len(), resident.len());
                 }
                 StageMessage::StreamAssign { .. }

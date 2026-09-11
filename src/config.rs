@@ -102,6 +102,7 @@ pub struct SchedulerServiceConfig {
     /// 请求命中别名时重写为真实模型再调度，供按模型名过滤的客户端（Claude Desktop 等）使用。
     #[serde(default)]
     pub model_aliases: std::collections::HashMap<String, String>,
+    /// 未命中缓存时的容量等待秒数；缓存命中则在持有节点等待。
     #[serde(default = "default_dispatch_wait_seconds")]
     pub dispatch_wait_seconds: u64,
 }
@@ -787,6 +788,9 @@ pub struct Glm52NodeExecutionConfig {
     /// DSpark checkpoint 目录；与 MTP 互斥。
     #[serde(default)]
     pub dspark_directory: Option<PathBuf>,
+    /// DFlash2 BF16 checkpoint；与 MTP/DSpark 互斥，只支持 ROCm greedy。
+    #[serde(default)]
+    pub dflash2_directory: Option<PathBuf>,
     /// DSpark proposal backbone 的执行设备。CPU 仍复用 ROCm capture/cache，
     /// 只把独立 proposal 计算移出 16 卡流水线。
     #[serde(default)]
@@ -819,6 +823,8 @@ pub struct Glm52NodeExecutionConfig {
     pub scheduling: Glm52SchedulingConfig,
     #[serde(default)]
     pub diagnostics: Glm52DiagnosticsConfig,
+    #[serde(default = "default_dflash2_draft_tokens")]
+    pub dflash2_draft_tokens: usize,
 }
 
 impl Default for Glm52NodeExecutionConfig {
@@ -837,8 +843,10 @@ impl Default for Glm52NodeExecutionConfig {
             kv_admission_layers_per_device: 0,
             mtp: false,
             dspark_directory: None,
+            dflash2_directory: None,
             dspark_backend: Glm52DsparkExecutionBackend::default(),
             dspark_cpu_affinity: None,
+            dflash2_draft_tokens: default_dflash2_draft_tokens(),
             dspark_draft_tokens: default_dspark_draft_tokens(),
             dspark_confidence_threshold: None,
             dspark_weight_quantization: ResidentWeightQuantization::Native,
@@ -944,6 +952,9 @@ pub struct Glm52DiagnosticsConfig {
     pub trace_stage_output: bool,
     #[serde(default)]
     pub trace_stage_events: bool,
+    /// 记录已输出的累计 token 与时间，避免把 UTF-8 文本分块误算为逐路吞吐。
+    #[serde(default)]
+    pub trace_token_progress: bool,
     #[serde(default)]
     pub official_chat_template: bool,
 }
@@ -1112,6 +1123,9 @@ pub struct Glm52StageExecutionConfig {
     /// DSpark checkpoint 目录；每段只读取本段 capture 对应的 FC 列切片。
     #[serde(default)]
     pub dspark_directory: Option<PathBuf>,
+    /// DFlash2 BF16 checkpoint；与 MTP/DSpark 互斥，只支持 ROCm greedy。
+    #[serde(default)]
+    pub dflash2_directory: Option<PathBuf>,
     /// 本段 DSpark capture projection 的 resident 格式；不改变 target 权重。
     #[serde(default)]
     pub dspark_weight_quantization: ResidentWeightQuantization,
@@ -1138,6 +1152,7 @@ impl Default for Glm52StageExecutionConfig {
             max_concurrency: default_stage_max_concurrency(),
             mtp: false,
             dspark_directory: None,
+            dflash2_directory: None,
             dspark_weight_quantization: ResidentWeightQuantization::Native,
             mtp_draft_tokens: default_mtp_draft_tokens(),
             mtp_draft_vocabulary: None,
@@ -1673,6 +1688,7 @@ fn resolve_node_model_backend(base: &Path, model: &mut NodeModelConfig, backend:
             resolve_optional_path(base, &mut model.gguf_directory);
             resolve_optional_path(base, &mut model.execution.mtp_draft_vocabulary);
             resolve_optional_path(base, &mut model.execution.dspark_directory);
+            resolve_optional_path(base, &mut model.execution.dflash2_directory);
             if let Some(tokenizer) = &mut model.tokenizer {
                 resolve_path(base, tokenizer);
             } else {
@@ -1822,6 +1838,7 @@ impl StageProcessConfig {
                 resolve_optional_path(base, &mut model.execution.diagnostics.output_artifact);
                 resolve_optional_path(base, &mut model.execution.mtp_draft_vocabulary);
                 resolve_optional_path(base, &mut model.execution.dspark_directory);
+                resolve_optional_path(base, &mut model.execution.dflash2_directory);
                 validate_stage_glm52(model, backend)?;
             }
             StageModelConfig::Glm53Flash(model) => {
@@ -2108,6 +2125,9 @@ fn validate_glm52_stage_execution(execution: &Glm52StageExecutionConfig) -> Resu
     if execution.mtp_draft_vocabulary.is_some() && !execution.mtp {
         return Err(ConfigError::Invalid("GLM-5.2 mtp_draft_vocabulary 必须与 mtp 一起启用".to_owned()));
     }
+    if execution.dflash2_directory.is_some() && (execution.mtp || execution.dspark_directory.is_some()) {
+        return Err(ConfigError::Invalid("DFlash2 与 MTP/DSpark 不能同时启用".into()));
+    }
     if execution.mtp && execution.dspark_directory.is_some() {
         return Err(ConfigError::Invalid("GLM-5.2 MTP 与 DSpark 不能同时启用".to_owned()));
     }
@@ -2158,6 +2178,14 @@ fn validate_glm52(model: &Glm52NodeModelConfig, backend: &RocmBackendConfig) -> 
     if weight_overrides > 1 {
         return Err(ConfigError::Invalid("GLM-5.2 compressed_tensors_directory、nvfp4_directory 与 gguf_directory 最多配置一个".to_owned()));
     }
+    if model.execution.dflash2_directory.is_some() {
+        if model.execution.mtp || model.execution.dspark_directory.is_some() || model.execution.dspark_backend != Glm52DsparkExecutionBackend::Rocm {
+            return Err(ConfigError::Invalid("DFlash2 要求关闭 MTP/DSpark 与 CPU proposal".into()));
+        }
+        if !(1..=7).contains(&model.execution.dflash2_draft_tokens) {
+            return Err(ConfigError::Invalid("DFlash2 dflash2_draft_tokens 必须在 1..=7".into()));
+        }
+    }
     if model.execution.mtp && model.execution.dspark_directory.is_some() {
         return Err(ConfigError::Invalid("GLM-5.2 MTP 与 DSpark 不能同时启用".to_owned()));
     }
@@ -2177,7 +2205,7 @@ fn validate_glm52(model: &Glm52NodeModelConfig, backend: &RocmBackendConfig) -> 
     if !single_process && model.head.downstream.ticket.trim().is_empty() {
         return Err(ConfigError::Invalid("model.head.downstream.ticket 不能为空".to_owned()));
     }
-    if single_process && (model.execution.mtp || model.execution.dspark_directory.is_some() || model.execution.cooperative_expert_pairs || model.execution.parallel_operator_pairs) {
+    if single_process && (model.execution.mtp || model.execution.dspark_directory.is_some() || model.execution.dflash2_directory.is_some() || model.execution.cooperative_expert_pairs || model.execution.parallel_operator_pairs) {
         return Err(ConfigError::Invalid("GLM-5.2 单进程完整层链当前要求关闭 MTP、DSpark 与双卡算子".to_owned()));
     }
     let paired = model.execution.cooperative_expert_pairs || model.execution.parallel_operator_pairs;
@@ -2610,12 +2638,12 @@ mod tests {
         let RuntimeProcessConfig::Node(head) = RuntimeProcessConfig::load(Path::new("config/node-glm52.yaml")).unwrap() else { unreachable!() };
         let NodeModelConfig::Glm52(head_model) = head.model else { unreachable!() };
         let NodeBackendConfig::Rocm(head_backend) = head.backend else { unreachable!() };
-        assert_eq!(head.node.max_concurrency, Some(22));
+        assert_eq!(head.node.max_concurrency, Some(14));
         assert_eq!(head_model.head.stage_end, 38);
         assert_eq!(head_model.head.layer_ends, [2, 7, 12, 17, 22, 27, 32, 37]);
         assert_eq!(head_backend.devices, [0, 1, 2, 3, 4, 5, 6, 7]);
         assert!(head_model.execution.mtp);
-        assert_eq!(head_model.execution.mtp_draft_tokens, 3);
+        assert_eq!(head_model.execution.mtp_draft_tokens, 5);
         assert_eq!(head_model.execution.reasoning_effort, Glm52ReasoningEffort::Max);
         assert_eq!(head_model.execution.thinking_token_budget, Some(16_384));
 
@@ -2625,7 +2653,7 @@ mod tests {
         assert_eq!((tail_model.layers.start, tail_model.layers.end), (38, 78));
         assert_eq!(tail_model.layers.device_layer_ends, [42, 47, 52, 57, 62, 67, 73, 77]);
         assert_eq!(tail_backend.devices, [0, 1, 2, 3, 4, 5, 6, 7]);
-        assert_eq!(tail_model.execution.max_concurrency, 22);
+        assert_eq!(tail_model.execution.max_concurrency, 14);
         // MTP 驻留 head 首卡,tail 不再装载 MTP。
         assert!(!tail_model.execution.mtp);
     }
@@ -2902,5 +2930,53 @@ mod tests {
         model.execution.mtp = false;
         let error = validate_glm52(&model, &backend).unwrap_err();
         assert!(error.to_string().contains("mtp_draft_vocabulary"));
+    }
+
+    #[test]
+    fn dflash2_node_and_stage_configuration() {
+        let head = Glm52HeadConfig { stage_end: 38, layer_ends: vec![37], downstream: StagePeerConfig { ticket: "t".into(), iroh: IrohPeerConfig::default() } };
+        let (mut model, backend) = glm52_node_fixture(head, vec![0]);
+        model.execution.mtp = false;
+        model.execution.dflash2_directory = Some("draft".into());
+        assert_eq!(model.execution.block_draft_tokens(), 7);
+        validate_glm52(&model, &backend).unwrap();
+        for count in [0, 8] {
+            model.execution.dflash2_draft_tokens = count;
+            assert!(validate_glm52(&model, &backend).unwrap_err().to_string().contains("1..=7"));
+        }
+        model.execution.dflash2_draft_tokens = 7;
+        model.execution.mtp = true;
+        assert!(validate_glm52(&model, &backend).is_err());
+        model.execution.mtp = false;
+        model.execution.dspark_directory = Some("other".into());
+        assert!(validate_glm52(&model, &backend).is_err());
+        model.execution.dspark_directory = None;
+        model.execution.dspark_backend = Glm52DsparkExecutionBackend::Cpu;
+        assert!(validate_glm52(&model, &backend).is_err());
+        let mut stage = Glm52StageExecutionConfig::default();
+        stage.mtp = false;
+        stage.dflash2_directory = Some("draft".into());
+        validate_glm52_stage_execution(&stage).unwrap();
+        stage.dspark_directory = Some("other".into());
+        assert!(validate_glm52_stage_execution(&stage).is_err());
+        stage.dspark_directory = None;
+        stage.mtp = true;
+        assert!(validate_glm52_stage_execution(&stage).is_err());
+    }
+}
+
+const fn default_dflash2_draft_tokens() -> usize {
+    7
+}
+
+impl Glm52NodeExecutionConfig {
+    /// 只统一已共用的 verify/aux/cache 生命周期，不推断 checkpoint 的算法类型。
+    #[cfg(any(test, feature = "with-rocm"))]
+    pub(crate) fn block_draft_directory(&self) -> Option<&Path> {
+        self.dflash2_directory.as_deref().or(self.dspark_directory.as_deref())
+    }
+    #[cfg(any(test, feature = "with-rocm"))]
+    pub(crate) fn block_draft_tokens(&self) -> usize {
+        if self.dflash2_directory.is_some() { self.dflash2_draft_tokens } else { self.dspark_draft_tokens }
     }
 }

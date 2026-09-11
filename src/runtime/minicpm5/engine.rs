@@ -39,6 +39,15 @@ use crate::{
 #[path = "metal_session.rs"]
 mod metal_session;
 #[cfg(target_os = "macos")]
+#[path = "metal_replay.rs"]
+pub(crate) mod metal_replay;
+#[cfg(target_os = "macos")]
+#[path = "dspark_eval.rs"]
+pub(crate) mod dspark_eval;
+
+#[cfg(target_os = "macos")]
+pub use dspark_eval::run_dspark_eval;
+#[cfg(target_os = "macos")]
 use metal_session::{MiniCpm5MetalSequence, MiniCpm5MetalSession};
 
 /// MiniCPM5 Metal 引擎主体。
@@ -51,6 +60,8 @@ pub struct MiniCpm5Engine {
     compute_steps: Arc<AtomicCounterU64>,
     /// 连续对话终点缓存(通用 kv_cache::terminal_cache 机制,内存 LRU)。
     terminal_states: crate::kv_cache::terminal_cache::TerminalSessions<MiniCpm5TerminalState>,
+    /// decode 重放命令表:首个 Q8 请求录制一次,跨请求复用(按请求重绑 cache)。
+    replay: Option<metal_replay::Minicpm5ReplayEngine>,
 }
 
 /// 会话终点状态:KV cache + 边界 hidden + 全量 token + length 截断时未前向的 pending token。
@@ -115,7 +126,7 @@ impl MiniCpm5Engine {
         );
         residency.configure(&mut capabilities, &runtime);
         eprintln!("[minicpm5-kv-admission] available={:.1} MiB session={:.1} MiB", available as f64 / 1048576.0, session_resident_bytes as f64 / 1048576.0);
-        Ok(Self { session, residency, capabilities, runtime, compute_steps, terminal_states: crate::kv_cache::terminal_cache::TerminalSessions::new(1, None) })
+        Ok(Self { session, residency, capabilities, runtime, compute_steps, terminal_states: crate::kv_cache::terminal_cache::TerminalSessions::new(1, None), replay: None })
     }
 
     pub(crate) fn kv_residency(&self) -> KvResidency {
@@ -265,12 +276,97 @@ impl MiniCpm5Engine {
         // 采样请求(temperature/top_p)走同步循环:流水线的输出步是 argmax 贪心语义,
         // 采样进流水线是后续工作。
         let async_decode = self.session.async_decode_available() && sampling_state.is_none();
-        if async_decode {
+        // decode 重放(优先):每 token 单 CB 重编码,消除 16 ops/CB 的在飞 CB 积压
+        // (2B 实测 CPU 编码 14.7ms/tok 中 11.2ms 阻塞在 new_command_buffer)。
+        // 首个 Q8 请求上录制一次,失败降级现有异步流水线。
+        if async_decode && self.replay.is_none() && sequence.cache.format() == crate::kv_cache::KvCacheFormat::Int8 {
+            match self.session.record_decode_replay(&sequence.cache) {
+                Ok(engine) => self.replay = Some(engine),
+                Err(error) => eprintln!("[minicpm5] decode 重放录制失败,降级异步流水线: {error}"),
+            }
+        }
+        if let Some(replay) = &mut self.replay {
+            replay.bind_cache(&sequence.cache);
+        }
+        let use_replay = async_decode && self.replay.is_some();
+        if async_decode && !use_replay {
             self.session.begin_async_decode();
         }
         // 最后一次采样的 token:length 截断时它尚未前向,retain 时作为 pending 留给续写。
         let mut last_token: Option<u32> = None;
-        let loop_result = if async_decode {
+        let loop_result = if use_replay {
+            let replay = self.replay.as_ref().expect("use_replay 蕴含已录制");
+            let ctx = self.session.context();
+            let mut step_result: Result<(), String> = Ok(());
+            'outer: {
+                // 首 token 由常规输出步产出(重放命令表从第二个 token 开始闭环)。
+                // 输出步的 pending 记账依赖 defer 模式,提交后立即恢复——重放步
+                // 本身必须走非 defer 的独立 CB(重编码 + commit)。
+                self.session.begin_async_decode();
+                let pending = match self.session.submit_output(&sequence.hidden, sequence.tokens.len()) {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        self.session.end_async_decode();
+                        step_result = Err(error);
+                        break 'outer;
+                    }
+                };
+                let token0 = self.session.wait_token(&mut sequence, &pending);
+                self.session.end_async_decode();
+                replay.prime(0, token0);
+                // 与现有异步循环同构:轮 step emit token_step;投机提交的前向产出
+                // token_{step+1};EOS 时白算一轮,回滚 token/KV 游标和边界 hidden
+                // (重放的 state 槽与 readback 下次 prime 覆写,无需回滚)。
+                let mut inflight: Option<metal_replay::Minicpm5ReplayPending> = None;
+                let mut parity = 0usize;
+                for step in 0..max_tokens {
+                    if cancellation.load(Ordering::Acquire) {
+                        output.cancel();
+                        break;
+                    }
+                    let checkpoint_len = sequence.token_count();
+                    let checkpoint_hidden = (step + 1 < max_tokens).then(|| sequence.hidden.clone());
+                    let next = if step + 1 < max_tokens {
+                        match replay.step(ctx, &mut sequence, parity) {
+                            Ok(next) => Some(next),
+                            Err(error) => {
+                                step_result = Err(format!("{error:?}"));
+                                break 'outer;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    parity ^= 1;
+                    let token = match inflight.take() {
+                        Some(pending) => replay.wait_token(&mut sequence, &pending),
+                        None => token0,
+                    };
+                    last_token = Some(token);
+                    match emit_token!(token) {
+                        Ok(true) => {
+                            if self.session.is_eos(token)
+                                && let Some(hidden) = checkpoint_hidden
+                            {
+                                sequence.tokens.truncate(checkpoint_len);
+                                sequence.cache.truncate(checkpoint_len);
+                                sequence.hidden = hidden;
+                            }
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            step_result = Err(error);
+                            break 'outer;
+                        }
+                    }
+                    self.compute_steps.fetch_add(1);
+                    let Some(next) = next else { break };
+                    inflight = Some(next);
+                }
+            }
+            step_result
+        } else if async_decode {
             let mut step_result: Result<(), String> = Ok(());
             'outer: {
                 let mut pending = match self.session.submit_output(&sequence.hidden, sequence.tokens.len()) {
@@ -364,7 +460,7 @@ impl MiniCpm5Engine {
             }
             step_result
         };
-        if async_decode {
+        if async_decode && !use_replay {
             self.session.end_async_decode();
         }
         loop_result?;
@@ -402,6 +498,11 @@ mod tests {
     use std::path::Path;
 
     const WEIGHTS: &str = "/path/to/MiniCPM5-1B-Q4_K_M.gguf";
+
+    /// 诊断用权重覆盖:`MINICPM5_PROFILE_WEIGHTS=<gguf>`(仅 #[ignore] profile 测试读取)。
+    fn profile_weights() -> String {
+        std::env::var("MINICPM5_PROFILE_WEIGHTS").unwrap_or_else(|_| WEIGHTS.to_owned())
+    }
 
     /// 端到端回归:真实权重 prefill + 8 轮 greedy decode,逐 token 对拍
     /// llama.cpp 2.29.1 参考序列(2026-08-27 重录:思考模板打开 <think> 块)。
@@ -484,6 +585,72 @@ mod tests {
             rounds.push(generated);
         }
         assert_eq!(rounds[0], rounds[1], "同步路径两轮 decode 不一致");
+    }
+
+    /// decode 重放(命令表转录 + 逐 token 单 CB 重编码)必须与现有异步流水线
+    /// 逐 token 一致:短上下文覆盖 direct append 路径,长生成跨过 kv=512 边界
+    /// 覆盖均分 split 路径(与现有动态路径分块不同,数学上分块 softmax 合并等价)。
+    #[test]
+    fn minicpm5_replay_matches_async_pipeline() {
+        let weights = profile_weights();
+        if !Path::new(&weights).exists() {
+            eprintln!("skip: {weights} 不存在");
+            return;
+        }
+        let steps = 560usize;
+        let session = MiniCpm5MetalSession::load(Path::new(&weights), 4096, false, crate::weight::LmHeadQuantization::Native).unwrap();
+        let prompt = crate::runtime::minicpm5::minicpm5_instruct_prompt("请从一数到三十，每个数字单独一行。", None, true);
+        let tokens = session.tokenize(&prompt);
+        assert!(tokens.len() + steps < 4096, "测试 prompt 过长");
+        // 参照臂:现有异步流水线。
+        let mut sequence = session.prefill(tokens.clone()).unwrap();
+        session.begin_async_decode();
+        let mut pending = session.submit_output(&sequence.hidden, sequence.tokens.len()).unwrap();
+        let mut reference = Vec::with_capacity(steps);
+        for step in 0..steps {
+            let next = (step + 1 < steps).then(|| session.submit_step(&mut sequence, &mut pending).unwrap());
+            reference.push(session.wait_token(&mut sequence, &pending));
+            match next {
+                Some(next) => pending = next,
+                None => break,
+            }
+        }
+        session.end_async_decode();
+        // 重放臂:同一 prompt、新 KV cache,录制后按 engine 循环形态交替 parity。
+        let mut sequence = session.prefill(tokens).unwrap();
+        let replay = session.record_decode_replay(&sequence.cache).expect("MiniCPM5 重放录制");
+        let ctx = session.context();
+        // 首 token 的常规输出步在 defer 窗口内提交;重放步走非 defer 独立 CB。
+        session.begin_async_decode();
+        let pending = session.submit_output(&sequence.hidden, sequence.tokens.len()).unwrap();
+        let token0 = session.wait_token(&mut sequence, &pending);
+        session.end_async_decode();
+        replay.prime(0, token0);
+        let mut generated = Vec::with_capacity(steps);
+        let mut inflight = None;
+        let mut parity = 0usize;
+        for step in 0..steps {
+            let next = (step + 1 < steps).then(|| replay.step(ctx, &mut sequence, parity).unwrap());
+            parity ^= 1;
+            let token = match inflight.take() {
+                Some(pending) => replay.wait_token(&mut sequence, &pending),
+                None => token0,
+            };
+            generated.push(token);
+            if let Some(next) = next {
+                inflight = Some(next);
+            } else {
+                break;
+            }
+        }
+        // 前 512 行 direct 路径必须逐 token 一致;513 起切均分 split(分块合并
+        // 与 direct 的 f32 累加顺序不同,刀锋 margin 处允许罕见分叉——现有动态
+        // split 路径同样如此,见 minicpm5_decode_matches_llama_reference 注释)。
+        let direct = 512usize.saturating_sub(session.tokenize(&prompt).len()).min(steps);
+        assert_eq!(&generated[..direct], &reference[..direct], "重放 direct 路径 decode 序列与异步流水线不一致");
+        let mismatches = generated[direct..].iter().zip(&reference[direct..]).filter(|(left, right)| left != right).count();
+        let tail = generated.len() - direct;
+        assert!(mismatches * 20 <= tail, "重放 split 路径分叉过多: {mismatches}/{tail}(期望刀锋级 ≤5%)");
     }
 
     /// terminal-cache resume 的核心等价性:全量 prefill 与"前缀 prefill + 尾段
@@ -881,11 +1048,12 @@ mod tests {
     #[test]
     #[ignore]
     fn minicpm5_decode_profile() {
-        if !Path::new(WEIGHTS).exists() {
-            eprintln!("skip: {WEIGHTS} 不存在");
+        let weights = profile_weights();
+        if !Path::new(&weights).exists() {
+            eprintln!("skip: {weights} 不存在");
             return;
         }
-        let session = MiniCpm5MetalSession::load(Path::new(WEIGHTS), 8192, false, crate::weight::LmHeadQuantization::Native).unwrap();
+        let session = MiniCpm5MetalSession::load(Path::new(&weights), 8192, false, crate::weight::LmHeadQuantization::Native).unwrap();
         let prompt = crate::runtime::minicpm5::minicpm5_instruct_prompt("用一句话解释什么是注意力机制", None, true);
         let tokens = session.tokenize(&prompt);
         // prefill 耗时单独计时(server 每请求重建 KV cache + prefill,曾见 ~100ms 开销)
@@ -910,6 +1078,104 @@ mod tests {
         ctx.reset_gpu_stats();
         let started = std::time::Instant::now();
         const STEPS: usize = 32;
+        // 第一段:真实异步速率。detailed profile 会把批次上限强制为 1 op/CB,
+        // 放大 CB 边界开销;此段不 reset_gpu_stats,保持 serving 真实批形态。
+        // submit_wait 分开计时:submit ≈ CPU 编码耗时,wait>0 即 GPU 未跑满。
+        let mut submit_nanoseconds = 0u128;
+        const PROFILE_ASYNC_STEPS: usize = 256;
+        for _ in 0..PROFILE_ASYNC_STEPS {
+            let mut current = pending;
+            let submit_started = std::time::Instant::now();
+            let next = session.submit_step(&mut sequence, &mut current).unwrap();
+            submit_nanoseconds += submit_started.elapsed().as_nanos();
+            session.wait_token(&mut sequence, &current);
+            pending = next;
+        }
+        let wall = started.elapsed();
+        eprintln!(
+            "async(no-profile): {} tok/s, wall={:.2}ms/tok submit_cpu={:.2}ms",
+            PROFILE_ASYNC_STEPS as f64 / wall.as_secs_f64(),
+            wall.as_secs_f64() * 1e3 / PROFILE_ASYNC_STEPS as f64,
+            submit_nanoseconds as f64 * 1e-6 / PROFILE_ASYNC_STEPS as f64
+        );
+        let (alloc_ns, commit_ns) = ctx.decode_cpu_breakdown();
+        let (cb_ns, cb_new_ns) = ctx.command_buffer_nanoseconds();
+        eprintln!(
+            "cpu breakdown: alloc={:.2}ms commit={:.2}ms command_buffer={:.2}ms (new_cb={:.2}ms)",
+            alloc_ns as f64 * 1e-6 / PROFILE_ASYNC_STEPS as f64,
+            commit_ns as f64 * 1e-6 / PROFILE_ASYNC_STEPS as f64,
+            cb_ns as f64 * 1e-6 / PROFILE_ASYNC_STEPS as f64,
+            cb_new_ns as f64 * 1e-6 / PROFILE_ASYNC_STEPS as f64
+        );
+        // 对照:整轮 1 个 CB(绕过 begin_decode_batch 的 16 上限),隔离 CB 边界开销。
+        ctx.set_decode_batch_max_operations(4096);
+        let started = std::time::Instant::now();
+        for _ in 0..STEPS {
+            let mut current = pending;
+            let next = session.submit_step(&mut sequence, &mut current).unwrap();
+            session.wait_token(&mut sequence, &current);
+            pending = next;
+        }
+        let wall = started.elapsed();
+        eprintln!("async(4096 ops/CB): {} tok/s, wall={:.2}ms/tok", STEPS as f64 / wall.as_secs_f64(), wall.as_secs_f64() * 1e3 / STEPS as f64);
+        ctx.set_decode_batch_max_operations(16);
+        session.end_async_decode();
+        // 重放:命令表转录一次,逐 token 单 CB 重编码。与上述 async 数字同热态对比。
+        let mut sequence = session.prefill(session.tokenize(&prompt)).unwrap();
+        let replay_started = std::time::Instant::now();
+        let replay = session.record_decode_replay(&sequence.cache).expect("重放录制");
+        eprintln!("replay record: {:.1}ms (commands={})", replay_started.elapsed().as_secs_f64() * 1e3, replay.command_count());
+        session.begin_async_decode();
+        let pending = session.submit_output(&sequence.hidden, sequence.tokens.len()).unwrap();
+        let token0 = session.wait_token(&mut sequence, &pending);
+        session.end_async_decode();
+        replay.prime(0, token0);
+        let mut inflight = None;
+        let mut parity = 0usize;
+        for _ in 0..8 {
+            let next = replay.step(ctx, &mut sequence, parity).unwrap();
+            parity ^= 1;
+            if let Some(pending) = inflight.take() {
+                replay.wait_token(&mut sequence, &pending);
+            }
+            inflight = Some(next);
+        }
+        let started = std::time::Instant::now();
+        let mut replay_submit_ns = 0u128;
+        let mut replay_gpu_seconds = 0.0f64;
+        for _ in 0..PROFILE_ASYNC_STEPS {
+            let submit_started = std::time::Instant::now();
+            let next = replay.step(ctx, &mut sequence, parity).unwrap();
+            replay_submit_ns += submit_started.elapsed().as_nanos();
+            parity ^= 1;
+            let token = match inflight.take() {
+                Some(pending) => {
+                    let token = replay.wait_token(&mut sequence, &pending);
+                    replay_gpu_seconds += pending.step.command.gpu_end_time() - pending.step.command.gpu_start_time();
+                    token
+                }
+                None => token0,
+            };
+            let _ = token;
+            inflight = Some(next);
+        }
+        if let Some(pending) = inflight.take() {
+            replay.wait_token(&mut sequence, &pending);
+            replay_gpu_seconds += pending.step.command.gpu_end_time() - pending.step.command.gpu_start_time();
+        }
+        let wall = started.elapsed();
+        eprintln!(
+            "replay: {} tok/s, wall={:.2}ms/tok submit_cpu={:.2}ms gpu={:.2}ms/tok",
+            PROFILE_ASYNC_STEPS as f64 / wall.as_secs_f64(),
+            wall.as_secs_f64() * 1e3 / PROFILE_ASYNC_STEPS as f64,
+            replay_submit_ns as f64 * 1e-6 / PROFILE_ASYNC_STEPS as f64,
+            replay_gpu_seconds * 1e3 / PROFILE_ASYNC_STEPS as f64
+        );
+        // 第二段:逐算子归因(detailed 强制 1 op/CB,dispatch 间隔变大,仅用于归因)。
+        ctx.reset_gpu_stats();
+        let started = std::time::Instant::now();
+        session.begin_async_decode();
+        let mut pending = session.submit_output(&sequence.hidden, sequence.tokens.len()).unwrap();
         for _ in 0..STEPS {
             let mut current = pending;
             let next = session.submit_step(&mut sequence, &mut current).unwrap();
