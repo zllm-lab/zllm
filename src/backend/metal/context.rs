@@ -1031,9 +1031,7 @@ mod tests {
             let _ = format!("input=[{},{}],weight=[{},{}],type={}", 1, 1536, 256, 1536, 12);
         }
         let shape_format = started.elapsed().as_nanos() as f64 / N as f64 / 1e3;
-        eprintln!(
-            "cpu/op(µs): encoder_new_end={encoder_pair:.2} full_encode={full_encode:.2} pipeline_lookup={pipeline_lookup:.2} shape_format={shape_format:.2}"
-        );
+        eprintln!("cpu/op(µs): encoder_new_end={encoder_pair:.2} full_encode={full_encode:.2} pipeline_lookup={pipeline_lookup:.2} shape_format={shape_format:.2}");
         // deferred decode batch 模式下的 command_buffer() 复用路径
         ctx.set_deferred_waits(true);
         ctx.set_deferred_batch_max_operations(16);

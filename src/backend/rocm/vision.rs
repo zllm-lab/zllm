@@ -72,6 +72,10 @@ impl VisionBackend for RocmContext {
         Ok(output)
     }
 
+    fn vision_download(&self, input: &Self::Tensor) -> Result<Vec<f32>, BackendError> {
+        self.tensor_to_f32(input)
+    }
+
     fn scatter_rows(&self, destination: &mut Self::Tensor, start_row: usize, source: &Self::Tensor) -> Result<(), BackendError> {
         if destination.cols != source.cols || start_row.checked_add(source.rows).is_none_or(|end| end > destination.rows) {
             return Err(compute_error(format!("ROCm vision scatter destination=[{},{}] start={start_row} source=[{},{}] 非法", destination.rows, destination.cols, source.rows, source.cols)));

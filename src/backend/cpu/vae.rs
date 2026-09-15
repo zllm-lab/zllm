@@ -75,8 +75,12 @@ impl VaeBackend for CpuContext {
     }
 
     fn channels_to_time(&self, input: &Self::Tensor, channels: usize) -> Result<Self::Tensor, BackendError> {
+        if channels == 0 || !input.rows.is_multiple_of(channels) {
+            return Err(compute(format!("CPU channels-to-time input=[{},{}]，channels={channels}", input.rows, input.cols)));
+        }
         let data = cpu::vae::channels_to_time(&input.data, channels, input.cols).map_err(compute)?;
-        Ok(CpuTensor { data, rows: input.rows, cols: channels })
+        let rows = (input.rows / channels).checked_mul(input.cols).ok_or_else(|| compute("CPU channels-to-time rows 溢出"))?;
+        Ok(CpuTensor { data, rows, cols: channels })
     }
 
     fn causal_attention(&self, query: &Self::Tensor, key: &Self::Tensor, value: &Self::Tensor, time: usize, heads: usize, head_dim: usize, score_scale: f32) -> Result<Self::Tensor, BackendError> {
@@ -108,6 +112,12 @@ impl VaeBackend for CpuContext {
 
     fn tanh(&self, input: &Self::Tensor) -> Result<Self::Tensor, BackendError> {
         Ok(CpuTensor { data: input.data.iter().map(|value| value.tanh()).collect(), rows: input.rows, cols: input.cols })
+    }
+
+    fn vae_gelu(&self, input: &Self::Tensor) -> Result<Self::Tensor, BackendError> {
+        let mut data = vec![0.0; input.data.len()];
+        cpu::gelu(&input.data, &mut data);
+        Ok(CpuTensor { data, rows: input.rows, cols: input.cols })
     }
 
     fn take_rows(&self, input: &Self::Tensor, rows: usize) -> Result<Self::Tensor, BackendError> {
@@ -173,6 +183,11 @@ impl VaeBackend for CpuContext {
         self.conv3d(&padded, weight, bias, &padded_spec)
     }
 
+    fn encoder_conv3d_zero_pad(&self, input: &Self::Tensor, weight: &Self::Weight, bias: Option<&Self::Weight>, spec: &Conv3dSpec, spatial_pad_after: [usize; 2]) -> Result<Self::Tensor, BackendError> {
+        // CPU 的现有实现使用零填充；显式零填充能力复用同一条实现。
+        self.encoder_conv3d(input, weight, bias, spec, spatial_pad_after)
+    }
+
     fn group_norm(&self, input: &Self::Tensor, weight: &Self::Weight, bias: &Self::Weight, num_groups: usize, eps: f32) -> Result<Self::Tensor, BackendError> {
         if input.rows == 0 || input.cols == 0 || weight.data().len() != input.rows || bias.data().len() != input.rows {
             return Err(compute("CPU VAE GroupNorm shape 不兼容"));
@@ -217,6 +232,10 @@ impl VaeBackend for CpuContext {
 }
 
 impl DiffusionBackend for CpuContext {
+    fn diffusion_tensor_from_f32(&self, values: &[f32], rows: usize, cols: usize) -> Result<Self::Tensor, BackendError> {
+        self.vae_tensor_from_f32(values.to_vec(), rows, cols)
+    }
+
     fn silu(&self, input: &Self::Tensor) -> Result<Self::Tensor, BackendError> {
         Ok(CpuTensor { data: cpu::vae::silu(&input.data), rows: input.rows, cols: input.cols })
     }
@@ -260,6 +279,12 @@ impl DiffusionBackend for CpuContext {
         Ok(CpuTensor { data, rows: query.rows, cols: query.cols })
     }
 
+    fn varlen_attention(&self, query: Self::Tensor, key: Self::Tensor, value: Self::Tensor, query_offsets: &[usize], kv_offsets: &[usize], head_count: usize, head_dim: usize, score_scale: f32) -> Result<Self::Tensor, BackendError> {
+        let geometry = crate::attention::gqa::GqaGeometry { num_heads: head_count, num_kv_heads: head_count, head_dim };
+        let spec = crate::attention::block::BlockAttentionSpec::varlen(geometry, query.rows, key.rows, query_offsets, kv_offsets, score_scale).map_err(compute)?;
+        crate::backend::BlockAttentionBackend::block_attention(self, &query, &key, &value, &spec)
+    }
+
     fn adaln_modulate(&self, input: &Self::Tensor, shift: &Self::Tensor, scale: &Self::Tensor) -> Result<Self::Tensor, BackendError> {
         if shift.cols != input.cols || scale.cols != input.cols || shift.rows != scale.rows || (shift.rows != 1 && shift.rows != input.rows) {
             return Err(compute(format!("CPU AdaLN shape 不兼容: input=[{},{}] shift=[{},{}] scale=[{},{}]", input.rows, input.cols, shift.rows, shift.cols, scale.rows, scale.cols)));
@@ -292,5 +317,33 @@ impl DiffusionBackend for CpuContext {
         let row_map = modulation_row_map(segments, residual.rows, gate.rows).map_err(compute)?;
         let data = cpu::vae::gated_residual_segmented(&residual.data, &update.data, &gate.data, residual.rows, residual.cols, &row_map).map_err(compute)?;
         Ok(CpuTensor { data, rows: residual.rows, cols: residual.cols })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diffusion_upload_preserves_values_and_rejects_invalid_shapes() {
+        let values = [0.0, -0.0, 1.25, -3.5, f32::MIN_POSITIVE, f32::MAX];
+        let tensor = CpuContext.diffusion_tensor_from_f32(&values, 2, 3).unwrap();
+        assert_eq!((tensor.rows, tensor.cols), (2, 3));
+        assert!(tensor.data.iter().zip(values).all(|(a, b)| a.to_bits() == b.to_bits()));
+        assert!(CpuContext.diffusion_tensor_from_f32(&values, 3, 3).is_err());
+        assert!(CpuContext.diffusion_tensor_from_f32(&[], usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn diffusion_gelu_matches_tanh_reference_with_tail() {
+        let values = [-8.0, -3.0, -1.0, -0.1, 0.0, 0.1, 1.0, 3.0, 8.0];
+        let input = CpuContext.diffusion_tensor_from_f32(&values, 3, 3).unwrap();
+        let output = CpuContext.vae_gelu(&input).unwrap();
+        assert_eq!((output.rows, output.cols), (3, 3));
+        for (&actual, &x) in output.data.iter().zip(&values) {
+            let x = x as f64;
+            let expected = 0.5 * x * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (x + 0.044_715 * x.powi(3))).tanh());
+            assert!((actual as f64 - expected).abs() < 1e-6);
+        }
     }
 }

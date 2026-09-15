@@ -360,7 +360,7 @@ where
     let ffn = crate::moe::prefill::prefill_experts_observed(
         backend,
         &topk_moe_spec(cfg),
-        &MoeFfnRef { router_weight: &weights.router_weight, router_bias: &weights.router_bias, shared_experts: &shared, selected_experts: None },
+        &MoeFfnRef { router_weight: &weights.router_weight, router_bias: &weights.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None },
         layer,
         experts,
         &normed,
@@ -500,7 +500,7 @@ where
     let (attention_residual, normed, _, _) =
         attention_prefill(backend, cfg, cache, layer, &weights.input_norm, &weights.query, &weights.query_norm, &weights.key, &weights.key_norm, &weights.value, &weights.output, &weights.post_attention_norm, hidden, rope, position)?;
     let shared = [SharedExpertRef { gate: &weights.shared.gate, up: &weights.shared.up, down: &weights.shared.down, output_gate: None }];
-    let ffn_weights = MoeFfnRef { router_weight: &weights.router_weight, router_bias: &weights.router_bias, shared_experts: &shared, selected_experts: None };
+    let ffn_weights = MoeFfnRef { router_weight: &weights.router_weight, router_bias: &weights.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
     let source = expert_sources.source(layer).map_err(BackendError::ExpertLoad)?;
     let next_source = (layer + 1 < cfg.layer_count).then(|| expert_sources.source(layer + 1).map(|source| (layer + 1, source))).transpose().map_err(BackendError::ExpertLoad)?;
     let request = crate::runtime::expert_pipeline::ExpertDecodeRequest { layer, source, position, next: next_source };

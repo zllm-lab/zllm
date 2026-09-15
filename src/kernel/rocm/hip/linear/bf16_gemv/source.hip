@@ -116,13 +116,17 @@ extern "C" __global__ void f32_gemv_small_n_f32(
     const unsigned int lane = threadIdx.x & 31;
     const unsigned int wave = threadIdx.x >> 5;
     const unsigned int row = blockIdx.x * 8 + wave;
-    if (row >= rows || input_rows == 0 || input_rows > 8) return;
+    const unsigned int token_base = blockIdx.y * 8;
+    if (row >= rows || token_base >= input_rows) return;
+    const unsigned int token_count = min(8u, input_rows - token_base);
+    input += (unsigned long long)token_base * columns;
+    output += (unsigned long long)token_base * rows;
     const float* row_weight = weight + (unsigned long long)row * columns;
     float sums[8] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     unsigned int column = lane * 4;
     for (; column + 3 < columns; column += 128) {
         const float4 w = *reinterpret_cast<const float4*>(row_weight + column);
-        for (unsigned int token = 0; token < input_rows; ++token) {
+        for (unsigned int token = 0; token < token_count; ++token) {
             const float4 x = *reinterpret_cast<const float4*>(input + (unsigned long long)token * columns + column);
             sums[token] = fmaf(x.x, w.x, sums[token]);
             sums[token] = fmaf(x.y, w.y, sums[token]);
@@ -132,15 +136,15 @@ extern "C" __global__ void f32_gemv_small_n_f32(
     }
     for (; column < columns; column += 32) {
         const float w = row_weight[column];
-        for (unsigned int token = 0; token < input_rows; ++token) {
+        for (unsigned int token = 0; token < token_count; ++token) {
             sums[token] = fmaf(input[(unsigned long long)token * columns + column], w, sums[token]);
         }
     }
     for (unsigned int delta = 16; delta; delta >>= 1) {
-        for (unsigned int token = 0; token < input_rows; ++token) sums[token] += __shfl_down(sums[token], delta, 32);
+        for (unsigned int token = 0; token < token_count; ++token) sums[token] += __shfl_down(sums[token], delta, 32);
     }
     if (lane == 0) {
-        for (unsigned int token = 0; token < input_rows; ++token) output[(unsigned long long)token * rows + row] = sums[token];
+        for (unsigned int token = 0; token < token_count; ++token) output[(unsigned long long)token * rows + row] = sums[token];
     }
 }
 

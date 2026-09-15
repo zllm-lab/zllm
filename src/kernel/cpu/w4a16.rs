@@ -432,12 +432,29 @@ pub fn matmul_w4a16_matrix(packed: &[u8], scales: &[u8], scale_dtype: ScaleDType
     // 中间结果按 [rows, n_inputs] 布局:并行 over rows,每行写入连续的 n_inputs 个元素。
     let mut transposed = vec![0.0f32; rows * n_inputs];
     let packed_row_bytes = cols.div_ceil(8) * 4;
-    transposed.par_chunks_mut(n_inputs).enumerate().for_each(|(row, row_out)| {
-        let packed_row = &packed[row * packed_row_bytes..(row + 1) * packed_row_bytes];
+    // 四个输出与四个 token 共用 SIMD 输入，减少重复加载；只展开当前行块。
+    #[cfg(target_arch = "x86_64")]
+    let tiled = n_inputs >= 4 && cols.is_multiple_of(16) && is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let tiled = false;
+    let block_rows = if tiled { 4 } else { 1 };
+    transposed.par_chunks_mut(block_rows * n_inputs).enumerate().for_each(|(block, row_out)| {
+        let first_row = block * block_rows;
+        let count = row_out.len() / n_inputs;
         W_ROW.with(|cell| {
             let w = &mut *cell.borrow_mut();
-            w.resize(cols, 0.0);
-            decode_row_w4a16(packed_row, scales, scale_dtype, group_size, row, cols, w);
+            w.resize(count * cols, 0.0);
+            for local in 0..count {
+                let row = first_row + local;
+                let packed_row = &packed[row * packed_row_bytes..(row + 1) * packed_row_bytes];
+                decode_row_w4a16(packed_row, scales, scale_dtype, group_size, row, cols, &mut w[local * cols..(local + 1) * cols]);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if tiled {
+                // 调度已检查 CPU 特性、K 对齐；每个 worker 独占 count 行输出。
+                unsafe { matmul_w4a16_tile_avx512(w, input, cols, count, n_inputs, row_out) };
+                return;
+            }
             for n in 0..n_inputs {
                 row_out[n] = dot(w, &input[n * cols..(n + 1) * cols]);
             }
@@ -451,6 +468,39 @@ pub fn matmul_w4a16_matrix(packed: &[u8], scales: &[u8], scale_dtype: ScaleDType
         }
     }
     Ok(())
+}
+
+/// K 轴累计四行权重 × 四个 token；保持 F32 activation，不引入额外量化。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,fma")]
+unsafe fn matmul_w4a16_tile_avx512(w: &[f32], input: &[f32], cols: usize, rows: usize, n_inputs: usize, output: &mut [f32]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let full = if rows == 4 { n_inputs / 4 * 4 } else { 0 };
+        for first in (0..full).step_by(4) {
+            let mut sums = [[_mm512_setzero_ps(); 4]; 4];
+            for column in (0..cols).step_by(16) {
+                let weights: [_; 4] = std::array::from_fn(|row| _mm512_loadu_ps(w.as_ptr().add(row * cols + column)));
+                for n in 0..4 {
+                    let x = _mm512_loadu_ps(input.as_ptr().add((first + n) * cols + column));
+                    for row in 0..4 {
+                        sums[row][n] = _mm512_fmadd_ps(weights[row], x, sums[row][n]);
+                    }
+                }
+            }
+            for row in 0..4 {
+                for n in 0..4 {
+                    output[row * n_inputs + first + n] = _mm512_reduce_add_ps(sums[row][n]);
+                }
+            }
+        }
+        // 小尾块保持原 dot 路径，避免为不足四行的输出执行空 FMA。
+        for row in 0..rows {
+            for n in full..n_inputs {
+                output[row * n_inputs + n] = dot(&w[row * cols..(row + 1) * cols], &input[n * cols..(n + 1) * cols]);
+            }
+        }
+    }
 }
 
 /// 反量化单行权重到 `w`。group_size 是 SIMD_LANES 倍数时走 SIMD(每 word 解 8 nibble)。
@@ -734,6 +784,41 @@ mod tests {
             matvec_w4a16_matrix(&packed, &scales, ScaleDType::F32, group_size, rows, cols, &input[n * cols..(n + 1) * cols], &mut single).unwrap();
             for row in 0..rows {
                 assert!((batched[n * rows + row] - single[row]).abs() < 1.0e-5, "n={n} row={row}: {} vs {}", batched[n * rows + row], single[row]);
+            }
+        }
+    }
+
+    #[test]
+    fn batched_w4a16_tiles_match_decoded_weights() {
+        // 覆盖 SIMD 门槛、非整块 token、四行块尾部及各 scale 编码。
+        let rows: usize = 67;
+        let cols: usize = 96;
+        let group_size = 32;
+        let packed = (0..rows * cols / 2).map(|index| (index.wrapping_mul(37) + 19) as u8).collect::<Vec<_>>();
+        for dtype in [ScaleDType::F32, ScaleDType::F16, ScaleDType::Bf16] {
+            let scales = (0..rows * (cols / group_size))
+                .flat_map(|index| {
+                    let value = 0.01 * (1 + index % 11) as f32;
+                    match dtype {
+                        ScaleDType::F32 => value.to_le_bytes().to_vec(),
+                        ScaleDType::F16 => half::f16::from_f32(value).to_le_bytes().to_vec(),
+                        ScaleDType::Bf16 => half::bf16::from_f32(value).to_le_bytes().to_vec(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut decoded = vec![0.0; rows * cols];
+            decode_w4a16_matrix(&packed, &scales, dtype, group_size, rows, cols, &mut decoded).unwrap();
+            for n_inputs in [3, 4, 7, 8, 27, 65] {
+                let input = (0..n_inputs * cols).map(|index| (index as f32 * 0.13).sin()).collect::<Vec<_>>();
+                let mut output = vec![f32::NAN; rows * n_inputs];
+                matmul_w4a16_matrix(&packed, &scales, dtype, group_size, rows, cols, n_inputs, &input, &mut output).unwrap();
+                for n in 0..n_inputs {
+                    for row in 0..rows {
+                        let expected = input[n * cols..(n + 1) * cols].iter().zip(&decoded[row * cols..(row + 1) * cols]).map(|(&x, &w)| f64::from(x) * f64::from(w)).sum::<f64>();
+                        let actual = f64::from(output[n * rows + row]);
+                        assert!((actual - expected).abs() < 1e-5 * (1.0 + expected.abs()), "dtype={dtype:?} n={n} row={row}: {actual} vs {expected}");
+                    }
+                }
             }
         }
     }

@@ -768,9 +768,10 @@ impl Tokenizer {
         }
 
         // BPE merge 不能跨 pre-tokenizer piece；按 piece 分片并行不会改变 token 序列。
-        // 每个 worker 保留多个 piece，避免为代码文本里的短词创建海量微任务。
+        // 多核服务器上短 prompt 不能按全部 worker 拆成数百份；每份至少
+        // 256 个 piece，避免线程唤醒和抢任务的成本超过实际 BPE。
         let workers = rayon::current_num_threads().max(1);
-        let chunk_size = pieces.len().div_ceil(workers.saturating_mul(4)).max(1);
+        let chunk_size = pieces.len().div_ceil(workers.saturating_mul(4)).max(256);
         let chunks = pieces
             .par_chunks(chunk_size)
             .map(|pieces| {
@@ -1588,6 +1589,13 @@ mod tests {
         let serial_without_special = tokenizer.tokenize_prepared_serial(&prepared, false);
         assert_eq!(tokenizer.tokenize_prepared_parallel(&prepared, false), serial_without_special);
         assert_eq!(tokenizer.tokenize_with_special(input.as_bytes(), false), serial_without_special);
+        for threads in [1, 8, 32] {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(|| {
+                assert_eq!(tokenizer.tokenize_prepared_parallel(&prepared, true), serial);
+                assert_eq!(tokenizer.tokenize_prepared_parallel(&prepared, false), serial_without_special);
+            });
+        }
     }
 
     fn cl100k_tokenizer_json() -> Vec<u8> {

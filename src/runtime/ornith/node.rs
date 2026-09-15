@@ -112,6 +112,9 @@ impl OrnithEngine {
             crate::runtime::node::SessionDescriptor { model_format: "gguf-mixed", model_bytes: session.model_bytes(), max_seq_len, kv_cache_format: if options.kv_f16 { "f16" } else { "q8g64" }, input_modalities: &["text"] },
         );
         residency.configure(&mut capabilities, &runtime);
+        // 引擎走 activate_terminal_append 通用路径,瘦身后只渲染 suffix;miss 由
+        // 通用层哨兵上报。声明能力后 scheduler 命中时只发增量消息。
+        capabilities.terminal_resume_delta = true;
         let terminal_limit = options.terminal_cache_entries;
         eprintln!("[ornith-kv-admission] available={:.1} MiB session={:.1} MiB", available as f64 / 1048576.0, session_resident_bytes as f64 / 1048576.0);
         Ok(Self { session, terminal_states: crate::kv_cache::terminal_cache::TerminalSessions::new(terminal_limit, None), residency, capabilities, runtime, compute_steps })
@@ -169,7 +172,7 @@ impl OrnithEngine {
             |assistant| Ok(self.session.tokenize(&chat_prompt_suffix(request, assistant)?)),
             &(),
         )
-        .map_err(|error| format!("Ornith {error}; 请重新开始会话"))?;
+        .map_err(|error| if error.starts_with(crate::runtime::session::TERMINAL_RESUME_MISS) { error } else { format!("Ornith {error}; 请重新开始会话") })?;
         // resume 命中时只对 suffix 计费，避免 dispatch 把整段 prompt 算到当前 batch。
         let batch_tokens = resumed.as_ref().map_or(tokens.len(), |(state, suffix)| state.pending_tokens.len().saturating_add(suffix.len()));
         let _batch_guard = BatchTokenGuard::new(&self.runtime, batch_tokens);

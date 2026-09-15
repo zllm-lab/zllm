@@ -126,7 +126,7 @@ impl FjallCacheStore {
     }
 
     pub fn reader(&self, cache_id: &str, generation: u64, stage: usize, layer: usize, kind: FjallChunkKind, blob: FjallBlob) -> FjallChunkReader<'_> {
-        FjallChunkReader { store: self, cache_id: cache_id.to_owned(), generation, stage, layer, kind, blob, next_chunk: 0, remaining: blob.bytes, current: Cursor::new(Vec::new()) }
+        FjallChunkReader { store: self, cache_id: cache_id.to_owned(), generation, stage, layer, kind, blob, next_chunk: 0, remaining: blob.bytes, current: Cursor::new(fjall::UserValue::default()) }
     }
 
     pub fn remove_entry(&self, cache_id: &str) -> Result<(), String> {
@@ -160,9 +160,9 @@ impl FjallCacheStore {
         self.chunks.insert(key, bytes).map_err(fjall_error)
     }
 
-    fn get_chunk(&self, cache_id: &str, generation: u64, stage: usize, layer: usize, kind: FjallChunkKind, chunk: u32) -> Result<Option<Vec<u8>>, String> {
+    fn get_chunk(&self, cache_id: &str, generation: u64, stage: usize, layer: usize, kind: FjallChunkKind, chunk: u32) -> Result<Option<fjall::UserValue>, String> {
         let key = chunk_key(cache_id, generation, stage, layer, kind, chunk)?;
-        self.chunks.get(key).map_err(fjall_error).map(|value| value.map(|value| value.to_vec()))
+        self.chunks.get(key).map_err(fjall_error)
     }
 }
 
@@ -309,7 +309,8 @@ pub struct FjallChunkReader<'a> {
     blob: FjallBlob,
     next_chunk: u32,
     remaining: u64,
-    current: Cursor<Vec<u8>>,
+    // 持有 fjall 已校验、解压的分块，避免每个大块再复制并释放一份 Vec。
+    current: Cursor<fjall::UserValue>,
 }
 
 impl Read for FjallChunkReader<'_> {

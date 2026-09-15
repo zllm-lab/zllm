@@ -178,11 +178,16 @@ pub struct H3VideoVaeBlockWeights<T = TensorData> {
 /// PyTorch VAE 先把 QKV reshape 成 `[token, head, 3 * head_dim]` 再切分，
 /// safetensors 的输出维因此按 head 交错。这里一次性改成 runtime 使用的连续 Q/K/V。
 fn reorder_decoder_qkv(mut tensor: TensorData, hidden: usize, head_dim: usize) -> Result<TensorData, String> {
-    if tensor.dtype != "F32" || tensor.shape.first() != Some(&(hidden * 3)) || !hidden.is_multiple_of(head_dim) {
+    let element_bytes = match tensor.dtype.as_str() {
+        "F32" => 4,
+        "BF16" | "F16" => 2,
+        _ => return Err(format!("H3 video VAE QKV {} dtype={} 不受支持", tensor.name, tensor.dtype)),
+    };
+    if tensor.shape.first() != Some(&(hidden * 3)) || head_dim == 0 || !hidden.is_multiple_of(head_dim) {
         return Err(format!("H3 video VAE QKV {} dtype={} shape={:?} hidden={hidden} head_dim={head_dim} 非法", tensor.name, tensor.dtype, tensor.shape,));
     }
     let row_elements = tensor.shape.iter().skip(1).product::<usize>();
-    let block_bytes = head_dim.checked_mul(row_elements).and_then(|value| value.checked_mul(std::mem::size_of::<f32>())).ok_or_else(|| format!("H3 video VAE QKV {} block 大小溢出", tensor.name))?;
+    let block_bytes = head_dim.checked_mul(row_elements).and_then(|value| value.checked_mul(element_bytes)).ok_or_else(|| format!("H3 video VAE QKV {} block 大小溢出", tensor.name))?;
     let heads = hidden / head_dim;
     let expected = heads.checked_mul(3).and_then(|value| value.checked_mul(block_bytes)).ok_or_else(|| format!("H3 video VAE QKV {} 大小溢出", tensor.name))?;
     if tensor.data.len() != expected {
@@ -336,6 +341,12 @@ mod tests {
         let tensor = reorder_decoder_qkv(tensor, 4, 2).unwrap();
         let values = tensor.data.chunks_exact(4).map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>();
         assert_eq!(values, vec![0.0, 1.0, 6.0, 7.0, 2.0, 3.0, 8.0, 9.0, 4.0, 5.0, 10.0, 11.0]);
+        for dtype in ["BF16", "F16"] {
+            let tensor = TensorData { name: "qkv".to_owned(), dtype: dtype.to_owned(), shape: vec![12, 2], data: (0u16..24).flat_map(u16::to_le_bytes).collect() };
+            let tensor = reorder_decoder_qkv(tensor, 4, 2).unwrap();
+            let values = tensor.data.chunks_exact(2).map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>();
+            assert_eq!(values, [0, 1, 2, 3, 12, 13, 14, 15, 4, 5, 6, 7, 16, 17, 18, 19, 8, 9, 10, 11, 20, 21, 22, 23]);
+        }
     }
 }
 
@@ -503,8 +514,8 @@ impl H3AudioVaeSource {
 // 视频/音频 VAE 的加载、shape 校验与 config 读取逻辑完全一致,仅错误标签不同;共享私有 helper 消除两份拷贝。
 fn vae_load(store: &SafetensorStore, label: &str, name: &str, shape: &[usize]) -> Result<TensorData, String> {
     let tensor = store.load(name).map_err(|error| format!("{label} {name}: {error}"))?;
-    if tensor.dtype != "F32" || tensor.shape != shape {
-        return Err(format!("{label} {name} dtype={} shape={:?}，期望 F32 {shape:?}", tensor.dtype, tensor.shape));
+    if !matches!(tensor.dtype.as_str(), "F32" | "BF16" | "F16") || tensor.shape != shape {
+        return Err(format!("{label} {name} dtype={} shape={:?}，期望 F32/BF16/F16 {shape:?}", tensor.dtype, tensor.shape));
     }
     Ok(tensor)
 }

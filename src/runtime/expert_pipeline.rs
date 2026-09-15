@@ -115,7 +115,7 @@ impl<S> ExpertDecodePipeline<S> {
     {
         let mut shared = None;
         let expert_input = inputs.expert;
-        let routed_weights = RoutedMoeWeightsRef { router: weights.router_weight, bias: weights.router_bias, selected_experts: weights.selected_experts };
+        let routed_weights = RoutedMoeWeightsRef { router: weights.router_weight, bias: weights.router_bias, selected_experts: weights.selected_experts, bias_vl: None, image_rows: None };
         let routed = self.decode_routed_with_ready(backend, spec, routed_weights, request, inputs, || {
             shared = decode_shared_experts(backend, spec, weights, expert_input)?;
             if shared.is_some() {

@@ -294,6 +294,27 @@ mod tests {
     }
 
     #[test]
+    fn 瘦身请求的suffix与完整请求一致() {
+        // server 把命中请求截为 [边界 assistant, ...增量];assistant=0 的 suffix
+        // 渲染必须与完整请求按真实边界渲染逐字节一致,否则节点恢复后的 token
+        // 流与全量路径分叉。official 与硬编码模板两条路径都要等价。
+        for official in [true, false] {
+            let full = json!({"messages": [
+                {"role": "user", "content": "旧问题"},
+                {"role": "assistant", "content": "可见答案", "tool_calls": null},
+                {"role": "tool", "content": "工具结果"},
+                {"role": "user", "content": "继续"}
+            ]});
+            let slim = json!({"messages": [
+                {"role": "assistant", "content": "可见答案", "tool_calls": null},
+                {"role": "tool", "content": "工具结果"},
+                {"role": "user", "content": "继续"}
+            ], "_zllm_resume": "cache", "_zllm_resume_hash": "anchor"});
+            assert_eq!(chat_prompt_suffix_glm52(&slim, 0, official).unwrap(), chat_prompt_suffix_glm52(&full, 1, official).unwrap(), "official={official}");
+        }
+    }
+
+    #[test]
     fn chat_prompt_and_stream_follow_glm_tool_format() {
         let request = json!({
             "stream": true,

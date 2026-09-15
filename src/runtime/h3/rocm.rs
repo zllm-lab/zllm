@@ -7,16 +7,22 @@ use crate::backend::{
     rocm::{RocmContext, RocmTensor, RocmWeight},
 };
 use crate::diffusion::ModulationSegment;
+use crate::moe::Activation;
 use crate::weight::model::h3::{H3AttentionWeights, H3DitBlockWeights};
 
 use super::{
-    H3ConditionInput, H3Config, H3DenoiseLatents, H3PackedLayout, H3PreparedGlobal, H3UlyssesPlan, H3VelocityOutput, block_adaln, build_modulation_plan, dit_final_layer, h3_euler_step, h3_sigma_schedule, h3_time_state, mlp, mm_rope_tables,
+    H3ConditionInput, H3Config, H3DenoiseLatents, H3PackedLayout, H3PreparedGlobal, H3UlyssesPlan, H3VelocityOutput, block_adaln, build_modulation_plan, dit_final_layer, h3_euler_step, h3_sigma_schedule, h3_time_state, mm_rope_tables,
     pack_dit_inputs_with_prefix, prepare_dit_static_prefix_conditioned, time_embedding,
 };
 
 /// 同一 H3 请求使用的 ROCm rank 组。
 pub struct H3RocmUlyssesGroup {
     contexts: Vec<RocmContext>,
+}
+
+fn ulysses_xor_rounds(ranks: usize) -> Vec<Vec<(usize, usize)>> {
+    debug_assert!(ranks.is_power_of_two());
+    (1..ranks).map(|round| (0..ranks).filter_map(|left| (left < (left ^ round)).then_some((left, left ^ round))).collect()).collect()
 }
 
 /// First-block cache 的数值策略。缓存只活在一次 denoise 请求内，不能跨请求复用。
@@ -51,6 +57,8 @@ impl H3RocmUlyssesGroup {
         if devices.iter().copied().collect::<HashSet<_>>().len() != devices.len() {
             return Err("H3 ROCm Ulysses devices 不能重复".to_owned());
         }
+        // 显式池启用由 node 层按 yaml 决定（15s/1MP U8 负载需 false），
+        // 构造函数不再携带进程级分配策略副作用。
         let contexts = devices
             .iter()
             .map(|&device| RocmContext::configured(device, allow_cpu_reference_fallback).and_then(|context| context.with_independent_stream()).map_err(|error| format!("初始化 H3 ROCm rank device {device}: {error}")))
@@ -97,6 +105,62 @@ impl H3RocmUlyssesGroup {
             context.retire_ordered_p2p_sources();
         }
         Ok(())
+    }
+
+    /// power-of-two rank 用 XOR 轮次覆盖完整 all-to-all。每轮每张卡只出现一次，
+    /// 每对 producer ready event 都在任一入向复制前同时记录，避免按目标逐卡提交
+    /// 时把后续 rank 的 ready event 排到前一个 rank 的 peer-copy 之后。
+    fn exchange_all_to_all(&self, sources: Vec<Vec<RocmTensor>>) -> Result<Vec<Vec<RocmTensor>>, BackendError> {
+        let ranks = self.contexts.len();
+        if sources.len() != ranks || sources.iter().any(|row| row.len() != ranks) {
+            return Err(BackendError::Compute { msg: format!("H3 Ulysses all-to-all sources={} ranks={ranks}", sources.len()) });
+        }
+        let mut destinations = vec![vec![None; ranks]; ranks];
+        for rank in 0..ranks {
+            destinations[rank][rank] = Some(sources[rank][rank].clone());
+        }
+        let completion_device_id = self.primary().device_id();
+        for pairs in ulysses_xor_rounds(ranks) {
+            for (left, right) in pairs {
+                let (left_on_right, right_on_left) = RocmContext::exchange_stable_tensors_ordered(&sources[left][right], &sources[right][left], completion_device_id)?;
+                destinations[right][left] = Some(left_on_right);
+                destinations[left][right] = Some(right_on_left);
+            }
+        }
+        destinations
+            .into_iter()
+            .enumerate()
+            .map(|(destination, sources)| sources.into_iter().enumerate().map(|(source, tensor)| tensor.ok_or_else(|| BackendError::Compute { msg: format!("H3 Ulysses all-to-all 缺少 {source}->{destination}") })).collect())
+            .collect()
+    }
+
+    /// 第二次 attention A2A 直接把每个 source rank 的 head shard 写入对端
+    /// 最终列区，避免物化连续 P2P 副本后再按 source rank 拼接。
+    fn exchange_all_to_all_columns_into(&self, sources: Vec<Vec<RocmTensor>>, targets: &[RocmTensor], source_column_starts: &[usize]) -> Result<(), BackendError> {
+        let ranks = self.contexts.len();
+        if sources.len() != ranks || sources.iter().any(|row| row.len() != ranks) || targets.len() != ranks || source_column_starts.len() != ranks {
+            return Err(BackendError::Compute {
+                msg: format!("H3 Ulysses column all-to-all sources={} targets={} starts={} ranks={ranks}", sources.len(), targets.len(), source_column_starts.len()),
+            });
+        }
+        for rank in 0..ranks {
+            self.contexts[rank].copy_columns_into(&sources[rank][rank], &targets[rank], source_column_starts[rank])?;
+        }
+        let completion_device_id = self.primary().device_id();
+        for pairs in ulysses_xor_rounds(ranks) {
+            for (left, right) in pairs {
+                RocmContext::exchange_stable_columns_into_ordered(
+                    &sources[left][right],
+                    &targets[right],
+                    source_column_starts[left],
+                    &sources[right][left],
+                    &targets[left],
+                    source_column_starts[right],
+                    completion_device_id,
+                )?;
+            }
+        }
+        self.synchronize_all()
     }
 
     /// 主卡完整 sequence resident tensor 切分到各 rank；当前实现是正确性底座，
@@ -160,89 +224,108 @@ impl H3RocmUlyssesGroup {
             qkv.push(context.linear(input, &weights.qkv)?);
         }
 
-        // 每个 source rank 先一次性产出所有目标 head shard。ordered P2P 会在
-        // source stream 的 compact/stable-copy 之后录 event，目标 stream 等待该
-        // event；这里不需要额外的 host/global barrier。
-        let compact_qkv = self
+        // 每个 source rank 在本地完成 Q/K norm、RoPE 与 BF16 round，再产出所有
+        // 目标 head shard。舍入位置与原目标端 prepare 完全相同，但 A2A 每元素
+        // 从 F32 4 B 降为 BF16 2 B。
+        let prepared_qkv = self
             .contexts
             .iter()
             .enumerate()
             .map(|(source_rank, source)| {
-                let shards = plan
-                    .shards
-                    .iter()
-                    .map(|head_shard| {
-                        let compact = source.compact_qkv_heads(&qkv[source_rank], config.num_attention_heads, head_shard.heads.clone(), config.attention_head_dim)?;
-                        source.tensor_to_stable_deferred(compact)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(shards)
+                let weights = weights[source_rank];
+                source.prepare_compact_qkv_heads_bf16(
+                    &qkv[source_rank],
+                    &weights.q_norm,
+                    &weights.k_norm,
+                    config.num_attention_heads,
+                    0..config.num_attention_heads,
+                    config.attention_head_dim,
+                    config.rope_inv_freq_len * 6,
+                    config.qk_norm_eps,
+                    plan.shards[source_rank].sequence.start,
+                    cosine,
+                    sine,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
-
-        let head_rows = self
+        let compact_qkv = self
             .contexts
             .iter()
-            .enumerate()
-            .map(|(head_rank, destination)| {
-                let rows = compact_qkv.iter().map(|source_shards| destination.tensor_on_device_ordered(source_shards[head_rank].clone())).collect::<Result<Vec<_>, _>>()?;
-                Ok(rows)
-            })
+            .zip(&prepared_qkv)
+            .map(|(source, prepared)| plan.shards.iter().map(|head_shard| source.compact_prepared_qkv_heads_bf16(prepared, config.num_attention_heads, head_shard.heads.clone(), config.attention_head_dim).and_then(|tensor| source.tensor_to_stable_deferred(tensor))).collect::<Result<Vec<_>, _>>())
             .collect::<Result<Vec<_>, _>>()?;
+        // 每张 source 卡的 prepare 已在本卡 stream 读完 QKV；后续 P2P 只依赖
+        // BF16 stable shard，不再把完整 F32 projection 保留到 attention 返回。
+        drop(qkv);
+        drop(prepared_qkv);
+
+        let profile = crate::kernel::rocm::hip::device_profile_enabled();
+        if profile {
+            for context in &self.contexts {
+                context.activate().map_err(|msg| BackendError::Compute { msg })?;
+                context.profile_scope_begin("h3_qkv_a2a")?;
+            }
+        }
+        let head_rows = self.exchange_all_to_all(compact_qkv)?;
         self.synchronize_all()?;
+        if profile {
+            for context in &self.contexts {
+                context.activate().map_err(|msg| BackendError::Compute { msg })?;
+                crate::kernel::rocm::hip::device_profile_scope_operator(context.device_id(), "h3_attention").map_err(|msg| BackendError::Compute { msg })?;
+            }
+        }
         let mut head_outputs = Vec::with_capacity(self.contexts.len());
-        for (head_rank, ((destination, weights), rows)) in self.contexts.iter().zip(weights).zip(head_rows).enumerate() {
+        for (head_rank, (destination, rows)) in self.contexts.iter().zip(head_rows).enumerate() {
             let refs = rows.iter().collect::<Vec<_>>();
             let qkv = destination.concat_token_rows(&refs)?;
-            let output = destination.full_attention_qkv(
+            let output = destination.full_attention_prepared_qkv_bf16(
                 qkv,
-                &weights.q_norm,
-                &weights.k_norm,
                 plan.shards[head_rank].heads.len(),
                 config.attention_head_dim,
-                config.rope_inv_freq_len * 6,
-                config.qk_norm_eps,
-                cosine,
-                sine,
                 (config.attention_head_dim as f32).sqrt().recip(),
             )?;
             head_outputs.push(destination.tensor_to_stable_deferred(output)?);
         }
 
-        let source_columns = plan
-            .shards
+        let source_columns = self
+            .contexts
             .iter()
-            .map(|shard| {
-                let sequence = &shard.sequence;
-                self.contexts
+            .enumerate()
+            .map(|(head_rank, source)| {
+                plan.shards
                     .iter()
-                    .enumerate()
-                    .map(|(head_rank, source)| {
-                        let local = source.slice_token_rows(&head_outputs[head_rank], sequence.start, sequence.len())?;
-                        let local = source.tensor_to_stable_deferred(local)?;
-                        Ok(local)
+                    .map(|shard| {
+                        let local = source.slice_token_rows(&head_outputs[head_rank], shard.sequence.start, shard.sequence.len())?;
+                        source.tensor_to_stable_deferred(local)
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-
-        let destination_columns = self
+        // H3 的 attention value 宽度 7168 与 residual hidden 5376 不同；这里
+        // 必须按 heads×head_dim 分配，output projection 随后才降回 hidden。
+        let attention_output_columns = config.num_attention_heads.checked_mul(config.attention_head_dim).ok_or_else(|| BackendError::Compute { msg: "H3 attention output columns 溢出".to_owned() })?;
+        let attended = self
             .contexts
             .iter()
-            .zip(source_columns)
-            .map(|(destination, columns)| {
-                let columns = columns.into_iter().map(|column| destination.tensor_on_device_ordered(column)).collect::<Result<Vec<_>, _>>()?;
-                Ok(columns)
-            })
+            .zip(&plan.shards)
+            .map(|(destination, shard)| destination.allocate_peer_f32_tensor(shard.sequence.len(), attention_output_columns))
             .collect::<Result<Vec<_>, _>>()?;
-        self.synchronize_all()?;
-        let mut outputs = Vec::with_capacity(self.contexts.len());
-        for ((destination, weights), columns) in self.contexts.iter().zip(weights).zip(destination_columns) {
-            let mut columns = columns.into_iter();
-            let mut attended = columns.next().expect("H3 Ulysses rank 非空");
-            for column in columns {
-                attended = destination.concat_columns(&attended, &column)?;
+        let source_column_starts = plan.shards.iter().map(|shard| shard.heads.start * config.attention_head_dim).collect::<Vec<_>>();
+        if profile {
+            for context in &self.contexts {
+                context.activate().map_err(|msg| BackendError::Compute { msg })?;
+                crate::kernel::rocm::hip::device_profile_scope_operator(context.device_id(), "h3_inverse_a2a").map_err(|msg| BackendError::Compute { msg })?;
             }
+        }
+        self.exchange_all_to_all_columns_into(source_columns, &attended, &source_column_starts)?;
+        if profile {
+            for context in &self.contexts {
+                context.activate().map_err(|msg| BackendError::Compute { msg })?;
+                context.profile_scope_end()?;
+            }
+        }
+        let mut outputs = Vec::with_capacity(self.contexts.len());
+        for ((destination, weights), attended) in self.contexts.iter().zip(weights).zip(attended) {
             outputs.push(destination.linear(&attended, &weights.output)?);
         }
         Ok(outputs)
@@ -317,16 +400,11 @@ impl H3RocmUlyssesGroup {
                 Ok(normalized)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mlp_updates = self
-            .contexts
-            .iter()
-            .zip(&normalized)
-            .zip(weights)
-            .map(|((context, normalized), weights)| {
-                let update = mlp(context, config, normalized, &weights.mlp)?;
-                Ok(update)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // 超大 gate/up 在激活后释放时可能同步设备。先向所有 rank 提交上投影，
+        // 再逐卡消费，避免一个 rank 完成整条 MLP 后才启动下一个 rank。
+        let gate_up = self.contexts.iter().zip(&normalized).zip(weights).map(|((context, normalized), weights)| context.linear(normalized, &weights.mlp.gate_up)).collect::<Result<Vec<_>, _>>()?;
+        let activated = self.contexts.iter().zip(gate_up).map(|(context, gate_up)| context.split_gated_activation(gate_up, config.ffn_hidden_size, &Activation::Silu)).collect::<Result<Vec<_>, _>>()?;
+        let mlp_updates = self.contexts.iter().zip(&activated).zip(weights).map(|((context, activated), weights)| context.linear(activated, &weights.mlp.down)).collect::<Result<Vec<_>, _>>()?;
         let outputs = self
             .contexts
             .iter()
@@ -341,6 +419,73 @@ impl H3RocmUlyssesGroup {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(outputs)
     }
+}
+
+/// 每张卡处理连续的空间 tile batch，回读后仍按原顺序做时空融合。
+#[allow(clippy::too_many_arguments)]
+pub fn decode_video_vae_tiled_rocm(
+    contexts: &[RocmContext],
+    source: &crate::weight::model::h3_vae::H3VideoVaeSource,
+    globals: &[super::H3PreparedVideoVae<RocmWeight>],
+    latent: &[f32],
+    shape: [usize; 3],
+    output_frames: usize,
+    patch: [usize; 3],
+) -> Result<Vec<f32>, String> {
+    // 外部 oracle 仍使用原入口；正式 node 传入任务取消标记。
+    decode_video_vae_tiled_rocm_cancellable(contexts, source, globals, latent, shape, output_frames, patch, &std::sync::atomic::AtomicBool::new(false), &mut |_, _| Ok(()))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_video_vae_tiled_rocm_cancellable(
+    contexts: &[RocmContext],
+    source: &crate::weight::model::h3_vae::H3VideoVaeSource,
+    globals: &[super::H3PreparedVideoVae<RocmWeight>],
+    latent: &[f32],
+    shape: [usize; 3],
+    output_frames: usize,
+    patch: [usize; 3],
+    cancellation: &std::sync::atomic::AtomicBool,
+    on_decoded: &mut dyn FnMut(&[f32], usize) -> Result<(), String>,
+) -> Result<Vec<f32>, String> {
+    use crate::backend::VaeBackend;
+    if contexts.is_empty() || contexts.len() != globals.len() {
+        return Err(format!("H3 VAE devices={} 与 prepared globals={} 不匹配", contexts.len(), globals.len()));
+    }
+    super::video_vae::decode_video_vae_tiled_temporal_pipelined_with_tiles(
+        &mut |tiles, tile_shape, patch| {
+            std::thread::scope(|scope| {
+                let count = contexts.len().min(tiles.len());
+                let mut handles = Vec::with_capacity(count);
+                for rank in 0..count {
+                    let context = &contexts[rank];
+                    let global = &globals[rank];
+                    let tiles = &tiles[tiles.len() * rank / count..tiles.len() * (rank + 1) / count];
+                    handles.push(scope.spawn(move || {
+                        context.activate()?;
+                        let rows = (0..3).map(|axis| tile_shape[axis] / patch[axis]).product::<usize>();
+                        let cols = crate::vae::H3VideoVaeSpec::standard().latent_channels * patch.into_iter().product::<usize>();
+                        let inputs = tiles.iter().map(|tile| context.vae_tensor_from_f32(tile.clone(), rows, cols)).collect::<Result<Vec<_>, _>>().map_err(|error| format!("H3 VAE rank {rank} 上传: {error:?}"))?;
+                        let output = super::video_vae::decode_video_vae_batched(context, source, global, &inputs, tile_shape, patch).map_err(|error| format!("H3 VAE rank {rank} decode: {error:?}"))?;
+                        context.vae_tensor_to_f32(&output).map_err(|error| format!("H3 VAE rank {rank} 回读: {error:?}"))
+                    }));
+                }
+                let mut output = Vec::with_capacity(count);
+                for (rank, handle) in handles.into_iter().enumerate() {
+                    output.push(handle.join().map_err(|_| format!("H3 VAE rank {rank} 线程 panic"))??);
+                }
+                Ok(output)
+            })
+        },
+        latent,
+        shape[0],
+        shape[1],
+        shape[2],
+        output_frames,
+        patch,
+        cancellation,
+        on_decoded,
+    )
 }
 
 /// 完整 H3 Ulysses 采样。conditioning、prefix、final layer 与 latent 更新留在
@@ -486,6 +631,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn xor_rounds_cover_every_rank_pair_once() {
+        for ranks in [1, 2, 4, 8] {
+            let rounds = ulysses_xor_rounds(ranks);
+            assert_eq!(rounds.len(), ranks.saturating_sub(1));
+            let mut pairs = std::collections::BTreeSet::new();
+            for round in rounds {
+                let mut seen = std::collections::BTreeSet::new();
+                for (left, right) in round {
+                    assert!(left < right && right < ranks);
+                    assert!(seen.insert(left) && seen.insert(right));
+                    assert!(pairs.insert((left, right)));
+                }
+                assert_eq!(seen.len(), ranks);
+            }
+            assert_eq!(pairs.len(), ranks * ranks.saturating_sub(1) / 2);
+        }
+    }
+
+    #[test]
     #[ignore = "需要显式设置 H3_ROCM_TEST_DEVICES 并占用对应 ROCm 卡"]
     fn ulysses_scatter_gather_round_trip() {
         let devices = std::env::var("H3_ROCM_TEST_DEVICES").expect("设置 H3_ROCM_TEST_DEVICES，例如 4,5,6,7").split(',').map(|value| value.parse::<i32>().expect("device id 必须是 i32")).collect::<Vec<_>>();
@@ -502,7 +666,7 @@ mod tests {
     #[test]
     #[ignore = "需要显式设置 H3_ROCM_TEST_DEVICES 并占用对应 ROCm 卡"]
     fn ulysses_qkv_and_attention_output_exchanges_are_bitwise() {
-        use crate::backend::Backend;
+        use crate::backend::{Backend, BackendResources, LinearWeight};
 
         let devices = std::env::var("H3_ROCM_TEST_DEVICES").expect("设置 H3_ROCM_TEST_DEVICES，例如 0,1,2,3").split(',').map(|value| value.parse::<i32>().expect("device id 必须是 i32")).collect::<Vec<_>>();
         let group = H3RocmUlyssesGroup::new(&devices, false).unwrap();
@@ -523,9 +687,9 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         group.synchronize_all().unwrap();
-        for (head_rank, destination) in group.contexts.iter().enumerate() {
-            let chunks = compact.iter().map(|source| destination.tensor_on_device_ordered(source[head_rank].clone())).collect::<Result<Vec<_>, _>>().unwrap();
-            group.synchronize_all().unwrap();
+        let chunks_by_head = group.exchange_all_to_all(compact).unwrap();
+        group.synchronize_all().unwrap();
+        for (head_rank, (destination, chunks)) in group.contexts.iter().zip(chunks_by_head).enumerate() {
             for (source_rank, chunk) in chunks.iter().enumerate() {
                 let values = destination.tensor_to_f32(chunk).unwrap();
                 assert!(values.iter().any(|value| *value != 0.0), "第一次 QKV exchange source_rank={source_rank} head_rank={head_rank} 全 0");
@@ -545,6 +709,71 @@ mod tests {
             assert_eq!(actual, expected, "第一次 QKV exchange head_rank={head_rank}");
         }
 
+        let norm = vec![1.0; head_dim];
+        let norms = group
+            .contexts
+            .iter()
+            .map(|context| {
+                (
+                    context.prepare_weight(LinearWeight::F32(&norm), 1, head_dim).unwrap(),
+                    context.prepare_weight(LinearWeight::F32(&norm), 1, head_dim).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let angles = (0..rows * head_dim / 2).map(|index| (index % 13) as f32 * 0.03125).collect::<Vec<_>>();
+        let cosine = angles.iter().map(|angle| angle.cos()).collect::<Vec<_>>();
+        let sine = angles.iter().map(|angle| angle.sin()).collect::<Vec<_>>();
+        let prepared = group
+            .contexts
+            .iter()
+            .enumerate()
+            .map(|(source_rank, source)| {
+                let all = source.prepare_compact_qkv_heads_bf16(
+                    &sequence_shards[source_rank],
+                    &norms[source_rank].0,
+                    &norms[source_rank].1,
+                    heads,
+                    0..heads,
+                    head_dim,
+                    head_dim,
+                    1e-6,
+                    plan.shards[source_rank].sequence.start,
+                    &cosine,
+                    &sine,
+                )?;
+                plan.shards
+                    .iter()
+                    .map(|head_shard| source.compact_prepared_qkv_heads_bf16(&all, heads, head_shard.heads.clone(), head_dim))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let prepared_by_head = group.exchange_all_to_all(prepared).unwrap();
+        group.synchronize_all().unwrap();
+        for (head_rank, (destination, chunks)) in group.contexts.iter().zip(prepared_by_head).enumerate() {
+            let refs = chunks.iter().collect::<Vec<_>>();
+            let actual = destination.concat_token_rows(&refs).unwrap();
+            let actual = destination.tensor_to_bf16_bits(&actual).unwrap();
+            let expected = group
+                .primary()
+                .prepare_compact_qkv_heads_bf16(
+                    &qkv,
+                    &norms[0].0,
+                    &norms[0].1,
+                    heads,
+                    plan.shards[head_rank].heads.clone(),
+                    head_dim,
+                    head_dim,
+                    1e-6,
+                    0,
+                    &cosine,
+                    &sine,
+                )
+                .unwrap();
+            let expected = group.primary().tensor_to_bf16_bits(&expected).unwrap();
+            assert_eq!(actual, expected, "BF16 prepared QKV exchange head_rank={head_rank}");
+        }
+
         let output_cols = heads * head_dim;
         let output_values = (0..rows * output_cols).map(|index| index as f32 + 17.0).collect::<Vec<_>>();
         let head_outputs = plan
@@ -560,31 +789,18 @@ mod tests {
                 context.tensor_from_f32(values, rows, head_shard.heads.len() * head_dim).unwrap()
             })
             .collect::<Vec<_>>();
-        let source_columns = plan
-            .shards
+        let source_columns = group
+            .contexts
             .iter()
-            .map(|shard| {
-                group
-                    .contexts
-                    .iter()
-                    .enumerate()
-                    .map(|(head_rank, source)| source.slice_token_rows(&head_outputs[head_rank], shard.sequence.start, shard.sequence.len()).and_then(|tensor| source.tensor_to_stable_deferred(tensor)))
-                    .collect::<Result<Vec<_>, _>>()
+            .enumerate()
+            .map(|(head_rank, source)| {
+                plan.shards.iter().map(|shard| source.slice_token_rows(&head_outputs[head_rank], shard.sequence.start, shard.sequence.len()).and_then(|tensor| source.tensor_to_stable_deferred(tensor))).collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        group.synchronize_all().unwrap();
-        let mut sequence_outputs = Vec::new();
-        for (destination, columns) in group.contexts.iter().zip(source_columns) {
-            let columns = columns.into_iter().map(|column| destination.tensor_on_device_ordered(column)).collect::<Result<Vec<_>, _>>().unwrap();
-            group.synchronize_all().unwrap();
-            let mut columns = columns.into_iter();
-            let mut joined = columns.next().unwrap();
-            for column in columns {
-                joined = destination.concat_columns(&joined, &column).unwrap();
-            }
-            sequence_outputs.push(joined);
-        }
+        let sequence_outputs = group.contexts.iter().zip(&plan.shards).map(|(context, shard)| context.allocate_f32_tensor(shard.sequence.len(), output_cols).unwrap()).collect::<Vec<_>>();
+        let source_column_starts = plan.shards.iter().map(|shard| shard.heads.start * head_dim).collect::<Vec<_>>();
+        group.exchange_all_to_all_columns_into(source_columns, &sequence_outputs, &source_column_starts).unwrap();
         let gathered = group.gather_sequence(&sequence_outputs, &plan).unwrap();
         assert_eq!(group.primary().tensor_to_f32(&gathered).unwrap(), output_values, "第二次 attention output exchange");
     }

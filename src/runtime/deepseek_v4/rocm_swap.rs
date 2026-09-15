@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::{
+    attention::compressed_sparse::CompressedKvFormat,
     backend::rocm::{RocmCompressedKvSerde, RocmGatedPoolSerde},
     kv_cache::{
         FjallBlob, FjallCacheStore, FjallChunkKind,
@@ -16,7 +17,7 @@ use crate::{
     runtime::deepseek_v4::{dspark_rocm::RocmDeepSeekV4DsparkCache, rocm_stage::DeepSeekV4StageCache},
 };
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const INFO_MAGIC: [u8; 8] = *b"ZDSV4I01";
 const MANIFEST_MAGIC: [u8; 8] = *b"ZDSV4M01";
 static GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -301,7 +302,7 @@ fn read_session(mut input: impl Read) -> Result<(Vec<DeepSeekV4StageCache>, Opti
 }
 
 fn write_layer(output: &mut impl Write, layer: &RocmCompressedKvSerde) -> Result<(), String> {
-    for value in [layer.window_size, layer.kv_width, layer.q8_group_size, layer.recent_capacity, layer.recent_start, layer.recent_len, layer.recent_first_position] {
+    for value in [layer.window_size, layer.kv_width, layer.q8_group_size, usize::from(layer.format == CompressedKvFormat::Fp8WindowFp4Compressed), layer.recent_capacity, layer.recent_start, layer.recent_len, layer.recent_first_position] {
         put_usize(output, value)?;
     }
     put_option_usize(output, layer.next_recent_position)?;
@@ -316,6 +317,7 @@ fn write_layer(output: &mut impl Write, layer: &RocmCompressedKvSerde) -> Result
     }
     put_usize(output, layer.compressed_index_width)?;
     put_option_bytes(output, layer.compressed_index_key.as_deref())?;
+    put_option_bytes(output, layer.compressed_index_key_scales.as_deref())?;
     write_pool(output, &layer.compressor)?;
     write_pool(output, &layer.indexer)
 }
@@ -324,6 +326,11 @@ fn read_layer(input: &mut impl Read) -> Result<RocmCompressedKvSerde, String> {
     let window_size = get_usize(input)?;
     let kv_width = get_usize(input)?;
     let q8_group_size = get_usize(input)?;
+    let format = match get_usize(input)? {
+        0 => CompressedKvFormat::Q8,
+        1 => CompressedKvFormat::Fp8WindowFp4Compressed,
+        value => return Err(format!("DeepSeek-V4 cache KV format={value} 非法")),
+    };
     let recent_capacity = get_usize(input)?;
     let recent_start = get_usize(input)?;
     let recent_len = get_usize(input)?;
@@ -342,10 +349,12 @@ fn read_layer(input: &mut impl Read) -> Result<RocmCompressedKvSerde, String> {
     let compressed_value_scales = get_bytes(input)?;
     let compressed_index_width = get_usize(input)?;
     let compressed_index_key = get_option_bytes(input)?;
+    let compressed_index_key_scales = get_option_bytes(input)?;
     Ok(RocmCompressedKvSerde {
         window_size,
         kv_width,
         q8_group_size,
+        format,
         recent_capacity,
         recent_start,
         recent_len,
@@ -364,6 +373,7 @@ fn read_layer(input: &mut impl Read) -> Result<RocmCompressedKvSerde, String> {
         compressed_value_scales,
         compressed_index_width,
         compressed_index_key,
+        compressed_index_key_scales,
         compressor: read_pool(input)?,
         indexer: read_pool(input)?,
     })
@@ -474,6 +484,7 @@ mod tests {
             window_size: 2,
             kv_width: 2,
             q8_group_size: 1,
+            format: CompressedKvFormat::Q8,
             recent_capacity: 2,
             recent_start: 1,
             recent_len: 2,
@@ -492,6 +503,7 @@ mod tests {
             compressed_value_scales: Vec::new(),
             compressed_index_width: 1,
             compressed_index_key: Some(vec![7; 8]),
+            compressed_index_key_scales: None,
             compressor: pool(),
             indexer: pool(),
         }

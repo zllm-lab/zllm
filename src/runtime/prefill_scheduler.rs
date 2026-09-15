@@ -81,6 +81,7 @@ pub(crate) fn record_stage_trace(line: String) {
 /// 从提交到完成的区间；空泡是同一 stage 无在途工作到下一次提交之间的区间。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StageFlowSnapshot {
+    pub decode_busy_stages: u64,
     pub decode_micros: u64,
     pub prefill_micros: u64,
     pub prefill_work_units: u64,
@@ -93,6 +94,7 @@ pub struct StageFlowSnapshot {
 
 #[derive(Default)]
 struct StageFlowMetrics {
+    decode_busy_stages: std::sync::atomic::AtomicU64,
     decode_micros: std::sync::atomic::AtomicU64,
     prefill_micros: std::sync::atomic::AtomicU64,
     prefill_work_units: std::sync::atomic::AtomicU64,
@@ -167,11 +169,12 @@ impl StageFlowMetrics {
     fn snapshot(&self) -> StageFlowSnapshot {
         let ordering = std::sync::atomic::Ordering::Relaxed;
         StageFlowSnapshot {
+            decode_busy_stages: self.decode_busy_stages.load(ordering),
             decode_micros: self.decode_micros.load(ordering),
             prefill_micros: self.prefill_micros.load(ordering),
             prefill_work_units: self.prefill_work_units.load(ordering),
             prefill_batches: self.prefill_batches.load(ordering),
-            // 只记录所有 stage 同时空闲的交集；错峰 idle 不能承载完整 pipeline work。
+            // 各 stage 的空闲区间求和，准入时再换算成平均 stage 预算。
             idle_micros: self.idle_micros.load(ordering),
             prefill_idle_micros: self.prefill_idle_micros.load(ordering),
             prefill_active: self.prefill_active.load(ordering),
@@ -189,8 +192,85 @@ pub struct StageSchedulerConfig {
     pub pipeline_work_window: usize,
     pub prefill_admission_burst: usize,
     pub decode_batch_limit: usize,
-    pub prefill_batch_limit: usize,
     pub profile_completion: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StageSchedulerRuntimePolicy {
+    pub execution_slots: usize,
+    pub decode_execution_slots: usize,
+    pub pipeline_work_window: usize,
+    pub prefill_admission_burst: usize,
+    pub decode_batch_limit: usize,
+}
+
+struct StageSchedulerRuntime {
+    execution_slots: std::sync::atomic::AtomicUsize,
+    decode_execution_slots: std::sync::atomic::AtomicUsize,
+    pipeline_work_window: std::sync::atomic::AtomicUsize,
+    prefill_admission_burst: std::sync::atomic::AtomicUsize,
+    decode_batch_limit: std::sync::atomic::AtomicUsize,
+    profile_completion: std::sync::atomic::AtomicBool,
+    session_capacity: usize,
+}
+
+impl StageSchedulerRuntime {
+    fn new(config: StageSchedulerConfig) -> Self {
+        Self {
+            execution_slots: std::sync::atomic::AtomicUsize::new(config.execution_slots),
+            decode_execution_slots: std::sync::atomic::AtomicUsize::new(config.decode_execution_slots),
+            pipeline_work_window: std::sync::atomic::AtomicUsize::new(config.pipeline_work_window),
+            prefill_admission_burst: std::sync::atomic::AtomicUsize::new(config.prefill_admission_burst),
+            decode_batch_limit: std::sync::atomic::AtomicUsize::new(config.decode_batch_limit),
+            profile_completion: std::sync::atomic::AtomicBool::new(config.profile_completion),
+            session_capacity: config.session_capacity,
+        }
+    }
+
+    fn update(&self, policy: StageSchedulerRuntimePolicy) -> Result<(), BackendError> {
+        if policy.execution_slots == 0 || policy.decode_execution_slots == 0 || policy.pipeline_work_window == 0 || policy.prefill_admission_burst == 0 || policy.decode_batch_limit == 0 {
+            return Err(BackendError::Compute { msg: format!("stage runtime policy 各项必须大于 0: {policy:?}") });
+        }
+        let order = std::sync::atomic::Ordering::Release;
+        self.execution_slots.store(policy.execution_slots.min(self.session_capacity), order);
+        self.decode_execution_slots.store(policy.decode_execution_slots.min(self.session_capacity), order);
+        self.pipeline_work_window.store(policy.pipeline_work_window, order);
+        self.prefill_admission_burst.store(policy.prefill_admission_burst, order);
+        self.decode_batch_limit.store(policy.decode_batch_limit.min(self.session_capacity), order);
+        Ok(())
+    }
+
+    fn execution_slots(&self, kind: StageWorkKind) -> usize {
+        let order = std::sync::atomic::Ordering::Acquire;
+        match kind {
+            StageWorkKind::Decode => self.decode_execution_slots.load(order),
+            StageWorkKind::Prefill => self.execution_slots.load(order),
+        }
+    }
+
+    fn batch_limit(&self, kind: StageWorkKind) -> usize {
+        let order = std::sync::atomic::Ordering::Acquire;
+        match kind {
+            StageWorkKind::Decode => self.decode_batch_limit.load(order),
+            StageWorkKind::Prefill => self.session_capacity,
+        }
+    }
+
+    fn pipeline_work_window(&self) -> usize {
+        self.pipeline_work_window.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn prefill_admission_burst(&self) -> usize {
+        self.prefill_admission_burst.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn profile_completion(&self) -> bool {
+        self.profile_completion.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn set_profile_completion(&self, enabled: bool) {
+        self.profile_completion.store(enabled, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl StageSchedulerConfig {
@@ -204,31 +284,15 @@ impl StageSchedulerConfig {
             || self.pipeline_work_window == 0
             || self.prefill_admission_burst == 0
             || self.decode_batch_limit == 0
-            || self.prefill_batch_limit == 0
         {
             return Err(BackendError::Compute {
                 msg: format!(
-                    "stage scheduler 配置非法: sessions={session_count}/{} stages={stage_count} work_limit={} slots={}/{} window={} prefill_burst={} decode_batch={} prefill_batch={}",
-                    self.session_capacity, self.batch_work_limit, self.execution_slots, self.decode_execution_slots, self.pipeline_work_window, self.prefill_admission_burst, self.decode_batch_limit, self.prefill_batch_limit,
+                    "stage scheduler 配置非法: sessions={session_count}/{} stages={stage_count} work_limit={} slots={}/{} window={} prefill_burst={} decode_batch={}",
+                    self.session_capacity, self.batch_work_limit, self.execution_slots, self.decode_execution_slots, self.pipeline_work_window, self.prefill_admission_burst, self.decode_batch_limit,
                 ),
             });
         }
         Ok(self)
-    }
-
-    fn batch_limit(self, kind: StageWorkKind) -> usize {
-        match kind {
-            StageWorkKind::Decode => self.decode_batch_limit,
-            StageWorkKind::Prefill => self.prefill_batch_limit,
-        }
-        .min(self.session_capacity)
-    }
-
-    fn execution_slots(self, kind: StageWorkKind) -> usize {
-        match kind {
-            StageWorkKind::Decode => self.decode_execution_slots,
-            StageWorkKind::Prefill => self.execution_slots,
-        }
     }
 }
 
@@ -378,9 +442,7 @@ pub struct StageSchedulerHandle<T, S> {
     next_ready_cohort: std::sync::atomic::AtomicU64,
     session_capacity: usize,
     stage_count: usize,
-    pipeline_work_window: usize,
-    prefill_admission_burst: usize,
-    decode_batch_limit: usize,
+    runtime: std::sync::Arc<StageSchedulerRuntime>,
     stage_flow: std::sync::Arc<StageFlowMetrics>,
 }
 
@@ -421,7 +483,7 @@ fn choose_stage_work_kind(decode_available: bool, prefill_available: bool, decod
 impl<T, S> StageSchedulerHandle<T, S> {
     /// 填满全部 stage execution slot 所需的模型无关工作窗口。
     pub fn pipeline_work_window(&self) -> usize {
-        self.pipeline_work_window
+        self.runtime.pipeline_work_window()
     }
 
     pub fn stage_count(&self) -> usize {
@@ -430,7 +492,16 @@ impl<T, S> StageSchedulerHandle<T, S> {
 
     /// 同一会话连续 admission 与在途 prefill chunk 的上限；不改变 stage batch。
     pub fn prefill_admission_burst(&self) -> usize {
-        self.prefill_admission_burst
+        self.runtime.prefill_admission_burst()
+    }
+
+    /// 只改变后续尚未提交的调度；当前在途 batch 保持原边界。
+    pub fn update_runtime_policy(&self, policy: StageSchedulerRuntimePolicy) -> Result<(), BackendError> {
+        self.runtime.update(policy)
+    }
+
+    pub fn set_profile_completion(&self, enabled: bool) {
+        self.runtime.set_profile_completion(enabled);
     }
 
     pub fn stage_flow_snapshot(&self) -> StageFlowSnapshot {
@@ -458,7 +529,7 @@ impl<T, S> StageSchedulerHandle<T, S> {
 
     pub fn commit_prefill_submission(&self, cursor: &mut PrefillAdmissionCursor, session: usize, session_complete: bool) {
         cursor.submitted += 1;
-        if session_complete || cursor.submitted >= self.prefill_admission_burst {
+        if session_complete || cursor.submitted >= self.runtime.prefill_admission_burst() {
             cursor.session = (session + 1) % self.session_capacity;
             cursor.submitted = 0;
         }
@@ -507,8 +578,9 @@ impl<T, S> StageSchedulerHandle<T, S> {
         I: IntoIterator<Item = (usize, usize, T)>,
     {
         let work = work.into_iter().collect::<Vec<_>>();
-        if work.is_empty() || work.len() > self.decode_batch_limit {
-            return Err(BackendError::Compute { msg: format!("stage scheduler ready wave 大小非法: {}/{}", work.len(), self.decode_batch_limit) });
+        let decode_batch_limit = self.runtime.batch_limit(StageWorkKind::Decode);
+        if work.is_empty() || work.len() > decode_batch_limit {
+            return Err(BackendError::Compute { msg: format!("stage scheduler ready wave 大小非法: {}/{decode_batch_limit}", work.len()) });
         }
         if let Some((session, _, _)) = work.iter().find(|(session, _, _)| *session >= self.session_capacity) {
             return Err(BackendError::Compute { msg: format!("stage scheduler ready wave session={session} 越界，capacity={}", self.session_capacity) });
@@ -522,8 +594,9 @@ impl<T, S> StageSchedulerHandle<T, S> {
     /// 接收跨进程 wave 的一个成员。成员无需等待同 wave 的其余行到齐，传入顺序
     /// 就是 stage 顺序；尾部仍可用同一 id/size 收口共享 output head。
     pub fn submit_wave_member(&self, wave: u64, wave_size: usize, session: usize, position: usize, value: T) -> Result<(), BackendError> {
-        if wave == 0 || wave_size == 0 || wave_size > self.decode_batch_limit || session >= self.session_capacity {
-            return Err(BackendError::Compute { msg: format!("stage scheduler wave 参数非法: id={wave} size={wave_size}/{} session={session}/{}", self.decode_batch_limit, self.session_capacity) });
+        let decode_batch_limit = self.runtime.batch_limit(StageWorkKind::Decode);
+        if wave == 0 || wave_size == 0 || wave_size > decode_batch_limit || session >= self.session_capacity {
+            return Err(BackendError::Compute { msg: format!("stage scheduler wave 参数非法: id={wave} size={wave_size}/{decode_batch_limit} session={session}/{}", self.session_capacity) });
         }
         self.input
             .send(Ok(StageSchedulerMessage::Work { queued_at: Instant::now(), cohort: None, wave: Some((wave, wave_size)), items: vec![(session, position, value)] }))
@@ -535,8 +608,9 @@ impl<T, S> StageSchedulerHandle<T, S> {
     where
         I: IntoIterator<Item = (usize, usize, T)>,
     {
-        if cohort == 0 || cohort_size == 0 || cohort_size > self.decode_batch_limit {
-            return Err(BackendError::Compute { msg: format!("stage scheduler cohort 参数非法: id={cohort} size={cohort_size}/{}", self.decode_batch_limit) });
+        let decode_batch_limit = self.runtime.batch_limit(StageWorkKind::Decode);
+        if cohort == 0 || cohort_size == 0 || cohort_size > decode_batch_limit {
+            return Err(BackendError::Compute { msg: format!("stage scheduler cohort 参数非法: id={cohort} size={cohort_size}/{decode_batch_limit}") });
         }
         let work = work.into_iter().collect::<Vec<_>>();
         if let Some((session, _, _)) = work.iter().find(|(session, _, _)| *session >= self.session_capacity) {
@@ -835,6 +909,7 @@ where
     let session_count = sessions.len();
     let stage_count = backends.len();
     let config = config.validate(session_count, stage_count)?;
+    let runtime_policy = std::sync::Arc::new(StageSchedulerRuntime::new(config));
     if sessions.iter().any(|states| states.len() != stage_count) {
         return Err(BackendError::Compute { msg: format!("stage scheduler 的 session stage 数不一致: sessions={session_count} stages={stage_count}") });
     }
@@ -858,6 +933,7 @@ where
             let work_kind = &work_kind;
             let batch_class = &batch_class;
             let stage_flow_worker = std::sync::Arc::clone(&stage_flow);
+            let runtime_policy_worker = std::sync::Arc::clone(&runtime_policy);
             workers.push(scope.spawn(move || {
                 backend.pin_submission_thread();
                 let mut decode_queue = VecDeque::<(Option<QueuedGroup>, usize, usize, T, Instant)>::new();
@@ -865,10 +941,9 @@ where
                 let mut active_sessions = states.iter().filter(|state| state.is_some()).count();
                 let mut direct_submissions = [0_usize; 2];
                 let concurrent_submissions = backend.supports_concurrent_stage_submissions();
-                let decode_submission_slots = config.execution_slots(StageWorkKind::Decode).min(backend.max_queued_latency_submissions().max(1));
                 let submission_slots = |kind| match kind {
-                    StageWorkKind::Decode => decode_submission_slots,
-                    StageWorkKind::Prefill => config.execution_slots(StageWorkKind::Prefill),
+                    StageWorkKind::Decode => runtime_policy_worker.execution_slots(kind).min(backend.max_queued_latency_submissions().max(1)),
+                    StageWorkKind::Prefill => runtime_policy_worker.execution_slots(kind),
                 };
                 let execution_window = |concurrent| {
                     if concurrent {
@@ -890,7 +965,6 @@ where
                 let mut filling_slots = false;
                 let mut idle_started = None::<(Instant, bool, u64)>;
                 let mut backoff = SpinBackoff::new();
-                let profile_completion = config.profile_completion;
                 let trace_events = stage_event_trace_enabled();
                 let mut profile_batches = [0_usize; 2];
                 let mut profile_sessions = [0_usize; 2];
@@ -899,7 +973,7 @@ where
                 // index 0 保留；其余项按本次实际 decode batch 行数累计
                 // [batches, submit_us, total_us]，避免只看平均 sessions/batch
                 // 掩盖某个多行 kernel 的近线性退化。
-                let mut profile_decode_batch_buckets = vec![[0_u64; 3]; config.decode_batch_limit.saturating_add(1)];
+                let mut profile_decode_batch_buckets = vec![[0_u64; 3]; config.session_capacity.saturating_add(1)];
                 let mut profile_decode_idle_micros = 0_u64;
                 let mut profile_decode_dispatches = 0_u64;
                 let mut profile_decode_queue_after = 0_u64;
@@ -919,7 +993,6 @@ where
                 // admission window 表示允许在流水线中积累的工作量，burst 表示
                 // 单会话可连续送入的 prefill chunk。两者的商给出 decode-first
                 // 周期：默认仍饿死 prefill；积压达到一整个公平份额后只放一块。
-                let prefill_max_wait = config.pipeline_work_window.div_ceil(config.prefill_admission_burst).max(1);
                 let enqueue = |queued_at: Instant,
                                cohort: Option<(u64, usize)>,
                                wave: Option<(u64, usize)>,
@@ -1077,6 +1150,7 @@ where
                 };
 
                 loop {
+                    let profile_completion = runtime_policy_worker.profile_completion();
                     let mut made_progress = false;
                     if !filling_slots {
                         loop {
@@ -1103,6 +1177,9 @@ where
                             break;
                         };
                         in_flight_by_kind[kind_index] = remaining;
+                        if kind == StageWorkKind::Decode && remaining == 0 {
+                            stage_flow_worker.decode_busy_stages.fetch_sub(1, Ordering::Relaxed);
+                        }
                         let completion_prefill_epoch = timing.as_ref().map(|timing| timing.prefill_epoch);
                         if let Some(timing) = timing {
                             let total_micros = timing.started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -1354,6 +1431,7 @@ where
                     let prefill_first = prefill_queue.iter().position(|item| dispatchable(&controls, item.1, StageWorkKind::Prefill));
                     let decode_available = shared_slot_available && decode_first.is_some() && in_flight_by_kind[0] < submission_slots(StageWorkKind::Decode);
                     let prefill_available = shared_slot_available && prefill_first.is_some() && in_flight_by_kind[1] < submission_slots(StageWorkKind::Prefill);
+                    let prefill_max_wait = runtime_policy_worker.pipeline_work_window().div_ceil(runtime_policy_worker.prefill_admission_burst()).max(1);
                     let Some(kind) = choose_stage_work_kind(decode_available, prefill_available, decode_dispatches_since_prefill, prefill_max_wait) else {
                         filling_slots = false;
                         // 独立后台队列只允许纯 prefill 留在后台等待；只要 latency
@@ -1395,7 +1473,7 @@ where
                     let mut decode_batch_size = 1_usize;
                     if kind == StageWorkKind::Decode {
                         let first_group = queue.get(first_index).map(|item| item.0).expect("decode work 已定位");
-                        let required = first_group.map_or(config.batch_limit(kind), |group| if group.batch { group.size } else { 1 });
+                        let required = first_group.map_or(runtime_policy_worker.batch_limit(kind), |group| if group.batch { group.size } else { 1 });
                         controls.iter_mut().for_each(|control| control.occupied = false);
                         let ready_sessions = queue
                             .iter()
@@ -1406,7 +1484,7 @@ where
                                 controls[item.1].occupied = true;
                                 fresh
                             })
-                            .take(config.batch_limit(kind))
+                            .take(runtime_policy_worker.batch_limit(kind))
                             .count();
                         if required > 1 && ready_sessions < required {
                             if first_group.is_some_and(|group| group.batch) {
@@ -1442,7 +1520,7 @@ where
                     let batch_limit = if group.is_none() && kind == StageWorkKind::Decode {
                         decode_batch_size
                     } else if batching {
-                        config.batch_limit(kind)
+                        runtime_policy_worker.batch_limit(kind)
                     } else {
                         1
                     };
@@ -1577,6 +1655,8 @@ where
                     let output = match run_batch(backend, &mut states, stage, batch) {
                         Ok(output) => output,
                         Err(error) => {
+                            // 驱动可能先看到后续通道断开，必须在源头保留算子首错。
+                            eprintln!("[stage-worker-error] stage={stage} kind={kind:?} position={position_min}..={position_max}: {error:?}");
                             if trace_lanes.is_some() {
                                 let _ = backend.trace_stage_work_end();
                             }
@@ -1645,6 +1725,9 @@ where
                         stage_flow_worker.begin_prefill();
                         decode_dispatches_since_prefill = 0;
                     } else {
+                        if in_flight_by_kind[0] == 0 {
+                            StageFlowMetrics::add(&stage_flow_worker.decode_busy_stages, 1);
+                        }
                         decode_dispatches_since_prefill = decode_dispatches_since_prefill.saturating_add(1);
                     }
                     in_flight_by_kind[queue_index] += 1;
@@ -1657,7 +1740,7 @@ where
                     filling_slots = shared_slot_available
                         && ((!decode_queue.is_empty() && in_flight_by_kind[0] < submission_slots(StageWorkKind::Decode)) || (!prefill_queue.is_empty() && in_flight_by_kind[1] < submission_slots(StageWorkKind::Prefill)));
                 }
-                if profile_completion {
+                if runtime_policy_worker.profile_completion() {
                     for (profile, kind) in [StageWorkKind::Decode, StageWorkKind::Prefill].into_iter().enumerate() {
                         if profile_batches[profile] != 0 {
                             eprintln!(
@@ -1701,9 +1784,7 @@ where
             next_ready_cohort: std::sync::atomic::AtomicU64::new(1_u64 << 63),
             session_capacity: config.session_capacity,
             stage_count,
-            pipeline_work_window: config.pipeline_work_window,
-            prefill_admission_burst: config.prefill_admission_burst,
-            decode_batch_limit: config.decode_batch_limit,
+            runtime: runtime_policy,
             stage_flow,
         };
         let mut drive_result = drive(&scheduler);
@@ -1805,7 +1886,8 @@ mod tests {
         admission.commit_work(32, 1);
         assert_eq!(admission.limits(StageFlowSnapshot::default(), 8, 8, true, 32, 256), (0, 1, Some(32)));
 
-        let first = StageFlowSnapshot { decode_micros: 1_600, prefill_micros: 3_200, prefill_work_units: 32, prefill_batches: 1, idle_micros: 25_600, prefill_idle_micros: 0, prefill_active: 0, prefill_idle_pending: 0 };
+        let first =
+            StageFlowSnapshot { decode_busy_stages: 8, decode_micros: 1_600, prefill_micros: 3_200, prefill_work_units: 32, prefill_batches: 1, idle_micros: 25_600, prefill_idle_micros: 0, prefill_active: 0, prefill_idle_pending: 0 };
         assert_eq!(admission.limits(first, 8, 8, true, 32, 256), (1, 1, Some(32)));
         admission.commit_work(32, 1);
         let bubble = StageFlowSnapshot { prefill_micros: 6_400, prefill_work_units: 64, prefill_batches: 2, idle_micros: 128_000, ..first };
@@ -1829,9 +1911,45 @@ mod tests {
         assert!(admission.short_request_ready());
         admission.commit_work(128, 1);
         assert!(!admission.short_request_ready());
-        let completed = StageFlowSnapshot { prefill_micros: 8_000, prefill_work_units: 128, prefill_batches: 1, prefill_active: 0, prefill_idle_pending: 0, ..StageFlowSnapshot::default() };
+        let completed = StageFlowSnapshot { decode_busy_stages: 8, prefill_micros: 8_000, prefill_work_units: 128, prefill_batches: 1, prefill_active: 0, prefill_idle_pending: 0, ..StageFlowSnapshot::default() };
         assert_eq!(admission.limits(completed, 8, 8, true, 32, 256), (0, 1, Some(32)));
         assert!(admission.short_request_ready());
+    }
+
+    #[test]
+    fn opportunistic_prefill退休后的空闲不能变成下一块的计算债务() {
+        let mut admission = OpportunisticPrefillAdmission::default();
+        assert_eq!(admission.limits(StageFlowSnapshot::default(), 4, 4, true, 32, 256), (1, 1, Some(32)));
+        admission.commit_work(32, 1);
+        // 四个 stage 共执行 80ms，随后等待下一轮 decode 的空闲共 800ms。
+        // 即使空闲紧跟 prefill，设备已经空闲，不能把它算成 880ms 的计算。
+        let retired = StageFlowSnapshot { decode_busy_stages: 4, prefill_micros: 80_000, prefill_work_units: 32, prefill_batches: 1, prefill_idle_micros: 800_000, ..StageFlowSnapshot::default() };
+        assert_eq!(admission.limits(retired, 4, 4, true, 32, 256), (1, 1, Some(64)));
+    }
+
+    #[test]
+    fn opportunistic_prefill无需等待空闲stage再次收到工作才能退休() {
+        let mut admission = OpportunisticPrefillAdmission::default();
+        admission.limits(StageFlowSnapshot::default(), 4, 4, true, 32, 256);
+        admission.commit_work(32, 1);
+        let retired = StageFlowSnapshot { prefill_micros: 80_000, prefill_work_units: 32, prefill_batches: 1, prefill_idle_pending: 4, ..StageFlowSnapshot::default() };
+        admission.limits(retired, 4, 4, true, 32, 256);
+        assert!(admission.short_request_ready(), "没有在途 prefill，等待下一次提交的空闲 stage 不应阻止短请求续发");
+    }
+
+    #[test]
+    fn opportunistic_prefill有空闲stage就按4096发起但不堆积后台工作() {
+        let mut admission = OpportunisticPrefillAdmission::default();
+        let initial = StageFlowSnapshot { decode_busy_stages: 1, ..StageFlowSnapshot::default() };
+        assert_eq!(admission.limits(initial, 8, 4, true, 4096, 4096), (1, 1, Some(4096)));
+        admission.commit_work(4096, 1);
+        assert_eq!(admission.limits(initial, 8, 4, true, 4096, 4096).0, 0);
+        let retired = StageFlowSnapshot { prefill_micros: 1_000_000, prefill_work_units: 4096, prefill_batches: 1, ..initial };
+        assert_eq!(admission.limits(retired, 8, 4, true, 4096, 4096), (1, 1, Some(4096)), "尚有空闲 stage，不能为上块的历史耗时继续等待");
+        let saturated = StageFlowSnapshot { decode_busy_stages: 4, ..retired };
+        assert_eq!(admission.limits(saturated, 8, 4, true, 4096, 4096).0, 0, "占满时保持公平预算约束");
+        assert_eq!(admission.chunk_size(4096, 4096, 10_240), 4096);
+        assert_eq!(admission.chunk_size(4096, 4096, 1024), 1024);
     }
 
     #[test]
@@ -2005,17 +2123,7 @@ mod tests {
     #[test]
     fn close在每个stage归还状态前释放临时资源() {
         let releases = Arc::new(Mutex::new(0));
-        let config = StageSchedulerConfig {
-            session_capacity: 1,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 1,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 1, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 1, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![ClosingBackend(releases.clone()), ClosingBackend(releases.clone())],
             vec![vec![0_i32, 1_i32]],
@@ -2044,17 +2152,7 @@ mod tests {
     #[test]
     fn recoverable_scheduler保留首个stage错误() {
         let ready = Arc::new(AtomicBool::new(true));
-        let config = StageSchedulerConfig {
-            session_capacity: 1,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 1,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 1, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 1, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let (result, remaining) = drive_stage_scheduler_recoverable(
             vec![TestBackend { ready, poll_allowed: true }],
             vec![vec![0_i32]],
@@ -2079,17 +2177,7 @@ mod tests {
     fn 输入通道退出不遮蔽首个stage错误() {
         let ready = Arc::new(AtomicBool::new(true));
         let failed = Arc::new(AtomicBool::new(false));
-        let config = StageSchedulerConfig {
-            session_capacity: 1,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 1,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 1, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 1, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let (result, remaining) = drive_stage_scheduler_recoverable(
             vec![TestBackend { ready, poll_allowed: true }],
             vec![vec![0_i32]],
@@ -2121,17 +2209,7 @@ mod tests {
     #[test]
     fn recoverable_scheduler错误时不丢已完成close的state() {
         let ready = Arc::new(AtomicBool::new(true));
-        let config = StageSchedulerConfig {
-            session_capacity: 2,
-            batch_work_limit: 2,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 1,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 2,
-            prefill_batch_limit: 2,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 2, batch_work_limit: 2, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 1, prefill_admission_burst: 1, decode_batch_limit: 2, profile_completion: false };
         let stages = 8;
         let sessions = vec![(0..stages).collect::<Vec<_>>(), (100..100 + stages).collect::<Vec<_>>()];
         let (result, remaining) = drive_stage_scheduler_recoverable(
@@ -2174,17 +2252,7 @@ mod tests {
         let first_ready = Arc::new(AtomicBool::new(false));
         let second_ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<usize>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 1,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 2,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 1, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 2, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: first_ready.clone(), poll_allowed: true }, TestBackend { ready: second_ready.clone(), poll_allowed: true }],
             vec![vec![0_i32, 100_i32]],
@@ -2230,17 +2298,7 @@ mod tests {
     fn 独立后台队列允许跨会话decode越过prefill完成() {
         let backend = ConcurrentTestBackend::new();
         let dispatches = Mutex::new(Vec::<(StageWorkKind, usize)>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 2,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 2,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 2, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 2, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![backend.clone()],
             vec![vec![0_i32], vec![100_i32]],
@@ -2305,17 +2363,7 @@ mod tests {
         let first = ConcurrentTestBackend::new();
         let second = ConcurrentTestBackend::new();
         let dispatches = Mutex::new(Vec::<usize>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 1,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 2,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 1, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 2, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![first.clone(), second.clone()],
             vec![vec![0_i32, 100_i32]],
@@ -2370,17 +2418,7 @@ mod tests {
         let first_ready = Arc::new(AtomicBool::new(false));
         let second_ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<(usize, usize)>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 1,
-            batch_work_limit: 1,
-            execution_slots: 3,
-            decode_execution_slots: 3,
-            pipeline_work_window: 3,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 1, batch_work_limit: 1, execution_slots: 3, decode_execution_slots: 3, pipeline_work_window: 3, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: first_ready.clone(), poll_allowed: true }, TestBackend { ready: second_ready.clone(), poll_allowed: true }],
             vec![vec![0_i32, 100_i32]],
@@ -2428,17 +2466,7 @@ mod tests {
     fn 同会话decode不能越过较早prefill() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<(usize, StageWorkKind, usize)>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 2,
-            batch_work_limit: 2,
-            execution_slots: 2,
-            decode_execution_slots: 2,
-            pipeline_work_window: 2,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 2, batch_work_limit: 2, execution_slots: 2, decode_execution_slots: 2, pipeline_work_window: 2, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }],
             vec![vec![0_i32], vec![0_i32]],
@@ -2498,9 +2526,16 @@ mod tests {
             next_ready_cohort: std::sync::atomic::AtomicU64::new(1_u64 << 63),
             session_capacity: 3,
             stage_count: 1,
-            pipeline_work_window: 8,
-            prefill_admission_burst: 3,
-            decode_batch_limit: 3,
+            runtime: Arc::new(StageSchedulerRuntime::new(StageSchedulerConfig {
+                session_capacity: 3,
+                batch_work_limit: 1,
+                execution_slots: 1,
+                decode_execution_slots: 1,
+                pipeline_work_window: 8,
+                prefill_admission_burst: 3,
+                decode_batch_limit: 3,
+                profile_completion: false,
+            })),
             stage_flow: Arc::new(StageFlowMetrics::new(1)),
         };
         let mut cursor = PrefillAdmissionCursor::default();
@@ -2516,20 +2551,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_policy_changes_next_dispatch_limits() {
+        let runtime = StageSchedulerRuntime::new(StageSchedulerConfig {
+            session_capacity: 12,
+            batch_work_limit: 1,
+            execution_slots: 1,
+            decode_execution_slots: 1,
+            pipeline_work_window: 8,
+            prefill_admission_burst: 1,
+            decode_batch_limit: 4,
+            profile_completion: false,
+        });
+        runtime.update(StageSchedulerRuntimePolicy { execution_slots: 2, decode_execution_slots: 3, pipeline_work_window: 12, prefill_admission_burst: 2, decode_batch_limit: 6 }).unwrap();
+        assert_eq!(runtime.execution_slots(StageWorkKind::Decode), 3);
+        assert_eq!(runtime.execution_slots(StageWorkKind::Prefill), 2);
+        assert_eq!(runtime.batch_limit(StageWorkKind::Decode), 6);
+        assert_eq!(runtime.batch_limit(StageWorkKind::Prefill), 12);
+        assert_eq!(runtime.pipeline_work_window(), 12);
+        assert_eq!(runtime.prefill_admission_burst(), 2);
+        assert!(!runtime.profile_completion());
+        runtime.set_profile_completion(true);
+        assert!(runtime.profile_completion());
+    }
+
+    #[test]
     fn busy_stage_prioritizes_decode_before_prefill() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<Vec<i32>>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 8,
-            batch_work_limit: 3,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 3,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 2,
-            prefill_batch_limit: 3,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 8, batch_work_limit: 3, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 3, prefill_admission_burst: 1, decode_batch_limit: 2, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }],
             vec![vec![0_i32], vec![10_i32], vec![20_i32], vec![30_i32], vec![40_i32], vec![50_i32], vec![60_i32], vec![70_i32]],
@@ -2589,17 +2638,7 @@ mod tests {
     fn close等待同一会话的排队和执行工作完成() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<i32>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 1,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 1,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 1, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 1, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }],
             vec![vec![0_i32]],
@@ -2653,17 +2692,7 @@ mod tests {
     fn cancel丢弃未发射工作并等待在途completion后关闭() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<i32>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 1,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 3,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 1, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 3, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }],
             vec![vec![0_i32]],
@@ -2715,17 +2744,7 @@ mod tests {
     fn cancel让已发射工作走完整条stage链() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<(usize, i32)>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 1,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 3,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 1, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 3, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }, TestBackend { ready: ready.clone(), poll_allowed: true }],
             vec![vec![0_i32, 100_i32]],
@@ -2777,17 +2796,7 @@ mod tests {
     fn idle_slots_dispatch_multiple_prefill_batches() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<Vec<i32>>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 4,
-            batch_work_limit: 1,
-            execution_slots: 4,
-            decode_execution_slots: 4,
-            pipeline_work_window: 4,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 4, batch_work_limit: 1, execution_slots: 4, decode_execution_slots: 4, pipeline_work_window: 4, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }],
             vec![vec![0_i32], vec![10_i32], vec![20_i32], vec![30_i32]],
@@ -2842,17 +2851,7 @@ mod tests {
     fn decode_slots_can_exceed_prefill_slots() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<i32>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 4,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 4,
-            pipeline_work_window: 4,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 4, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 4, pipeline_work_window: 4, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }],
             vec![vec![0_i32], vec![10_i32], vec![20_i32], vec![30_i32]],
@@ -2895,17 +2894,7 @@ mod tests {
     fn backend_latency上限把设备在途保持为一份() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<i32>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 2,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 4,
-            pipeline_work_window: 2,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 2, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 4, pipeline_work_window: 2, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![OrderedLatencyTestBackend(TestBackend { ready: ready.clone(), poll_allowed: true })],
             vec![vec![0_i32], vec![10_i32]],
@@ -2951,17 +2940,7 @@ mod tests {
     fn backend_latency上限为二时允许两份decode在途() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<i32>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 2,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 4,
-            pipeline_work_window: 2,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 2, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 4, pipeline_work_window: 2, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         struct DualInFlightTestBackend(TestBackend);
         impl StageExecutionBackend for DualInFlightTestBackend {
             type Completion = TestCompletion;
@@ -2998,6 +2977,7 @@ mod tests {
                     assert!(std::time::Instant::now() < deadline, "cap=2 时第二份 decode 应在前一份 completion 前提交");
                     std::thread::yield_now();
                 }
+                assert_eq!(scheduler.stage_flow_snapshot().decode_busy_stages, 1, "同一 stage 的两份提交不能冒充两张忙卡");
                 ready.store(true, Ordering::Release);
                 let mut work = 0;
                 while work < 2 {
@@ -3007,6 +2987,7 @@ mod tests {
                         Some(StageSchedulerOutput::Opened { .. } | StageSchedulerOutput::Closed { .. }) | None => std::thread::yield_now(),
                     }
                 }
+                assert_eq!(scheduler.stage_flow_snapshot().decode_busy_stages, 0, "全部 completion 退休后必须归还 busy stage");
                 Ok(())
             },
         )
@@ -3019,17 +3000,7 @@ mod tests {
     fn decode占满共享窗口时prefill等待completion() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<(StageWorkKind, i32)>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 3,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 2,
-            pipeline_work_window: 3,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 3, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 2, pipeline_work_window: 3, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }],
             vec![vec![0_i32], vec![10_i32], vec![20_i32]],
@@ -3057,8 +3028,9 @@ mod tests {
                 }
                 ready.store(true, Ordering::Release);
                 let mut work = 0;
+                let completion_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
                 while work < 3 {
-                    assert!(std::time::Instant::now() < deadline, "等待 decode/prefill completion 超时");
+                    assert!(std::time::Instant::now() < completion_deadline, "等待 decode/prefill completion 超时");
                     match scheduler.try_recv()? {
                         Some(StageSchedulerOutput::Work { .. }) => work += 1,
                         Some(StageSchedulerOutput::Opened { .. } | StageSchedulerOutput::Closed { .. }) | None => std::thread::yield_now(),
@@ -3077,17 +3049,7 @@ mod tests {
         let ready = Arc::new(AtomicBool::new(true));
         let release_first = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<(StageWorkKind, i32)>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 6,
-            batch_work_limit: 1,
-            execution_slots: 1,
-            decode_execution_slots: 2,
-            pipeline_work_window: 3,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 1,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 6, batch_work_limit: 1, execution_slots: 1, decode_execution_slots: 2, pipeline_work_window: 3, prefill_admission_burst: 1, decode_batch_limit: 1, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready, poll_allowed: true }],
             (0..6).map(|_| vec![0_i32]).collect(),
@@ -3136,17 +3098,7 @@ mod tests {
     fn 同会话队头不阻挡其他会话成批() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<Vec<(usize, i32)>>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 4,
-            batch_work_limit: 3,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 4,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 3,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 4, batch_work_limit: 3, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 4, prefill_admission_burst: 1, decode_batch_limit: 3, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }],
             (0..4).map(|_| vec![0_i32]).collect(),
@@ -3190,17 +3142,7 @@ mod tests {
     fn 首项立即发射且只在cu_completion后loop() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<Vec<i32>>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 4,
-            batch_work_limit: 4,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 4,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 4,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 4, batch_work_limit: 4, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 4, prefill_admission_burst: 1, decode_batch_limit: 4, profile_completion: false };
         drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }],
             (0..4).map(|_| vec![0_i32]).collect(),
@@ -3243,17 +3185,7 @@ mod tests {
     fn stage0对设备忙时自然积累的decode立即部分合批() {
         let ready = Arc::new(AtomicBool::new(false));
         let dispatches = Mutex::new(Vec::<Vec<i32>>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 5,
-            batch_work_limit: 5,
-            execution_slots: 1,
-            decode_execution_slots: 2,
-            pipeline_work_window: 5,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 3,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 5, batch_work_limit: 5, execution_slots: 1, decode_execution_slots: 2, pipeline_work_window: 5, prefill_admission_burst: 1, decode_batch_limit: 3, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }],
             vec![vec![0_i32], vec![10_i32], vec![20_i32], vec![30_i32], vec![40_i32]],
@@ -3293,17 +3225,7 @@ mod tests {
     fn stage只合并相同兼容类的work() {
         let ready = Arc::new(AtomicBool::new(true));
         let dispatches = Mutex::new(Vec::<Vec<(usize, i32)>>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 4,
-            batch_work_limit: 4,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 4,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 4,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 4, batch_work_limit: 4, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 4, prefill_admission_burst: 1, decode_batch_limit: 4, profile_completion: false };
         drive_stage_scheduler_with_batch_class(
             vec![TestBackend { ready, poll_allowed: true }],
             (0..4).map(|_| vec![0_i32]).collect(),
@@ -3341,17 +3263,7 @@ mod tests {
     fn stage0低压decode不等待并消费已到达的小批() {
         let ready = Arc::new(AtomicBool::new(true));
         let dispatches = Mutex::new(Vec::<Vec<i32>>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 4,
-            batch_work_limit: 4,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 3,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 4,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 4, batch_work_limit: 4, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 3, prefill_admission_burst: 1, decode_batch_limit: 4, profile_completion: false };
         drive_stage_scheduler(
             vec![TestBackend { ready, poll_allowed: true }],
             (0..3).map(|_| vec![0_i32]).collect(),
@@ -3384,17 +3296,7 @@ mod tests {
     fn 显式cohort穿过全部stage不拆批() {
         let ready = Arc::new(AtomicBool::new(true));
         let dispatches = Mutex::new(Vec::<(usize, Vec<i32>)>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 4,
-            batch_work_limit: 16,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 4,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 4,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 4, batch_work_limit: 16, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 4, prefill_admission_burst: 1, decode_batch_limit: 4, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }, TestBackend { ready, poll_allowed: true }],
             (0..4).map(|_| vec![0_i32, 0_i32]).collect(),
@@ -3435,17 +3337,7 @@ mod tests {
     fn 有序wave逐行穿过全部stage并保留尾部聚合标识() {
         let ready = Arc::new(AtomicBool::new(true));
         let dispatches = Mutex::new(Vec::<(usize, Vec<i32>)>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 4,
-            batch_work_limit: 16,
-            execution_slots: 1,
-            decode_execution_slots: 4,
-            pipeline_work_window: 8,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 4,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 4, batch_work_limit: 16, execution_slots: 1, decode_execution_slots: 4, pipeline_work_window: 8, prefill_admission_burst: 1, decode_batch_limit: 4, profile_completion: false };
         let ((), remaining) = drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }, TestBackend { ready, poll_allowed: true }],
             (0..4).map(|_| vec![0_i32, 0_i32]).collect(),
@@ -3487,17 +3379,7 @@ mod tests {
     fn 取消排队会话后cohort缩小但不拆批() {
         let ready = Arc::new(AtomicBool::new(true));
         let dispatches = Mutex::new(Vec::<(usize, Vec<usize>)>::new());
-        let config = StageSchedulerConfig {
-            session_capacity: 4,
-            batch_work_limit: 4,
-            execution_slots: 1,
-            decode_execution_slots: 1,
-            pipeline_work_window: 4,
-            prefill_admission_burst: 1,
-            decode_batch_limit: 4,
-            prefill_batch_limit: 1,
-            profile_completion: false,
-        };
+        let config = StageSchedulerConfig { session_capacity: 4, batch_work_limit: 4, execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 4, prefill_admission_burst: 1, decode_batch_limit: 4, profile_completion: false };
         drive_stage_scheduler(
             vec![TestBackend { ready: ready.clone(), poll_allowed: true }, TestBackend { ready, poll_allowed: true }],
             (0..4).map(|_| vec![0_i32, 0_i32]).collect(),

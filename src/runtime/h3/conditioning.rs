@@ -26,7 +26,6 @@ pub struct H3VisualVaeInput {
 
 pub struct H3VisualVaeClip {
     pub frame_range: std::ops::Range<usize>,
-    pub drop_latent_tokens: usize,
     pub input: H3VisualVaeInput,
 }
 
@@ -35,11 +34,33 @@ pub fn h3_preprocess_reference_image(image: &RgbImage) -> Result<H3VisualVaeInpu
 }
 
 pub fn h3_preprocess_reference_frames(frames: &[RgbImage]) -> Result<H3VisualVaeInput, BackendError> {
+    preprocess_reference_frames(frames, None)
+}
+
+/// 面积预算只作用于 VisualVAE；Qwen 视觉编码仍使用原始图片及自己的 processor。
+pub fn h3_preprocess_reference_image_with_max_pixels(image: &RgbImage, max_pixels: Option<usize>) -> Result<H3VisualVaeInput, BackendError> {
+    preprocess_reference_frames(std::slice::from_ref(image), max_pixels)
+}
+
+fn preprocess_reference_frames(frames: &[RgbImage], max_pixels: Option<usize>) -> Result<H3VisualVaeInput, BackendError> {
     let first = frames.first().ok_or_else(|| crate::runtime::compute_error("H3 reference video 没有帧"))?;
     if first.width == 0 || first.height == 0 {
         return Err(crate::runtime::compute_error("H3 reference frame 尺寸为 0"));
     }
-    let (width, height) = h3_reference_size(first.width, first.height)?;
+    let (width, height) = h3_reference_size(first.width, first.height, max_pixels)?;
+    preprocess_reference_frames_to_size(frames, width, height)
+}
+
+/// 首尾帧必须与目标 video latent 的空间网格完全一致，不能按
+/// 普通参考图自己的画幅编码，否则就无法锚定到目标时间轴。
+pub fn h3_preprocess_keyframe(image: &RgbImage, width: usize, height: usize) -> Result<H3VisualVaeInput, BackendError> {
+    if width == 0 || height == 0 || !width.is_multiple_of(H3_REFERENCE_ALIGNMENT) || !height.is_multiple_of(H3_REFERENCE_ALIGNMENT) {
+        return Err(crate::runtime::compute_error(format!("H3 keyframe target={width}x{height} 必须是非零 32 对齐尺寸")));
+    }
+    preprocess_reference_frames_to_size(std::slice::from_ref(image), width, height)
+}
+
+fn preprocess_reference_frames_to_size(frames: &[RgbImage], width: usize, height: usize) -> Result<H3VisualVaeInput, BackendError> {
     let frame_pixels = height.checked_mul(width).ok_or_else(|| crate::runtime::compute_error("H3 reference frame pixels 溢出"))?;
     let mut values = vec![0.0; 3usize.checked_mul(frames.len()).and_then(|value| value.checked_mul(frame_pixels)).ok_or_else(|| crate::runtime::compute_error("H3 reference video values 溢出"))?];
     for (time, frame) in frames.iter().enumerate() {
@@ -61,7 +82,7 @@ pub fn h3_preprocess_reference_frames(frames: &[RgbImage]) -> Result<H3VisualVae
     Ok(H3VisualVaeInput { values, shape: [frames.len(), height, width] })
 }
 
-pub fn h3_preprocess_reference_video(frames: &[RgbImage]) -> Result<Vec<H3VisualVaeClip>, BackendError> {
+pub fn h3_preprocess_reference_video(frames: &[RgbImage], max_pixels: Option<usize>) -> Result<Vec<H3VisualVaeClip>, BackendError> {
     if frames.is_empty() {
         return Err(crate::runtime::compute_error("H3 reference video 没有帧"));
     }
@@ -69,25 +90,46 @@ pub fn h3_preprocess_reference_video(frames: &[RgbImage]) -> Result<Vec<H3Visual
     let mut start = 0usize;
     while start < frames.len() {
         let end = start.saturating_add(H3_VIDEO_CLIP_FRAMES).min(frames.len());
-        let input = h3_preprocess_reference_frames(&frames[start..end])?;
-        clips.push(H3VisualVaeClip { frame_range: start..end, drop_latent_tokens: usize::from(start != 0) * H3_VIDEO_CLIP_TOKEN_DROP, input });
+        let mut padded = frames[start..end].to_vec();
+        if padded.len() < H3_VIDEO_CLIP_FRAMES {
+            let last = padded.last().expect("reference video clip 非空").clone();
+            padded.resize(H3_VIDEO_CLIP_FRAMES, last);
+        }
+        let input = preprocess_reference_frames(&padded, max_pixels)?;
+        clips.push(H3VisualVaeClip { frame_range: start..end, input });
         start = end;
     }
     Ok(clips)
 }
 
-fn h3_reference_size(width: usize, height: usize) -> Result<(usize, usize), BackendError> {
+fn h3_reference_size(width: usize, height: usize, max_pixels: Option<usize>) -> Result<(usize, usize), BackendError> {
     let short = width.min(height);
     if short == 0 {
         return Err(crate::runtime::compute_error("H3 reference image short edge 为 0"));
     }
-    let scale = H3_REFERENCE_SHORT_EDGE as f64 / short as f64;
+    let scale = if let Some(max_pixels) = max_pixels {
+        if max_pixels < H3_REFERENCE_ALIGNMENT * H3_REFERENCE_ALIGNMENT {
+            return Err(crate::runtime::compute_error(format!("H3 reference image max_pixels={max_pixels} 小于一个 32x32 patch")));
+        }
+        (max_pixels as f64 / (width as f64 * height as f64)).sqrt().min(1.0)
+    } else {
+        H3_REFERENCE_SHORT_EDGE as f64 / short as f64
+    };
     let aligned = |value: usize| -> Result<usize, BackendError> {
         let scaled = value as f64 * scale;
         if !scaled.is_finite() || scaled > usize::MAX as f64 {
             return Err(crate::runtime::compute_error("H3 reference resize 尺寸溢出"));
         }
-        Ok((((scaled / H3_REFERENCE_ALIGNMENT as f64).round() as usize).max(1)) * H3_REFERENCE_ALIGNMENT)
+        let patches = scaled / H3_REFERENCE_ALIGNMENT as f64;
+        if max_pixels.is_some() {
+            // 向下对齐才能同时保证不放大小图、不超面积预算。
+            if patches < 1.0 {
+                return Err(crate::runtime::compute_error(format!("H3 reference image {width}x{height} 在 max_pixels={max_pixels:?} 下短边不足 32")));
+            }
+            Ok(patches.floor() as usize * H3_REFERENCE_ALIGNMENT)
+        } else {
+            Ok((patches.round() as usize).max(1) * H3_REFERENCE_ALIGNMENT)
+        }
     };
     Ok((aligned(width)?, aligned(height)?))
 }
@@ -99,6 +141,57 @@ pub enum H3ReferenceKind {
     Audio,
 }
 
+#[cfg(test)]
+mod reference_size_tests {
+    use super::{H3_VIDEO_CLIP_FRAMES, adaptive_pool_audio_attention, h3_preprocess_reference_video, h3_reference_size};
+    use crate::vision::RgbImage;
+
+    #[test]
+    fn pixel_budget_preserves_legacy_and_never_upscales_or_exceeds_budget() {
+        assert_eq!(h3_reference_size(600, 400, None).unwrap(), (3072, 2048));
+        assert_eq!(h3_reference_size(600, 400, Some(1_032_192)).unwrap(), (576, 384));
+        assert_eq!(h3_reference_size(3000, 2000, Some(1_032_192)).unwrap(), (1216, 800));
+        for (width, height) in [(3000, 2000), (2000, 3000), (1344, 768), (768, 1344), (4096, 1024)] {
+            let (w, h) = h3_reference_size(width, height, Some(1_032_192)).unwrap();
+            assert!(w <= width && h <= height && w * h <= 1_032_192);
+            assert_eq!((w % 32, h % 32), (0, 0));
+        }
+        assert!(h3_reference_size(100, 100, Some(0)).is_err());
+        assert!(h3_reference_size(100, 10, Some(1_032_192)).is_err());
+        assert!(h3_reference_size(0, 100, None).is_err());
+    }
+
+    #[test]
+    fn reference_video_pads_only_the_last_seventeen_frame_clip() {
+        let frames = (0..18).map(|value| RgbImage::new(32, 32, vec![value; 32 * 32 * 3]).unwrap()).collect::<Vec<_>>();
+        let clips = h3_preprocess_reference_video(&frames, Some(32 * 32)).unwrap();
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0].frame_range, 0..17);
+        assert_eq!(clips[1].frame_range, 17..18);
+        assert!(clips.iter().all(|clip| clip.input.shape == [H3_VIDEO_CLIP_FRAMES, 32, 32]));
+        let frame_area = 32 * 32;
+        let last_clip = &clips[1].input.values;
+        for channel in 0..3 {
+            assert_eq!(
+                &last_clip[(channel * H3_VIDEO_CLIP_FRAMES) * frame_area..(channel * H3_VIDEO_CLIP_FRAMES + 1) * frame_area],
+                &last_clip[(channel * H3_VIDEO_CLIP_FRAMES + 16) * frame_area..(channel * H3_VIDEO_CLIP_FRAMES + 17) * frame_area]
+            );
+        }
+    }
+
+    #[test]
+    fn audio_attention_pool_averages_heads_then_adaptive_bins() {
+        let mut values = Vec::new();
+        for head in 0..2 {
+            for column in 0..8 {
+                values.push((head * 100 + column) as f32);
+            }
+        }
+        assert_eq!(adaptive_pool_audio_attention(&values, 1, 2, 8, 4).unwrap(), vec![50.5, 52.5, 54.5, 56.5]);
+    }
+}
+
+#[derive(Clone)]
 pub struct H3QwenVisual<T> {
     pub embedding: T,
     pub deepstack: Vec<T>,
@@ -216,7 +309,18 @@ pub fn build_h3_reference_layout<T>(text_len: usize, latent_t: usize, latent_h: 
     let (_, target_width_grid) = super::spatial_frame_grid(latent_h, latent_w, patch_size[1], patch_size[2]);
     let mut positions = Vec::new();
     let mut segments = Vec::with_capacity(references.conditions.len());
+    let mut cursor = text_len as f32;
+    let mut reference_start = cursor;
+    let mut current_source = None;
     for reference in &references.conditions {
+        let source_index = match reference {
+            H3PackedReferenceCondition::Video { source_index, .. } | H3PackedReferenceCondition::Audio { source_index, .. } => *source_index,
+        };
+        // 同一视频的音轨与画面相邻且共享 source_index；共用起点，按较长跨度推进。
+        if current_source != Some(source_index) {
+            reference_start = cursor;
+            current_source = Some(source_index);
+        }
         let start = text_len + positions.len();
         let kind = match reference {
             H3PackedReferenceCondition::Video { condition, .. } => {
@@ -225,11 +329,13 @@ pub fn build_h3_reference_layout<T>(text_len: usize, latent_t: usize, latent_h: 
                 }
                 let grid_t = condition.latent_shape[0] / condition.patch_shape[0];
                 let (frame_grid, _) = super::spatial_frame_grid(condition.latent_shape[1], condition.latent_shape[2], condition.patch_shape[1], condition.patch_shape[2]);
-                let mut time = text_len as f32;
+                let mut time = reference_start;
                 for span in super::video_time_spans(grid_t) {
                     positions.extend(frame_grid.iter().map(|&[height, width]| [time, height, width]));
                     time += span;
                 }
+                // 图片只有一个 latent time，占一个整数位置；视频使用 VAE 的非均匀时间跨度。
+                cursor = cursor.max(if grid_t == 1 { reference_start + 1.0 } else { time });
                 super::H3SegmentKind::VideoCondition
             }
             H3PackedReferenceCondition::Audio { condition, .. } => {
@@ -238,8 +344,9 @@ pub fn build_h3_reference_layout<T>(text_len: usize, latent_t: usize, latent_h: 
                 }
                 for channel in 0..condition.batch {
                     let width = if channel == 0 { target_width_grid[0] } else { target_width_grid[target_width_grid.len() - 1] };
-                    positions.extend((0..condition.time).map(|frame| [text_len as f32 + frame as f32, 0.0, width]));
+                    positions.extend((0..condition.time).map(|frame| [reference_start + frame as f32, 0.0, width]));
                 }
+                cursor = cursor.max(reference_start + condition.time as f32);
                 super::H3SegmentKind::AudioCondition
             }
         };
@@ -249,7 +356,8 @@ pub fn build_h3_reference_layout<T>(text_len: usize, latent_t: usize, latent_h: 
     let mut position_ids = Vec::with_capacity(layout.position_ids.len() + shift);
     position_ids.extend_from_slice(&layout.position_ids[..text_len]);
     position_ids.extend(positions);
-    position_ids.extend_from_slice(&layout.position_ids[text_len..]);
+    let target_time_shift = cursor - text_len as f32;
+    position_ids.extend(layout.position_ids[text_len..].iter().map(|&[time, height, width]| [time + target_time_shift, height, width]));
     let mut packed_segments = Vec::with_capacity(layout.segments.len() + segments.len());
     packed_segments.push(layout.segments[0].clone());
     packed_segments.extend(segments);
@@ -260,6 +368,68 @@ pub fn build_h3_reference_layout<T>(text_len: usize, latent_t: usize, latent_h: 
     layout.audio_rows = layout.audio_rows.start + shift..layout.audio_rows.end + shift;
     layout.video_rows = layout.video_rows.start + shift..layout.video_rows.end + shift;
     Ok(layout)
+}
+
+#[cfg(test)]
+mod reference_layout_tests {
+    use super::*;
+
+    fn visual(source_index: usize, time: usize) -> H3PackedReferenceCondition<()> {
+        H3PackedReferenceCondition::Video { source_index, condition: H3VideoCondition { tensor: (), latent_shape: [time, 2, 2], patch_shape: [1, 2, 2] } }
+    }
+
+    fn audio(source_index: usize, time: usize) -> H3PackedReferenceCondition<()> {
+        H3PackedReferenceCondition::Audio { source_index, condition: H3AudioCondition { tensor: (), batch: 2, time, channels: 32 } }
+    }
+
+    #[test]
+    fn images_advance_reference_and_target_origins_without_changing_spatial_layout() {
+        let baseline = super::super::build_packed_layout(10, 7, 4, 4, 5, [1, 2, 2], &[]).unwrap();
+        for count in 0..=2 {
+            let references = H3OrderedReferences { conditions: (0..count).map(|index| visual(index, 1)).collect() };
+            let layout = build_h3_reference_layout(10, 7, 4, 4, 5, [1, 2, 2], &references).unwrap();
+            assert_eq!(&layout.position_ids[..10], &baseline.position_ids[..10]);
+            for index in 0..count {
+                assert_eq!(layout.position_ids[10 + index][0], (10 + index) as f32);
+            }
+            assert_eq!(layout.audio_rows, baseline.audio_rows.start + count..baseline.audio_rows.end + count);
+            assert_eq!(layout.video_rows, baseline.video_rows.start + count..baseline.video_rows.end + count);
+            for (&actual, &old) in layout.position_ids[10 + count..].iter().zip(&baseline.position_ids[10..]) {
+                assert_eq!(actual, [old[0] + count as f32, old[1], old[2]]);
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_references_share_video_audio_origin_and_advance_by_longer_span() {
+        // 图片、独立音频、带音轨视频、图片；同时覆盖视频较长和音轨较长。
+        for soundtrack_time in [10, 60] {
+            let references = H3OrderedReferences { conditions: vec![visual(4, 1), audio(7, 3), audio(2, soundtrack_time), visual(2, 7), visual(9, 1)] };
+            let layout = build_h3_reference_layout(10, 7, 2, 2, 5, [1, 2, 2], &references).unwrap();
+            let starts = layout.segments.iter().map(|segment| layout.position_ids[segment.rows.start][0]).collect::<Vec<_>>();
+            let final_image_start = 14.0 + (22.0f32 * 5.0 / 3.0).max(soundtrack_time as f32);
+            for (actual, expected) in starts.iter().zip([0.0, 10.0, 11.0, 14.0, 14.0, final_image_start, final_image_start + 1.0, final_image_start + 1.0]) {
+                assert!((actual - expected).abs() < 1.0e-4, "soundtrack={soundtrack_time} starts={starts:?}");
+            }
+            assert_eq!(starts.len(), 8);
+            let video_start = layout.segments[4].rows.start;
+            assert!((layout.position_ids[video_start + 1][0] - (14.0 + 5.0 / 3.0)).abs() < 1.0e-4);
+            assert!((layout.position_ids[video_start + 2][0] - (14.0 + 25.0 / 3.0)).abs() < 1.0e-4);
+            assert_eq!(layout.segments[2].rows.len(), 6);
+            assert_eq!(layout.segments[3].rows.len(), soundtrack_time * 2);
+            assert_eq!(layout.segments[4].rows.len(), 7);
+        }
+    }
+
+    #[test]
+    fn video_without_soundtrack_advances_full_temporal_span() {
+        let references = H3OrderedReferences { conditions: vec![visual(0, 7), visual(1, 1)] };
+        let layout = build_h3_reference_layout(10, 7, 2, 2, 5, [1, 2, 2], &references).unwrap();
+        let image_start = layout.position_ids[layout.segments[2].rows.start][0];
+        assert!((image_start - (10.0 + 22.0 * 5.0 / 3.0)).abs() < 1.0e-4);
+        assert_eq!(layout.position_ids[layout.audio_rows.start][0], image_start + 1.0);
+        assert_eq!(layout.position_ids[layout.video_rows.start][0], image_start + 1.0);
+    }
 }
 
 /// 将 safetensors tensor 直接准备成 backend resident 权重；卷积也按 `[out, flattened input]` 处理。
@@ -387,8 +557,18 @@ where
     if latent_channels == 0 || latent_std.len() != latent_channels {
         return Err(crate::runtime::compute_error(format!("H3 audio latent mean/std={latent_channels}/{} 不一致", latent_std.len())));
     }
-    let attention = prepare_audio_pre_block(backend, &global.pre_block)?;
-    Ok(PreparedH3AudioEncoder { conv_in: prepare_audio_conv(backend, &global.input, 1, 1, 3)?, stages, final_snake: prepare_audio_snake(backend, &global.final_activation)?, attention, latent_channels, latent_mean, latent_std })
+    let attention = prepare_audio_pre_block(backend, &global.pre_block, spec.encoder_attention_heads)?;
+    Ok(PreparedH3AudioEncoder {
+        conv_in: prepare_audio_conv(backend, &global.input, 1, 1, 3)?,
+        stages,
+        final_snake: prepare_audio_snake(backend, &global.final_activation)?,
+        final_conv: prepare_audio_conv(backend, &global.final_conv, 1, 1, 1)?,
+        attention,
+        mean_projection: PreparedH3Linear { weight: prepare_h3_tensor(backend, &global.mean_proj_weight)?, bias: Some(prepare_h3_tensor(backend, &global.mean_proj_bias)?) },
+        latent_channels,
+        latent_mean,
+        latent_std,
+    })
 }
 
 fn prepare_audio_conv<B: Backend>(backend: &B, conv: &H3AudioConvWeights, stride: usize, dilation: usize, padding: usize) -> Result<PreparedH3AudioConv<B::Weight>, BackendError> {
@@ -421,22 +601,40 @@ fn prepare_audio_unit<B: Backend>(backend: &B, unit: &H3AudioEncoderUnitWeights,
     })
 }
 
-fn prepare_audio_pre_block<B: Backend>(backend: &B, block: &H3AudioPreBlockWeights) -> Result<PreparedH3AudioAttention<B::Weight>, BackendError> {
+fn prepare_audio_pre_block<B: Backend>(backend: &B, block: &H3AudioPreBlockWeights, heads: usize) -> Result<PreparedH3AudioAttention<B::Weight>, BackendError> {
     if block.qkv_weight.shape.len() != 2 || block.qkv_weight.shape[0] % 3 != 0 {
         return Err(crate::runtime::compute_error(format!("H3 audio pre-block qkv shape={:?} 非法", block.qkv_weight.shape)));
     }
     let attention_columns = block.qkv_weight.shape[0] / 3;
+    let head_dim = attention_columns
+        .checked_div(heads)
+        .filter(|_| heads > 0 && attention_columns.is_multiple_of(heads))
+        .ok_or_else(|| crate::runtime::compute_error(format!("H3 audio pre-block columns={attention_columns} 不能按 heads={heads} 拆分")))?;
     Ok(PreparedH3AudioAttention {
+        norm: PreparedH3Norm { weight: prepare_h3_tensor(backend, &block.norm1_weight)?, bias: prepare_h3_tensor(backend, &block.norm1_bias)? },
         qkv: PreparedH3Linear { weight: prepare_h3_tensor(backend, &block.qkv_weight)?, bias: Some(prepare_h3_tensor(backend, &block.qkv_bias)?) },
         output: PreparedH3Linear { weight: prepare_h3_tensor(backend, &block.attention_output_weight)?, bias: Some(prepare_h3_tensor(backend, &block.attention_output_bias)?) },
-        heads: 1,
-        head_dim: attention_columns,
+        input_norm: PreparedH3Norm { weight: prepare_h3_tensor(backend, &block.input_norm_weight)?, bias: prepare_h3_tensor(backend, &block.input_norm_bias)? },
+        input: PreparedH3Linear { weight: prepare_h3_tensor(backend, &block.input_weight)?, bias: Some(prepare_h3_tensor(backend, &block.input_bias)?) },
+        output_norm: PreparedH3Norm { weight: prepare_h3_tensor(backend, &block.norm2_weight)?, bias: prepare_h3_tensor(backend, &block.norm2_bias)? },
+        mlp_norm: PreparedH3Norm { weight: prepare_h3_tensor(backend, &block.mlp_norm_weight)?, bias: prepare_h3_tensor(backend, &block.mlp_norm_bias)? },
+        gate: PreparedH3Linear { weight: prepare_h3_tensor(backend, &block.gate_weight)?, bias: Some(prepare_h3_tensor(backend, &block.gate_bias)?) },
+        up: PreparedH3Linear { weight: prepare_h3_tensor(backend, &block.up_weight)?, bias: Some(prepare_h3_tensor(backend, &block.up_bias)?) },
+        down: PreparedH3Linear { weight: prepare_h3_tensor(backend, &block.down_weight)?, bias: Some(prepare_h3_tensor(backend, &block.down_bias)?) },
+        heads,
+        head_dim,
+        output_dim: block.attention_output_weight.shape[1],
     })
 }
 
 pub struct PreparedH3Linear<W> {
     pub weight: W,
     pub bias: Option<W>,
+}
+
+pub struct PreparedH3Norm<W> {
+    pub weight: W,
+    pub bias: W,
 }
 
 pub struct PreparedH3VideoConv<W> {
@@ -517,17 +715,28 @@ pub struct PreparedH3AudioStage<W> {
 }
 
 pub struct PreparedH3AudioAttention<W> {
+    pub norm: PreparedH3Norm<W>,
     pub qkv: PreparedH3Linear<W>,
     pub output: PreparedH3Linear<W>,
+    pub input_norm: PreparedH3Norm<W>,
+    pub input: PreparedH3Linear<W>,
+    pub output_norm: PreparedH3Norm<W>,
+    pub mlp_norm: PreparedH3Norm<W>,
+    pub gate: PreparedH3Linear<W>,
+    pub up: PreparedH3Linear<W>,
+    pub down: PreparedH3Linear<W>,
     pub heads: usize,
     pub head_dim: usize,
+    pub output_dim: usize,
 }
 
 pub struct PreparedH3AudioEncoder<W> {
     pub conv_in: PreparedH3AudioConv<W>,
     pub stages: Vec<PreparedH3AudioStage<W>>,
     pub final_snake: W,
+    pub final_conv: PreparedH3AudioConv<W>,
     pub attention: PreparedH3AudioAttention<W>,
+    pub mean_projection: PreparedH3Linear<W>,
     pub latent_channels: usize,
     pub latent_mean: Vec<f32>,
     pub latent_std: Vec<f32>,
@@ -575,16 +784,13 @@ where
     Ok(H3VideoCondition { tensor, latent_shape: current_shape, patch_shape: encoder.patch })
 }
 
-/// 合并 17 帧分片；除首片外按官方规则丢弃开头 3 个 latent time token。
-pub fn h3_join_video_conditions<B>(backend: &B, clips: Vec<(H3VideoCondition<B::Tensor>, usize)>) -> Result<H3VideoCondition<B::Tensor>, BackendError>
+/// 合并 17 帧分片；官方编码契约是在所有分片拼接后只丢弃末尾 3 个 latent time token。
+pub fn h3_join_video_conditions<B>(backend: &B, clips: Vec<H3VideoCondition<B::Tensor>>, drop_trailing_tokens: usize) -> Result<H3VideoCondition<B::Tensor>, BackendError>
 where
     B: VaeBackend,
 {
     let mut clips = clips.into_iter();
-    let (first, first_drop) = clips.next().ok_or_else(|| crate::runtime::compute_error("H3 video condition clips 为空"))?;
-    if first_drop != 0 {
-        return Err(crate::runtime::compute_error("H3 video condition 首片不能丢弃 latent token"));
-    }
+    let first = clips.next().ok_or_else(|| crate::runtime::compute_error("H3 video condition clips 为空"))?;
     let columns = backend.token_cols(&first.tensor);
     let patch_shape = first.patch_shape;
     let mut latent_shape = first.latent_shape;
@@ -592,22 +798,24 @@ where
     if values.len() != backend.token_rows(&first.tensor).checked_mul(columns).ok_or_else(|| crate::runtime::compute_error("H3 first video condition 大小溢出"))? {
         return Err(crate::runtime::compute_error("H3 first video condition tensor shape 不匹配"));
     }
-    for (clip, drop_tokens) in clips {
+    for clip in clips {
         if clip.patch_shape != patch_shape || backend.token_cols(&clip.tensor) != columns {
             return Err(crate::runtime::compute_error("H3 video condition clip patch/columns 不一致"));
         }
-        let grid_height = clip.latent_shape[1] / patch_shape[1];
-        let grid_width = clip.latent_shape[2] / patch_shape[2];
-        let drop_rows = drop_tokens.checked_mul(grid_height).and_then(|value| value.checked_mul(grid_width)).ok_or_else(|| crate::runtime::compute_error("H3 video condition drop rows 溢出"))?;
-        let rows = backend.token_rows(&clip.tensor);
-        if drop_rows >= rows || clip.latent_shape[0] < drop_tokens.checked_mul(patch_shape[0]).ok_or_else(|| crate::runtime::compute_error("H3 video condition drop time 溢出"))? {
-            return Err(crate::runtime::compute_error(format!("H3 video condition drop={drop_tokens} 超过 clip rows={rows}")));
-        }
         let clip_values = backend.vae_tensor_to_f32(&clip.tensor)?;
-        let start = drop_rows.checked_mul(columns).ok_or_else(|| crate::runtime::compute_error("H3 video condition drop offset 溢出"))?;
-        values.extend_from_slice(clip_values.get(start..).ok_or_else(|| crate::runtime::compute_error("H3 video condition drop offset 越界"))?);
-        latent_shape[0] = latent_shape[0].checked_add(clip.latent_shape[0] - drop_tokens * patch_shape[0]).ok_or_else(|| crate::runtime::compute_error("H3 video condition latent time 溢出"))?;
+        values.extend_from_slice(&clip_values);
+        latent_shape[0] = latent_shape[0].checked_add(clip.latent_shape[0]).ok_or_else(|| crate::runtime::compute_error("H3 video condition latent time 溢出"))?;
     }
+    let grid_height = latent_shape[1] / patch_shape[1];
+    let grid_width = latent_shape[2] / patch_shape[2];
+    let drop_rows = drop_trailing_tokens.checked_mul(grid_height).and_then(|value| value.checked_mul(grid_width)).ok_or_else(|| crate::runtime::compute_error("H3 video condition trailing drop rows 溢出"))?;
+    let drop_values = drop_rows.checked_mul(columns).ok_or_else(|| crate::runtime::compute_error("H3 video condition trailing drop values 溢出"))?;
+    let drop_time = drop_trailing_tokens.checked_mul(patch_shape[0]).ok_or_else(|| crate::runtime::compute_error("H3 video condition trailing drop time 溢出"))?;
+    if drop_values >= values.len() || drop_time >= latent_shape[0] {
+        return Err(crate::runtime::compute_error(format!("H3 video condition trailing drop={drop_trailing_tokens} 超过 latent time={}", latent_shape[0])));
+    }
+    values.truncate(values.len() - drop_values);
+    latent_shape[0] -= drop_time;
     let rows = values.len().checked_div(columns).ok_or_else(|| crate::runtime::compute_error("H3 video condition columns 为 0"))?;
     let tensor = backend.vae_tensor_from_f32(values, rows, columns)?;
     Ok(H3VideoCondition { tensor, latent_shape, patch_shape })
@@ -643,11 +851,26 @@ where
         return Err(crate::runtime::compute_error("H3 condition tensor shape 不匹配"));
     }
     let mut random = ConditioningGaussian::new(seed);
-    let clean_scale = 1.0 - timestep;
+    // H3 的 timestep 是 data-ward：0 表示纯噪声，1 表示干净数据。
+    // condition 使用 0.999，必须保留 99.9% 参考内容。
     for value in &mut values {
-        *value = *value * clean_scale + random.next() * timestep;
+        *value = h3_condition_sample(*value, random.next(), timestep);
     }
     backend.vae_tensor_from_f32(values, rows, columns)
+}
+
+fn h3_condition_sample(clean: f32, noise: f32, timestep: f32) -> f32 {
+    clean * timestep + noise * (1.0 - timestep)
+}
+
+#[cfg(test)]
+mod condition_noise_tests {
+    #[test]
+    fn data_ward_timestep_preserves_the_correct_endpoint() {
+        assert_eq!(super::h3_condition_sample(2.0, -3.0, 0.0), -3.0);
+        assert_eq!(super::h3_condition_sample(2.0, -3.0, 1.0), 2.0);
+        assert!((super::h3_condition_sample(2.0, -3.0, 0.999) - 1.995).abs() < 1.0e-6);
+    }
 }
 
 pub fn h3_encode_audio_condition<B>(backend: &B, encoder: &PreparedH3AudioEncoder<B::Weight>, samples: Vec<f32>, batch: usize) -> Result<H3AudioCondition<B::Tensor>, BackendError>
@@ -684,16 +907,30 @@ where
         channels = stage.downsample.output_channels;
     }
     hidden = backend.snake(&hidden, &encoder.final_snake, channels)?;
+    hidden = audio_conv(backend, &hidden, batch, &encoder.final_conv)?;
+    channels = encoder.final_conv.output_channels;
     hidden = backend.channels_to_time(&hidden, channels)?;
 
-    let qkv = linear_with_bias(backend, &hidden, &encoder.attention.qkv)?;
+    let attention_input = backend.layer_norm(&hidden, &encoder.attention.norm.weight, &encoder.attention.norm.bias, 1.0e-5)?;
+    let qkv = linear_with_bias(backend, &attention_input, &encoder.attention.qkv)?;
     let attention_columns = encoder.attention.heads.checked_mul(encoder.attention.head_dim).ok_or_else(|| crate::runtime::compute_error("H3 audio attention columns 溢出"))?;
     let (query, key_value) = backend.split_columns(&qkv, attention_columns)?;
     let (key, value) = backend.split_columns(&key_value, attention_columns)?;
     let time = backend.token_rows(&hidden) / batch;
     let attention = backend.causal_attention(&query, &key, &value, time, encoder.attention.heads, encoder.attention.head_dim, (encoder.attention.head_dim as f32).sqrt().recip())?;
-    let moments = linear_with_bias(backend, &attention, &encoder.attention.output)?;
-    let (mean, _) = backend.split_columns(&moments, encoder.latent_channels)?;
+    let attention = pool_audio_attention(backend, &attention, encoder.attention.heads, encoder.attention.head_dim, encoder.attention.output_dim)?;
+    let attention = linear_with_bias(backend, &attention, &encoder.attention.output)?;
+    let residual = backend.layer_norm(&hidden, &encoder.attention.input_norm.weight, &encoder.attention.input_norm.bias, 1.0e-5)?;
+    let residual = linear_with_bias(backend, &residual, &encoder.attention.input)?;
+    let mut projected = backend.add(&residual, &attention)?;
+    let mlp = backend.layer_norm(&projected, &encoder.attention.output_norm.weight, &encoder.attention.output_norm.bias, 1.0e-5)?;
+    let mlp = backend.layer_norm(&mlp, &encoder.attention.mlp_norm.weight, &encoder.attention.mlp_norm.bias, 1.0e-5)?;
+    let gate = linear_with_bias(backend, &mlp, &encoder.attention.gate)?;
+    let up = linear_with_bias(backend, &mlp, &encoder.attention.up)?;
+    let mlp = backend.gated_activation(&gate, &up, &crate::moe::dense_mlp::Activation::GeluTanh)?;
+    let mlp = linear_with_bias(backend, &mlp, &encoder.attention.down)?;
+    projected = backend.add(&projected, &mlp)?;
+    let mean = linear_with_bias(backend, &projected, &encoder.mean_projection)?;
     let mut values = backend.vae_tensor_to_f32(&mean)?;
     for row in values.chunks_exact_mut(encoder.latent_channels) {
         for channel in 0..encoder.latent_channels {
@@ -702,6 +939,37 @@ where
     }
     let tensor = backend.vae_tensor_from_f32(values, batch * time, encoder.latent_channels)?;
     Ok(H3AudioCondition { tensor, batch, time, channels: encoder.latent_channels })
+}
+
+fn pool_audio_attention<B: VaeBackend>(backend: &B, input: &B::Tensor, heads: usize, head_dim: usize, output_dim: usize) -> Result<B::Tensor, BackendError> {
+    let rows = backend.token_rows(input);
+    let values = backend.vae_tensor_to_f32(input)?;
+    let pooled = adaptive_pool_audio_attention(&values, rows, heads, head_dim, output_dim)?;
+    backend.vae_tensor_from_f32(pooled, rows, output_dim)
+}
+
+fn adaptive_pool_audio_attention(values: &[f32], rows: usize, heads: usize, head_dim: usize, output_dim: usize) -> Result<Vec<f32>, BackendError> {
+    let columns = heads.checked_mul(head_dim).ok_or_else(|| crate::runtime::compute_error("H3 audio attention pooling columns 溢出"))?;
+    if rows == 0 || heads == 0 || head_dim == 0 || output_dim == 0 || values.len() != rows.checked_mul(columns).ok_or_else(|| crate::runtime::compute_error("H3 audio attention pooling 大小溢出"))? {
+        return Err(crate::runtime::compute_error(format!("H3 audio attention pooling values={} shape=[{rows},{heads},{head_dim}] output={output_dim} 非法", values.len())));
+    }
+    let mut output = vec![0.0; rows * output_dim];
+    for row in 0..rows {
+        for target in 0..output_dim {
+            let start = target * head_dim / output_dim;
+            let end = (target + 1).checked_mul(head_dim).ok_or_else(|| crate::runtime::compute_error("H3 audio attention pooling bin 溢出"))?.div_ceil(output_dim);
+            if start >= end || end > head_dim {
+                return Err(crate::runtime::compute_error(format!("H3 audio attention pooling head_dim={head_dim} output={output_dim} bin={start}..{end} 非法")));
+            }
+            let mut sum = 0.0;
+            for head in 0..heads {
+                let base = (row * heads + head) * head_dim;
+                sum += values[base + start..base + end].iter().sum::<f32>();
+            }
+            output[row * output_dim + target] = sum / (heads * (end - start)) as f32;
+        }
+    }
+    Ok(output)
 }
 
 fn video_residual<B>(backend: &B, input: &B::Tensor, shape: [usize; 3], block: &PreparedH3VideoResidual<B::Weight>) -> Result<B::Tensor, BackendError>

@@ -178,49 +178,49 @@ impl SseState {
     }
 
     fn emit_text(&mut self, reasoning: &str, text: &str) {
-                if !reasoning.is_empty() {
-                    self.pending.push_back(Ok(Event::default().data(self.reasoning_chunk(reasoning))));
+        if !reasoning.is_empty() {
+            self.pending.push_back(Ok(Event::default().data(self.reasoning_chunk(reasoning))));
+        }
+        if text.is_empty() {
+            return;
+        }
+        let output = match self.tool_fallback.as_mut() {
+            Some(fallback) => fallback.push(text),
+            None => vec![ToolOutput::Text(text.to_owned())],
+        };
+        for item in output {
+            let chunk = match item {
+                ToolOutput::Text(text) => self.content_chunk(&text),
+                ToolOutput::ToolCall(call) => {
+                    while self.streamed_tool_calls.contains(&self.fallback_tool_index) {
+                        self.fallback_tool_index += 1;
+                    }
+                    let index = self.fallback_tool_index;
+                    self.fallback_tool_index += 1;
+                    self.streamed_tool_calls.insert(index);
+                    self.fallback_has_tools = true;
+                    let tool_call = parsed_tool_call(&self.request_id, index, call);
+                    let chunk = json!({
+                        "id": self.request_id,
+                        "object": "chat.completion.chunk",
+                        "created": self.created,
+                        "model": self.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"reasoning_content": null, "tool_calls": [{
+                                "index": index,
+                                "id": tool_call.id,
+                                "type": tool_call.kind,
+                                "function": {"name": tool_call.function.name, "arguments": tool_call.function.arguments}
+                            }]},
+                            "finish_reason": null
+                        }]
+                    });
+                    sse_json(&chunk)
                 }
-                if text.is_empty() {
-                    return;
-                }
-                let output = match self.tool_fallback.as_mut() {
-                    Some(fallback) => fallback.push(text),
-                    None => vec![ToolOutput::Text(text.to_owned())],
-                };
-                for item in output {
-                    let chunk = match item {
-                        ToolOutput::Text(text) => self.content_chunk(&text),
-                        ToolOutput::ToolCall(call) => {
-                            while self.streamed_tool_calls.contains(&self.fallback_tool_index) {
-                                self.fallback_tool_index += 1;
-                            }
-                            let index = self.fallback_tool_index;
-                            self.fallback_tool_index += 1;
-                            self.streamed_tool_calls.insert(index);
-                            self.fallback_has_tools = true;
-                            let tool_call = parsed_tool_call(&self.request_id, index, call);
-                            let chunk = json!({
-                                "id": self.request_id,
-                                "object": "chat.completion.chunk",
-                                "created": self.created,
-                                "model": self.model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"reasoning_content": null, "tool_calls": [{
-                                        "index": index,
-                                        "id": tool_call.id,
-                                        "type": tool_call.kind,
-                                        "function": {"name": tool_call.function.name, "arguments": tool_call.function.arguments}
-                                    }]},
-                                    "finish_reason": null
-                                }]
-                            });
-                            sse_json(&chunk)
-                        }
-                    };
-                    self.pending.push_back(Ok(Event::default().data(chunk)));
-                }
+            };
+            self.pending.push_back(Ok(Event::default().data(chunk)));
+        }
     }
 
     fn handle(&mut self, event: InferenceEvent) {

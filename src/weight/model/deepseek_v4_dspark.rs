@@ -17,7 +17,9 @@ use crate::{
 #[derive(Clone, Debug, Deserialize)]
 pub struct DeepSeekV4DsparkConfig {
     pub vocab_size: usize,
+    #[serde(alias = "dim")]
     pub hidden_size: usize,
+    #[serde(alias = "n_layers")]
     pub num_hidden_layers: usize,
     pub dspark_block_size: usize,
     pub dspark_noise_token_id: u32,
@@ -27,8 +29,18 @@ pub struct DeepSeekV4DsparkConfig {
 
 impl DeepSeekV4DsparkConfig {
     pub fn read(root: &Path, target: &DeepSeekV4Config) -> Result<Self, String> {
-        let path = root.join("config.json");
-        let config: Self = serde_json::from_slice(&std::fs::read(&path).map_err(|error| format!("读取 {} 失败: {error}", path.display()))?).map_err(|error| format!("解析 {} 失败: {error}", path.display()))?;
+        let root_path = root.join("config.json");
+        let root_json = std::fs::read(&root_path).map_err(|error| format!("读取 {} 失败: {error}", root_path.display()))?;
+        let root_value: serde_json::Value = serde_json::from_slice(&root_json).map_err(|error| format!("解析 {} 失败: {error}", root_path.display()))?;
+        // V4.1 官方仓库把推理配置单独放在 inference/config.json，HF 根配置不含 DSpark 字段。
+        let (path, json) = if root_value.get("dspark_block_size").is_some() {
+            (root_path, root_json)
+        } else {
+            let path = root.join("inference/config.json");
+            let json = std::fs::read(&path).map_err(|error| format!("根配置不含 DSpark 字段，读取 {} 失败: {error}", path.display()))?;
+            (path, json)
+        };
+        let config: Self = serde_json::from_slice(&json).map_err(|error| format!("解析 {} 失败: {error}", path.display()))?;
         config.validate(target)?;
         Ok(config)
     }
@@ -37,9 +49,15 @@ impl DeepSeekV4DsparkConfig {
         BlockDraftSpec::new(self.dspark_block_size, self.dspark_block_size, 1).map_err(|error| error.to_string())
     }
 
-    pub fn capture_plan(&self, verifier_layer_count: usize) -> Result<HiddenStateCapturePlan, String> {
-        let boundaries = self.dspark_target_layer_ids.iter().map(|layer| layer.checked_add(1).ok_or("DeepSeek-V4 DSpark target layer boundary 溢出")).collect::<Result<Vec<_>, _>>()?;
-        HiddenStateCapturePlan::new(boundaries, verifier_layer_count).map_err(|error| error.to_string())
+    /// V4 捕获 target 层输出(boundary = target+1);V4.1 官方 inference 在 target
+    /// 层入口取 h(即前一层输出,boundary = target)。以 kv_source_layers 区分版本。
+    pub fn capture_plan(&self, target: &DeepSeekV4Config) -> Result<HiddenStateCapturePlan, String> {
+        let boundaries = if target.kv_source_layers.is_empty() {
+            self.dspark_target_layer_ids.iter().map(|layer| layer.checked_add(1).ok_or("DeepSeek-V4 DSpark target layer boundary 溢出")).collect::<Result<Vec<_>, _>>()?
+        } else {
+            self.dspark_target_layer_ids.clone()
+        };
+        HiddenStateCapturePlan::new(boundaries, target.layer_count).map_err(|error| error.to_string())
     }
 
     fn validate(&self, target: &DeepSeekV4Config) -> Result<(), String> {
@@ -53,7 +71,7 @@ impl DeepSeekV4DsparkConfig {
             return Err(format!("DeepSeek-V4 DSpark Markov/noise 非法: rank={} noise={}", self.dspark_markov_rank, self.dspark_noise_token_id));
         }
         self.block_spec()?;
-        self.capture_plan(target.layer_count)?;
+        self.capture_plan(target)?;
         Ok(())
     }
 }
@@ -64,7 +82,8 @@ pub struct DeepSeekV4DsparkInputWeights {
 }
 
 pub struct DeepSeekV4DsparkHeadWeights {
-    pub hyper_connection: DeepSeekV4HyperConnectionWeights,
+    /// V4 的 hc head 系数;V4.1 无(head 用最后 draft 层 ffn 的 pre_mix 折叠)。
+    pub hyper_connection: Option<DeepSeekV4HyperConnectionWeights>,
     pub norm: TensorData,
     pub markov_embedding: TensorData,
     pub markov_projection: TensorData,
@@ -92,9 +111,10 @@ impl DeepSeekV4DsparkCheckpoint {
     pub fn load_input(&self) -> Result<DeepSeekV4DsparkInputWeights, String> {
         let hidden = self.config.hidden_size;
         let captures = self.config.dspark_target_layer_ids.len();
+        let block = if self.weights.config().kv_source_layers.is_empty() { 128 } else { 32 };
         Ok(DeepSeekV4DsparkInputWeights {
-            projection: self.weights.load_block_fp8("mtp.0.main_proj", hidden, hidden.checked_mul(captures).ok_or("DeepSeek-V4 DSpark main projection 维度溢出")?)?,
-            norm: self.weights.load_dense("mtp.0.main_norm.weight", &[hidden])?,
+            projection: self.weights.load_block_fp8_with_block(&self.weights.namespaced("mtp.0.main_proj"), hidden, hidden.checked_mul(captures).ok_or("DeepSeek-V4 DSpark main projection 维度溢出")?, block)?,
+            norm: self.weights.load_dense(&self.weights.namespaced("mtp.0.main_norm.weight"), &[hidden])?,
         })
     }
 
@@ -112,15 +132,31 @@ impl DeepSeekV4DsparkCheckpoint {
         let copies = self.weights.config().hyper_connection_copies;
         let last = self.config.dspark_target_layer_ids.len() - 1;
         let prefix = format!("mtp.{last}");
-        Ok(DeepSeekV4DsparkHeadWeights {
-            hyper_connection: DeepSeekV4HyperConnectionWeights {
+        // hc head 张量按存在性装配:V4.1 checkpoint 无 hc_head_*。
+        let hyper_connection = if self.weights.has_namespaced(&format!("{prefix}.hc_head_fn")) {
+            Some(DeepSeekV4HyperConnectionWeights {
                 function: self.weights.load_f32(&format!("{prefix}.hc_head_fn"), &[copies, copies.checked_mul(hidden).ok_or("DeepSeek-V4 DSpark head hidden 维度溢出")?])?,
                 base: self.weights.load_f32(&format!("{prefix}.hc_head_base"), &[copies])?,
                 scale: self.weights.load_f32(&format!("{prefix}.hc_head_scale"), &[1])?,
-            },
+            })
+        } else {
+            None
+        };
+        let markov_embedding = if self.weights.has_namespaced(&format!("{prefix}.markov_head.embed.weight")) {
+            format!("{prefix}.markov_head.embed.weight")
+        } else {
+            format!("{prefix}.markov_head.markov_w1.weight")
+        };
+        let markov_projection = if self.weights.has_namespaced(&format!("{prefix}.markov_head.head.weight")) {
+            format!("{prefix}.markov_head.head.weight")
+        } else {
+            format!("{prefix}.markov_head.markov_w2.weight")
+        };
+        Ok(DeepSeekV4DsparkHeadWeights {
+            hyper_connection,
             norm: self.weights.load_dense(&format!("{prefix}.norm.weight"), &[hidden])?,
-            markov_embedding: self.weights.load_dense(&format!("{prefix}.markov_head.markov_w1.weight"), &[self.config.vocab_size, rank])?,
-            markov_projection: self.weights.load_dense(&format!("{prefix}.markov_head.markov_w2.weight"), &[self.config.vocab_size, rank])?,
+            markov_embedding: self.weights.load_dense(&markov_embedding, &[self.config.vocab_size, rank])?,
+            markov_projection: self.weights.load_dense(&markov_projection, &[self.config.vocab_size, rank])?,
             confidence_projection: self.weights.load_dense(&format!("{prefix}.confidence_head.proj.weight"), &[1, hidden + rank])?,
         })
     }
@@ -150,7 +186,20 @@ mod tests {
         .unwrap();
         let target = DeepSeekV4Config::flash();
         config.validate(&target).unwrap();
-        assert_eq!(config.capture_plan(43).unwrap().boundaries(), [41, 42, 43]);
+        assert_eq!(config.capture_plan(&DeepSeekV4Config::flash()).unwrap().boundaries(), [41, 42, 43]);
         assert_eq!(config.block_spec().unwrap(), BlockDraftSpec { block_size: 5, speculative_tokens: 5, verifier_accept_k: 1 });
+    }
+
+    #[test]
+    fn parses_v41_inference_dspark_config() {
+        let config: DeepSeekV4DsparkConfig = serde_json::from_str(
+            r#"{"vocab_size":129280,"dim":5120,"n_layers":40,
+            "dspark_block_size":5,"dspark_noise_token_id":128799,
+            "dspark_target_layer_ids":[37,38,39],"dspark_markov_rank":256}"#,
+        )
+        .unwrap();
+        let target = DeepSeekV4Config::flash_v41();
+        config.validate(&target).unwrap();
+        assert_eq!(config.capture_plan(&target).unwrap().boundaries(), [37, 38, 39]);
     }
 }

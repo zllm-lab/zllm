@@ -20,13 +20,7 @@ use crate::{
 use std::path::Path;
 use std::time::Instant;
 
-const QUESTIONS: &[&str] = &[
-    "世界上最高的山峰",
-    "请记住我的名字叫小石，只回答记住了。",
-    "计算17加25，并解释步骤。",
-    "写一个Python函数，返回列表中的最大值。",
-    "Translate into English: 今天下午我们一起去图书馆。",
-];
+const QUESTIONS: &[&str] = &["世界上最高的山峰", "请记住我的名字叫小石，只回答记住了。", "计算17加25，并解释步骤。", "写一个Python函数，返回列表中的最大值。", "Translate into English: 今天下午我们一起去图书馆。"];
 
 fn no_think_prompt(question: &str) -> String {
     format!("<s><|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
@@ -68,35 +62,18 @@ fn verify_block(
     let config = session.config();
     let embedding = session.weights().embedding_rows_f32(rows)?;
     let input = ctx.tensor_from_f32(&embedding, rows.len(), config.hidden_size)?;
-    let (hidden, captures) = minicpm5_text_hidden_with_captures(
-        ctx,
-        config,
-        session.layers(),
-        Some(cache),
-        input,
-        rope,
-        position,
-        draft.capture_layers(),
-    )
-    .map_err(|error| format!("MiniCPM5 verify 前向: {error:?}"))?;
+    let (hidden, captures) = minicpm5_text_hidden_with_captures(ctx, config, session.layers(), Some(cache), input, rope, position, draft.capture_layers()).map_err(|error| format!("MiniCPM5 verify 前向: {error:?}"))?;
     let head = session.output_head();
     let mut predicted = Vec::with_capacity(rows.len());
     for row in 0..rows.len() {
         let hidden_row = ctx.select_row(&hidden, row).map_err(|error| format!("verify select_row: {error:?}"))?;
-        let token = minicpm5_token_output(ctx, config, head, &hidden_row, &[])
-            .map_err(|error| format!("verify 输出步: {error:?}"))?
-            .token_id;
+        let token = minicpm5_token_output(ctx, config, head, &hidden_row, &[]).map_err(|error| format!("verify 输出步: {error:?}"))?.token_id;
         predicted.push(token);
     }
     Ok((predicted, captures))
 }
 
-fn run_speculative(
-    session: &MiniCpm5MetalSession,
-    draft: &Minicpm5DsparkRuntime,
-    prompt: &str,
-    max_tokens: usize,
-) -> Result<serde_json::Value, String> {
+fn run_speculative(session: &MiniCpm5MetalSession, draft: &Minicpm5DsparkRuntime, prompt: &str, max_tokens: usize) -> Result<serde_json::Value, String> {
     let ctx = session.context();
     let config = session.config();
     let ids = session.tokenize(prompt);
@@ -107,17 +84,7 @@ fn run_speculative(
     // prefill + 5 层捕获 → drafter 上下文预热
     let embedding = session.weights().embedding_rows_f32(&ids)?;
     let input = ctx.tensor_from_f32(&embedding, ids.len(), config.hidden_size)?;
-    let (hidden, captures) = minicpm5_text_hidden_with_captures(
-        ctx,
-        config,
-        session.layers(),
-        Some(&mut cache),
-        input,
-        &rope,
-        0,
-        draft.capture_layers(),
-    )
-    .map_err(|error| format!("MiniCPM5 prefill: {error:?}"))?;
+    let (hidden, captures) = minicpm5_text_hidden_with_captures(ctx, config, session.layers(), Some(&mut cache), input, &rope, 0, draft.capture_layers()).map_err(|error| format!("MiniCPM5 prefill: {error:?}"))?;
     let aux = draft.project_captures(ctx, &captures).map_err(|error| format!("DSpark 投影: {error:?}"))?;
     draft.extend_cache(ctx, &mut draft_cache, &aux, 0).map_err(|error| format!("DSpark 预热: {error:?}"))?;
     let mut last_aux = ctx.select_row(&aux, ids.len() - 1).map_err(|error| format!("DSpark warm 行: {error:?}"))?;
@@ -125,9 +92,7 @@ fn run_speculative(
 
     // 首 token 由目标自身给出
     let last = ctx.select_row(&hidden, ids.len() - 1).map_err(|error| format!("select last: {error:?}"))?;
-    let mut anchor = minicpm5_token_output(ctx, config, session.output_head(), &last, &[])
-        .map_err(|error| format!("首 token: {error:?}"))?
-        .token_id;
+    let mut anchor = minicpm5_token_output(ctx, config, session.output_head(), &last, &[]).map_err(|error| format!("首 token: {error:?}"))?.token_id;
     let mut tokens: Vec<u32> = vec![anchor];
     let mut sequence_tokens = ids.clone(); // KV 覆盖 0..ids.len()；anchor 尚未入 KV
 
@@ -142,9 +107,7 @@ fn run_speculative(
         noise_ids[0] = anchor;
         let noise_embedding = session.weights().embedding_rows_f32(&noise_ids)?;
         let noise = ctx.tensor_from_f32(&noise_embedding, draft.draft_tokens, config.hidden_size)?;
-        let block: SpeculativeBlock = draft
-            .draft_block(ctx, session.output_head().lm_head(), &mut draft_cache, anchor, noise, &last_aux, warm_position, position)
-            .map_err(|error| format!("DSpark draft: {error:?}"))?;
+        let block: SpeculativeBlock = draft.draft_block(ctx, session.output_head().lm_head(), &mut draft_cache, anchor, noise, &last_aux, warm_position, position).map_err(|error| format!("DSpark draft: {error:?}"))?;
         // 目标批量验证 [anchor + drafts]
         let mut rows = vec![anchor];
         rows.extend_from_slice(&block.drafts);

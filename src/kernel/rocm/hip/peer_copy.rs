@@ -165,8 +165,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-
-
     #[test]
     #[ignore = "需要 ROCm GPU"]
     fn small_deferred_upload_preserves_unaligned_lengths() {

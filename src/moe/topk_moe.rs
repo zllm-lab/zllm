@@ -53,6 +53,10 @@ pub struct MoeFfnRef<'a, W: ?Sized> {
     /// `Some` 走固定专家路由（router weight 只算权重，不改专家集合），
     /// 适用于 hash 路由等预先决定专家的场景（DeepSeek-V4 前若干层）。
     pub selected_experts: Option<&'a [u32]>,
+    /// VL 双偏置路由(DeepSeek-V4.1 noaux_tc_for_vl):`image_rows` 为 true 的行
+    /// 用 `router_bias_vl` 选专家(权重仍来自无偏分数);None 走纯文本 bias。
+    pub router_bias_vl: Option<&'a W>,
+    pub image_rows: Option<&'a [bool]>,
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +64,8 @@ pub struct RoutedMoeWeightsRef<'a, W: ?Sized> {
     pub router: &'a W,
     pub bias: &'a W,
     pub selected_experts: Option<&'a [u32]>,
+    pub bias_vl: Option<&'a W>,
+    pub image_rows: Option<&'a [bool]>,
 }
 
 #[derive(Clone, Copy)]
@@ -141,7 +147,7 @@ where
     if backend.token_rows(inputs.route) != backend.token_rows(inputs.expert) {
         return Err(BackendError::Compute { msg: "MoE route input 与 expert input 行数不一致".to_owned() });
     }
-    let resident_weights = RoutedMoeWeightsRef { router: weights.router, bias: weights.bias, selected_experts: weights.selected_experts };
+    let resident_weights = RoutedMoeWeightsRef { router: weights.router, bias: weights.bias, selected_experts: weights.selected_experts, bias_vl: None, image_rows: None };
     let resident_inputs = RoutedMoeInputs { route: inputs.route, expert: inputs.expert };
     if let Some((output, active)) = backend.decode_resident_routed_experts(spec, resident_weights, layer, source, state, resident_inputs)? {
         // `None` 表示 route 有意保持设备常驻；此时全量 resident backend 不需要预测反馈。

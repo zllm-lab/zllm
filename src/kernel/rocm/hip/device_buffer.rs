@@ -17,6 +17,25 @@ pub struct DeviceBuffer {
 }
 
 pub(super) const DEVICE_POOL_MAX_BUFFER_BYTES: usize = 384 * 1024 * 1024;
+
+/// 单块进池上限（淘汰阈值与大块 arena 直供路由阈值）。默认 384 MiB（LLM
+/// 经验值）；由 yaml `device_pool_max_block_gib` 经
+/// [`set_device_pool_max_block_bytes`] 覆盖（行为配置一律 yaml）——VAE 类
+/// 1.35 GiB Conv3D cache 块需要 ≥2 GiB 才能留在 L1 复用循环，否则每次相位
+/// sync malloc churn（2026-09-14 实测 216 次/任务）。
+pub(super) fn device_pool_max_buffer_bytes() -> usize {
+    DEVICE_POOL_MAX_BLOCK_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static DEVICE_POOL_MAX_BLOCK_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(DEVICE_POOL_MAX_BUFFER_BYTES);
+
+pub fn set_device_pool_max_block_bytes(bytes: usize) -> Result<(), String> {
+    if bytes == 0 {
+        return Err("device_pool_max_block 需大于 0".to_owned());
+    }
+    DEVICE_POOL_MAX_BLOCK_BYTES.store(bytes, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
 static DEVICE_POOL_MAX_BYTES_PER_DEVICE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(3 * 1024 * 1024 * 1024);
 pub(super) const DEVICE_ASYNC_MAX_BUFFER_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// stage completion 批量回收只适合短工作。长 prefill 若把所有层的临时 tensor
@@ -26,6 +45,7 @@ pub(super) const STAGE_DEFERRED_BUFFER_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 pub(super) struct PendingDeviceBuffer {
     pointer: usize,
+    capacity: usize,
     event: usize,
 }
 
@@ -36,10 +56,20 @@ struct PendingP2pSource {
 
 #[derive(Default)]
 pub(super) struct DeviceBufferPool {
-    buffers: HashMap<(i32, usize), Vec<usize>>,
+    /// value 是 (pointer, capacity)；key.1 是桶标称 `pool_bucket_key(capacity)`。
+    /// 桶内块 capacity 覆盖 `(标称-1MiB, 标称]` 区间，取出时必须逐块检查
+    /// `capacity >= 请求`。
+    buffers: HashMap<(i32, usize), Vec<(usize, usize)>>,
     pending: HashMap<(i32, usize), Vec<PendingDeviceBuffer>>,
     bytes: HashMap<i32, usize>,
-    available_events: Vec<usize>,
+    pub(super) available_events: Vec<usize>,
+}
+
+/// 桶标称：<1 MiB 精确；≥1 MiB 按 1 MiB 向上对齐。成对近尺寸（实测 H3
+/// 63.35/63.33 MiB、V4.1 一族整数 MiB）归入同桶互相命中，内碎有界 <1 MiB。
+fn pool_bucket_key(bytes: usize) -> usize {
+    const MIB: usize = 1 << 20;
+    if bytes < MIB { bytes } else { bytes.div_ceil(MIB) * MIB }
 }
 
 pub(super) static DEVICE_BUFFER_POOLS: OnceLock<Vec<Mutex<DeviceBufferPool>>> = OnceLock::new();
@@ -152,6 +182,11 @@ pub(crate) mod hip_api_stats {
         "stream_wait_event",
         "pool_take_hit",
         "pool_take_miss",
+        "arena_alloc",
+        "arena_full",
+        "arena_release",
+        "arena_pending",
+        "arena_leak",
     ];
     static COUNTS: [AtomicU64; KINDS.len()] = [const { AtomicU64::new(0) }; KINDS.len()];
     static MICROS: [AtomicU64; KINDS.len()] = [const { AtomicU64::new(0) }; KINDS.len()];
@@ -172,6 +207,11 @@ pub(crate) mod hip_api_stats {
     pub(crate) const STREAM_WAIT_EVENT: usize = 12;
     pub(crate) const POOL_TAKE_HIT: usize = 13;
     pub(crate) const POOL_TAKE_MISS: usize = 14;
+    pub(crate) const ARENA_ALLOC: usize = 15;
+    pub(crate) const ARENA_FULL: usize = 16;
+    pub(crate) const ARENA_RELEASE: usize = 17;
+    pub(crate) const ARENA_PENDING: usize = 18;
+    pub(crate) const ARENA_LEAK: usize = 19;
 
     /// 记录一次调用;launch 是最高频类别,每 65536 次打一行快照。
     pub(crate) fn record(kind: usize, started: Instant) {
@@ -243,6 +283,17 @@ pub(crate) mod hip_api_stats {
     }
 }
 
+fn mem_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("ZLLM_ROCM_MEM_TRACE").is_ok_and(|value| value == "1"))
+}
+
+pub(super) fn mem_trace(kind: &str, device_id: i32, bytes: usize, pointer: *mut c_void) {
+    if mem_trace_enabled() {
+        eprintln!("[mem-trace] {kind} dev={device_id} bytes={bytes} ptr={pointer:p} thread={:?} stream={:p}", std::thread::current().id(), crate::kernel::rocm::hip::active_compute_stream());
+    }
+}
+
 thread_local! {
     /// 异步 P2P 的源 buffer 与 source event 由目标 stage completion 持有，
     /// 复制结束前都不能回池复用。
@@ -292,6 +343,7 @@ pub(super) fn defer_stage_buffer_recycle(device_id: i32, pointer: *mut c_void, b
             }
             batch.bytes += bytes;
             batch.buffers.push((pointer as usize, bytes));
+            mem_trace("D", device_id, bytes, pointer);
             true
         })
         .unwrap_or(false)
@@ -313,17 +365,17 @@ fn enforce_device_buffer_pool_limit(pool: &mut DeviceBufferPool, device_id: i32)
     let limit = DEVICE_POOL_MAX_BYTES_PER_DEVICE.load(std::sync::atomic::Ordering::Relaxed);
     let mut used = pool.bytes.get(&device_id).copied().unwrap_or(0);
     let mut keys = pool.buffers.keys().copied().filter(|&(buffer_device, _)| buffer_device == device_id).collect::<Vec<_>>();
-    keys.sort_unstable_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
+    keys.sort_unstable_by_key(|&(_, nominal)| std::cmp::Reverse(nominal));
     let mut pointers_to_free = Vec::new();
-    for key @ (_, bytes) in keys {
-        let Some(pointers) = pool.buffers.remove(&key) else { continue };
+    for key in keys {
+        let Some(entries) = pool.buffers.remove(&key) else { continue };
         let mut reusable = Vec::new();
-        for pointer in pointers {
-            if bytes > DEVICE_POOL_MAX_BUFFER_BYTES || used > limit {
-                used = used.saturating_sub(bytes);
+        for (pointer, capacity) in entries {
+            if capacity > device_pool_max_buffer_bytes() || used > limit {
+                used = used.saturating_sub(capacity);
                 pointers_to_free.push(pointer);
             } else {
-                reusable.push(pointer);
+                reusable.push((pointer, capacity));
             }
         }
         if !reusable.is_empty() {
@@ -346,7 +398,8 @@ pub(super) fn recycle_completed_stage_buffers(device_id: i32, buffers: Vec<(usiz
     let Ok(mut pool) = pool.lock() else { return };
     let mut used = pool.bytes.get(&device_id).copied().unwrap_or(0);
     for (pointer, bytes) in buffers {
-        pool.buffers.entry((device_id, bytes)).or_default().push(pointer);
+        mem_trace("RS", device_id, bytes, pointer as *mut c_void);
+        pool.buffers.entry((device_id, pool_bucket_key(bytes))).or_default().push((pointer, bytes));
         used = used.saturating_add(bytes);
     }
     pool.bytes.insert(device_id, used);
@@ -361,7 +414,10 @@ pub(super) fn recycle_completed_stage_buffers(device_id: i32, buffers: Vec<(usiz
     let free_started = std::time::Instant::now();
     let free_start_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
     for pointer in pointers_to_free {
-        let _ = unsafe { free(pointer as *mut c_void) };
+        mem_trace("TRIM", device_id, 0, pointer as *mut c_void);
+        if !arena::release(device_id, pointer as *mut c_void) {
+            let _ = unsafe { free(pointer as *mut c_void) };
+        }
     }
     let free_micros = free_started.elapsed().as_micros();
     if free_micros >= 20_000 {
@@ -439,7 +495,10 @@ impl DeviceCompletion {
         recycle_completed_stage_buffers(self.device_id, std::mem::take(&mut *buffers));
     }
 
-    pub(crate) fn is_complete(&self) -> Result<bool, String> {
+    /// 只查询事件是否完成,不产生回收副作用。跨卡 stage completion 必须先轮询
+    /// 全部设备、齐 fire 后统一退休:owner 先 fire 时若立即回收,读取发生在
+    /// peer 流上的 P2P 源会被提前释放(DSA 分片使两流完成顺序反转后暴露为 IMA)。
+    pub(crate) fn query_fired(&self) -> Result<bool, String> {
         if self.retired.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(true);
         }
@@ -450,22 +509,14 @@ impl DeviceCompletion {
         let query_status = unsafe { query(self.event as HipEvent) };
         hip_api_stats::counted(hip_api_stats::EVENT_QUERY, stats_started);
         match query_status {
-            HIP_SUCCESS => {
-                self.recycle_p2p_sources();
-                self.finish_stage_inputs();
-                self.recycle_buffers();
-                // stage event 覆盖当前 submission stream 的所有临时 buffer，及时归还已完成 allocation，
-                // 避免取消整卡同步后 pending pool 只增不减。
-                promote_device_buffers(self.device_id);
-                self.retired.store(true, std::sync::atomic::Ordering::Release);
-                Ok(true)
-            }
+            HIP_SUCCESS => Ok(true),
             HIP_ERROR_NOT_READY => Ok(false),
             status => Err(runtime.hip_error(status, "hipEventQuery stage completion")),
         }
     }
 
-    pub(crate) fn wait(&self) -> Result<(), String> {
+    /// 只同步等待事件,不产生回收副作用;语义同 query_fired 的阻塞版。
+    pub(crate) fn wait_fired(&self) -> Result<(), String> {
         if self.retired.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
@@ -478,20 +529,41 @@ impl DeviceCompletion {
         if status != HIP_SUCCESS {
             return Err(runtime.hip_error(status, "hipEventSynchronize stage completion"));
         }
+        Ok(())
+    }
+
+    /// 幂等退休:确认事件已 fire(或被链序蕴含完成)后统一执行回收副作用。
+    pub(crate) fn retire_now(&self) {
+        if self.retired.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
         self.recycle_p2p_sources();
         self.finish_stage_inputs();
         self.recycle_buffers();
+        // stage event 覆盖当前 submission stream 的所有临时 buffer，及时归还已完成 allocation，
+        // 避免取消整卡同步后 pending pool 只增不减。
         promote_device_buffers(self.device_id);
-        self.retired.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn is_complete(&self) -> Result<bool, String> {
+        match self.query_fired()? {
+            true => {
+                self.retire_now();
+                Ok(true)
+            }
+            false => Ok(false),
+        }
+    }
+
+    pub(crate) fn wait(&self) -> Result<(), String> {
+        self.wait_fired()?;
+        self.retire_now();
         Ok(())
     }
 
     /// ordered 链尾 completion 已完成时，前序同一 stream 也必然完成。
     pub(crate) fn retire_ordered(&self) {
-        self.recycle_p2p_sources();
-        self.finish_stage_inputs();
-        self.recycle_buffers();
-        self.retired.store(true, std::sync::atomic::Ordering::Release);
+        self.retire_now();
     }
 }
 
@@ -557,54 +629,75 @@ fn take_device_buffer_bounded(device_id: i32, bytes: usize, max_capacity: usize)
 }
 
 pub(super) fn take_device_buffer_inner(device_id: i32, bytes: usize, max_capacity: usize) -> Option<(*mut c_void, usize)> {
+    fn take_from_bucket(entries: &mut Vec<(usize, usize)>, bytes: usize, max_capacity: usize) -> Option<(usize, usize)> {
+        let index = entries.iter().rposition(|&(_, capacity)| capacity >= bytes && capacity <= max_capacity)?;
+        Some(entries.swap_remove(index))
+    }
+    macro_rules! checkout {
+        ($pool:expr, $capacity:expr) => {{
+            let used = $pool.bytes.entry(device_id).or_default();
+            debug_assert!(*used >= $capacity, "HIP 池计账下溢: device={device_id} capacity={} used={used}", $capacity);
+            *used = used.saturating_sub($capacity);
+        }};
+    }
     let pool = device_buffer_pool(device_id)?;
     let mut pool = pool.lock().ok()?;
-    // 稳态 decode 反复取同一组精确尺寸；先精确命中再退到全表 best-fit 扫描。
-    if let Some(pointer) = pool.buffers.get_mut(&(device_id, bytes)).and_then(Vec::pop) {
-        let used = pool.bytes.entry(device_id).or_default();
-        debug_assert!(*used >= bytes, "HIP 池计账下溢: device={device_id} bytes={bytes} used={used}");
-        *used = used.saturating_sub(bytes);
-        if std::env::var("ZLLM_ROCM_POOL_TRACE").map_or(false, |value| value == "1") {
-            eprintln!("[pool-trace] T-exact dev={device_id} bytes={bytes} ptr={pointer:#x} thread={:?}", std::thread::current().id());
+    let trace = std::env::var("ZLLM_ROCM_POOL_TRACE").map_or(false, |value| value == "1");
+    // 1. 对齐桶（归并标称）：稳态 decode 反复取同一组尺寸；同桶块 capacity 可能
+    //    小于请求（归并区间），逐块检查。cache（max_capacity=bytes）在此实现
+    //    "只接精确块"语义：更大标称桶的过滤条件天然为空，不会误命中。
+    let bucket = pool_bucket_key(bytes);
+    if let Some(entries) = pool.buffers.get_mut(&(device_id, bucket))
+        && let Some((pointer, capacity)) = take_from_bucket(entries, bytes, max_capacity)
+    {
+        checkout!(pool, capacity);
+        if trace {
+            eprintln!("[pool-trace] T-exact dev={device_id} bytes={bytes} cap={capacity} ptr={pointer:#x} thread={:?}", std::thread::current().id());
         }
-        return Some((pointer as *mut c_void, bytes));
-    }
-    let key = pool.buffers.iter().filter(|(key, pointers)| key.0 == device_id && key.1 > bytes && key.1 <= max_capacity && !pointers.is_empty()).map(|(key, _)| *key).min_by_key(|&(_, capacity)| capacity);
-    if let Some(key @ (_, capacity)) = key {
-        let pointer = pool.buffers.get_mut(&key).and_then(Vec::pop).expect("best-fit key 已检查非空");
-        let used = pool.bytes.entry(device_id).or_default();
-        debug_assert!(*used >= capacity, "HIP 池计账下溢: device={device_id} capacity={capacity} used={used}");
-        *used = used.saturating_sub(capacity);
         return Some((pointer as *mut c_void, capacity));
     }
-
-    let mut pending_keys = pool.pending.keys().copied().filter(|&(buffer_device, capacity)| buffer_device == device_id && capacity >= bytes && capacity <= max_capacity).collect::<Vec<_>>();
-    pending_keys.sort_unstable_by_key(|&(_, capacity)| capacity);
+    // 2. best-fit：更大标称桶按标称升序，取首个有合格块的桶。
+    let mut keys = pool.buffers.keys().copied().filter(|&(device, nominal)| device == device_id && nominal > bucket && nominal <= max_capacity).collect::<Vec<_>>();
+    keys.sort_unstable_by_key(|&(_, nominal)| nominal);
+    for key in keys {
+        let found = {
+            let entries = pool.buffers.get_mut(&key).expect("best-fit key 来自当前 map");
+            take_from_bucket(entries, bytes, max_capacity)
+        };
+        if let Some((pointer, capacity)) = found {
+            checkout!(pool, capacity);
+            return Some((pointer as *mut c_void, capacity));
+        }
+    }
+    // 3. pending 晋升：标称下界粗筛 + 逐块 event 完成与 capacity 精查。上界不
+    //    过滤：cache（max_capacity=bytes）的精确块可能躺在更大标称桶里（归并
+    //    区间），由块级检查兜底；pending 桶数量有限，升序扫描代价可控。
+    let mut pending_keys = pool.pending.keys().copied().filter(|&(device, nominal)| device == device_id && nominal >= bucket).collect::<Vec<_>>();
+    pending_keys.sort_unstable_by_key(|&(_, nominal)| nominal);
     if pending_keys.is_empty() {
         return None;
     }
     let runtime = RocmRuntime::open().ok()?;
     let query = runtime.event_query().ok()?;
     let mut completed = None;
-    for key @ (_, capacity) in pending_keys {
+    for key in pending_keys {
         let found = {
             let pending = pool.pending.get_mut(&key).expect("pending key 来自当前 map");
-            pending.iter().rposition(|buffer| unsafe { query(buffer.event as HipEvent) } == HIP_SUCCESS).map(|index| (pending.swap_remove(index), pending.is_empty()))
+            pending.iter().rposition(|buffer| buffer.capacity >= bytes && buffer.capacity <= max_capacity && unsafe { query(buffer.event as HipEvent) } == HIP_SUCCESS).map(|index| (pending.swap_remove(index), pending.is_empty()))
         };
         if let Some((buffer, remove_key)) = found {
             if remove_key {
                 pool.pending.remove(&key);
             }
-            completed = Some((buffer, capacity));
+            completed = Some(buffer);
             break;
         }
     }
-    let (buffer, capacity) = completed?;
-    let used = pool.bytes.entry(device_id).or_default();
-    debug_assert!(*used >= capacity, "HIP 池计账下溢: device={device_id} capacity={capacity} used={used}");
-    *used = used.saturating_sub(capacity);
+    let buffer = completed?;
+    let capacity = buffer.capacity;
+    checkout!(pool, capacity);
     pool.available_events.push(buffer.event);
-    if std::env::var("ZLLM_ROCM_POOL_TRACE").map_or(false, |value| value == "1") {
+    if trace {
         eprintln!("[pool-trace] T-pending dev={device_id} bytes={capacity} ptr={:#x} thread={:?}", buffer.pointer, std::thread::current().id());
     }
     Some((buffer.pointer as *mut c_void, capacity))
@@ -643,8 +736,9 @@ pub(super) fn recycle_device_buffer(device_id: i32, pointer: *mut c_void, bytes:
         return false;
     };
     let used = pool.bytes.get(&device_id).copied().unwrap_or(0);
-    pool.pending.entry((device_id, bytes)).or_default().push(PendingDeviceBuffer { pointer: pointer as usize, event: event as usize });
+    pool.pending.entry((device_id, pool_bucket_key(bytes))).or_default().push(PendingDeviceBuffer { pointer: pointer as usize, capacity: bytes, event: event as usize });
     pool.bytes.insert(device_id, used.saturating_add(bytes));
+    mem_trace("R", device_id, bytes, pointer);
     if std::env::var("ZLLM_ROCM_POOL_TRACE").map_or(false, |value| value == "1") {
         eprintln!("[pool-trace] R dev={device_id} bytes={bytes} ptr={pointer:p} thread={:?} stream={:p}", std::thread::current().id(), crate::kernel::rocm::hip::active_compute_stream());
     }
@@ -652,6 +746,10 @@ pub(super) fn recycle_device_buffer(device_id: i32, pointer: *mut c_void, bytes:
 }
 
 pub(super) fn promote_device_buffers(device_id: i32) {
+    promote_device_buffers_inner(device_id, true);
+}
+
+fn promote_device_buffers_inner(device_id: i32, trim: bool) {
     if set_device(device_id).is_err() {
         return;
     }
@@ -667,7 +765,7 @@ pub(super) fn promote_device_buffers(device_id: i32) {
             let mut incomplete = Vec::new();
             for buffer in pending {
                 if unsafe { query(buffer.event as HipEvent) } == HIP_SUCCESS {
-                    pool.buffers.entry(key).or_default().push(buffer.pointer);
+                    pool.buffers.entry(key).or_default().push((buffer.pointer, buffer.capacity));
                     pool.available_events.push(buffer.event);
                 } else {
                     incomplete.push(buffer);
@@ -678,13 +776,20 @@ pub(super) fn promote_device_buffers(device_id: i32) {
             }
         }
 
+        // 容量查询只晋升完成的 event；真正退休/分配路径才执行可能同步整卡的 hipFree。
+        if !trim {
+            return;
+        }
         enforce_device_buffer_pool_limit(&mut pool, device_id)
     };
     let free_count = pointers_to_free.len();
     let free_started = std::time::Instant::now();
     let free_start_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
     for pointer in pointers_to_free {
-        let _ = unsafe { free(pointer as *mut c_void) };
+        mem_trace("TRIM", device_id, 0, pointer as *mut c_void);
+        if !arena::release(device_id, pointer as *mut c_void) {
+            let _ = unsafe { free(pointer as *mut c_void) };
+        }
     }
     let free_micros = free_started.elapsed().as_micros();
     if free_micros >= 20_000 {
@@ -693,9 +798,38 @@ pub(super) fn promote_device_buffers(device_id: i32) {
     }
 }
 
-/// 新 shape 在显存紧张时不能复用旧 shape；OOM 后只释放已经完成并进入
-/// available 池的 buffer，pending buffer 仍由各自 event 保护。
-pub(super) fn release_available_device_buffers(device_id: i32) -> usize {
+/// 优先回收少数大块 scratch，尽量保留小块 decode 缓冲；不触碰 pending event。
+fn take_available_buffers_for_release(pool: &mut DeviceBufferPool, device_id: i32, target_bytes: usize) -> (Vec<usize>, usize) {
+    let mut keys = pool.buffers.keys().copied().filter(|&(device, _)| device == device_id).collect::<Vec<_>>();
+    keys.sort_unstable_by_key(|&(_, nominal)| std::cmp::Reverse(nominal));
+    let mut pointers = Vec::new();
+    let mut released = 0usize;
+    for key in keys {
+        let buffers = pool.buffers.get_mut(&key).expect("key 来自当前 pool");
+        while released < target_bytes {
+            let Some((pointer, capacity)) = buffers.pop() else { break };
+            pointers.push(pointer);
+            released = released.saturating_add(capacity);
+        }
+        if buffers.is_empty() {
+            pool.buffers.remove(&key);
+        }
+        if released >= target_bytes {
+            break;
+        }
+    }
+    let remaining = pool.bytes.get(&device_id).copied().unwrap_or(0).saturating_sub(released);
+    if remaining == 0 {
+        pool.bytes.remove(&device_id);
+    } else {
+        pool.bytes.insert(device_id, remaining);
+    }
+    (pointers, released)
+}
+
+/// 新 shape 的首次 OOM 只回收本次申请所需空间，避免同步释放整个热池。
+/// 重试仍失败时由调用方同步并传入 MAX，保留原有完整回退能力。
+pub(super) fn release_available_device_buffers(device_id: i32, target_bytes: usize) -> usize {
     if set_device(device_id).is_err() {
         return 0;
     }
@@ -704,24 +838,13 @@ pub(super) fn release_available_device_buffers(device_id: i32) -> usize {
     let Ok(free) = runtime.free() else { return 0 };
     let (pointers, released) = {
         let Ok(mut pool) = pool.lock() else { return 0 };
-        let keys = pool.buffers.keys().copied().filter(|&(buffer_device, _)| buffer_device == device_id).collect::<Vec<_>>();
-        let mut pointers = Vec::new();
-        let mut released = 0usize;
-        for key @ (_, bytes) in keys {
-            let Some(buffers) = pool.buffers.remove(&key) else { continue };
-            released = released.saturating_add(bytes.saturating_mul(buffers.len()));
-            pointers.extend(buffers);
-        }
-        let remaining = pool.bytes.get(&device_id).copied().unwrap_or(0).saturating_sub(released);
-        if remaining == 0 {
-            pool.bytes.remove(&device_id);
-        } else {
-            pool.bytes.insert(device_id, remaining);
-        }
-        (pointers, released)
+        take_available_buffers_for_release(&mut pool, device_id, target_bytes)
     };
     for pointer in pointers {
-        let _ = unsafe { free(pointer as *mut c_void) };
+        mem_trace("TRIM", device_id, 0, pointer as *mut c_void);
+        if !arena::release(device_id, pointer as *mut c_void) {
+            let _ = unsafe { free(pointer as *mut c_void) };
+        }
     }
     released
 }
@@ -731,7 +854,12 @@ pub(super) fn explicit_device_pool_enabled(_reusable: bool) -> bool {
 }
 
 pub fn enable_device_buffer_reuse() {
-    DEVICE_BUFFER_REUSE.store(true, std::sync::atomic::Ordering::Release);
+    set_device_buffer_reuse(true);
+}
+
+/// 仅在旧执行器及其 workspace 全部释放后切换分配策略。
+pub fn set_device_buffer_reuse(enabled: bool) {
+    DEVICE_BUFFER_REUSE.store(enabled, std::sync::atomic::Ordering::Release);
 }
 
 /// 显式池只缓存已完成的临时 allocation；OOM 路径仍可全部驱逐，为 KV 等
@@ -755,7 +883,7 @@ pub(super) fn release_device_buffer_pool(device_id: i32) {
         let mut events = std::mem::take(&mut pool.available_events);
         pool.buffers.retain(|&(buffer_device, _), buffers| {
             if buffer_device == device_id {
-                pointers.extend(buffers.drain(..));
+                pointers.extend(buffers.drain(..).map(|(pointer, _)| pointer));
                 false
             } else {
                 true
@@ -785,7 +913,9 @@ pub(super) fn release_device_buffer_pool(device_id: i32) {
         }
     }
     for pointer in pointers {
-        let _ = unsafe { free(pointer as *mut c_void) };
+        if !arena::release(device_id, pointer as *mut c_void) {
+            let _ = unsafe { free(pointer as *mut c_void) };
+        }
     }
 }
 
@@ -794,13 +924,134 @@ pub(super) struct PinnedHostBuffer {
     bytes: usize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct HsaHandle {
+    handle: u64,
+}
+
+type HsaInfo = unsafe extern "C" fn(HsaHandle, u32, *mut c_void) -> u32;
+type HsaIterate = unsafe extern "C" fn(unsafe extern "C" fn(HsaHandle, *mut c_void) -> u32, *mut c_void) -> u32;
+type HsaLock = unsafe extern "C" fn(*mut c_void, usize, *const HsaHandle, i32, HsaHandle, u32, *mut *mut c_void) -> u32;
+type HsaUnlock = unsafe extern "C" fn(*mut c_void) -> u32;
+
+/// HIP 的 host register 会为所有可见 GPU 建映射；历史只由所属 GPU 读取。
+/// 保留 CPU fine-grained 语义，不能用默认 coarse-grained lock 替代。
+#[derive(Clone, Copy)]
+struct HostRegistrationTarget {
+    agent: HsaHandle,
+    pool: HsaHandle,
+    lock: HsaLock,
+    unlock: HsaUnlock,
+}
+
+fn host_registration_target(device_id: i32, runtime: &RocmRuntime) -> Result<Option<HostRegistrationTarget>, String> {
+    static TARGETS: OnceLock<Mutex<HashMap<i32, Option<HostRegistrationTarget>>>> = OnceLock::new();
+    let mut targets = TARGETS.get_or_init(|| Mutex::new(HashMap::new())).lock().map_err(|_| "host registration target 锁中毒")?;
+    if let Some(target) = targets.get(&device_id) {
+        return Ok(*target);
+    }
+    let discover = || -> Result<HostRegistrationTarget, String> {
+        // HSA 由 HIP 初始化并持有；符号来自常驻 HIP 的依赖，不另启停 runtime。
+        let status = unsafe { runtime.free()?(ptr::null_mut()) };
+        if status != HIP_SUCCESS {
+            return Err(runtime.hip_error(status, "初始化 host registration target"));
+        }
+        let iterate: Symbol<HsaIterate> = runtime.symbol(&runtime.hip, b"hsa_iterate_agents\0")?;
+        let info: Symbol<HsaInfo> = runtime.symbol(&runtime.hip, b"hsa_agent_get_info\0")?;
+        type Pools = unsafe extern "C" fn(HsaHandle, unsafe extern "C" fn(HsaHandle, *mut c_void) -> u32, *mut c_void) -> u32;
+        type Access = unsafe extern "C" fn(HsaHandle, HsaHandle, u32, *mut c_void) -> u32;
+        let pools: Symbol<Pools> = runtime.symbol(&runtime.hip, b"hsa_amd_agent_iterate_memory_pools\0")?;
+        let pool_info: Symbol<HsaInfo> = runtime.symbol(&runtime.hip, b"hsa_amd_memory_pool_get_info\0")?;
+        let access: Symbol<Access> = runtime.symbol(&runtime.hip, b"hsa_amd_agent_memory_pool_get_info\0")?;
+        type Pci = unsafe extern "C" fn(*mut std::ffi::c_char, i32, i32) -> HipError;
+        let pci: Symbol<Pci> = runtime.symbol(&runtime.hip, b"hipDeviceGetPCIBusId\0")?;
+        let mut bus_id = [0 as std::ffi::c_char; 64];
+        let status = unsafe { pci(bus_id.as_mut_ptr(), bus_id.len() as i32, device_id) };
+        if status != HIP_SUCCESS {
+            return Err(runtime.hip_error(status, "查询 host registration PCI"));
+        }
+        let pci = unsafe { std::ffi::CStr::from_ptr(bus_id.as_ptr()) }.to_str().map_err(|_| "GPU PCI 非 UTF-8")?;
+        let parts = pci.split([':', '.']).map(|part| u32::from_str_radix(part, 16)).collect::<Result<Vec<_>, _>>().map_err(|_| format!("GPU PCI 非法: {pci}"))?;
+        if parts.len() != 4 {
+            return Err(format!("GPU PCI 非法: {pci}"));
+        }
+        // ordinal 可被 HIP_VISIBLE_DEVICES 重排，必须按 PCI domain/BDF 唯一匹配。
+        let (domain, bdf) = (parts[0], (parts[1] << 8) | (parts[2] << 3) | parts[3]);
+        let mut agents = Vec::<HsaHandle>::new();
+        unsafe extern "C" fn collect(handle: HsaHandle, data: *mut c_void) -> u32 {
+            unsafe { &mut *data.cast::<Vec<HsaHandle>>() }.push(handle);
+            0
+        }
+        let status = unsafe { iterate(collect, (&mut agents as *mut Vec<HsaHandle>).cast()) };
+        if status != 0 {
+            return Err(format!("hsa_iterate_agents status={status}"));
+        }
+        let query = |call: HsaInfo, handle, attribute| -> Result<u32, String> {
+            let mut value = 0_u32;
+            let status = unsafe { call(handle, attribute, (&mut value as *mut u32).cast()) };
+            if status == 0 { Ok(value) } else { Err(format!("HSA info attribute={attribute} status={status}")) }
+        };
+        let mut matches = Vec::new();
+        let mut fine_pools = Vec::<HsaHandle>::new();
+        for agent in agents {
+            match query(*info, agent, 17)? {
+                // HSA_AGENT_INFO_DEVICE
+                0 => {
+                    let mut cpu_pools = Vec::<HsaHandle>::new();
+                    let status = unsafe { pools(agent, collect, (&mut cpu_pools as *mut Vec<HsaHandle>).cast()) };
+                    if status != 0 {
+                        return Err(format!("hsa_amd_agent_iterate_memory_pools status={status}"));
+                    }
+                    for pool in cpu_pools {
+                        // GLOBAL segment + FINE_GRAINED flag，保持主机和 GPU 读取一致性。
+                        if query(*pool_info, pool, 0)? == 0 && query(*pool_info, pool, 1)? & 2 != 0 {
+                            fine_pools.push(pool);
+                        }
+                    }
+                }
+                1 if query(*info, agent, 0xA00F)? == domain && query(*info, agent, 0xA006)? == bdf => matches.push(agent),
+                _ => {}
+            }
+        }
+        if matches.len() != 1 {
+            return Err(format!("GPU PCI={pci} HSA 匹配数量={}，期望 1", matches.len()));
+        }
+        let agent = matches[0];
+        for pool in fine_pools {
+            let mut allowed = 0_u32;
+            let status = unsafe { access(agent, pool, 0, (&mut allowed as *mut u32).cast()) };
+            if status != 0 {
+                return Err(format!("HSA pool access status={status}"));
+            }
+            if allowed == 0 {
+                continue;
+            } // NEVER_ALLOWED
+            let target = HostRegistrationTarget { agent, pool, lock: *runtime.symbol::<HsaLock>(&runtime.hip, b"hsa_amd_memory_lock_to_pool\0")?, unlock: *runtime.symbol::<HsaUnlock>(&runtime.hip, b"hsa_amd_memory_unlock\0")? };
+            eprintln!("[mla-host-registration] device={device_id} mode=hsa-one-fine pci={pci} agent={} pool={}", agent.handle, pool.handle);
+            return Ok(target);
+        }
+        Err(format!("GPU PCI={pci} 无可访问的 CPU fine-grained pool"))
+    };
+    let target = match discover() {
+        Ok(target) => Some(target),
+        Err(error) => {
+            eprintln!("[mla-host-registration] device={device_id} mode=hip-fallback reason={error}");
+            None
+        }
+    };
+    targets.insert(device_id, target);
+    Ok(target)
+}
+
 /// 借用稳定的 host allocation，只拥有注册生命周期，不拥有被注册的内存。
 /// 释放注册前排空设备读取；调用方必须让原 allocation 活得更久。
 pub(crate) struct RegisteredHostBuffer {
     device_id: i32,
-    host: *mut c_void,
+    registrations: Vec<(*mut c_void, usize)>,
     device: *mut c_void,
     bytes: usize,
+    hsa_unlock: Option<HsaUnlock>,
 }
 
 unsafe impl Send for RegisteredHostBuffer {}
@@ -813,6 +1064,18 @@ impl RegisteredHostBuffer {
     pub(crate) unsafe fn register(device_id: i32, pointer: *mut u8, bytes: usize) -> Result<Self, String> {
         set_device(device_id)?;
         let runtime = RocmRuntime::open()?;
+        if let Some(target) = host_registration_target(device_id, runtime)? {
+            let host = pointer.cast();
+            let mut device = ptr::null_mut();
+            let status = unsafe { (target.lock)(host, bytes, &target.agent, 1, target.pool, 0, &mut device) };
+            if status != 0 || device.is_null() {
+                if status == 0 {
+                    let _ = unsafe { (target.unlock)(host) };
+                }
+                return Err(format!("hsa_amd_memory_lock_to_pool KV history device={device_id} host={host:p} bytes={bytes} mapped={device:p} status={status}"));
+            }
+            return Ok(Self { device_id, registrations: vec![(host, bytes)], device, bytes, hsa_unlock: Some(target.unlock) });
+        }
         type Register = unsafe extern "C" fn(*mut c_void, usize, u32) -> HipError;
         type Unregister = unsafe extern "C" fn(*mut c_void) -> HipError;
         type DevicePointer = unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u32) -> HipError;
@@ -822,15 +1085,45 @@ impl RegisteredHostBuffer {
         let host = pointer.cast();
         let status = unsafe { register(host, bytes, 2) }; // hipHostRegisterMapped
         if status != HIP_SUCCESS {
-            return Err(runtime.hip_error(status, "hipHostRegister KV history"));
+            return Err(runtime.hip_error(status, &format!("hipHostRegister KV history device={device_id} host={host:p} bytes={bytes} status={status}")));
         }
         let mut device = ptr::null_mut();
         let status = unsafe { mapped(&mut device, host, 0) };
         if status != HIP_SUCCESS || device.is_null() {
             let _ = unsafe { unregister(host) };
-            return Err(runtime.hip_error(status, "hipHostGetDevicePointer KV history"));
+            return Err(runtime.hip_error(status, &format!("hipHostGetDevicePointer KV history device={device_id} host={host:p} bytes={bytes} mapped={device:p} status={status}")));
         }
-        Ok(Self { device_id, host, device, bytes })
+        Ok(Self { device_id, registrations: vec![(host, bytes)], device, bytes, hsa_unlock: None })
+    }
+
+    /// # Safety
+    /// 原 allocation 必须仍覆盖扩展后的 bytes，且满足 register 的稳定性约束。
+    /// 不同注册的设备地址未必连续；不能拼接时保留旧注册供调用方重建。
+    pub(crate) unsafe fn try_extend(&mut self, bytes: usize) -> Result<bool, String> {
+        if bytes <= self.bytes {
+            return Ok(true);
+        }
+        let host = (self.registrations[0].0 as usize).checked_add(self.bytes).ok_or("host 注册尾地址溢出")?;
+        let tail = unsafe { Self::register(self.device_id, host as *mut u8, bytes - self.bytes) }?;
+        Ok(self.join_tail(tail))
+    }
+
+    pub(crate) fn is_contiguous_tail(&self, tail: &Self) -> bool {
+        self.device_id == tail.device_id
+            && self.hsa_unlock.is_some() == tail.hsa_unlock.is_some()
+            && self.registrations.first().zip(tail.registrations.first()).is_some_and(|(&(host, _), &(next, _))| (host as usize).checked_add(self.bytes) == Some(next as usize))
+            && (self.device as usize).checked_add(self.bytes) == Some(tail.device as usize)
+            && self.bytes.checked_add(tail.bytes).is_some()
+    }
+
+    /// 接回后台完成的尾段；旧映射保持不动，空的 tail 析构不触发设备同步。
+    pub(crate) fn join_tail(&mut self, mut tail: Self) -> bool {
+        if !self.is_contiguous_tail(&tail) {
+            return false;
+        }
+        self.registrations.append(&mut tail.registrations);
+        self.bytes += tail.bytes;
+        true
     }
 
     pub(crate) fn device_pointer(&self) -> usize {
@@ -843,11 +1136,28 @@ impl RegisteredHostBuffer {
 
 impl Drop for RegisteredHostBuffer {
     fn drop(&mut self) {
+        if self.registrations.is_empty() {
+            return;
+        }
         let _ = synchronize_device(self.device_id, "registered host buffer release");
+        if let Some(unlock) = self.hsa_unlock {
+            for &(host, bytes) in self.registrations.iter().rev() {
+                let status = unsafe { unlock(host) };
+                if status != 0 {
+                    eprintln!("[mla-host-unregister-error] hsa_amd_memory_unlock KV history device={} host={host:p} bytes={bytes} status={status}", self.device_id);
+                }
+            }
+            return;
+        }
         if let Ok(runtime) = RocmRuntime::open() {
             type Unregister = unsafe extern "C" fn(*mut c_void) -> HipError;
             if let Ok(unregister) = runtime.symbol::<Unregister>(&runtime.hip, b"hipHostUnregister\0") {
-                let _ = unsafe { unregister(self.host) };
+                for &(host, bytes) in self.registrations.iter().rev() {
+                    let status = unsafe { unregister(host) };
+                    if status != HIP_SUCCESS {
+                        eprintln!("[mla-host-unregister-error] {}", runtime.hip_error(status, &format!("hipHostUnregister KV history device={} host={host:p} bytes={bytes} status={status}", self.device_id)));
+                    }
+                }
             }
         }
     }
@@ -858,7 +1168,7 @@ impl Drop for RegisteredHostBuffer {
 pub(crate) struct AsyncHostDownload {
     device_id: i32,
     event: HipEvent,
-    staging: PinnedHostBuffer,
+    staging: CachedPinnedHostBuffer,
     bytes: usize,
     pending: bool,
 }
@@ -876,7 +1186,7 @@ impl AsyncHostDownload {
         if status != HIP_SUCCESS {
             return Err(runtime.hip_error(status, "hipEventCreateWithFlags async D2H"));
         }
-        match PinnedHostBuffer::allocate(bytes.max(1)) {
+        match CachedPinnedHostBuffer::allocate(bytes.max(1)) {
             Ok(staging) => Ok(Self { device_id, event, staging, bytes: 0, pending: false }),
             Err(error) => {
                 let _ = unsafe { destroy(event) };
@@ -899,7 +1209,7 @@ impl AsyncHostDownload {
             return Err(format!("small async D2H 状态非法: pending={} device={}/{} bytes={bytes}/{}", self.pending, self.device_id, source.device_id, source.bytes));
         }
         if bytes > self.staging.bytes {
-            self.staging = PinnedHostBuffer::allocate(bytes)?;
+            self.staging = CachedPinnedHostBuffer::allocate(bytes)?;
         }
         set_device(self.device_id)?;
         let runtime = RocmRuntime::open()?;
@@ -949,7 +1259,9 @@ impl AsyncHostDownload {
             bytes = bytes.checked_add(length).ok_or("async D2H segments 大小溢出")?;
         }
         if bytes > self.staging.bytes {
-            self.staging = PinnedHostBuffer::allocate(bytes)?;
+            // 上一份 D2H 已完成，旧槽可以复用；hipHostFree 会等待同卡其它
+            // stream，把大块 append 的缓冲扩容变成 decode 的全卡同步。
+            self.staging = CachedPinnedHostBuffer::allocate(bytes)?;
         }
         set_device(self.device_id)?;
         let runtime = RocmRuntime::open()?;
@@ -962,6 +1274,10 @@ impl AsyncHostDownload {
             let status = unsafe { copy(self.staging.pointer.cast::<u8>().add(destination_offset).cast(), source.pointer.cast::<u8>().add(source_offset).cast(), length, HIP_MEMORY_COPY_DEVICE_TO_HOST, stream) };
             hip_api_stats::counted(hip_api_stats::MEMCPY_ASYNC, stats_started);
             if status != HIP_SUCCESS {
+                // 前面的片段可能已入队，归还 staging 前必须等它们停止写入。
+                if let Ok(synchronize) = runtime.stream_synchronize() {
+                    let _ = unsafe { synchronize(stream) };
+                }
                 return Err(runtime.hip_error(status, "hipMemcpyAsync segmented D2H"));
             }
             destination_offset += length;
@@ -1108,8 +1424,8 @@ impl Drop for AsyncHostUpload {
     }
 }
 
-/// 双机边界的小块 pinned host cache。槽与 device buffer 一起被 stage
-/// completion 持有；Drop 只归还本进程 cache，不调用 hipHostFree。
+/// pinned host 槽由传输 event 或 stage completion 保持到设备访问结束；
+/// Drop 只归还本进程 cache，避免扩容和会话回收时同步 hipHostFree。
 struct CachedPinnedHostBuffer {
     pointer: *mut c_void,
     bytes: usize,
@@ -1462,28 +1778,47 @@ impl DeviceBuffer {
         };
         set_device(device_id)?;
         let explicit_pool = force_explicit_pool || explicit_device_pool_enabled(reusable);
+        let make_buffer = |pointer: *mut c_void, capacity_bytes: usize, recyclable: bool| Self {
+            device_id,
+            pointer,
+            bytes,
+            capacity_bytes,
+            recyclable,
+            retain_until_stage_completion: false,
+            stage_completion_ready: std::sync::atomic::AtomicBool::new(false),
+            deferred_host: None,
+            deferred_upload_enqueued: std::sync::atomic::AtomicBool::new(false),
+            async_allocated: false,
+            owner: None,
+        };
         if explicit_pool {
-            if let Some((pointer, capacity_bytes)) = take_device_buffer_bounded(device_id, bytes, max_reuse_capacity) {
-                log_slow_request("explicit-pool-hit");
-                return Ok(Self {
-                    device_id,
-                    pointer,
-                    bytes,
-                    capacity_bytes,
-                    recyclable: explicit_pool,
-                    retain_until_stage_completion: false,
-                    stage_completion_ready: std::sync::atomic::AtomicBool::new(false),
-                    deferred_host: None,
-                    deferred_upload_enqueued: std::sync::atomic::AtomicBool::new(false),
-                    async_allocated: false,
-                    owner: None,
-                });
+            // 大块（>单块上限）不进 L1 也不进 arena，直接非池化驱动分配：
+            // H3/DiT 的 churn 集中在中小块（实测 ≤63 MiB），大块是稳定 per-layer
+            // 尺寸，交给驱动异步池（≤2 GiB，自管复用/trim/抗碎片）比钉 arena VA
+            // 更稳——2026-09-14 H3 15s 1MP U8 曾被大块 L1/arena 占用勒爆 48G 卡。
+            // 需要大块 L1 精确复用的负载（VAE 1.35 GiB 相位 cache）显式调大上限。
+            if !reusable || bytes <= device_pool_max_buffer_bytes() {
+                if let Some((pointer, capacity_bytes)) = take_device_buffer_bounded(device_id, bytes, max_reuse_capacity) {
+                    log_slow_request("explicit-pool-hit");
+                    return Ok(make_buffer(pointer, capacity_bytes, explicit_pool));
+                }
+                // L1 精确桶 miss → L2 arena 供给（仅 reusable 中小块；cache 永久块
+                // 直走驱动，不钉 arena VA）。arena 关闭/段满时回退下方驱动分配。
+                if reusable && let Some((pointer, capacity_bytes)) = arena::allocate(device_id, bytes) {
+                    log_slow_request("arena");
+                    return Ok(make_buffer(pointer, capacity_bytes, explicit_pool));
+                }
             }
         }
         let runtime = RocmRuntime::open()?;
         // 超大 activation 在 ROCm 默认异步池中容易形成无法及时 trim 的碎片；层边界用同步释放保证复用空间。
+        // 显式池 miss（ramp 尖峰/arena 满）同样先落异步池：驱动池可 trim、
+        // 抗物理碎片；裸 hipMalloc 回退只在 >2GiB 或异步池失败时使用。
+        // 2026-09-14 H3 15s 1MP U8：裸 hipMalloc 回退反复碎片化导致 block 0-5 OOM。
+        // force_explicit_pool（P2P peer/稳定化目标）例外：stream-ordered 分配
+        // 不能作为 peer 读写端，必须保持稳定分配语义。
         let async_max_bytes = std::env::var("ZLLM_ROCM_ASYNC_POOL_OFF").map_or(DEVICE_ASYNC_MAX_BUFFER_BYTES, |value| if value == "1" { 0 } else { DEVICE_ASYNC_MAX_BUFFER_BYTES });
-        if !explicit_pool && bytes <= async_max_bytes {
+        if !force_explicit_pool && bytes <= async_max_bytes {
             if let Ok(malloc_async) = runtime.malloc_async() {
                 let mut pointer = ptr::null_mut();
                 let stats_started = hip_api_stats::start();
@@ -1491,6 +1826,7 @@ impl DeviceBuffer {
                 hip_api_stats::counted(hip_api_stats::MALLOC_ASYNC, stats_started);
                 if status == HIP_SUCCESS {
                     log_slow_request("hipMallocAsync");
+                    mem_trace("A-async", device_id, bytes, pointer);
                     return Ok(Self {
                         device_id,
                         pointer,
@@ -1530,8 +1866,8 @@ impl DeviceBuffer {
             // 精确 shape 池无法满足放大的 prefill microbatch 时，先回收已完成的
             // 旧 shape，再清理默认异步池后重试。只有这条无同步慢路径仍然 OOM
             // 时才等待设备，把 pending 和当前 stage 已完成的 buffer 一并释放。
-            promote_device_buffers(device_id);
-            let mut released = release_available_device_buffers(device_id);
+            promote_device_buffers_inner(device_id, false);
+            let mut released = release_available_device_buffers(device_id, bytes);
             let _ = trim_device_memory_pool(device_id);
             pointer = ptr::null_mut();
             status = unsafe { malloc(&mut pointer, bytes) };
@@ -1541,7 +1877,7 @@ impl DeviceBuffer {
                 // 同步后逐 buffer event 也已完成；先晋升 pending，否则下面只能
                 // 释放 available，4 GiB 软池会被误当成不可回收显存。
                 promote_device_buffers(device_id);
-                released = released.saturating_add(release_available_device_buffers(device_id));
+                released = released.saturating_add(release_available_device_buffers(device_id, usize::MAX));
                 let _ = trim_device_memory_pool(device_id);
                 pointer = ptr::null_mut();
                 status = unsafe { malloc(&mut pointer, bytes) };
@@ -1553,6 +1889,7 @@ impl DeviceBuffer {
             return Err(format!("{} (申请 {} bytes)", runtime.hip_error(status, "hipMalloc device buffer"), bytes));
         }
         log_slow_request("hipMalloc");
+        mem_trace("A-malloc", device_id, bytes, pointer);
         Ok(Self {
             device_id,
             pointer,
@@ -1580,7 +1917,15 @@ impl DeviceBuffer {
             let synchronize = runtime.stream_synchronize()?;
             let status = unsafe { copy(self.pointer, input.as_ptr().cast(), input.len(), HIP_MEMORY_COPY_HOST_TO_DEVICE, stream) };
             if status != HIP_SUCCESS {
-                return Err(runtime.hip_error(status, "hipMemcpyAsync input H2D"));
+                return Err(format!(
+                    "{} (dst={:p} dev={} len={} stream={stream:p} async_alloc={} recyclable={})",
+                    runtime.hip_error(status, "hipMemcpyAsync input H2D"),
+                    self.pointer,
+                    self.device_id,
+                    input.len(),
+                    self.async_allocated,
+                    self.recyclable
+                ));
             }
             let status = unsafe { synchronize(stream) };
             if status != HIP_SUCCESS {
@@ -1913,7 +2258,7 @@ impl DeviceBuffer {
             super::device_profile_operator(device_id, "handoff_copy")?;
             // W7900D 的 hipMemcpyPeerAsync copy-engine 路径会在连续多层提交时退化；
             // peer access 已启用，改用目标卡上的 float4 拷贝 kernel 经 PCIe BAR
-            // 直读源卡显存。完整 19-step 实测为 154.316s，对照全 DMA
+            // 直读源卡显存。已验证的 8 卡主机完整 19-step 为 154.316s，对照全 DMA
             // 201.295s、仅大块 DMA 181.090s。
             if synchronize_source_event {
                 let status = unsafe { copy_ready(output.pointer, device_id, self.pointer, self.device_id, self.bytes) };
@@ -1953,11 +2298,24 @@ impl DeviceBuffer {
     /// route ids、route weights 与 activation 共享同一 producer 边界，逐个
     /// 建 event 既增加 host/API 开销，也容易在切卡后误取 stream。
     pub(crate) fn copy_stable_group_to_device_ordered_async_retained_by(sources: &[std::sync::Arc<Self>], device_id: i32, completion_device_id: i32) -> Result<Vec<Self>, String> {
+        let bytes = sources.iter().map(|source| source.bytes).collect::<Vec<_>>();
+        Self::copy_stable_prefix_group_to_device_ordered_async_retained_by(sources, &bytes, device_id, completion_device_id)
+    }
+
+    /// 与整组 ordered P2P 相同，但只复制每个 cache 的有效 prefix。
+    pub(crate) fn copy_stable_prefix_group_to_device_ordered_async_retained_by(
+        sources: &[std::sync::Arc<Self>],
+        bytes: &[usize],
+        device_id: i32,
+        completion_device_id: i32,
+    ) -> Result<Vec<Self>, String> {
         let source_device_id = sources.first().ok_or("ordered P2P buffer 组不能为空")?.device_id;
-        if sources.iter().any(|source| source.device_id != source_device_id || source.async_allocated) {
-            return Err("ordered P2P buffer 组必须来自同一 device 的显式 allocation".to_owned());
+        if sources.len() != bytes.len()
+            || sources.iter().zip(bytes).any(|(source, bytes)| source.device_id != source_device_id || source.async_allocated || *bytes == 0 || *bytes > source.bytes)
+        {
+            return Err("ordered P2P prefix 组的 device、allocation 或范围非法".to_owned());
         }
-        let outputs = sources.iter().map(|source| Self::allocate_peer(device_id, source.bytes)).collect::<Result<Vec<_>, _>>()?;
+        let outputs = bytes.iter().map(|bytes| Self::allocate_peer(device_id, *bytes)).collect::<Result<Vec<_>, _>>()?;
         let runtime = RocmRuntime::open()?;
         enable_peer_access(device_id, source_device_id)?;
         let create: Symbol<HipEventCreateWithFlags> = runtime.symbol(&runtime.hip, b"hipEventCreateWithFlags\0")?;
@@ -1986,13 +2344,13 @@ impl DeviceBuffer {
                 return Err(runtime.hip_error(status, "hipStreamWaitEvent grouped ordered P2P destination"));
             }
             super::device_profile_operator(device_id, "handoff_copy")?;
-            for (source, output) in sources.iter().zip(&outputs) {
-                if source.bytes % 16 == 0 && crate::kernel::rocm::hip::active_compute_stream() == destination_stream {
-                    super::peer_copy::try_peer_copy_kernel_ordered(device_id, output.pointer, source.pointer, source.bytes)?;
+            for ((source, output), bytes) in sources.iter().zip(&outputs).zip(bytes) {
+                if bytes.is_multiple_of(16) && crate::kernel::rocm::hip::active_compute_stream() == destination_stream {
+                    super::peer_copy::try_peer_copy_kernel_ordered(device_id, output.pointer, source.pointer, *bytes)?;
                 } else {
-                    let status = unsafe { copy(output.pointer, device_id, source.pointer, source_device_id, source.bytes, destination_stream) };
+                    let status = unsafe { copy(output.pointer, device_id, source.pointer, source_device_id, *bytes, destination_stream) };
                     if status != HIP_SUCCESS {
-                        return Err(format!("{}: source_device={source_device_id} destination_device={device_id} bytes={}", runtime.hip_error(status, "hipMemcpyPeerAsync grouped ordered P2P"), source.bytes));
+                        return Err(format!("{}: source_device={source_device_id} destination_device={device_id} bytes={bytes}", runtime.hip_error(status, "hipMemcpyPeerAsync grouped ordered P2P")));
                     }
                 }
             }
@@ -2094,17 +2452,159 @@ impl DeviceBuffer {
             });
             Ok(())
         })();
-        if result.is_err() {
+        if let Err(error) = result {
+            // 第一向可能已经入队，第二向才失败；源引用和本地输出都要等两流完成才能回收。
+            let mut drain_errors = Vec::new();
+            for (device_id, stream) in [(left_device_id, left_stream), (right_device_id, right_stream)] {
+                let drained = set_device(device_id).and_then(|()| {
+                    let synchronize = runtime.stream_synchronize()?;
+                    let status = unsafe { synchronize(stream) };
+                    if status == HIP_SUCCESS { Ok(()) } else { Err(runtime.hip_error(status, "hipStreamSynchronize failed bidirectional P2P")) }
+                });
+                if let Err(error) = drained {
+                    drain_errors.push(format!("device={device_id} stream={stream:p}: {error}"));
+                }
+            }
+            if !drain_errors.is_empty() {
+                // 无法证明 peer 读写完成时，连同 ready event 保留双方 allocation，避免池提前复用。
+                for source in left.iter().chain(right) {
+                    std::mem::forget(std::sync::Arc::clone(source));
+                }
+                std::mem::forget(left_on_right);
+                std::mem::forget(right_on_left);
+                return Err(format!("{error}; 双向 P2P 恢复等待失败，保留源/目标 allocation 和 event: {}", drain_errors.join("; ")));
+            }
             for (device_id, event) in [(left_device_id, left_event), (right_device_id, right_event)] {
                 let _ = set_device(device_id).and_then(|()| {
                     let status = unsafe { destroy(event) };
                     if status == HIP_SUCCESS { Ok(()) } else { Err(runtime.hip_error(status, "hipEventDestroy bidirectional ordered P2P")) }
                 });
             }
+            return Err(error);
         }
-        result?;
         set_device(completion_device_id)?;
         Ok((left_on_right, right_on_left))
+    }
+
+    /// 双向 source shard 直接写入对端最终行布局的列区。ready event 与普通
+    /// 双向 exchange 相同，但不分配连续 P2P 副本，也不需要后续 concat。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn exchange_stable_columns_into_ordered_async_retained_by(
+        left: &std::sync::Arc<Self>,
+        left_target: &std::sync::Arc<Self>,
+        left_rows: usize,
+        left_columns: usize,
+        left_target_column_start: usize,
+        right: &std::sync::Arc<Self>,
+        right_target: &std::sync::Arc<Self>,
+        right_rows: usize,
+        right_columns: usize,
+        right_target_column_start: usize,
+        target_columns: usize,
+        completion_device_id: i32,
+    ) -> Result<(), String> {
+        let left_device_id = left.device_id;
+        let right_device_id = right.device_id;
+        let bytes = |rows: usize, columns: usize| rows.checked_mul(columns).and_then(|elements| elements.checked_mul(4));
+        if left_device_id == right_device_id
+            || left.async_allocated
+            || right.async_allocated
+            || left_target.device_id != right_device_id
+            || right_target.device_id != left_device_id
+            || bytes(left_rows, left_columns) != Some(left.bytes)
+            || bytes(right_rows, right_columns) != Some(right.bytes)
+            || bytes(left_rows, target_columns).is_none_or(|required| left_target.bytes < required)
+            || bytes(right_rows, target_columns).is_none_or(|required| right_target.bytes < required)
+            || left_target_column_start.checked_add(left_columns).is_none_or(|end| end > target_columns)
+            || right_target_column_start.checked_add(right_columns).is_none_or(|end| end > target_columns)
+        {
+            return Err("ordered P2P column exchange shape/device 非法".to_owned());
+        }
+        let runtime = RocmRuntime::open()?;
+        enable_peer_access(right_device_id, left_device_id)?;
+        enable_peer_access(left_device_id, right_device_id)?;
+        let create: Symbol<HipEventCreateWithFlags> = runtime.symbol(&runtime.hip, b"hipEventCreateWithFlags\0")?;
+        let record: Symbol<HipEventRecord> = runtime.symbol(&runtime.hip, b"hipEventRecord\0")?;
+        let wait: Symbol<HipStreamWaitEvent> = runtime.symbol(&runtime.hip, b"hipStreamWaitEvent\0")?;
+        let destroy: Symbol<HipEventDestroy> = runtime.symbol(&runtime.hip, b"hipEventDestroy\0")?;
+        let left_stream = compute_stream_for(left_device_id);
+        let right_stream = compute_stream_for(right_device_id);
+        let mut left_event = device_buffer_pool(left_device_id).and_then(|pool| pool.lock().ok()?.available_events.pop()).map(|event| event as HipEvent).unwrap_or(ptr::null_mut());
+        let create_event = |device_id: i32, event: &mut HipEvent| -> Result<(), String> {
+            set_device(device_id)?;
+            if event.is_null() {
+                let status = unsafe { create(event, HIP_EVENT_DISABLE_TIMING) };
+                if status != HIP_SUCCESS {
+                    return Err(runtime.hip_error(status, "hipEventCreateWithFlags column exchange"));
+                }
+            }
+            Ok(())
+        };
+        create_event(left_device_id, &mut left_event)?;
+        let mut right_event = device_buffer_pool(right_device_id).and_then(|pool| pool.lock().ok()?.available_events.pop()).map(|event| event as HipEvent).unwrap_or(ptr::null_mut());
+        if let Err(error) = create_event(right_device_id, &mut right_event) {
+            set_device(left_device_id)?;
+            let _ = unsafe { destroy(left_event) };
+            return Err(error);
+        }
+        let result = (|| {
+            set_device(left_device_id)?;
+            let status = unsafe { record(left_event, left_stream) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventRecord column exchange left"));
+            }
+            set_device(right_device_id)?;
+            let status = unsafe { record(right_event, right_stream) };
+            if status != HIP_SUCCESS {
+                return Err(runtime.hip_error(status, "hipEventRecord column exchange right"));
+            }
+            let copy = |source: &Self, target: &Self, rows, columns, column_start, device_id, stream, event| -> Result<(), String> {
+                set_device(device_id)?;
+                let status = unsafe { wait(stream, event, 0) };
+                if status != HIP_SUCCESS {
+                    return Err(runtime.hip_error(status, "hipStreamWaitEvent column exchange"));
+                }
+                super::device_profile_operator(device_id, "handoff_copy")?;
+                super::tensor::try_copy_columns_into_pointer_ordered_f32(device_id, source.pointer, target.pointer, rows, columns, target_columns, column_start)
+            };
+            copy(left, left_target, left_rows, left_columns, left_target_column_start, right_device_id, right_stream, left_event)?;
+            copy(right, right_target, right_rows, right_columns, right_target_column_start, left_device_id, left_stream, right_event)?;
+            PENDING_P2P_SOURCES.with(|pending| {
+                let mut pending = pending.borrow_mut();
+                let entries = pending.entry(completion_device_id).or_default();
+                entries.push(PendingP2pSource { sources: vec![left.clone()], event: left_event as usize });
+                entries.push(PendingP2pSource { sources: vec![right.clone()], event: right_event as usize });
+            });
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let mut drain_errors = Vec::new();
+            for (device_id, stream) in [(left_device_id, left_stream), (right_device_id, right_stream)] {
+                let drained = set_device(device_id).and_then(|()| {
+                    let synchronize = runtime.stream_synchronize()?;
+                    let status = unsafe { synchronize(stream) };
+                    if status == HIP_SUCCESS { Ok(()) } else { Err(runtime.hip_error(status, "hipStreamSynchronize failed column exchange")) }
+                });
+                if let Err(error) = drained {
+                    drain_errors.push(format!("device={device_id} stream={stream:p}: {error}"));
+                }
+            }
+            if !drain_errors.is_empty() {
+                // 无法证明 peer 读写完成时保留 allocation 与 event，避免池提前复用。
+                for buffer in [left, right, left_target, right_target] {
+                    std::mem::forget(buffer.clone());
+                }
+                return Err(format!("{error}; 双向列写恢复等待失败，保留源/目标 allocation 和 event: {}", drain_errors.join("; ")));
+            }
+            for (device_id, event) in [(left_device_id, left_event), (right_device_id, right_event)] {
+                let _ = set_device(device_id).and_then(|()| {
+                    let status = unsafe { destroy(event) };
+                    if status == HIP_SUCCESS { Ok(()) } else { Err(runtime.hip_error(status, "hipEventDestroy column exchange")) }
+                });
+            }
+            return Err(error);
+        }
+        set_device(completion_device_id)
     }
 
     /// 两张卡各自直接读取对端 stable partial，并在本卡一次完成
@@ -2214,12 +2714,32 @@ impl DeviceBuffer {
     /// pair-native cache 用它把增量落到 peer cache offset，省掉临时 P2P
     /// allocation 与随后一次同卡 D2D。
     pub(crate) fn copy_stable_group_into_device_ordered_async_retained_by(sources: &[std::sync::Arc<Self>], destinations: &[(&Self, usize)], device_id: i32, completion_device_id: i32) -> Result<(), String> {
+        let source_offsets = vec![0; sources.len()];
+        let bytes = sources.iter().map(|source| source.bytes).collect::<Vec<_>>();
+        Self::copy_stable_ranges_into_device_ordered_async_retained_by(sources, &source_offsets, destinations, &bytes, device_id, completion_device_id)
+    }
+
+    /// 只把稳定来源的指定区间写入固定目标地址。追加型 peer cache 用它保留
+    /// 已镜像的 prefix，每轮只跨 PCIe 搬新增行。
+    pub(crate) fn copy_stable_ranges_into_device_ordered_async_retained_by(
+        sources: &[std::sync::Arc<Self>],
+        source_offsets: &[usize],
+        destinations: &[(&Self, usize)],
+        bytes: &[usize],
+        device_id: i32,
+        completion_device_id: i32,
+    ) -> Result<(), String> {
         let source_device_id = sources.first().ok_or("ordered P2P buffer 组不能为空")?.device_id;
-        if sources.len() != destinations.len()
+        if sources.len() != source_offsets.len() || sources.len() != destinations.len() || sources.len() != bytes.len()
             || sources.iter().any(|source| source.device_id != source_device_id || source.async_allocated)
-            || destinations.iter().zip(sources).any(|((destination, offset), source)| destination.device_id != device_id || offset.checked_add(source.bytes).is_none_or(|end| end > destination.bytes))
+            || sources.iter().zip(source_offsets).zip(destinations).zip(bytes).any(|(((source, source_offset), (destination, destination_offset)), bytes)| {
+                *bytes == 0
+                    || source_offset.checked_add(*bytes).is_none_or(|end| end > source.bytes)
+                    || destination.device_id != device_id
+                    || destination_offset.checked_add(*bytes).is_none_or(|end| end > destination.bytes)
+            })
         {
-            return Err("ordered P2P buffer 组来源或固定目标非法".to_owned());
+            return Err("ordered P2P buffer 组来源、范围或固定目标非法".to_owned());
         }
         let runtime = RocmRuntime::open()?;
         enable_peer_access(device_id, source_device_id)?;
@@ -2250,23 +2770,26 @@ impl DeviceBuffer {
             }
             super::device_profile_operator(device_id, "handoff_copy")?;
             let copy3 = sources.len() == 3
-                && sources.iter().all(|source| source.bytes.is_multiple_of(16) && source.bytes <= 4096)
-                && sources.iter().map(|source| source.bytes).sum::<usize>() <= 4096
-                && sources.iter().zip(destinations).all(|(source, (destination, offset))| (source.pointer as usize).is_multiple_of(16) && (destination.pointer as usize + offset).is_multiple_of(16))
+                && bytes.iter().all(|bytes| bytes.is_multiple_of(16) && *bytes <= 4096)
+                && bytes.iter().sum::<usize>() <= 4096
+                && sources.iter().zip(source_offsets).zip(destinations).all(|((source, source_offset), (destination, destination_offset))| {
+                    (source.pointer as usize + source_offset).is_multiple_of(16) && (destination.pointer as usize + destination_offset).is_multiple_of(16)
+                })
                 && crate::kernel::rocm::hip::active_compute_stream() == destination_stream;
             if copy3 {
-                let source_pointers = std::array::from_fn(|index| sources[index].pointer);
+                let source_pointers = std::array::from_fn(|index| unsafe { sources[index].pointer.cast::<u8>().add(source_offsets[index]).cast() });
                 let destination_pointers = std::array::from_fn(|index| unsafe { destinations[index].0.pointer.cast::<u8>().add(destinations[index].1).cast() });
-                super::peer_copy::try_peer_copy3_kernel_ordered(device_id, source_pointers, destination_pointers, std::array::from_fn(|index| sources[index].bytes))?;
+                super::peer_copy::try_peer_copy3_kernel_ordered(device_id, source_pointers, destination_pointers, std::array::from_fn(|index| bytes[index]))?;
             } else {
-                for (source, (destination, offset)) in sources.iter().zip(destinations) {
-                    let destination_pointer = unsafe { destination.pointer.cast::<u8>().add(*offset).cast() };
-                    if source.bytes % 16 == 0 && (source.pointer as usize).is_multiple_of(16) && (destination_pointer as usize).is_multiple_of(16) && crate::kernel::rocm::hip::active_compute_stream() == destination_stream {
-                        super::peer_copy::try_peer_copy_kernel_ordered(device_id, destination_pointer, source.pointer, source.bytes)?;
+                for (((source, source_offset), (destination, destination_offset)), bytes) in sources.iter().zip(source_offsets).zip(destinations).zip(bytes) {
+                    let source_pointer = unsafe { source.pointer.cast::<u8>().add(*source_offset).cast() };
+                    let destination_pointer = unsafe { destination.pointer.cast::<u8>().add(*destination_offset).cast() };
+                    if bytes.is_multiple_of(16) && (source_pointer as usize).is_multiple_of(16) && (destination_pointer as usize).is_multiple_of(16) && crate::kernel::rocm::hip::active_compute_stream() == destination_stream {
+                        super::peer_copy::try_peer_copy_kernel_ordered(device_id, destination_pointer, source_pointer, *bytes)?;
                     } else {
-                        let status = unsafe { copy(destination_pointer, device_id, source.pointer, source_device_id, source.bytes, destination_stream) };
+                        let status = unsafe { copy(destination_pointer, device_id, source_pointer, source_device_id, *bytes, destination_stream) };
                         if status != HIP_SUCCESS {
-                            return Err(format!("{}: source_device={source_device_id} destination_device={device_id} bytes={}", runtime.hip_error(status, "hipMemcpyPeerAsync grouped ordered P2P"), source.bytes));
+                            return Err(format!("{}: source_device={source_device_id} destination_device={device_id} bytes={bytes}", runtime.hip_error(status, "hipMemcpyPeerAsync grouped ordered P2P")));
                         }
                     }
                 }
@@ -2397,6 +2920,13 @@ impl DeviceBuffer {
         self.bytes
     }
 
+    pub(crate) fn copy_columns_into_ordered_f32(&self, target: &Self, rows: usize, input_columns: usize, output_columns: usize, output_column_start: usize) -> Result<(), String> {
+        if self.device_id != target.device_id {
+            return Err(format!("copy columns source device={} target device={} 不一致", self.device_id, target.device_id));
+        }
+        super::tensor::try_copy_columns_into_pointer_ordered_f32(self.device_id, self.pointer, target.pointer, rows, input_columns, output_columns, output_column_start)
+    }
+
     /// 底层 pointer 的真实 allocation 大小；显存归属统计不能用逻辑 view/请求大小。
     pub(crate) fn allocation_bytes(&self) -> usize {
         self.owner.as_ref().map_or(self.capacity_bytes, |owner| owner.capacity_bytes)
@@ -2510,6 +3040,14 @@ impl DeviceBuffer {
         self.copy_to_host(unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast(), bytes) })?;
         Ok(output)
     }
+
+    /// selection buffer(压缩行索引)下载;V4.1 跨层 selection 复用走 host 中转。
+    pub fn download_u32(&self, elements: usize) -> Result<Vec<u32>, String> {
+        let bytes = elements.checked_mul(std::mem::size_of::<u32>()).ok_or("ROCm selection 下载大小溢出")?;
+        let mut output = vec![0_u32; elements];
+        self.copy_to_host(unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast(), bytes) })?;
+        Ok(output)
+    }
 }
 
 impl Drop for DeviceBuffer {
@@ -2521,31 +3059,53 @@ impl Drop for DeviceBuffer {
             return;
         }
         if self.async_allocated {
-            if let Ok(runtime) = RocmRuntime::open() {
-                if let Ok(free) = runtime.free_async() {
+            let runtime = match RocmRuntime::open() {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("[rocm-memory] async buffer device={} bytes={} 无法确认释放顺序，保留指针: {error}", self.device_id, self.bytes);
+                    return;
+                }
+            };
+            let stream = crate::kernel::rocm::hip::active_compute_stream();
+            let free_error = match runtime.free_async() {
+                Ok(free) => {
                     let stats_started = hip_api_stats::start();
-                    let status = unsafe { free(self.pointer, crate::kernel::rocm::hip::active_compute_stream()) };
+                    let status = unsafe { free(self.pointer, stream) };
                     hip_api_stats::counted(hip_api_stats::FREE_ASYNC, stats_started);
                     if status == HIP_SUCCESS {
+                        mem_trace("FA", self.device_id, self.bytes, self.pointer);
                         return;
                     }
-                    if options().log_memory {
-                        eprintln!("[rocm-memory] hipFreeAsync device={} bytes={} status={}，回退 hipFree", self.device_id, self.bytes, status);
-                    }
+                    runtime.hip_error(status, "hipFreeAsync device buffer")
                 }
+                Err(error) => error,
+            };
+            // hipFree 不会等待 hipMallocAsync 指针的使用；直接等原流，避免在 Drop 中重入池回收。
+            let synchronized = runtime.stream_synchronize().and_then(|synchronize| {
+                let status = unsafe { synchronize(stream) };
+                if status == HIP_SUCCESS { Ok(()) } else { Err(runtime.hip_error(status, "hipStreamSynchronize before async buffer hipFree fallback")) }
+            });
+            if let Err(error) = synchronized {
+                eprintln!("[rocm-memory] async buffer device={} bytes={} stream={stream:p} 释放失败: {free_error}；等待失败，保留指针: {error}", self.device_id, self.bytes);
+                return;
             }
-        }
-        if self.recyclable && self.retain_until_stage_completion && self.stage_completion_ready.load(std::sync::atomic::Ordering::Acquire) && options().memory_pool {
+            if options().log_memory {
+                eprintln!("[rocm-memory] async buffer device={} bytes={} 释放失败: {free_error}；原流已完成，回退 hipFree", self.device_id, self.bytes);
+            }
+        } else if self.recyclable && self.retain_until_stage_completion && self.stage_completion_ready.load(std::sync::atomic::Ordering::Acquire) && options().memory_pool {
             recycle_completed_stage_buffers(self.device_id, vec![(self.pointer as usize, self.capacity_bytes)]);
             return;
+        } else if self.recyclable && (defer_stage_buffer_recycle(self.device_id, self.pointer, self.capacity_bytes) || recycle_device_buffer(self.device_id, self.pointer, self.capacity_bytes)) {
+            return;
         }
-        if self.recyclable && (defer_stage_buffer_recycle(self.device_id, self.pointer, self.capacity_bytes) || recycle_device_buffer(self.device_id, self.pointer, self.capacity_bytes)) {
+        if arena::release_pending(self.device_id, self.pointer) {
             return;
         }
         if let Ok(runtime) = RocmRuntime::open() {
             if let Ok(free) = runtime.free() {
                 let started = std::time::Instant::now();
                 let start_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros();
+                mem_trace("F", self.device_id, self.capacity_bytes, self.pointer);
                 let _ = unsafe { free(self.pointer) };
                 let duration_us = started.elapsed().as_micros();
                 if duration_us >= 5_000 {
@@ -2602,12 +3162,15 @@ pub fn device_memory_info(device_id: i32) -> Result<(usize, usize), String> {
 /// decode 期间的新请求准入不能把可驱逐软池误算成会话常驻显存。这里只晋升
 /// 已完成 event 并统计 available buffer，不释放指针，避免容量探测破坏热池。
 pub fn device_admission_available_bytes(device_id: i32) -> Result<usize, String> {
-    promote_device_buffers(device_id);
-    let reclaimable = device_buffer_pool(device_id)
-        .and_then(|pool| pool.lock().ok())
-        .map(|pool| pool.buffers.iter().filter(|((buffer_device, _), _)| *buffer_device == device_id).map(|((_, bytes), pointers)| bytes.saturating_mul(pointers.len())).fold(0usize, usize::saturating_add))
+    promote_device_buffers_inner(device_id, false);
+    // 读 raw free 前保留池锁，防止同一批指针刚计入可回收量，又被释放后重复计入 free。
+    let pool = device_buffer_pool(device_id).and_then(|pool| pool.lock().ok());
+    let reclaimable = pool
+        .as_ref()
+        .map(|pool| pool.buffers.iter().filter(|((buffer_device, _), _)| *buffer_device == device_id).map(|(_, entries)| entries.iter().fold(0usize, |acc, &(_, capacity)| acc.saturating_add(capacity))).fold(0usize, usize::saturating_add))
         .unwrap_or(0);
     let (free, total) = device_memory_info(device_id)?;
+    drop(pool);
     Ok(free.saturating_add(reclaimable).min(total))
 }
 
@@ -2627,4 +3190,92 @@ pub(super) fn trim_device_memory_pool(device_id: i32) -> Result<(), String> {
         return Err(runtime.hip_error(status, "hipMemPoolTrimTo"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oom只释放申请所需的大块并保留decode与pending() {
+        let mut pool = DeviceBufferPool::default();
+        pool.buffers.insert((0, 1024), vec![(1, 1024), (2, 1024)]);
+        pool.buffers.insert((0, 16), vec![(3, 16), (4, 16)]);
+        pool.buffers.insert((1, 4096), vec![(5, 4096)]);
+        pool.pending.insert((0, 2048), vec![PendingDeviceBuffer { pointer: 6, capacity: 2048, event: 7 }]);
+        pool.bytes.insert(0, 4128);
+        pool.bytes.insert(1, 4096);
+        assert_eq!(take_available_buffers_for_release(&mut pool, 0, 0), (vec![], 0));
+        assert_eq!(take_available_buffers_for_release(&mut pool, 0, 800), (vec![2], 1024));
+        assert_eq!(pool.buffers[&(0, 16)], [(3, 16), (4, 16)]);
+        assert_eq!(pool.buffers[&(0, 1024)], [(1, 1024)]);
+        assert_eq!(pool.bytes[&0], 3104);
+        assert_eq!(take_available_buffers_for_release(&mut pool, 0, usize::MAX), (vec![1, 4, 3], 1056));
+        assert_eq!(pool.bytes[&0], 2048);
+        assert_eq!(pool.pending[&(0, 2048)][0].pointer, 6);
+        assert_eq!(pool.buffers[&(1, 4096)], [(5, 4096)]);
+        assert_eq!(pool.bytes[&1], 4096);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU，单独进程执行"]
+    fn async_download_growth_reuses_completed_slots_and_preserves_segments() {
+        let bytes = 4096 * 656;
+        let data = (0..bytes * 2 + 32).map(|i| (i * 73 % 251) as u8).collect::<Vec<_>>();
+        let source = DeviceBuffer::upload(0, &data).unwrap();
+        let mut download = AsyncHostDownload::new(0, 1).unwrap();
+        for length in [bytes, bytes * 2] {
+            let old_pointer = download.staging.pointer as usize;
+            let old_capacity = download.staging.bytes;
+            let segments = [(&source, 7, length / 2), (&source, length / 2 + 19, length - length / 2)];
+            let expected = [&data[7..7 + length / 2], &data[length / 2 + 19..length + 19]].concat();
+            download.enqueue_segments(&segments).unwrap();
+            assert!(download.enqueue_segments(&segments).is_err());
+            // 扩容不能注销旧槽，也不能把还在被 GPU 写入的新槽交给其它传输。
+            let pool = CACHED_PINNED_HOST_BUFFERS.get().unwrap().lock().unwrap();
+            assert!(pool.get(&old_capacity).is_some_and(|slots| slots.contains(&old_pointer)));
+            drop(pool);
+            let other = AsyncHostDownload::new(0, length).unwrap();
+            assert_ne!(other.staging.pointer, download.staging.pointer);
+            assert_eq!(download.wait().unwrap(), expected);
+            drop(other);
+        }
+        let pointer = download.staging.pointer;
+        download.enqueue(&source, bytes * 2).unwrap();
+        // Drop 也必须等待 event，再让下一份传输使用相同槽。
+        drop(download);
+        let mut reused = AsyncHostDownload::new(0, bytes * 2).unwrap();
+        assert_eq!(reused.staging.pointer, pointer);
+        reused.enqueue_segments(&[(&source, 11, bytes)]).unwrap();
+        assert_eq!(reused.wait().unwrap(), &data[11..11 + bytes]);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU，单独进程执行"]
+    fn admission_query_preserves_completed_pool_above_soft_limit() {
+        configure(RocmOptions { memory_pool: true, ..RocmOptions::default() }).unwrap();
+        enable_device_buffer_reuse();
+        let data = (0..8192).map(|i| (i * 37 % 251) as u8).collect::<Vec<_>>();
+        let buffer = DeviceBuffer::allocate_peer(0, data.len()).unwrap();
+        buffer.copy_from_host(&data).unwrap();
+        let pointer = buffer.device_pointer();
+        let bytes = buffer.capacity_bytes;
+        drop(buffer);
+        let pool = device_buffer_pool(0).unwrap();
+        let event = pool.lock().unwrap().pending[&(0, bytes)].iter().find(|entry| entry.pointer == pointer).unwrap().event;
+        let runtime = RocmRuntime::open().unwrap();
+        // 只等待该 buffer 的事件，避免同步 helper 先触发池裁剪而掩盖查询副作用。
+        assert_eq!(unsafe { runtime.event_synchronize().unwrap()(event as HipEvent) }, HIP_SUCCESS);
+        let old_limit = DEVICE_POOL_MAX_BYTES_PER_DEVICE.swap(1024, std::sync::atomic::Ordering::AcqRel);
+        let available = device_admission_available_bytes(0);
+        let preserved = pool.lock().unwrap().buffers.get(&(0, bytes)).is_some_and(|pointers| pointers.iter().any(|&(p, _)| p == pointer));
+        DEVICE_POOL_MAX_BYTES_PER_DEVICE.store(old_limit, std::sync::atomic::Ordering::Release);
+        assert!(available.is_ok(), "{available:?}");
+        assert!(preserved, "显存预算查询不能裁剪已完成且可复用的 buffer");
+        let restored = DeviceBuffer::allocate_cache(0, bytes).unwrap();
+        assert_eq!(restored.device_pointer(), pointer);
+        let mut actual = vec![0; data.len()];
+        restored.copy_to_host(&mut actual).unwrap();
+        assert_eq!(actual, data);
+    }
 }

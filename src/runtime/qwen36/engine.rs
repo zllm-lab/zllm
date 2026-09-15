@@ -108,6 +108,9 @@ impl Qwen36Engine {
             crate::runtime::node::SessionDescriptor { model_format: session.model_format(), model_bytes: session.model_bytes(), max_seq_len, kv_cache_format: if kv_f16 { "f16" } else { "q8g64" }, input_modalities: modalities },
         );
         residency.configure(&mut capabilities, &runtime);
+        // 引擎走 activate_terminal_append 通用路径,瘦身后只渲染 suffix;miss
+        // 由通用层哨兵上报。声明能力后 scheduler 命中时只发增量消息。
+        capabilities.terminal_resume_delta = true;
         eprintln!("[qwen36-kv-admission] available={:.1} MiB session={:.1} MiB", available as f64 / 1048576.0, session_residency_bytes as f64 / 1048576.0);
         let dspark = session.dspark_available();
         Ok(Self { session, variant, mtp, dspark, mtp_context_limit: execution.mtp_context_limit, mtp_draft_tokens: execution.mtp_draft_tokens, snapshot_resources, terminal_states, residency, capabilities, runtime, compute_steps })
@@ -192,7 +195,7 @@ impl Qwen36Engine {
             |assistant| Ok(self.session.tokenize(&chat_prompt_suffix(request, assistant, !thinking_disabled)?)),
             &self.snapshot_resources,
         )
-        .map_err(|error| format!("Qwen3.6 {error}; 请重新开始会话"))?;
+        .map_err(|error| if error.starts_with(crate::runtime::session::TERMINAL_RESUME_MISS) { error } else { format!("Qwen3.6 {error}; 请重新开始会话") })?;
         let full_prefill = if resumed.is_none() {
             // 占位符行数取决于 preprocess 后的 grid；cache miss 才物化历史图像。
             let mut visuals = Vec::with_capacity(image_urls.len());

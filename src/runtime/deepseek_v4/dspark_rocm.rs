@@ -14,8 +14,9 @@ use crate::{
 };
 
 use super::{
-    DeepSeekV4, DeepSeekV4Config, DeepSeekV4OutputHead, DeepSeekV4PrefillSegment, DeepSeekV4PreparedLayer, DeepSeekV4RopeTables, deepseek_v4_output_hidden, deepseek_v4_prefill_layer, deepseek_v4_prefill_layer_segmented,
-    deepseek_v4_store_attention_kv, prepare_deepseek_v4_loaded_layer, prepare_dense_tensor, prepare_hyper_connection, prepare_unit_norm,
+    DeepSeekV4, DeepSeekV4Config, DeepSeekV4OutputHead, DeepSeekV4PrefillSegment, DeepSeekV4PreparedLayer, DeepSeekV4RopeTables, V41SharedState, deepseek_v4_output_hidden, deepseek_v4_prefill_layer,
+    deepseek_v4_prefill_layer_segmented, deepseek_v4_prefill_layer_v41_chained, deepseek_v4_store_attention_kv, prepare_deepseek_v4_loaded_layer, prepare_dense_tensor, prepare_hyper_connection,
+    prepare_unit_norm,
 };
 
 struct DsparkInput {
@@ -78,6 +79,7 @@ pub struct RocmDeepSeekV4Dspark {
     confidence_projection: Option<RocmWeight>,
     confidence_threshold: Option<f32>,
     draft_tokens: usize,
+    v41: bool,
     profile: bool,
     pending_target_prefills: Vec<(RocmContext, crate::backend::rocm::RocmStageCompletion)>,
 }
@@ -117,10 +119,21 @@ impl RocmDeepSeekV4Dspark {
             return Err(compute_error("DeepSeek-V4 DSpark draft_tokens 必须大于 0"));
         }
         let mut config = checkpoint.target_weights().config().clone();
+        let v41 = !config.kv_source_layers.is_empty();
         config.layer_count = checkpoint.config.dspark_target_layer_ids.len();
         config.mtp_layer_count = 0;
         config.hash_layer_count = 0;
         config.compress_ratios = vec![0; config.layer_count];
+        config.kv_source_layers.clear();
+        config.index_source_layers.clear();
+        config.candidate_source_layer = None;
+        // draft 层走 mtp 专家档:V4.1 为 128 专家取 3(主干 384 取 6)。
+        config.expert_count = config.mtp_expert_count;
+        config.expert_top_k = config.mtp_expert_top_k;
+        // 官方 DSpark draft 全是文本 token，不应用视觉路由偏置。
+        if v41 {
+            config.router_value_level_bias = false;
+        }
         let model = DeepSeekV4::new(config.clone()).map_err(|error| compute_error(error.to_string()))?;
         let input = checkpoint.load_input().map_err(compute_error)?;
         if devices.len() != config.layer_count {
@@ -149,13 +162,11 @@ impl RocmDeepSeekV4Dspark {
         let dspark_head = checkpoint.load_head().map_err(compute_error)?;
         let copies = config.hyper_connection_copies;
         let expanded = copies.checked_mul(config.hidden_size).ok_or_else(|| compute_error("DeepSeek-V4 DSpark output hidden 宽度溢出"))?;
-        let hyper_connection = prepare_hyper_connection(&context, &dspark_head.hyper_connection)?;
         let output_norm = prepare_dense_tensor(&context, &dspark_head.norm)?;
+        let input_width = if dspark_head.hyper_connection.is_some() { expanded } else { config.hidden_size };
         let head = DeepSeekV4OutputHead {
-            input_norm: prepare_unit_norm(&context, expanded)?,
-            function: hyper_connection.function,
-            base: hyper_connection.base,
-            scale: hyper_connection.scale,
+            input_norm: prepare_unit_norm(&context, input_width)?,
+            hyper_connection: dspark_head.hyper_connection.as_ref().map(|hc| prepare_hyper_connection(&context, hc)).transpose()?,
             output: target_head.output.clone_with_prepared_norm(output_norm, false),
         };
         if dspark_head.markov_embedding.dtype != "BF16" || dspark_head.markov_embedding.shape != [checkpoint.config.vocab_size, checkpoint.config.dspark_markov_rank] {
@@ -165,7 +176,7 @@ impl RocmDeepSeekV4Dspark {
         let markov_projection = prepare_dense_tensor(&context, &dspark_head.markov_projection)?;
         let confidence_projection = confidence_threshold.map(|_| prepare_dense_tensor(&context, &dspark_head.confidence_projection)).transpose()?;
         let output_context = context.with_independent_stream().map_err(compute_error)?;
-        Ok(Self { output_context, checkpoint, config, model, rope, input, stages, head, markov_embedding, markov_projection, confidence_projection, confidence_threshold, draft_tokens, profile, pending_target_prefills: Vec::new() })
+        Ok(Self { output_context, checkpoint, config, model, rope, input, stages, head, markov_embedding, markov_projection, confidence_projection, confidence_threshold, draft_tokens, v41, profile, pending_target_prefills: Vec::new() })
     }
 
     fn retire_target_prefills(&mut self) -> Result<(), BackendError> {
@@ -360,7 +371,10 @@ impl RocmDeepSeekV4Dspark {
         if profile {
             self.output_context.profile_scope_end()?;
         }
-        for layer in 0..self.stages.len() {
+        let mut pre_mix: Option<RocmTensor> = None;
+        let mut shared = V41SharedState::new();
+        let stage_count = self.stages.len();
+        for layer in 0..stage_count {
             let spec = self.model.layer_spec(layer).map_err(|error| compute_error(error.to_string()))?;
             let stage = &mut self.stages[layer];
             stage.context.activate().map_err(compute_error)?;
@@ -368,21 +382,47 @@ impl RocmDeepSeekV4Dspark {
                 stage.context.profile_scope_begin("dspark_layer")?;
             }
             hidden = stage.context.tensor_on_device(hidden)?;
-            hidden = deepseek_v4_prefill_layer(
-                &stage.context,
-                &self.config,
-                spec,
-                &stage.layer,
-                &mut stage.sessions[session].as_mut().expect("DSpark session 已打开").block_cache,
-                &mut stage.experts,
-                layer,
-                &hidden,
-                self.rope.layer(spec),
-                &positions,
-                &tokens,
-                false,
-                &spec.hyper_connection,
-            )?;
+            hidden = if self.v41 {
+                let incoming = pre_mix.take().map(|pre| stage.context.tensor_on_device(pre)).transpose()?;
+                let cache = &mut stage.sessions[session].as_mut().expect("DSpark session 已打开").block_cache;
+                let (next, next_pre) = deepseek_v4_prefill_layer_v41_chained(
+                    &stage.context,
+                    &self.model,
+                    spec,
+                    &stage.layer,
+                    layer,
+                    std::slice::from_mut(cache),
+                    None,
+                    &mut shared,
+                    &mut stage.experts,
+                    layer,
+                    &hidden,
+                    incoming.as_ref(),
+                    self.rope.layer(spec),
+                    &positions,
+                    &tokens,
+                    false,
+                    layer + 1 == stage_count,
+                )?;
+                pre_mix = Some(next_pre);
+                next
+            } else {
+                deepseek_v4_prefill_layer(
+                    &stage.context,
+                    &self.config,
+                    spec,
+                    &stage.layer,
+                    &mut stage.sessions[session].as_mut().expect("DSpark session 已打开").block_cache,
+                    &mut stage.experts,
+                    layer,
+                    &hidden,
+                    self.rope.layer(spec),
+                    &positions,
+                    &tokens,
+                    false,
+                    &spec.hyper_connection,
+                )?
+            };
             hidden = stage.context.tensor_as_bf16(hidden)?;
             if profile {
                 stage.context.profile_scope_end()?;
@@ -482,7 +522,7 @@ impl RocmDeepSeekV4Dspark {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
-        if batch.len() == 1 || self.confidence_threshold.is_some() {
+        if batch.len() == 1 || self.confidence_threshold.is_some() || self.v41 {
             let mut outputs = Vec::with_capacity(batch.len());
             for (index, &(session, anchor, position)) in batch.iter().enumerate() {
                 outputs.push(self.draft_session(session, anchor, position, fences[index].take())?);

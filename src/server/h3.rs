@@ -89,7 +89,11 @@ pub(super) async fn download_artifact(State(state): State<ServerState>, mut head
     let Some(path) = state.scheduler.artifact_path(&task_id, &artifact_id) else {
         return h3_error(StatusCode::BAD_REQUEST, "产物 ID 非法");
     };
-    let metadata = match tokio::fs::metadata(&path).await {
+    file_response(&path, &artifact.content_type, &artifact.file_name, &headers).await
+}
+
+pub(super) async fn file_response(path: &std::path::Path, content_type: &str, file_name: &str, headers: &HeaderMap) -> Response {
+    let metadata = match tokio::fs::metadata(path).await {
         Ok(metadata) if metadata.is_file() => metadata,
         _ => return h3_error(StatusCode::NOT_FOUND, "产物文件不存在"),
     };
@@ -103,7 +107,7 @@ pub(super) async fn download_artifact(State(state): State<ServerState>, mut head
         },
         None => (StatusCode::OK, 0, total.saturating_sub(1)),
     };
-    let mut file = match tokio::fs::File::open(&path).await {
+    let mut file = match tokio::fs::File::open(path).await {
         Ok(file) => file,
         Err(error) => return h3_error(StatusCode::INTERNAL_SERVER_ERROR, format!("打开产物失败: {error}")),
     };
@@ -114,17 +118,17 @@ pub(super) async fn download_artifact(State(state): State<ServerState>, mut head
     let stream = ReaderStream::new(file.take(length));
     let mut builder = Response::builder()
         .status(status)
-        .header(header::CONTENT_TYPE, artifact.content_type.as_str())
+        .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, length.to_string())
         .header(header::ACCEPT_RANGES, "bytes")
-        .header(header::CONTENT_DISPOSITION, format!("inline; filename=\"{}\"", artifact.file_name.chars().map(|character| if matches!(character, '"' | '\r' | '\n') { '_' } else { character }).collect::<String>()));
+        .header(header::CONTENT_DISPOSITION, format!("inline; filename=\"{}\"", file_name.chars().map(|character| if matches!(character, '"' | '\r' | '\n') { '_' } else { character }).collect::<String>()));
     if status == StatusCode::PARTIAL_CONTENT {
         builder = builder.header(header::CONTENT_RANGE, format!("bytes {start}-{end}/{total}"));
     }
     builder.body(Body::from_stream(stream)).expect("artifact response 构建失败")
 }
 
-fn validate_request(request: &Value) -> Result<Value, String> {
+pub(super) fn validate_request(request: &Value) -> Result<Value, String> {
     let object = request.as_object().ok_or("请求必须是 JSON 对象")?;
     if object.get("model").and_then(Value::as_str) != Some("MiniMax-H3") {
         return Err("model 必须为 MiniMax-H3".to_owned());
@@ -253,6 +257,17 @@ fn byte_range(value: &str, total: u64) -> Option<(u64, u64)> {
     let start = start.parse::<u64>().ok()?;
     let end = if end.is_empty() { total - 1 } else { end.parse::<u64>().ok()?.min(total - 1) };
     (start <= end && start < total).then_some((start, end))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn video_range_supports_browser_streaming_and_seeking() {
+        assert_eq!(super::byte_range("bytes=0-1023", 4096), Some((0, 1023)));
+        assert_eq!(super::byte_range("bytes=1024-", 4096), Some((1024, 4095)));
+        assert_eq!(super::byte_range("bytes=-512", 4096), Some((3584, 4095)));
+        assert_eq!(super::byte_range("bytes=4096-", 4096), None);
+    }
 }
 
 fn h3_error(status: StatusCode, message: impl Into<String>) -> Response {

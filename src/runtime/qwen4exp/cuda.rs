@@ -496,7 +496,7 @@ pub fn run(path: &Path, prompt: &str, options: CudaOptions) -> Result<(), Box<dy
         hidden = Some(state.forward(&ctx, &cfg, &source, &layers, &rope, options.profile, chunk, chunk_index * options.prefill_chunk_size, &mut |layer, input| {
             let weights = &layers[layer];
             let shared = [moe_ref(weights)];
-            let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
+            let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
             prefill_experts_untraced(&ctx, &spec, &reference, layer, &mut prefill_experts, input, None)
         })?);
         if let Some(mtp) = &mut mtp {
@@ -549,7 +549,7 @@ pub fn run(path: &Path, prompt: &str, options: CudaOptions) -> Result<(), Box<dy
         hidden = state.forward(&ctx, &cfg, &source, &layers, &rope, options.profile, &[token], position, &mut |layer, input| {
             let weights = &layers[layer];
             let shared = [moe_ref(weights)];
-            let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
+            let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
             let next = (layer + 1 < cfg.num_layers).then(|| source.source(layer + 1).map(|source| (layer + 1, source))).transpose().map_err(crate::backend::BackendError::ExpertLoad)?;
             expert_state.decode(&ctx, &spec, &reference, ExpertDecodeRequest { layer, source: source.source(layer).map_err(crate::backend::BackendError::ExpertLoad)?, position, next }, input)
         })?;
@@ -639,7 +639,7 @@ fn run_mtp_decode(
             state.forward(ctx, cfg, source, layers, rope, options.profile, &inputs, position, &mut |layer, input| {
                 let weights = &layers[layer];
                 let shared = [SharedExpertRef { gate: &weights.moe.shared_gate, up: &weights.moe.shared_up, down: &weights.moe.shared_down, output_gate: Some(&weights.moe.shared_output_gate) }];
-                let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
+                let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
                 let next = (layer + 1 < cfg.num_layers).then(|| source.source(layer + 1).map(|source| (layer + 1, source))).transpose().map_err(crate::backend::BackendError::ExpertLoad)?;
                 experts.decode(ctx, &spec, &reference, ExpertDecodeRequest { layer, source: source.source(layer).map_err(crate::backend::BackendError::ExpertLoad)?, position, next }, input)
             })?
@@ -649,7 +649,7 @@ fn run_mtp_decode(
             let result = state.forward(ctx, cfg, source, layers, rope, options.profile, &inputs, position, &mut |layer, input| {
                 let weights = &layers[layer];
                 let shared = [SharedExpertRef { gate: &weights.moe.shared_gate, up: &weights.moe.shared_up, down: &weights.moe.shared_down, output_gate: Some(&weights.moe.shared_output_gate) }];
-                let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
+                let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
                 prefill_experts_untraced(ctx, &spec, &reference, layer, &mut verify_experts, input, None)
             });
             verify_experts.swap_decode_state(experts.backend_state_mut());

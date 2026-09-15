@@ -78,6 +78,8 @@ impl PixelShuffleSpec {
 /// VAE 编解码器规格。
 #[derive(Clone, Debug)]
 pub enum VaeSpec {
+    /// FLUX.2 Klein 图像 VAE：32 latent channels，经 2×2 patch 打包为 128 通道。
+    Flux2Klein(crate::model_spec::flux2_klein::Flux2KleinVaeConfig),
     /// H3 视频 VAE：时空因果卷积，空间 16× / 时间 4× 压缩，24 latent channels。
     H3Video(H3VideoVaeSpec),
     /// H3 音频 VAE：32kHz → 40Hz，32 latent channels。
@@ -156,6 +158,8 @@ pub struct H3AudioVaeSpec {
     pub latent_rate: usize,
     /// 编码器隐藏维度。
     pub encoder_dim: usize,
+    /// 编码器投影注意力头数。
+    pub encoder_attention_heads: usize,
     /// 解码器隐藏维度。
     pub decoder_dim: usize,
     /// VAE 内部连续表示维度。
@@ -178,6 +182,7 @@ impl H3AudioVaeSpec {
             sample_rate: 32000,
             latent_rate: 40,
             encoder_dim: 64,
+            encoder_attention_heads: 8,
             decoder_dim: 1024,
             latent_dim: 2048,
             output_channels: 2,
@@ -189,4 +194,21 @@ impl H3AudioVaeSpec {
             alias_filter_kernel: 12,
         }
     }
+}
+/// 流式因果卷积的逻辑头部/尾部及输出形状；历史长度随时间 stride 改变。
+pub fn conv3d_history_layout(spec: &Conv3dSpec, history_frames: Option<usize>, spatial_pad_after: [usize; 2]) -> Result<(usize, usize, [usize; 3]), String> {
+    if spec.input_shape.contains(&0) || spec.kernel.contains(&0) || spec.stride.contains(&0) || spec.input_channels == 0 || spec.output_channels == 0 || spec.padding[0] != 0 || spec.causal || spec.stride[0] > spec.kernel[0] {
+        return Err(format!("Conv3D history规格非法: {spec:?}"));
+    }
+    let keep = spec.kernel[0] - spec.stride[0];
+    if history_frames.is_some_and(|n| n != keep || n == 0) {
+        return Err(format!("Conv3D history帧数={history_frames:?}，期望 {keep}"));
+    }
+    let head = history_frames.unwrap_or(spec.kernel[0] - 1);
+    let mut logical = *spec;
+    logical.input_shape[0] = logical.input_shape[0].checked_add(head).ok_or("Conv3D history深度溢出")?;
+    for axis in 1..3 {
+        logical.input_shape[axis] = logical.input_shape[axis].checked_add(spatial_pad_after[axis - 1]).ok_or("Conv3D history空间padding溢出")?;
+    }
+    Ok((head, keep, logical.output_shape()?))
 }

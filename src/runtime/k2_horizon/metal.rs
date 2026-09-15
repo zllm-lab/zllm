@@ -167,8 +167,17 @@ impl<'a> K2MetalRuntime<'a> {
             K2Mlp::Dense { gate, up, down } => self.context.gated_mlp_add_residual(&input, gate, up, down, &crate::moe::Activation::Silu, &residual),
             K2Mlp::Sparse { router, bias, shared_gate, shared_up, shared_down } => {
                 let shared = [SharedExpertRef { gate: shared_gate, up: shared_up, down: shared_down, output_gate: None }];
-                let output =
-                    prefill_experts_observed(self.context, &self.config.moe_spec(), &MoeFfnRef { router_weight: router, router_bias: bias, shared_experts: &shared, selected_experts: None }, layer, experts, &input, None, |_| {})?.tensor;
+                let output = prefill_experts_observed(
+                    self.context,
+                    &self.config.moe_spec(),
+                    &MoeFfnRef { router_weight: router, router_bias: bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None },
+                    layer,
+                    experts,
+                    &input,
+                    None,
+                    |_| {},
+                )?
+                .tensor;
                 self.context.add(&residual, &output)
             }
         }
@@ -218,7 +227,7 @@ impl<'a> K2MetalRuntime<'a> {
                         experts.decode_inputs(
                             self.context,
                             &self.config.moe_spec(),
-                            &MoeFfnRef { router_weight: router, router_bias: bias, shared_experts: &shared, selected_experts: None },
+                            &MoeFfnRef { router_weight: router, router_bias: bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None },
                             ExpertDecodeRequest { layer, source: expert_source, position, next },
                             RoutedMoeInputs { route: &input, expert: &input },
                         )?

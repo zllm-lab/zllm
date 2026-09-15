@@ -296,6 +296,113 @@ extern "C" __global__ void moe_router_topk_256_f32(
     }
 }
 
+extern "C" __global__ void moe_router_topk_vl_256_f32(
+    const float* logits,
+    const float* bias,
+    const float* bias_vl,
+    const unsigned char* row_mask,
+    unsigned int* expert_ids,
+    float* route_weights,
+    unsigned int rows,
+    unsigned int experts,
+    unsigned int top_k,
+    unsigned int scoring,
+    float scaling)
+{
+    const unsigned int row = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    if (row >= rows || blockDim.x != 256 || top_k == 0 || top_k > 16) return;
+    // 每个 lane 串行扫描 lane, lane+256, ... 覆盖任意 experts 数(GLM5.3 为
+    // 288);已选专家在重扫时跳过,平局取小 expert id,与逐专家插入排序语义一致。
+    __shared__ float raw_values[256];
+    __shared__ float wave_scores[8];
+    __shared__ unsigned int wave_ids[8];
+    __shared__ float selected_raw[16];
+    __shared__ unsigned int selected_id[16];
+    __shared__ float denominator;
+    // VL(DeepSeek-V4.1 noaux_tc_for_vl):image 行改用 bias_vl 选专家
+    const float* row_bias = row_mask[row] ? bias_vl : bias;
+    for (unsigned int slot = 0; slot < top_k; ++slot) {
+        float score = -3.402823466e+38F;
+        float raw = 0.0F;
+        unsigned int expert_id = lane;
+        for (unsigned int expert = lane; expert < experts; expert += 256U) {
+            bool taken = false;
+            for (unsigned int seen = 0; seen < slot; ++seen) taken = taken || selected_id[seen] == expert;
+            if (taken) continue;
+            const float logit = logits[(unsigned long long)row * experts + expert];
+            float current_raw;
+            float current_score;
+            if (scoring == 0) {
+                current_raw = logit;
+                current_score = logit;
+            } else if (scoring == 1) {
+                current_raw = 1.0F / (1.0F + expf(-logit));
+                current_score = current_raw + row_bias[expert];
+            } else {
+                const float softplus = logit > 0.0F ? logit + log1pf(expf(-logit)) : log1pf(expf(logit));
+                current_raw = sqrtf(softplus);
+                current_score = current_raw + row_bias[expert];
+            }
+            if (current_score > score || (current_score == score && expert < expert_id)) {
+                score = current_score;
+                raw = current_raw;
+                expert_id = expert;
+            }
+        }
+        raw_values[lane] = raw;
+        const unsigned int wave_lane = lane % warpSize;
+        const unsigned int wave = lane / warpSize;
+        const unsigned int wave_count = blockDim.x / warpSize;
+        float best_score = score;
+        unsigned int best_id = expert_id;
+        for (unsigned int offset = warpSize >> 1; offset > 0; offset >>= 1) {
+            const float other_score = __shfl_down(best_score, offset);
+            const unsigned int other_id = __shfl_down(best_id, offset);
+            if (other_score > best_score || (other_score == best_score && other_id < best_id)) {
+                best_score = other_score;
+                best_id = other_id;
+            }
+        }
+        if (wave_lane == 0) {
+            wave_scores[wave] = best_score;
+            wave_ids[wave] = best_id;
+        }
+        __syncthreads();
+        if (lane == 0) {
+            float block_score = wave_scores[0];
+            unsigned int block_id = wave_ids[0];
+            for (unsigned int item = 1; item < wave_count; ++item) {
+                const float item_score = wave_scores[item];
+                const unsigned int item_id = wave_ids[item];
+                if (item_score > block_score || (item_score == block_score && item_id < block_id)) {
+                    block_score = item_score;
+                    block_id = item_id;
+                }
+            }
+            selected_id[slot] = block_id;
+            selected_raw[slot] = raw_values[block_id % 256U];
+        }
+        __syncthreads();
+    }
+    if (lane == 0) {
+        float sum = 0.0F;
+        if (scoring == 0) {
+            for (unsigned int slot = 0; slot < top_k; ++slot) sum += expf(selected_raw[slot] - selected_raw[0]);
+        } else {
+            for (unsigned int slot = 0; slot < top_k; ++slot) sum += selected_raw[slot];
+        }
+        denominator = sum;
+    }
+    __syncthreads();
+    if (lane < top_k) {
+        const unsigned long long route = (unsigned long long)row * top_k + lane;
+        expert_ids[route] = selected_id[lane];
+        const float mass = scoring == 0 ? expf(selected_raw[lane] - selected_raw[0]) : selected_raw[lane];
+        route_weights[route] = mass / denominator * scaling;
+    }
+}
+
 extern "C" __global__ void moe_zero_f32(float* output, unsigned int elements)
 {
     const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;

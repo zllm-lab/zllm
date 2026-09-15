@@ -381,6 +381,17 @@ impl GqaPrefillBackend for CpuContext {
         Ok(output)
     }
 
+    fn gqa_prefill_attention_visible(&self, query: &CpuTensor, key: &CpuTensor, value: &CpuTensor, spec: &GqaSpec, visible_ends: &[u32]) -> Result<CpuTensor, BackendError> {
+        let query_cols = spec.num_heads.checked_mul(spec.head_dim).ok_or_else(|| compute("GQA query 维度溢出"))?;
+        let kv_cols = spec.num_kv_heads.checked_mul(spec.head_dim).ok_or_else(|| compute("GQA KV 维度溢出"))?;
+        if query.rows != key.rows || query.rows != value.rows || query.cols != query_cols || key.cols != kv_cols || value.cols != kv_cols || visible_ends.len() != query.rows {
+            return Err(compute(format!("GQA visible prefill shape 异常: Q=[{},{}] K=[{},{}] V=[{},{}] visible={}", query.rows, query.cols, key.rows, key.cols, value.rows, value.cols, visible_ends.len())));
+        }
+        let mut output = CpuTensor { data: vec![0.0; query.rows * query_cols], rows: query.rows, cols: query_cols };
+        gqa_prefill_attention_at_visible(&query.data, &key.data, &value.data, 0, key.rows, 0, spec, Some(visible_ends), &mut output.data);
+        Ok(output)
+    }
+
     fn gqa_prefill_attention_cached(&self, cache: &mut CpuKvCache, layer: usize, position: usize, query: &CpuTensor, key: &CpuTensor, value: &CpuTensor, spec: &GqaSpec, retain_full_cache: bool) -> Result<CpuTensor, BackendError> {
         let query_cols = spec.num_heads.checked_mul(spec.head_dim).ok_or_else(|| compute("GQA query 维度溢出"))?;
         let kv_cols = spec.num_kv_heads.checked_mul(spec.head_dim).ok_or_else(|| compute("GQA KV 维度溢出"))?;

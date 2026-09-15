@@ -12,6 +12,7 @@ pub mod diffusion;
 pub mod embedded;
 pub mod kernel;
 pub mod kv_cache;
+pub mod mempool;
 pub mod model_spec;
 pub mod moe;
 pub mod norm;

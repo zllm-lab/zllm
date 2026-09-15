@@ -43,7 +43,7 @@ impl RocmContext {
 
     /// 提交线程绑定到 `ZLLM_ROCM_SUBMIT_CPUS` 指定的 CPU 列表（一次设置）。
     /// gfx1100 实测跨 NUMA 节点的 hipLaunchKernel 约 2.4µs、本节点约 1.0µs；
-    /// 目标 8-GPU 机器上全部以 NUMA0(0-31,64-95) 最快。未设置时完全不动。
+    /// 已验证的 8 卡主机以 NUMA0(0-31,64-95) 最快。未设置时完全不动。
     pub(crate) fn pin_submission_thread_to_configured_cpus(&self) {
         static CPUS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
         let Some(cpus) = CPUS.get_or_init(|| std::env::var("ZLLM_ROCM_SUBMIT_CPUS").ok().filter(|value| !value.trim().is_empty())) else { return };
@@ -51,6 +51,16 @@ impl RocmContext {
             eprintln!("[rocm-submit-affinity] device={} 绑定 {cpus} 失败: {error}", self.device_id);
         }
     }
+}
+
+/// 第三 IMA 定位探针:`ZLLM_ROCM_PROBE_SYNC` 按位启用段边界带标签流同步:
+/// 1=attention owner,2=attention peer,4=MoE owner,8=MoE peer。同步返回的粘连
+/// IMA 错误把故障定位到上一探针与本探针之间;探针本身是串行化点,通过/失败
+/// 语义按启用位解释。诊断专用,默认关闭(0)。
+pub(crate) fn probe_sync_mask(bit: u32) -> bool {
+    static MASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let mask = *MASK.get_or_init(|| std::env::var("ZLLM_ROCM_PROBE_SYNC").ok().and_then(|value| value.parse().ok()).unwrap_or(0));
+    mask & bit != 0
 }
 
 impl crate::backend::StageExecutionBackend for RocmContext {
@@ -79,7 +89,7 @@ impl crate::backend::StageExecutionBackend for RocmContext {
     }
 
     fn stage_available_bytes(&self) -> Result<usize, BackendError> {
-        ops::hip::device_memory_info(self.device_id).map(|(free, _)| free).map_err(compute_error)
+        ops::hip::device_admission_available_bytes(self.device_id).map_err(compute_error)
     }
 
     fn stage_total_bytes(&self) -> Result<usize, BackendError> {
@@ -112,18 +122,6 @@ impl crate::backend::StageExecutionBackend for RocmContext {
         self.pin_submission_thread_to_configured_cpus();
     }
 
-    fn max_queued_latency_submissions(&self) -> usize {
-        // latency work 共用一条有序 compute stream。默认仍只允许一份在途；C6+
-        // 诊断显示 stage 墙钟占用已约 90% 但每批 submit→complete 里约一半是
-        // 主机提交，第二份在途可以把下一批的主机提交叠到本批 GPU 尾部之下。
-        // 回收批次/完成事件均按提交顺序在每批 record 时切分，两份在途不共享
-        // 可写 scratch；>2 没有证据支持，先封顶 4 只做实验对照。
-        static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *LIMIT.get_or_init(|| {
-            std::env::var("ZLLM_ROCM_DECODE_IN_FLIGHT").ok().and_then(|value| value.parse::<usize>().ok()).filter(|&value| (1..=4).contains(&value)).unwrap_or(1)
-        })
-    }
-
     fn begin_stage_submission(&self) -> Result<(), BackendError> {
         ops::hip::begin_stage_buffer_recycle(self.device_id).map_err(compute_error)
     }
@@ -139,25 +137,43 @@ impl crate::backend::StageExecutionBackend for RocmContext {
     }
 
     fn stage_completion_ready(&self, completion: &Self::Completion) -> Result<bool, BackendError> {
-        if !completion.owner.is_complete().map_err(compute_error)? {
+        // 先轮询两侧事件、全部 fire 后才统一退休:owner 先 fire 时若立即回收,
+        // 读取发生在 peer 流上的 P2P 源会被提前释放(预置缺陷;DSA 分片使两流
+        // 完成顺序反转后暴露为 IMA)。
+        if !completion.owner.query_fired().map_err(compute_error)? {
             return Ok(false);
         }
-        completion.peers.iter().try_fold(true, |ready, peer| peer.is_complete().map(|peer_ready| ready && peer_ready))
+        for peer in &completion.peers {
+            if !peer.query_fired()? {
+                return Ok(false);
+            }
+        }
+        completion.owner.retire_now();
+        for peer in &completion.peers {
+            peer.retire_now();
+        }
+        Ok(true)
     }
 
     fn wait_stage_completion(&self, completion: &Self::Completion) -> Result<(), BackendError> {
-        completion.owner.wait().map_err(compute_error)?;
+        // 与 ready 相同:两侧事件都同步等到后再统一退休。
+        completion.owner.wait_fired().map_err(compute_error)?;
         for peer in &completion.peers {
-            peer.wait()?;
+            peer.wait_fired()?;
+        }
+        completion.owner.retire_now();
+        for peer in &completion.peers {
+            peer.retire_now();
         }
         Ok(())
     }
 
     fn retire_ordered_stage_completion(&self, completion: &Self::Completion) -> Result<(), BackendError> {
-        completion.owner.retire_ordered();
+        // 链尾 fire 蕴含 owner 完成,但不蕴含更早 peer;先等 peer,再统一退休。
         for peer in &completion.peers {
             peer.retire_ordered()?;
         }
+        completion.owner.retire_now();
         Ok(())
     }
 

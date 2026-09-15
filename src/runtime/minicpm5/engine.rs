@@ -36,14 +36,14 @@ use crate::{
 };
 
 #[cfg(target_os = "macos")]
-#[path = "metal_session.rs"]
-mod metal_session;
+#[path = "dspark_eval.rs"]
+pub(crate) mod dspark_eval;
 #[cfg(target_os = "macos")]
 #[path = "metal_replay.rs"]
 pub(crate) mod metal_replay;
 #[cfg(target_os = "macos")]
-#[path = "dspark_eval.rs"]
-pub(crate) mod dspark_eval;
+#[path = "metal_session.rs"]
+mod metal_session;
 
 #[cfg(target_os = "macos")]
 pub use dspark_eval::run_dspark_eval;
@@ -125,6 +125,9 @@ impl MiniCpm5Engine {
             crate::runtime::node::SessionDescriptor { model_format: "gguf-mixed", model_bytes: session.model_bytes(), max_seq_len, kv_cache_format: if kv_f16 { "f16" } else { "q8g64" }, input_modalities: &["text"] },
         );
         residency.configure(&mut capabilities, &runtime);
+        // 引擎支持瘦身 resume(只渲染 suffix);miss 由下方哨兵上报(前缀复用
+        // 依赖全量 tokens,瘦身后不可用)。声明能力后 scheduler 命中时只发增量。
+        capabilities.terminal_resume_delta = true;
         eprintln!("[minicpm5-kv-admission] available={:.1} MiB session={:.1} MiB", available as f64 / 1048576.0, session_resident_bytes as f64 / 1048576.0);
         Ok(Self { session, residency, capabilities, runtime, compute_steps, terminal_states: crate::kv_cache::terminal_cache::TerminalSessions::new(1, None), replay: None })
     }
@@ -209,7 +212,16 @@ impl MiniCpm5Engine {
                 eprintln!("[zllm-runtime] terminal cache 拼接命中 cached={} new={}", cached.len(), suffix.len());
                 (state, suffix)
             });
+            // contains 与 activate 之间被驱逐的竞态:瘦身后无法退回全量渲染。
+            if resumed.is_none() && request.get("_zllm_resume").is_some() {
+                return Err(format!("{} {cache_id}", crate::runtime::session::TERMINAL_RESUME_MISS));
+            }
             (resumed, None, reservation)
+        } else if request.get("_zllm_resume").is_some() {
+            // 瘦身请求没有完整 messages:未命中既不能退回前缀复用(残缺 tokens 的
+            // 内容前缀匹配会错误复用别的 cache),也不能全量渲染,哨兵让 server 重发。
+            let cache_id = request.get("_zllm_resume").and_then(Value::as_str).unwrap_or_default();
+            return Err(format!("{} {cache_id}", crate::runtime::session::TERMINAL_RESUME_MISS));
         } else {
             let (prefix, reservation) = self
                 .terminal_states

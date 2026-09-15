@@ -285,6 +285,41 @@ pub fn try_mhc_split_f32(device_id: i32, mixes: &DeviceBuffer, base: &DeviceBuff
         return Err(format!("ROCm mHC split shape 非法: rows={rows} copies={copies} iterations={iterations} eps={eps}"));
     }
     let functions = hyper_connection_functions(device_id)?;
+    if rows == 1 && copies <= 16 {
+        // decode 不能让一个线程串行完成全部 sigmoid/softmax/Sinkhorn。复用 prepare
+        // 的 block 协作系数 kernel；布局仍是 pre/post/combination 三段连续 F32。
+        let pre_bytes = rows.checked_mul(copies).and_then(|n| n.checked_mul(4)).ok_or("ROCm mHC split pre 大小溢出")?;
+        let combination_bytes = rows.checked_mul(copies).and_then(|n| n.checked_mul(copies)).and_then(|n| n.checked_mul(4)).ok_or("ROCm mHC split combination 大小溢出")?;
+        let owner = std::sync::Arc::new(DeviceBuffer::allocate_reusable(device_id, pre_bytes.checked_mul(2).and_then(|n| n.checked_add(combination_bytes)).ok_or("ROCm mHC split coefficient 大小溢出")?)?);
+        let pre = DeviceBuffer::view(owner.clone(), 0, pre_bytes)?;
+        let post = DeviceBuffer::view(owner.clone(), pre_bytes, pre_bytes)?;
+        let combination = DeviceBuffer::view(owner, pre_bytes * 2, combination_bytes)?;
+        let mut d_mixes = mixes.pointer;
+        let mut d_base = base.pointer;
+        let mut d_scale = scale.pointer;
+        let mut d_coefficients = pre.pointer;
+        let mut copies_u32 = u32_value("mHC copies", copies)?;
+        let mut iterations_u32 = u32_value("mHC iterations", iterations)?;
+        let mut eps_f32 = eps;
+        let mut rows_u32 = u32_value("mHC rows", rows)?;
+        launch(
+            functions.prepare_coefficients,
+            u32_value("mHC split decode grid", rows)?,
+            MHC_BLOCK,
+            &mut [
+                (&mut d_mixes as *mut *mut c_void).cast(),
+                (&mut d_base as *mut *mut c_void).cast(),
+                (&mut d_scale as *mut *mut c_void).cast(),
+                (&mut d_coefficients as *mut *mut c_void).cast(),
+                (&mut copies_u32 as *mut u32).cast(),
+                (&mut iterations_u32 as *mut u32).cast(),
+                (&mut eps_f32 as *mut f32).cast(),
+                (&mut rows_u32 as *mut u32).cast(),
+            ],
+            "hip mhc split decode coefficients",
+        )?;
+        return Ok((pre, post, combination));
+    }
     let pre = DeviceBuffer::allocate(device_id, rows * copies * 4)?;
     let post = DeviceBuffer::allocate(device_id, rows * copies * 4)?;
     let combination = DeviceBuffer::allocate(device_id, rows * copies * copies * 4)?;

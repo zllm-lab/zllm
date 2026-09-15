@@ -279,7 +279,7 @@ impl<'a, B: Backend> OrnithRuntime<'a, B> {
             let moe = prefill_experts_observed(
                 self.backend,
                 &self.moe,
-                &MoeFfnRef { router_weight: &weights.layer.moe.router_weight, router_bias: &weights.layer.moe.router_bias, shared_experts: &shared, selected_experts: None },
+                &MoeFfnRef { router_weight: &weights.layer.moe.router_weight, router_bias: &weights.layer.moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None },
                 self.config.layer_count,
                 experts,
                 &moe_input,
@@ -335,7 +335,7 @@ impl<'a, B: Backend> OrnithRuntime<'a, B> {
         let feedforward = expert_state.decode(
             self.backend,
             &self.moe,
-            &MoeFfnRef { router_weight: &weights.layer.moe.router_weight, router_bias: &weights.layer.moe.router_bias, shared_experts: &shared, selected_experts: None },
+            &MoeFfnRef { router_weight: &weights.layer.moe.router_weight, router_bias: &weights.layer.moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None },
             ExpertDecodeRequest { layer: self.config.layer_count, source, position, next: None },
             &moe_input,
         )?;
@@ -482,7 +482,7 @@ where
         let moe = prefill_experts_observed(
             self.runtime.backend,
             &self.runtime.moe,
-            &MoeFfnRef { router_weight: &weights.moe.router_weight, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None },
+            &MoeFfnRef { router_weight: &weights.moe.router_weight, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None },
             layer,
             experts,
             &moe_input,
@@ -544,7 +544,7 @@ where
         self.runtime.backend.begin_decode_batch();
         let (residual, moe_input) = self.attention_block(weights, layer, hidden)?;
         let shared = [SharedExpertRef { gate: &weights.moe.shared_gate, up: &weights.moe.shared_up, down: &weights.moe.shared_down, output_gate: Some(&weights.moe.shared_output_gate) }];
-        let ffn = MoeFfnRef { router_weight: &weights.moe.router_weight, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
+        let ffn = MoeFfnRef { router_weight: &weights.moe.router_weight, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
         let source = expert_sources.source(layer).map_err(BackendError::ExpertLoad)?;
         // 只在本设备的层区间内预取下一层专家；区间外属于别的设备，不提前装载。
         let next_source = (layer + 1 < self.runtime.first_layer + self.runtime.layers.len()).then(|| expert_sources.source(layer + 1).map(|source| (layer + 1, source))).transpose().map_err(BackendError::ExpertLoad)?;

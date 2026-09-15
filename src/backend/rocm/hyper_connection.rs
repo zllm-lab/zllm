@@ -247,6 +247,10 @@ mod tests {
         let mixes4 = upload(device_id, &mixes4_values);
         let base4 = upload(device_id, &base4_values);
         let expected4 = split_f32(&mixes4_values, &base4_values, &scale_values, &spec4).unwrap();
+        let (pre4, post4, combination4) = mhc::try_mhc_split_f32(device_id, &mixes4, &base4, &scale, 1, 4, 20, 1.0e-6).unwrap();
+        assert_close(&download(&pre4, 4), &expected4.pre);
+        assert_close(&download(&post4, 4), &expected4.post);
+        assert_close(&download(&combination4, 16), &expected4.combination);
         let (residual4, reduced4, post4) = mhc::try_mhc_prepare_sublayer_f32(device_id, &hidden4, &mixes4, &base4, &scale, 1, 8, 4, 20, 1.0e-6).unwrap();
         assert_close(&download(&residual4, 32), &mix_f32(&hidden4_values, &expected4.combination, 4).unwrap());
         assert_close(&download(&reduced4, 8), &reduce_f32(&hidden4_values, &expected4.pre, 4).unwrap());

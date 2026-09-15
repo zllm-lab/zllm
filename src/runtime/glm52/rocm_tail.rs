@@ -2,6 +2,14 @@
 
 use super::*;
 
+/// 只统计原始空闲与已完成、可复用的池内 allocation；不能沿用启动快照。
+pub(super) fn refresh_tail_device_memory(devices: &mut [StageDeviceMemory]) -> Result<(), String> {
+    for device in devices {
+        device.available_bytes = ops::hip::device_admission_available_bytes(device.device)? as u64;
+    }
+    Ok(())
+}
+
 pub(super) struct TailSession {
     pub(super) states: Vec<Glm52StageState>,
     pub(super) placement: usize,
@@ -14,6 +22,155 @@ pub(super) struct TailSession {
     pub(super) started: Instant,
 }
 
+pub(in crate::runtime::glm52) fn pair_session_reservation(states: &[Glm52StageState], rows: usize, cfg: &Glm52Config) -> Result<Vec<(i32, usize)>, String> {
+    let mut result = Vec::with_capacity(states.len() * 2);
+    for state in states {
+        let peer = state.experts.lock().map_err(|_| "GPU reservation expert 锁中毒")?.operator_peer_context().ok_or("GPU reservation 需要 operator pair")?;
+        let layers = state.layer_start..state.layer_start + state.layers.len();
+        let mla = state.cache.operator_reservation_bytes(layers.clone(), rows, cfg.kv_lora_rank, cfg.qk_rope_head_dim).map_err(|error| format!("MLA reservation: {error:?}"))?;
+        let mut dsa = [0usize; 2];
+        // IndexShare 不拥有 history，不能为它创建空 DSA 层；否则首次 decode
+        // truncate 会把这个从未写入的空层当成已完成历史。
+        for layer in resident_indexer_layers(state.layer_start, &state.layers) {
+            let bytes = state.dsa.sequence_shard_reservation_bytes(layer..layer + 1, rows).map_err(|error| format!("DSA reservation: {error:?}"))?;
+            for parity in 0..2 {
+                dsa[parity] = dsa[parity].saturating_add(bytes[parity]);
+            }
+        }
+        for (parity, context) in [state.backend, peer].into_iter().enumerate() {
+            result.push((context.device_id(), mla[parity].saturating_add(dsa[parity])));
+        }
+    }
+    Ok(result)
+}
+
+fn resident_indexer_layers<W>(start: usize, layers: &[RuntimeGlm52PrefillLayer<W>]) -> impl Iterator<Item = usize> + '_ {
+    layers.iter().enumerate().filter_map(move |(offset, layer)| {
+        let has_indexer = match layer {
+            RuntimeGlm52PrefillLayer::Dense(weights) => weights.indexer.is_some(),
+            RuntimeGlm52PrefillLayer::Moe(weights) => weights.indexer.is_some(),
+        };
+        has_indexer.then_some(start + offset)
+    })
+}
+
+pub(in crate::runtime::glm52) fn reserve_pair_session(states: &mut [Glm52StageState], rows: usize, cfg: &Glm52Config) -> Result<(), String> {
+    // 每个 stage 独占本层的 MLA/DSA 和设备对；复制主存历史与预留可同时进行。
+    // 错误返回前也要 join 全部工作，不能让资源预算早于实际分配生命周期释放。
+    std::thread::scope(|scope| {
+        let jobs = states
+            .iter_mut()
+            .map(|state| {
+                scope.spawn(move || -> Result<(), String> {
+                    state.backend.activate().map_err(|error| format!("预留 L{} 激活 device={}: {error}", state.layer_start, state.backend.device_id()))?;
+                    let peer = state.experts.lock().map_err(|_| "GPU reservation expert 锁中毒")?.operator_peer_context().ok_or("GPU reservation 需要 operator pair")?;
+                    let layers = state.layer_start..state.layer_start + state.layers.len();
+                    let indexers = resident_indexer_layers(state.layer_start, &state.layers).collect::<Vec<_>>();
+                    for layer in indexers {
+                        state.dsa.reserve_sequence_shard_rows(&state.backend, &peer, layer..layer + 1, rows).map_err(|error| format!("预留 L{layer} DSA 两分块: {error:?}"))?;
+                    }
+                    state.cache.reserve_operator_rows(&state.backend, &peer, layers, rows, cfg.kv_lora_rank, cfg.qk_rope_head_dim).map_err(|error| format!("预留 L{} MLA 热窗及元数据: {error:?}", state.layer_start))?;
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut error = None;
+        for job in jobs {
+            if let Err(message) = job.join().map_err(|_| "GLM stage cache 预留线程 panic".to_owned()).and_then(|result| result) {
+                error.get_or_insert(message);
+            }
+        }
+        error.map_or(Ok(()), Err)
+    })
+}
+
+// placement 与 Indexer 分布在服务期间固定；启动时统计，查询余量不等待计算锁。
+pub(super) fn tail_indexer_layer_counts(templates: &[Vec<Glm52StageState>], devices: &[StageDeviceMemory]) -> Result<Vec<usize>, String> {
+    let mut indexers = HashMap::<i32, usize>::new();
+    for template in templates {
+        let mut plan = HashMap::<i32, usize>::new();
+        for state in template {
+            let peer = state.experts.lock().map_err(|_| "GPU indexer 计数 expert 锁中毒")?.operator_peer_context().ok_or("GPU indexer 计数需要 operator pair")?;
+            for context in [state.backend, peer] {
+                *plan.entry(context.device_id()).or_default() += resident_indexer_layers(state.layer_start, &state.layers).count();
+            }
+        }
+        for (device, count) in plan {
+            let total = indexers.entry(device).or_default();
+            *total = (*total).max(count);
+        }
+    }
+    Ok(devices.iter().map(|device| indexers.get(&device.device).copied().unwrap_or(0)).collect())
+}
+
+fn fresh_tail_reservation(templates: &[Vec<Glm52StageState>], cfg: &Glm52Config, max_seq_len: usize, rows: usize) -> Result<Vec<(i32, usize)>, String> {
+    // Open 可以选择不同 placement，逐设备取各方案上界，不能假定首方案。
+    let mut worst = HashMap::<i32, usize>::new();
+    for template in templates {
+        let fresh = template.iter().map(|state| state.fresh_session(cfg, max_seq_len)).collect::<Result<Vec<_>, _>>().map_err(|error| format!("创建 GPU 准入计算用空 cache: {error:?}"))?;
+        let mut plan = HashMap::<i32, usize>::new();
+        for (device, bytes) in pair_session_reservation(&fresh, rows, cfg)? {
+            *plan.entry(device).or_default() += bytes;
+        }
+        for (device, bytes) in plan {
+            let total = worst.entry(device).or_default();
+            *total = (*total).max(bytes);
+        }
+    }
+    Ok(worst.into_iter().collect())
+}
+
+fn deduct_pending_tail_memory(devices: &mut [StageDeviceMemory], pending: &[TailPendingOpen]) {
+    for device in devices {
+        let held = pending
+            .iter()
+            .filter_map(|item| match &item.work {
+                TailOpenWork::Read { required, .. } => Some(required),
+                TailOpenWork::Prepare { .. } => None,
+            })
+            .flatten()
+            .filter(|(id, _)| *id == device.device)
+            .fold(0_u64, |sum, (_, bytes)| sum.saturating_add(*bytes as u64));
+        device.available_bytes = device.available_bytes.saturating_sub(held);
+    }
+}
+
+pub(super) fn report_tail_memory_requirement(
+    link: &mut StageTransport,
+    devices: &mut [StageDeviceMemory],
+    resident: &mut HashMap<RequestId, TailResident>,
+    swap: &Glm52SwapStore,
+    output_context: &RocmContext,
+    templates: &[Vec<Glm52StageState>],
+    cfg: &Glm52Config,
+    max_seq_len: usize,
+    cache_request_id: Option<RequestId>,
+    rows: usize,
+    indexer_layers: &[usize],
+    pending: &[TailPendingOpen],
+) -> Result<(), String> {
+    let reserve = ops::hip::options().mla_gpu_resident_reserve_bytes.ok_or("实时 GPU 准入需要配置 MLA 保留空间")?;
+    if indexer_layers.len() != devices.len() {
+        return Err(format!("GPU Indexer 统计数量={}，设备数={}", indexer_layers.len(), devices.len()));
+    }
+    if rows == 0 {
+        refresh_tail_device_memory(devices)?;
+        deduct_pending_tail_memory(devices, pending);
+        return link.send_memory_requirement(devices, &vec![0; devices.len()], indexer_layers);
+    }
+    loop {
+        let required = if let Some(saved) = cache_request_id.and_then(|id| resident.get(&id)) { pair_session_reservation(&saved.states, rows, cfg)? } else { fresh_tail_reservation(templates, cfg, max_seq_len, rows)? };
+        refresh_tail_device_memory(devices)?;
+        deduct_pending_tail_memory(devices, pending);
+        let bytes = devices.iter().map(|device| required.iter().filter(|(id, _)| *id == device.device).map(|(_, bytes)| *bytes as u64).sum::<u64>()).collect::<Vec<_>>();
+        if devices.iter().zip(&bytes).all(|(device, bytes)| device.available_bytes >= bytes.saturating_add(reserve as u64)) {
+            return link.send_memory_requirement(devices, &bytes, indexer_layers);
+        }
+        let victim = resident.iter().filter(|(id, _)| Some(**id) != cache_request_id).min_by_key(|(_, saved)| saved.completed_unix).map(|(id, _)| *id);
+        let Some(victim) = victim else { return link.send_memory_requirement(devices, &bytes, indexer_layers) };
+        tail_cache_to_host(resident, swap, output_context, victim)?;
+    }
+}
 /// tail stage 的 resident cache:已完成的 session 状态,等待复用或换出。
 /// 输出与 MTP 驻留 head 首卡,tail 的 resident 只含 KV/DSA 与 terminal hidden。
 pub(super) struct TailResident {
@@ -22,9 +179,9 @@ pub(super) struct TailResident {
     pub(super) hidden: RocmTensor,
     pub(super) position: usize,
     pub(super) completed_unix: u64,
-    pub(super) prompt_tokens: usize,
 }
 
+#[derive(Clone)]
 pub(super) struct TailOpenRequest {
     pub(super) request_id: RequestId,
     pub(super) cache_request_id: Option<RequestId>,
@@ -35,11 +192,17 @@ pub(super) struct TailOpenRequest {
 }
 
 pub(super) struct TailPendingOpen {
-    request: TailOpenRequest,
-    receiver: std::sync::mpsc::Receiver<Result<Option<Glm52CacheSnapshot>, String>>,
+    pub(super) request: TailOpenRequest,
+    work: TailOpenWork,
 }
 
-/// resident hit 立即完成；SSD hit 只并行读取 host snapshot，GPU 恢复仍留在 stage 线程。
+enum TailOpenWork {
+    // 尚未实际分配的 GPU 字节；进入 Prepare 后物理 free 已反映占用。
+    Read { receiver: std::sync::mpsc::Receiver<Result<Option<Arc<Glm52CacheSnapshot>>, String>>, required: Vec<(i32, usize)> },
+    Prepare { session: TailSession, worker: Glm52HotHistoryPrepare },
+}
+
+/// resident hit 立即完成；SSD 预读与注册保留在 pending 中，完成后才发送 Ready。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn begin_tail_stage_open(
     link: &mut StageTransport,
@@ -58,8 +221,21 @@ pub(super) fn begin_tail_stage_open(
     }
     let needs_ssd = request.cache_hit && request.cache_request_id.is_some_and(|cache_id| !resident.contains_key(&cache_id));
     if !needs_ssd {
-        return tail_stage_open(link, active, resident, swap, output_context, templates, cfg, max_seq_len, request, None);
+        return tail_stage_open(link, active, resident, pending, swap, output_context, templates, cfg, max_seq_len, request, None);
     }
+    let hip = ops::hip::options();
+    let required = if hip.mla_gpu_resident_reserve_bytes.is_some()
+        && hip.mla_cpu_hot_rows > 64
+        && !hip.kv_f16
+        && !hip.dsa_cpu_select
+        && !hip.prefill_attention_cpu
+        && templates.first().and_then(|states| states.first()).is_some_and(|state| state.experts.lock().ok().is_some_and(|experts| experts.operator_peer_context().is_some()))
+    {
+        let rows = request.reserved_rows.max(request.cached_tokens).min(request.cached_tokens.saturating_add(1).div_ceil(4096).saturating_mul(4096)).min(max_seq_len);
+        fresh_tail_reservation(templates, cfg, max_seq_len, rows)?
+    } else {
+        Vec::new()
+    };
     let cache_id = request.cache_request_id.expect("needs_ssd 已检查 cache id").to_string();
     let request_id = request.request_id;
     let swap = Arc::clone(swap);
@@ -68,12 +244,12 @@ pub(super) fn begin_tail_stage_open(
         .name(format!("glm52-tail-{}", request_id.to_string().chars().take(12).collect::<String>()))
         .spawn(move || {
             let started = Instant::now();
-            let result = swap.get(&cache_id);
+            let result = swap.load(&cache_id);
             eprintln!("[glm52-swap-prefetch] side=tail request_id={request_id} cache_id={cache_id} hit={} read_ms={:.3}", result.as_ref().ok().is_some_and(Option::is_some), started.elapsed().as_secs_f64() * 1000.0);
             let _ = sender.send(result);
         })
         .map_err(|error| format!("启动 tail SSD prefetch: {error}"))?;
-    pending.push(TailPendingOpen { request, receiver });
+    pending.push(TailPendingOpen { request, work: TailOpenWork::Read { receiver, required } });
     Ok(())
 }
 
@@ -92,16 +268,35 @@ pub(super) fn poll_tail_stage_opens(
     let mut progressed = false;
     let mut index = 0;
     while index < pending.len() {
-        let result = match pending[index].receiver.try_recv() {
-            Ok(result) => result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                index += 1;
-                continue;
+        let snapshot = match &pending[index].work {
+            TailOpenWork::Read { receiver, .. } => Some(match receiver.try_recv() {
+                Ok(result) => result,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    index += 1;
+                    continue;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("tail SSD prefetch 线程提前退出".to_owned()),
+            }),
+            TailOpenWork::Prepare { worker, .. } => {
+                if !worker.is_finished() {
+                    index += 1;
+                    continue;
+                }
+                None
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("tail SSD prefetch 线程提前退出".to_owned()),
         };
         let item = pending.remove(index);
-        tail_stage_open(link, active, resident, swap, output_context, templates, cfg, max_seq_len, item.request, Some(result))?;
+        match item.work {
+            TailOpenWork::Read { .. } => tail_stage_open(link, active, resident, pending, swap, output_context, templates, cfg, max_seq_len, item.request, Some(snapshot.expect("Read 必有结果")))?,
+            TailOpenWork::Prepare { mut session, worker } => {
+                session.states = worker.finish()?;
+                session.started = Instant::now();
+                let request_id = item.request.request_id;
+                eprintln!("[glm52-session-placement] request_id={request_id} plan={} cache_hit={}", session.placement, session.resumed);
+                active.insert(request_id, session);
+                link.send_ready(request_id, item.request.cached_tokens)?;
+            }
+        }
         progressed = true;
     }
     Ok(progressed)
@@ -116,18 +311,23 @@ pub(super) fn tail_stage_open(
     link: &mut StageTransport,
     active: &mut HashMap<RequestId, TailSession>,
     resident: &mut HashMap<RequestId, TailResident>,
+    pending: &mut Vec<TailPendingOpen>,
     swap: &Glm52SwapStore,
     output_context: &RocmContext,
     templates: &[Vec<Glm52StageState>],
     cfg: &Glm52Config,
     max_seq_len: usize,
     request: TailOpenRequest,
-    prefetched: Option<Result<Option<Glm52CacheSnapshot>, String>>,
+    prefetched: Option<Result<Option<Arc<Glm52CacheSnapshot>>, String>>,
 ) -> Result<(), String> {
-    let TailOpenRequest { request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling: sampling_config } = request;
+    let TailOpenRequest { request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling: sampling_config } = request.clone();
     if active.contains_key(&request_id) {
         return Err(format!("后继重复 Open active request={request_id}"));
     }
+    let mla_bytes = cfg.kv_lora_rank + cfg.kv_lora_rank / crate::kv_cache::DEFAULT_GROUP_SIZE * 2 + cfg.qk_rope_head_dim * 2;
+    let layers = templates.iter().map(|states| states.iter().map(|state| state.layers.len()).sum::<usize>()).max().unwrap_or(0);
+    // 后继独立检查主存余量；按两份 mirror 预留，不能只依赖链头机器的 RAM。
+    swap.spill_host(reserved_rows.max(cached_tokens).saturating_mul(layers).saturating_mul(2).saturating_mul(mla_bytes) as u64)?;
     let fresh_states = |placement: usize| {
         templates
             .get(placement)
@@ -140,6 +340,7 @@ pub(super) fn tail_stage_open(
     let mut placement = choose_tail_placement(active, templates)?;
     let mut states = fresh_states(placement)?;
     let mut hidden = None;
+    let mut restored_host = false;
     if cache_hit {
         let reserved_rows = if reserved_rows == 0 { cached_tokens } else { reserved_rows };
         if reserved_rows < cached_tokens || reserved_rows > max_seq_len {
@@ -165,7 +366,7 @@ pub(super) fn tail_stage_open(
             let cache_id = cache_request_id.to_string();
             let snapshot = match prefetched {
                 Some(result) => result?,
-                None => swap.get(&cache_id)?,
+                None => swap.load(&cache_id)?,
             };
             let Some(snapshot) = snapshot else {
                 eprintln!("[stage-cache-reject] request_id={request_id} SSD cache 未命中 cache_id={cache_id}");
@@ -182,8 +383,11 @@ pub(super) fn tail_stage_open(
                 .position(|template| template.len() == snapshot.stages.len() && template.iter().zip(&snapshot.stages).all(|(state, cached)| state.layer_start == cached.layer_start))
                 .ok_or_else(|| format!("tail SSD cache 的 placement 与当前 {} 个方案均不匹配", templates.len()))?;
             states = fresh_states(placement)?;
-            upload_glm52_session(&mut states, &snapshot.stages, cfg, max_seq_len, reserved_rows)?;
-            hidden = Some(output_context.tensor_from_bf16_bits(snapshot.last_hidden, 1, cfg.hidden_size).map_err(|error| format!("恢复 tail terminal hidden: {error:?}"))?);
+            // 未生成的输出与尚未计算的 append 不占物理 cache；先恢复已有前缀及下一小段。
+            let restore_rows = reserved_rows.min(cached_tokens.saturating_add(1).div_ceil(4096).saturating_mul(4096)).min(max_seq_len);
+            upload_glm52_session(&mut states, &snapshot.stages, cfg, max_seq_len, restore_rows)?;
+            restored_host = true;
+            hidden = Some(output_context.tensor_from_bf16_bits(snapshot.last_hidden.clone(), 1, cfg.hidden_size).map_err(|error| format!("恢复 tail terminal hidden: {error:?}"))?);
             eprintln!("[stage-swap-in] cache_id={request_id} tokens={cached_tokens}");
         }
     } else {
@@ -191,7 +395,26 @@ pub(super) fn tail_stage_open(
     }
     // 采样参数在 head 侧消费;这里只做一次合法性校验,坏参数在 Open 期暴露。
     SamplingState::new(sampling_config)?;
-    active.insert(request_id, TailSession { states, placement, hidden, completed_hidden: None, prompt_hidden: None, prompt_position: None, position: cached_tokens, resumed: cache_hit, started: Instant::now() });
+    let hip = ops::hip::options();
+    let live_reservation = hip.mla_gpu_resident_reserve_bytes.is_some()
+        && hip.mla_cpu_hot_rows > 64
+        && !hip.kv_f16
+        && !hip.dsa_cpu_select
+        && !hip.prefill_attention_cpu
+        && states.first().is_some_and(|state| state.experts.lock().ok().is_some_and(|experts| experts.operator_peer_context().is_some()));
+    if live_reservation {
+        let next_rows = reserved_rows.max(cached_tokens).min(cached_tokens.saturating_add(1).div_ceil(4096).saturating_mul(4096)).min(max_seq_len);
+        reserve_pair_session(&mut states, next_rows, cfg)?;
+    }
+    let mut session = TailSession { states, placement, hidden, completed_hidden: None, prompt_hidden: None, prompt_position: None, position: cached_tokens, resumed: cache_hit, started: Instant::now() };
+    if restored_host && live_reservation {
+        // 两份 DSA 已实际分配。注册只拥有这份待激活状态，主循环继续收发已有 decode。
+        let rows = reserved_rows.max(cached_tokens).min(cached_tokens.saturating_add(1).div_ceil(4096).saturating_mul(4096)).min(max_seq_len);
+        let worker = Glm52HotHistoryPrepare::start(std::mem::take(&mut session.states), rows)?;
+        pending.push(TailPendingOpen { request, work: TailOpenWork::Prepare { session, worker } });
+        return Ok(());
+    }
+    active.insert(request_id, session);
     eprintln!("[glm52-session-placement] request_id={request_id} plan={placement} cache_hit={cache_hit}");
     link.send_ready(request_id, cached_tokens)
 }
@@ -264,25 +487,23 @@ pub(super) fn tail_stage_cache_commit(
     }
     let hidden = tail.hidden.ok_or_else(|| "后继 Cache 缺少 terminal hidden".to_owned())?;
     let completed_unix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    resident.insert(next_request_id, TailResident { states: tail.states, placement: tail.placement, hidden, position: tokens, completed_unix, prompt_tokens: tail.prompt_position.unwrap_or(tokens) });
+    resident.insert(next_request_id, TailResident { states: tail.states, placement: tail.placement, hidden, position: tokens, completed_unix });
     link.send_ready(request_id, tokens)?;
     Ok(())
 }
 
-/// 把 resident session 换出到本机 SSD 并 ACK。continuous 入口此前没有换出日志,收编后统一。
+/// 把 resident session 的 MLA 镜像与 DSA 两分块交给主存，必要时再溢写 SSD。
 pub(super) fn tail_stage_swap_out(link: &mut StageTransport, resident: &mut HashMap<RequestId, TailResident>, swap: &Glm52SwapStore, output_context: &RocmContext, request_id: RequestId) -> Result<(), String> {
-    // 快照下载或 SSD 提交失败时，完整 RAM/GPU 状态必须仍由 resident 持有。
-    let Some(saved) = resident.get(&request_id) else {
+    let position = tail_cache_to_host(resident, swap, output_context, request_id)?;
+    link.send_ready(request_id, position)
+}
+
+fn tail_cache_to_host(resident: &mut HashMap<RequestId, TailResident>, swap: &Glm52SwapStore, output_context: &RocmContext, request_id: RequestId) -> Result<usize, String> {
+    // 完成全部下载后才移动 MLA；主存接管后，即使 SSD 写入失败仍可恢复。
+    let Some(saved) = resident.get_mut(&request_id) else {
         let info = swap.info(&request_id.to_string())?.ok_or_else(|| format!("后继 SwapOut cache={request_id} 不在 resident 或 SSD"))?;
-        link.send_ready(request_id, info.token_count)?;
-        return Ok(());
+        return Ok(info.token_count);
     };
-    if saved.prompt_tokens < crate::runtime::glm52::rocm_swap::MIN_PERSIST_TOKENS {
-        let position = saved.position;
-        resident.remove(&request_id);
-        link.send_ready(request_id, position)?;
-        return Ok(());
-    }
     let snapshot = Glm52CacheSnapshot {
         cache_id: request_id.to_string(),
         cache_namespace: None,
@@ -290,16 +511,50 @@ pub(super) fn tail_stage_swap_out(link: &mut StageTransport, resident: &mut Hash
         token_count: saved.position,
         pending_tokens: None,
         last_hidden: output_context.tensor_to_bf16_bits(&saved.hidden).map_err(|error| format!("下载 tail terminal hidden: {error:?}"))?,
-        stages: download_glm52_session(&saved.states)?,
+        stages: take_glm52_session(&mut saved.states)?,
         mtp: None,
         dspark_aux: None,
         dspark_target: None,
     };
-    swap.put_completed(&snapshot, saved.completed_unix)?;
+    swap.cache_host(Arc::new(snapshot), saved.completed_unix);
     let position = saved.position;
     resident.remove(&request_id);
-    link.send_ready(request_id, position)?;
+    if let Err(error) = swap.spill_host(0) {
+        eprintln!("[glm52-host-spill-deferred] side=tail cache_id={request_id}: {error}");
+    }
     eprintln!("[stage-swap-out] cache_id={request_id} tokens={position}");
+    Ok(position)
+}
+
+/// 下游显存独立增长，不能等链头下次 Open 才发现压力。仅换出已完成会话，
+/// 保留原 cache id；之后的 Open/SwapOut 继续通过现有 RAM/SSD 路径处理。
+pub(super) fn trim_tail_gpu_cache(
+    resident: &mut HashMap<RequestId, TailResident>,
+    swap: &Glm52SwapStore,
+    output_context: &RocmContext,
+    devices: &[StageDeviceMemory],
+    cfg: &Glm52Config,
+    rows: usize,
+    keep: Option<RequestId>,
+) -> Result<(), String> {
+    let Some(reserve) = ops::hip::options().mla_gpu_resident_reserve_bytes else { return Ok(()) };
+    let row_bytes = cfg.kv_lora_rank + cfg.kv_lora_rank / crate::kv_cache::DEFAULT_GROUP_SIZE * 2 + cfg.qk_rope_head_dim * 2;
+    while !resident.is_empty() {
+        let mut pressure = false;
+        for device in devices {
+            let required = reserve.saturating_add(rows.saturating_mul(row_bytes).saturating_mul(device.model_units)).saturating_add(rows.saturating_mul(cfg.hidden_size).saturating_mul(2));
+            let (free, _) = ops::hip::device_memory_info(device.device)?;
+            if free < required && ops::hip::device_admission_available_bytes(device.device)? < required {
+                pressure = true;
+                break;
+            }
+        }
+        if !pressure {
+            break;
+        }
+        let Some(cache_id) = resident.iter().filter(|(id, _)| Some(**id) != keep).min_by_key(|(_, saved)| saved.completed_unix).map(|(id, _)| *id) else { break };
+        tail_cache_to_host(resident, swap, output_context, cache_id)?;
+    }
     Ok(())
 }
 
@@ -307,9 +562,6 @@ pub(super) fn tail_stage_swap_out(link: &mut StageTransport, resident: &mut Hash
 /// continuous 入口此前只处理 resident 命中分支,收编后统一三分支,差异仅为诊断日志。
 pub(super) fn tail_stage_persist(resident: &mut HashMap<RequestId, TailResident>, swap: &Glm52SwapStore, output_context: &RocmContext, request_id: RequestId) -> Result<(), String> {
     if let Some(saved) = resident.get(&request_id) {
-        if saved.prompt_tokens < crate::runtime::glm52::rocm_swap::MIN_PERSIST_TOKENS {
-            return Ok(());
-        }
         let snapshot = Glm52CacheSnapshot {
             cache_id: request_id.to_string(),
             cache_namespace: None,
@@ -324,7 +576,7 @@ pub(super) fn tail_stage_persist(resident: &mut HashMap<RequestId, TailResident>
         };
         swap.put_completed(&snapshot, saved.completed_unix)?;
         eprintln!("[stage-persist] cache_id={request_id} tokens={}", saved.position);
-    } else if swap.get(&request_id.to_string())?.is_some() {
+    } else if swap.persist_host(&request_id.to_string())? || swap.info(&request_id.to_string())?.is_some() {
         eprintln!("[stage-persist] cache_id={request_id} 已在 SSD");
     } else {
         eprintln!("[stage-persist] cache_id={request_id} 不在 resident 或 SSD");
@@ -338,7 +590,7 @@ pub(super) fn tail_stage_persist_all(resident: &mut HashMap<RequestId, TailResid
     for request_id in &request_ids {
         tail_stage_persist(resident, swap, output_context, *request_id)?;
     }
-    Ok(request_ids.len())
+    Ok(request_ids.len() + swap.persist_host_all()?)
 }
 
 /// 从 active/resident/SSD 删除 session,返回删除前 position(continuous 需要随 ACK 上报)。
@@ -752,4 +1004,163 @@ pub(in crate::runtime::glm52) fn prepare_head_output_runtime(
         None
     };
     Ok((output_head, mtp_runtime))
+}
+
+#[cfg(test)]
+mod reservation_tests {
+    use super::*;
+    use crate::runtime::glm52::{Glm52DensePrefillLayer, Glm52IndexerDecodeWeights};
+    use std::sync::Mutex;
+
+    #[test]
+    #[ignore = "需要四张 ROCm GPU"]
+    fn parallel_pair_reservation_preserves_history_and_joins_on_error() {
+        use crate::backend::rocm::{DsaLayerSerde, MlaLayerSerde, RocmKvOwnership};
+        use crate::runtime::glm52::rocm_swap::Glm52StageCache;
+        struct NoExperts;
+        impl crate::weight::expert_source::GgufExpertSource for NoExperts {
+            fn intermediate(&self) -> usize {
+                1
+            }
+            fn hidden(&self) -> usize {
+                1
+            }
+            fn load_expert_gguf(&self, _: usize, _: usize) -> Result<crate::weight::expert_source::GgufExpertWeights, String> {
+                Err("缓存预留测试不能读取权重".to_owned())
+            }
+        }
+        ops::hip::configure(ops::hip::RocmOptions { mla_cpu_hot_rows: 2304, mla_gpu_resident_reserve_bytes: Some(0), ..Default::default() }).unwrap();
+        let mut cfg = Glm52Config::standard();
+        cfg.layer_count = 2;
+        cfg.kv_lora_rank = 64;
+        cfg.qk_rope_head_dim = 8;
+        cfg.index_head_dim = 16;
+        cfg.index_top_k = 2;
+        let mut states = (0..2)
+            .map(|stage| {
+                let backend = RocmContext::new(stage as i32 * 2).unwrap();
+                let w = backend.prepare_f32(&[1.0], 1, 1).unwrap();
+                let mut experts = RocmPrefillExperts::gguf(Arc::new(NoExperts));
+                experts.enable_operator_peer(RocmContext::new(stage as i32 * 2 + 1).unwrap()).unwrap();
+                Glm52StageState {
+                    backend,
+                    layer_start: stage,
+                    layers: Arc::new(vec![RuntimeGlm52PrefillLayer::Dense(Glm52DensePrefillLayer {
+                        indexer: Some(Glm52IndexerDecodeWeights { wq_b: w.clone(), wk: w.clone(), weights_proj: w.clone(), k_norm_weight: w.clone(), k_norm_bias: w.clone() }),
+                        input_norm: w.clone(),
+                        q_a_proj: w.clone(),
+                        q_a_norm: w.clone(),
+                        q_b_proj: w.clone(),
+                        kv_a_proj: w.clone(),
+                        kv_a_norm: w.clone(),
+                        kv_b_proj: w.clone(),
+                        o_proj: w.clone(),
+                        post_attn_norm: w.clone(),
+                        gate_proj: w.clone(),
+                        up_proj: w.clone(),
+                        down_proj: w,
+                    })]),
+                    experts: Arc::new(Mutex::new(experts)),
+                    cache: RocmKvCache::with_capacity(2, 8192),
+                    dsa: RocmDsaState::new(2, 8192, 16, 2).unwrap(),
+                    decode_active: false,
+                    hidden_projectors: Vec::new(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let snapshots = (0..2)
+            .map(|stage| {
+                let rows = 3001 + stage * 1100;
+                let mut kv = vec![None, None];
+                kv[stage] = Some(MlaLayerSerde {
+                    rows,
+                    ownership: RocmKvOwnership::Full,
+                    latent_cols: 64,
+                    rope_cols: 8,
+                    latent_group_size: 64,
+                    latent: (0..rows * 64).map(|i| (i * 17 + stage * 11) as u8).collect(),
+                    latent_scales: Some(vec![0x38; rows * 2]),
+                    rope: vec![stage as u8 + 1; rows * 16],
+                });
+                let mut dsa = vec![None, None];
+                dsa[stage] = Some(DsaLayerSerde { rows, key_group_size: 16, hadamard: false, keys: (0..rows * 16).map(|i| (i * 31 + stage * 7) as u8).collect(), scales: vec![0x38; rows * 2] });
+                Glm52StageCache { layer_start: stage, kv, dsa }
+            })
+            .collect::<Vec<_>>();
+        upload_glm52_session(&mut states, &snapshots, &cfg, 8192, 8192).unwrap();
+        reserve_pair_session(&mut states, 8192, &cfg).unwrap();
+        for (stage, (actual, expected)) in download_glm52_session(&states).unwrap().iter().zip(&snapshots).enumerate() {
+            let actual_kv = actual.kv[stage].as_ref().unwrap();
+            let expected_kv = expected.kv[stage].as_ref().unwrap();
+            assert_eq!(actual_kv.latent, expected_kv.latent);
+            assert_eq!(actual_kv.latent_scales, expected_kv.latent_scales);
+            assert_eq!(actual_kv.rope, expected_kv.rope);
+            assert_eq!(actual.dsa[stage].as_ref().unwrap().keys, expected.dsa[stage].as_ref().unwrap().keys);
+            assert_eq!(actual.dsa[stage].as_ref().unwrap().scales, expected.dsa[stage].as_ref().unwrap().scales);
+        }
+        upload_glm52_session(&mut states, &snapshots, &cfg, 8192, 8192).unwrap();
+        // 第一组失败仍必须完成第二组预留，调用方才能安全释放会话及预算。
+        states[0].experts = Arc::new(Mutex::new(RocmPrefillExperts::gguf(Arc::new(NoExperts))));
+        assert!(reserve_pair_session(&mut states, 8192, &cfg).unwrap_err().contains("需要 operator pair"));
+        assert!(pair_session_reservation(&states[1..], 8192, &cfg).unwrap().iter().all(|(_, bytes)| *bytes == 0));
+        let restored = states[1].dsa.download_layers().unwrap();
+        assert_eq!(restored[1].as_ref().unwrap().keys, snapshots[1].dsa[1].as_ref().unwrap().keys);
+    }
+
+    #[test]
+    fn reservation_skips_index_share_history() {
+        // stage 从 IndexShare 开始；不能按 stage 的首层或层数推测 Indexer。
+        let layers = [false, true, false, false, false, true].map(|has_indexer| {
+            RuntimeGlm52PrefillLayer::Dense(Glm52DensePrefillLayer {
+                indexer: has_indexer.then_some(Glm52IndexerDecodeWeights { wq_b: (), wk: (), weights_proj: (), k_norm_weight: (), k_norm_bias: () }),
+                input_norm: (),
+                q_a_proj: (),
+                q_a_norm: (),
+                q_b_proj: (),
+                kv_a_proj: (),
+                kv_a_norm: (),
+                kv_b_proj: (),
+                o_proj: (),
+                post_attn_norm: (),
+                gate_proj: (),
+                up_proj: (),
+                down_proj: (),
+            })
+        });
+        assert_eq!(resident_indexer_layers(9, &layers).collect::<Vec<_>>(), [10, 14]);
+        assert_eq!(resident_indexer_layers(9, &layers[..1]).count(), 0);
+        assert_eq!(resident_indexer_layers::<()>(9, &[]).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod pending_open_tests {
+    use super::*;
+
+    #[test]
+    fn pending_open_reservation_is_released_after_physical_allocation() {
+        let request = |id| TailOpenRequest { request_id: RequestId::from_cache_id(id), cache_request_id: None, cached_tokens: 128, reserved_rows: 4096, cache_hit: true, sampling: SamplingConfig::greedy(0) };
+        let (_, rx0) = std::sync::mpsc::channel();
+        let (_, rx1) = std::sync::mpsc::channel();
+        let session = TailSession { states: Vec::new(), placement: 0, hidden: None, completed_hidden: None, prompt_hidden: None, prompt_position: None, position: 128, resumed: true, started: Instant::now() };
+        let mut pending = vec![
+            TailPendingOpen { request: request("first"), work: TailOpenWork::Read { receiver: rx0, required: vec![(2, 200), (3, 400)] } },
+            TailPendingOpen { request: request("second"), work: TailOpenWork::Read { receiver: rx1, required: vec![(2, 100)] } },
+            TailPendingOpen { request: request("allocated"), work: TailOpenWork::Prepare { session, worker: Glm52HotHistoryPrepare::start(Vec::new(), 0).unwrap() } },
+        ];
+        let mut devices = vec![
+            StageDeviceMemory { device: 2, model_units: 10, available_bytes: 1000, total_bytes: 2000 },
+            StageDeviceMemory { device: 3, model_units: 10, available_bytes: 300, total_bytes: 2000 },
+            StageDeviceMemory { device: 4, model_units: 10, available_bytes: 700, total_bytes: 2000 },
+        ];
+        deduct_pending_tail_memory(&mut devices, &pending);
+        assert_eq!(devices.iter().map(|d| d.available_bytes).collect::<Vec<_>>(), [700, 0, 700]);
+        // 第一份已物理分配或被取消，新鲜 free 不能再扣它；Prepare 本身不重复扣除。
+        pending.remove(0);
+        for (device, free) in devices.iter_mut().zip([1000, 300, 700]) {
+            device.available_bytes = free;
+        }
+        deduct_pending_tail_memory(&mut devices, &pending);
+        assert_eq!(devices.iter().map(|d| d.available_bytes).collect::<Vec<_>>(), [900, 300, 700]);
+    }
 }

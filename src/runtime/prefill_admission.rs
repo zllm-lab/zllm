@@ -7,9 +7,8 @@ pub struct PrefillAdmissionCursor {
     pub(super) submitted: usize,
 }
 
-/// decode 活跃时，prefill 只能消费真实 stage 空泡和固定的公平份额。预算按
-/// completion event 时间而不是 work 数量计费，因此大 chunk 不会伪装成一个便宜
-/// work 挤占整个流水线；没有 backlog 时仍恢复完整 prefill window。
+/// decode 未占满 stage 时直接准入一块 prefill；stage 内的执行槽和优先级
+/// 决定何时提交。只有 decode 占满流水线时才使用空闲与公平份额预算。
 #[derive(Default)]
 pub struct OpportunisticPrefillAdmission {
     cursor: PrefillAdmissionCursor,
@@ -31,9 +30,7 @@ impl OpportunisticPrefillAdmission {
         &mut self.cursor
     }
 
-    /// mixed prefill 始终保持准入 quantum；ceiling 内短请求由
-    /// `short_request_ready` 在上一块全 stage 退休后立即续发。这样既不背历史
-    /// 时间债，也不会把完整短 suffix 放大成一个不可抢占的长 kernel。
+    /// 请求末块可以小于配置分块，不能为凑满分块读越 token 边界。
     pub fn chunk_size(&self, requested: usize, limit: usize, remaining: usize) -> usize {
         requested.min(limit).min(remaining)
     }
@@ -46,15 +43,16 @@ impl OpportunisticPrefillAdmission {
 
     fn observe(&mut self, snapshot: StageFlowSnapshot, ceiling: usize, stage_count: usize) {
         let decode = snapshot.decode_micros.saturating_sub(self.observed.decode_micros);
-        let idle = snapshot.idle_micros.saturating_sub(self.observed.idle_micros);
+        let idle = snapshot.idle_micros.saturating_sub(self.observed.idle_micros).saturating_add(snapshot.prefill_idle_micros.saturating_sub(self.observed.prefill_idle_micros));
         self.observed = snapshot;
         if let Some(started) = self.sample_started
             && snapshot.prefill_batches > started.prefill_batches
             && snapshot.prefill_active == 0
-            && snapshot.prefill_idle_pending == 0
         {
             let batches = snapshot.prefill_batches - started.prefill_batches;
-            let micros = snapshot.prefill_micros.saturating_sub(started.prefill_micros).saturating_add(snapshot.prefill_idle_micros.saturating_sub(started.prefill_idle_micros));
+            // stage 已经空闲时不再消耗计算资源；等待下一轮 decode 的时间
+            // 不能算成 prefill 成本，否则会同时增加债务并剥夺空闲预算。
+            let micros = snapshot.prefill_micros.saturating_sub(started.prefill_micros);
             let batch_sample = micros.div_ceil(batches).max(1);
             self.prefill_micros_per_batch = if self.prefill_micros_per_batch == 0 { batch_sample } else { self.prefill_micros_per_batch.saturating_mul(3).saturating_add(batch_sample).div_ceil(4) };
             if batches == u64::try_from(self.sample_work_items).unwrap_or(u64::MAX) && self.sample_work_units != 0 {
@@ -87,12 +85,15 @@ impl OpportunisticPrefillAdmission {
         if !decode_active {
             return (pipeline_work_window, pipeline_work_window, None);
         }
-        // 32-token admission 已足够细；继续拆成更小 work 只会重复支付
-        // kernel launch 与 stage handoff 固定成本。stage 内有界公平负责退休。
         let mixed_floor = base;
         let work_items = 1;
         if self.sample_started.is_some() {
             return (0, work_items, Some(mixed_floor));
+        }
+        // 不能把“存在 decode”误当成“全部 stage 已满”。仍只放一块，
+        // 防止后台排队淹没 latency 队列；实际设备提交服从 stage 执行槽。
+        if snapshot.decode_busy_stages < u64::try_from(stage_count.max(1)).unwrap_or(u64::MAX) {
+            return (1, work_items, Some(mixed_floor));
         }
         if self.prefill_micros_per_batch == 0 {
             return (usize::from(!self.bootstrap_submitted), work_items, Some(mixed_floor));

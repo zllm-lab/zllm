@@ -170,7 +170,7 @@ impl Mtp {
         let (mixed, inject) = super::cuda::hc_mix(ctx, cfg, &residual, &self.weights.hc_ffn)?;
         let moe = &self.weights.moe;
         let shared = [SharedExpertRef { gate: &moe.shared_gate, up: &moe.shared_up, down: &moe.shared_down, output_gate: Some(&moe.shared_output_gate) }];
-        let weights = MoeFfnRef { router_weight: &moe.router, router_bias: &moe.router_bias, shared_experts: &shared, selected_experts: None };
+        let weights = MoeFfnRef { router_weight: &moe.router, router_bias: &moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
         let output = self.experts.decode(ctx, &cfg.moe_spec(), &weights, ExpertDecodeRequest { layer: cfg.num_layers, source: ExpertSource::Gguf(self.source.as_ref()), position, next: None }, &mixed)?;
         Ok(grouped::sigmoid_residual(ctx, &residual, &output, inject.as_ref().unwrap())?)
     }

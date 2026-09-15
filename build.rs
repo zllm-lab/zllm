@@ -43,12 +43,7 @@ fn main() {
     // 设备侧 HTP 引擎(trace 解释器 / decode / prefill / ASR):源码使用 C++ 异常,
     // 与上面的 no-exceptions FFI shim 分开编译。引擎只依赖 QNN header,架构差异
     // (V73/V75/V79)全部由运行期配置与部署产物承载,不进入编译期。
-    let engine = [
-        "src/backend/qnn/htp_trace.cpp",
-        "src/runtime/minicpm5/qnn_decode.cpp",
-        "src/runtime/minicpm5/qnn_prefill.cpp",
-        "src/runtime/sensevoice/qnn_asr.cpp",
-    ];
+    let engine = ["src/backend/qnn/htp_trace.cpp", "src/runtime/minicpm5/qnn_decode.cpp", "src/runtime/minicpm5/qnn_prefill.cpp", "src/runtime/sensevoice/qnn_asr.cpp"];
     for file in &engine {
         println!("cargo:rerun-if-changed={file}");
     }

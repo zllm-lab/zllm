@@ -10,7 +10,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use super::file_ext::FileExt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use half::{bf16, f16};
 
@@ -113,6 +113,89 @@ struct CachedShard {
     file: File,
     header: HashMap<String, TensorMetadata>,
     data_offset: u64,
+    #[cfg(unix)]
+    mapping: OnceLock<Result<Arc<MappedFile>, String>>,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct MappedFile {
+    address: *mut libc::c_void,
+    len: usize,
+}
+
+#[cfg(unix)]
+unsafe impl Send for MappedFile {}
+#[cfg(unix)]
+unsafe impl Sync for MappedFile {}
+
+#[cfg(unix)]
+impl MappedFile {
+    fn open(file: &File) -> Result<Self, String> {
+        use std::os::fd::AsRawFd;
+        let len = usize::try_from(file.metadata().map_err(|error| format!("读取 safetensors 文件长度: {error}"))?.len()).map_err(|_| "safetensors 文件长度超过 usize".to_owned())?;
+        if len == 0 {
+            return Err("safetensors 文件为空，无法 mmap".to_owned());
+        }
+        let address = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ, libc::MAP_PRIVATE, file.as_raw_fd(), 0) };
+        if address == libc::MAP_FAILED {
+            return Err(format!("mmap safetensors: {}", std::io::Error::last_os_error()));
+        }
+        // Engram embed 是超大随机行表；关闭顺序预读，避免一次 256B 行访问把无关页
+        // 带进 CPU page cache。madvise 失败不影响读取正确性。
+        unsafe {
+            libc::madvise(address, len, libc::MADV_RANDOM);
+        }
+        Ok(Self { address, len })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.address.cast(), self.len) }
+    }
+
+    fn prefetch(&self, range: Range<usize>) -> Result<(), String> {
+        if range.is_empty() || range.end > self.len {
+            return Err(format!("mmap prefetch {range:?} 越界于 {}", self.len));
+        }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            return Err(format!("读取系统页大小失败: {page}"));
+        }
+        let page = page as usize;
+        let start = range.start / page * page;
+        let end = range.end.div_ceil(page).saturating_mul(page).min(self.len);
+        let address = unsafe { self.address.cast::<u8>().add(start).cast::<libc::c_void>() };
+        let len = end - start;
+        unsafe {
+            libc::madvise(address, len, libc::MADV_SEQUENTIAL);
+            libc::madvise(address, len, libc::MADV_WILLNEED);
+        }
+        let mut checksum = 0_u8;
+        for offset in (start..end).step_by(page) {
+            checksum ^= unsafe { std::ptr::read_volatile(self.address.cast::<u8>().add(offset)) };
+        }
+        std::hint::black_box(checksum);
+        unsafe {
+            libc::madvise(address, len, libc::MADV_RANDOM);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for MappedFile {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.address, self.len);
+        }
+    }
+}
+
+impl CachedShard {
+    #[cfg(unix)]
+    fn mapped(&self) -> Result<&MappedFile, String> {
+        self.mapping.get_or_init(|| MappedFile::open(&self.file).map(Arc::new)).as_ref().map(Arc::as_ref).map_err(Clone::clone)
+    }
 }
 
 type SharedShards = Arc<Mutex<HashMap<String, Arc<CachedShard>>>>;
@@ -150,7 +233,44 @@ impl SafetensorStore {
             if !cached.contains_key(&shard_name) {
                 let mut file = File::open(&shard_path).map_err(|error| format!("缺少 {}，且打开单文件 {} 失败: {error}", index_path.display(), shard_path.display()))?;
                 let (header, data_offset) = header_and_data_offset(&mut file)?;
-                cached.insert(shard_name.clone(), Arc::new(CachedShard { file, header, data_offset }));
+                cached.insert(
+                    shard_name.clone(),
+                    Arc::new(CachedShard {
+                        file,
+                        header,
+                        data_offset,
+                        #[cfg(unix)]
+                        mapping: OnceLock::new(),
+                    }),
+                );
+            }
+            cached[&shard_name].header.keys().map(|name| (name.clone(), shard_name.clone())).collect()
+        };
+        Ok(Self { root, weight_map, shards })
+    }
+
+    /// 打开名字不遵循 `model.safetensors` 约定的单文件 checkpoint。
+    /// Diffusers 等上游常使用组件专有文件名，模型权重映射不应要求用户改名或复制大文件。
+    pub fn open_file(path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref();
+        let root = path.parent().ok_or_else(|| format!("safetensors 路径 {} 缺少父目录", path.display()))?.to_path_buf();
+        let shard_name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| format!("safetensors 文件名 {} 不是 UTF-8", path.display()))?.to_owned();
+        let shards = shared_shards(&root)?;
+        let weight_map = {
+            let mut cached = shards.lock().map_err(|_| "safetensors shard cache 锁中毒".to_owned())?;
+            if !cached.contains_key(&shard_name) {
+                let mut file = File::open(path).map_err(|error| format!("打开 safetensors 单文件 {} 失败: {error}", path.display()))?;
+                let (header, data_offset) = header_and_data_offset(&mut file)?;
+                cached.insert(
+                    shard_name.clone(),
+                    Arc::new(CachedShard {
+                        file,
+                        header,
+                        data_offset,
+                        #[cfg(unix)]
+                        mapping: OnceLock::new(),
+                    }),
+                );
             }
             cached[&shard_name].header.keys().map(|name| (name.clone(), shard_name.clone())).collect()
         };
@@ -276,31 +396,69 @@ impl SafetensorStore {
     }
 
     pub fn load_rows(&self, name: &str, rows: &[usize]) -> Result<TensorData, String> {
+        self.load_rows_impl(name, rows, false)
+    }
+
+    /// 超大随机行表经只读 mmap 取数，避免每个小行触发一次 `pread` 系统调用。
+    /// 非 Unix 平台保持 `pread` 路径。
+    pub fn load_rows_mapped(&self, name: &str, rows: &[usize]) -> Result<TensorData, String> {
+        self.load_rows_impl(name, rows, true)
+    }
+
+    /// 将 tensor 对应的文件页全部触入 CPU page cache；只建立一份文件页，不复制
+    /// tensor。调用线程的 NUMA affinity 决定缺页时物理页的首选节点。
+    #[cfg(unix)]
+    pub fn prefetch_mapped(&self, name: &str) -> Result<usize, String> {
+        let (shard_name, shard) = self.cached_shard(name)?;
+        let metadata = shard.header.get(name).ok_or_else(|| format!("{name:?} 在 {shard_name} 中缺失"))?;
+        let start = shard.data_offset.checked_add(metadata.data_offsets[0]).ok_or_else(|| format!("{name} mmap 起点溢出"))?;
+        let end = shard.data_offset.checked_add(metadata.data_offsets[1]).ok_or_else(|| format!("{name} mmap 末尾溢出"))?;
+        let start = usize::try_from(start).map_err(|_| format!("{name} mmap 起点超过 usize"))?;
+        let end = usize::try_from(end).map_err(|_| format!("{name} mmap 末尾超过 usize"))?;
+        shard.mapped()?.prefetch(start..end)?;
+        Ok(end - start)
+    }
+
+    fn load_rows_impl(&self, name: &str, rows: &[usize], mapped: bool) -> Result<TensorData, String> {
         if rows.is_empty() {
             return Err("tensor 行选择不能为空".into());
         }
         let (shard_name, shard) = self.cached_shard(name)?;
         let metadata = shard.header.get(name).ok_or_else(|| format!("{name:?} 在 {shard_name} 中缺失"))?;
-        if metadata.shape.len() != 2 {
-            return Err(format!("{name:?} 不是 rank-2 tensor，shape={:?}", metadata.shape));
+        if metadata.shape.len() != 2 && metadata.shape.len() != 3 {
+            return Err(format!("{name:?} 不是 rank-2/3 tensor，shape={:?}", metadata.shape));
         }
         let element_bytes = match metadata.dtype.as_str() {
             "BF16" | "F16" => 2,
             "F32" | "U32" | "I32" => 4,
-            "U8" | "I8" => 1,
+            "F8_E4M3" | "F8_E8M0" | "U8" | "I8" => 1,
             dtype => return Err(format!("{name:?} dtype={dtype} 暂不支持按行读取")),
         };
-        let source_rows = metadata.shape[0];
-        let columns = metadata.shape[1];
+        // rank-3(如合并专家 [E, rows, cols])按前两维展平后的行索引读取
+        let source_rows: usize = metadata.shape[..metadata.shape.len() - 1].iter().product();
+        let columns = metadata.shape[metadata.shape.len() - 1];
         let row_bytes = columns.checked_mul(element_bytes).ok_or_else(|| format!("{name:?} 行宽溢出"))?;
         let mut data = vec![0_u8; rows.len().checked_mul(row_bytes).ok_or_else(|| format!("{name:?} 行选择过大"))?];
         let tensor_start = shard.data_offset.checked_add(metadata.data_offsets[0]).ok_or_else(|| "tensor 数据起始偏移溢出".to_owned())?;
+        #[cfg(unix)]
+        let mapping = mapped.then(|| shard.mapped()).transpose()?;
         for (dst_row, &source_row) in rows.iter().enumerate() {
             if source_row >= source_rows {
                 return Err(format!("row {source_row} 越界于 {name:?} 的 {source_rows} 行"));
             }
             let source_offset = tensor_start.checked_add(source_row.checked_mul(row_bytes).ok_or_else(|| "tensor 行偏移溢出".to_owned())? as u64).ok_or_else(|| "tensor 行偏移溢出".to_owned())?;
-            shard.file.read_exact_at(&mut data[dst_row * row_bytes..(dst_row + 1) * row_bytes], source_offset).map_err(|error| format!("读取 row {name} 失败: {error}"))?;
+            let target = &mut data[dst_row * row_bytes..(dst_row + 1) * row_bytes];
+            #[cfg(unix)]
+            if let Some(mapping) = mapping {
+                let source_offset = usize::try_from(source_offset).map_err(|_| format!("row {source_row} 文件偏移超过 usize"))?;
+                let source_end = source_offset.checked_add(row_bytes).ok_or("tensor mmap 行末尾溢出")?;
+                let source = mapping.bytes().get(source_offset..source_end).ok_or_else(|| format!("row {source_row} 超过 mmap 文件边界 {}", mapping.len))?;
+                target.copy_from_slice(source);
+                continue;
+            }
+            #[cfg(not(unix))]
+            let _ = mapped;
+            shard.file.read_exact_at(target, source_offset).map_err(|error| format!("读取 row {name} 失败: {error}"))?;
         }
         Ok(TensorData { name: name.to_owned(), dtype: metadata.dtype.clone(), shape: vec![rows.len(), columns], data })
     }
@@ -313,7 +471,13 @@ impl SafetensorStore {
 
         let mut file = File::open(self.root.join(&shard_name)).map_err(|error| format!("打开 shard {shard_name} 失败: {error}"))?;
         let (header, data_offset) = header_and_data_offset(&mut file)?;
-        let loaded = Arc::new(CachedShard { file, header, data_offset });
+        let loaded = Arc::new(CachedShard {
+            file,
+            header,
+            data_offset,
+            #[cfg(unix)]
+            mapping: OnceLock::new(),
+        });
         let shard = self.shards.lock().map_err(|_| "safetensors shard cache 锁中毒".to_owned())?.entry(shard_name.clone()).or_insert(loaded).clone();
         Ok((shard_name, shard))
     }
@@ -400,6 +564,39 @@ mod tests {
         let values = tensor.data.chunks_exact(2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])).collect::<Vec<_>>();
         assert_eq!(tensor.shape, [3, 2]);
         assert_eq!(values, [2, 3, 6, 7, 10, 11]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mapped_rows_keep_requested_order_and_duplicates() {
+        let root = std::env::temp_dir().join(format!("zllm-safetensor-mapped-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&root).unwrap();
+        let header = br#"{"weight":{"dtype":"U8","shape":[4,3],"data_offsets":[0,12]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend(0_u8..12);
+        std::fs::write(root.join("model.safetensors"), bytes).unwrap();
+        let store = SafetensorStore::open(&root).unwrap();
+        assert_eq!(store.prefetch_mapped("weight").unwrap(), 12);
+        let tensor = store.load_rows_mapped("weight", &[3, 1, 3, 0]).unwrap();
+        assert_eq!(tensor.shape, [4, 3]);
+        assert_eq!(tensor.data, [9, 10, 11, 3, 4, 5, 9, 10, 11, 0, 1, 2]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opens_named_single_file_without_renaming() {
+        let root = std::env::temp_dir().join(format!("zllm-safetensor-named-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&root).unwrap();
+        let header = br#"{"weight":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&3.5f32.to_le_bytes());
+        let path = root.join("diffusion_pytorch_model.safetensors");
+        std::fs::write(&path, bytes).unwrap();
+        let tensor = SafetensorStore::open_file(&path).unwrap().load("weight").unwrap();
+        assert_eq!(tensor.to_f32().unwrap(), [3.5]);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -168,6 +168,8 @@ pub struct RocmKvCache {
     capacity: usize,
     /// stage 显式区分小块 prefill 和 MTP verify；非 stage 调用仍按行数兼容。
     stage_decode: Option<bool>,
+    /// operator 先按此决定 packed 复制方式；同一次 append 内不能再次改变存储形态。
+    resident_append: Option<(usize, usize, usize)>,
     pub(super) block_table: RocmBlockTable,
     /// cooperative append 先把当前 chunk 量化到连续 staging；它的 identity
     /// table 生命周期与持续增长的 parity cache table 不同，不能共用。
@@ -226,6 +228,16 @@ pub(super) struct RocmGqaLayer {
 }
 
 impl RocmKvCache {
+    pub(crate) fn minimum_reservation_bytes(rows: usize, capacity: usize, hot_rows: usize, latent_cols: usize, rope_cols: usize) -> Result<usize, BackendError> {
+        if rows == 0 || rows > capacity || hot_rows <= MLA_HOT_LOG_ROWS {
+            return Err(compute_error("MLA minimum reservation rows/capacity/hot_rows 非法"));
+        }
+        let committed = (rows.min(hot_rows).div_ceil(ROCM_KV_BLOCK_SIZE) * ROCM_KV_BLOCK_SIZE).min(capacity);
+        let row_bytes = latent_cols + latent_cols / crate::kv_cache::DEFAULT_GROUP_SIZE * 2 + rope_cols * 2;
+        let metadata = super::kv_cache_gpu_hot::GpuHotCache::new(0, hot_rows - MLA_HOT_LOG_ROWS)?.metadata_reservation_bytes(rows)?;
+        Ok(committed.saturating_mul(row_bytes).saturating_add(metadata))
+    }
+
     pub fn new(layer_count: usize) -> Self {
         Self::with_capacity(layer_count, 4096)
     }
@@ -237,6 +249,7 @@ impl RocmKvCache {
             gqa_layers: (0..layer_count).map(|_| None).collect(),
             capacity,
             stage_decode: None,
+            resident_append: None,
             block_table: RocmBlockTable::new(),
             cooperative_staging_table: RocmBlockTable::new(),
             ownership: RocmKvOwnership::Full,
@@ -263,9 +276,152 @@ impl RocmKvCache {
         Ok(())
     }
 
-    /// 大块 append 先补齐 recent 日志，再恢复连续 GPU 前缀。全部上传成功后
-    /// 才替换热窗；分配失败时仍保留完整的旧 cache，允许上层回收资源后重试。
+    /// 只预留最低驻留工作集；Full 历史仍按压力决定是否收缩。所需字节包括
+    /// 扩容期间尚未释放的旧 allocation，因此不能用净增量冒充本次分配量。
+    pub(crate) fn operator_reservation_bytes(&self, layers: std::ops::Range<usize>, rows: usize, latent_cols: usize, rope_cols: usize) -> Result<[usize; 2], BackendError> {
+        let owner = self.reservation_bytes(layers.clone(), rows, latent_cols, rope_cols)?;
+        let peer = match &self.operator_peer {
+            Some(peer) => peer.cache.lock().map_err(|_| compute_error("MLA reserve peer 锁中毒"))?.reservation_bytes(layers, rows, latent_cols, rope_cols)?,
+            None => Self::with_capacity(self.paged_layers.len(), self.capacity).reservation_bytes(layers, rows, latent_cols, rope_cols)?,
+        };
+        Ok([owner, peer])
+    }
+
+    fn reservation_bytes(&self, layers: std::ops::Range<usize>, rows: usize, latent_cols: usize, rope_cols: usize) -> Result<usize, BackendError> {
+        let hot_rows = ops::hip::options().mla_cpu_hot_rows;
+        if !gpu_hot_prefill_enabled() || rows == 0 || rows > self.capacity {
+            return Err(compute_error(format!("MLA reserve rows={rows} capacity={} 需要 GPU hot 模式", self.capacity)));
+        }
+        let committed = (rows.min(hot_rows).div_ceil(ROCM_KV_BLOCK_SIZE) * ROCM_KV_BLOCK_SIZE).min(self.capacity);
+        let row_bytes = latent_cols + latent_cols / crate::kv_cache::DEFAULT_GROUP_SIZE * 2 + rope_cols * 2;
+        let mut bytes = 0usize;
+        for layer in layers {
+            let cached = self.paged_layers.get(layer).ok_or(BackendError::UnsupportedLayer { layer })?.as_ref();
+            if cached.is_none_or(|cached| cached.committed_rows < committed) {
+                bytes = bytes.saturating_add(committed * row_bytes);
+            }
+            let empty = || super::kv_cache_gpu_hot::GpuHotCache::new(0, hot_rows - MLA_HOT_LOG_ROWS)?.metadata_reservation_bytes(rows);
+            let metadata = if let Some(hot) = cached.and_then(|cached| cached.cpu_hot.as_ref()) {
+                let hot = hot.lock().map_err(|_| compute_error("MLA reserve hot 锁中毒"))?;
+                match &hot.gpu {
+                    Some(gpu) => gpu.metadata_reservation_bytes(rows)?,
+                    None => empty()?,
+                }
+            } else if let Some(mirror) = cached.and_then(|cached| cached.cpu_mirror.as_ref()) {
+                let mirror = mirror.lock().map_err(|_| compute_error("MLA reserve mirror 锁中毒"))?;
+                match &mirror.gpu {
+                    Some(gpu) => gpu.metadata_reservation_bytes(rows)?,
+                    None => empty()?,
+                }
+            } else {
+                empty()?
+            };
+            bytes = bytes.saturating_add(metadata);
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn reserve_operator_rows(&mut self, owner: &RocmContext, peer: &RocmContext, layers: std::ops::Range<usize>, rows: usize, latent_cols: usize, rope_cols: usize) -> Result<(), BackendError> {
+        // 首次创建 peer 必须在 owner 的空缓存预留之前，避免把零行当作已完成前缀复制。
+        let replica = self.ensure_operator_peer(owner, peer)?;
+        self.reserve_rows(owner, layers.clone(), rows, latent_cols, rope_cols)?;
+        replica.lock().map_err(|_| compute_error("MLA reserve peer 锁中毒"))?.reserve_rows(peer, layers, rows, latent_cols, rope_cols)?;
+        ops::hip::set_device(owner.device_id).map_err(compute_error)
+    }
+
+    fn reserve_rows(&mut self, context: &RocmContext, layers: std::ops::Range<usize>, rows: usize, latent_cols: usize, rope_cols: usize) -> Result<(), BackendError> {
+        self.reservation_bytes(layers.clone(), rows, latent_cols, rope_cols)?;
+        let hot_rows = ops::hip::options().mla_cpu_hot_rows;
+        let committed = (rows.min(hot_rows).div_ceil(ROCM_KV_BLOCK_SIZE) * ROCM_KV_BLOCK_SIZE).min(self.capacity);
+        let group = crate::kv_cache::DEFAULT_GROUP_SIZE;
+        let scale_bytes = latent_cols / group * 2;
+        for layer in layers {
+            if self.paged_layers[layer].is_none() {
+                self.paged_layers[layer] = Some(RocmPagedMlaLayer {
+                    latent: Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, committed * latent_cols).map_err(compute_error)?),
+                    latent_scales: Some(Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, committed * scale_bytes).map_err(compute_error)?)),
+                    latent_group_size: group,
+                    rope: Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, committed * rope_cols * 2).map_err(compute_error)?),
+                    rows: 0,
+                    latent_cols,
+                    rope_cols,
+                    committed_rows: committed,
+                    cpu_mirror: Some(Mutex::new(RocmMlaCpuMirror::new(self.capacity, latent_cols, group, rope_cols)?)),
+                    cpu_hot: None,
+                });
+            }
+            let cached = self.paged_layers[layer].as_mut().expect("MLA reserve 已创建");
+            if cached.committed_rows < committed {
+                cached.latent = grow_cache_buffer(context.device_id, &cached.latent, cached.rows * latent_cols, committed * latent_cols)?;
+                cached.latent_scales = Some(grow_cache_buffer(context.device_id, cached.latent_scales.as_ref().expect("Q8 scales"), cached.rows * scale_bytes, committed * scale_bytes)?);
+                cached.rope = grow_cache_buffer(context.device_id, &cached.rope, cached.rows * rope_cols * 2, committed * rope_cols * 2)?;
+                cached.committed_rows = committed;
+            }
+            let reserve = |gpu: &mut Option<super::kv_cache_gpu_hot::GpuHotCache>| -> Result<(), BackendError> {
+                if gpu.is_none() {
+                    *gpu = Some(super::kv_cache_gpu_hot::GpuHotCache::new(context.device_id, hot_rows - MLA_HOT_LOG_ROWS)?);
+                }
+                gpu.as_mut().expect("GPU hot 已创建").reserve_metadata(context.device_id, rows)
+            };
+            if let Some(hot) = &cached.cpu_hot {
+                reserve(&mut hot.lock().map_err(|_| compute_error("MLA reserve hot 锁中毒"))?.gpu)?;
+            } else {
+                let mirror = cached.cpu_mirror.as_ref().ok_or_else(|| compute_error(format!("L{layer} MLA reserve 缺少主存镜像")))?;
+                reserve(&mut mirror.lock().map_err(|_| compute_error("MLA reserve mirror 锁中毒"))?.gpu)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn resident_mla_growth_bytes(&self, end: usize) -> Result<usize, BackendError> {
+        self.paged_layers.iter().flatten().filter(|cached| cached.cpu_hot.is_none()).try_fold(0_usize, |total, cached| {
+            let committed = committed_cache_rows(cached.committed_rows, end, self.capacity)?;
+            let latent_bytes = if cached.latent_group_size == 0 { cached.latent_cols * 2 } else { cached.latent_cols + cached.latent_cols / cached.latent_group_size * 2 };
+            let row_bytes = latent_bytes + cached.rope_cols * 2;
+            Ok(total.saturating_add(committed.saturating_sub(cached.committed_rows).saturating_mul(row_bytes)))
+        })
+    }
+
+    /// 延迟换出模式按 pair 的最小余量保留完整历史；压力下改用有界选集。
+    /// 兼容模式仍在大块 append 前恢复完整前缀，失败时保留原热窗。
     pub(super) fn prepare_mla_append(&mut self, context: &RocmContext, layer: usize, rows: usize) -> Result<(), BackendError> {
+        if gpu_hot_prefill_enabled() {
+            let hot_rows = ops::hip::options().mla_cpu_hot_rows;
+            let Some(cached) = self.paged_layers.get(layer).and_then(Option::as_ref) else { return Ok(()) };
+            let end = cached.rows.checked_add(rows).ok_or_else(|| compute_error(format!("L{layer} MLA append rows 溢出")))?;
+            let committed = committed_cache_rows(cached.committed_rows, end, self.capacity)?;
+            if cached.rows > hot_rows && cached.cpu_hot.is_none() {
+                let resident_append = (layer, cached.rows, rows);
+                if self.resident_append == Some(resident_append) {
+                    return Ok(());
+                }
+                let row_bytes = cached.latent_cols + cached.latent_cols / cached.latent_group_size * 2 + cached.rope_cols * 2;
+                let growth = committed.saturating_sub(cached.committed_rows).saturating_mul(row_bytes);
+                // 同一分块中已扩容的层和固定热窗不再增长；把它们继续按完整
+                // 历史计费会迫使其它层过早换出。当前层 copy 完成前仍需旧 buffer。
+                let required = self.resident_mla_growth_bytes(end)?.saturating_add(if growth == 0 { 0 } else { cached.committed_rows.saturating_mul(row_bytes) });
+                let reserve = ops::hip::options().mla_gpu_resident_reserve_bytes.expect("入口已检查延迟换出策略");
+                let target = reserve.saturating_add(required);
+                let available_for = |device| {
+                    let (free, _) = ops::hip::device_memory_info(device).map_err(compute_error)?;
+                    // 余量充足时不整理软池；promote 可能触发 hipFree，不能让每层
+                    // 的压力查询给正常 decode 增加池裁剪与设备等待。
+                    if free >= target { Ok(free) } else { ops::hip::device_admission_available_bytes(device).map_err(compute_error) }
+                };
+                let mut available = available_for(context.device_id)?;
+                if let Some(peer) = &self.operator_peer {
+                    available = available.min(available_for(peer.device_id)?);
+                    ops::hip::set_device(context.device_id).map_err(compute_error)?;
+                }
+                if available >= target {
+                    self.resident_append = Some(resident_append);
+                    return Ok(());
+                }
+                eprintln!("[mla-lazy-evict] device={} layer={layer} history={} append={rows} available={available} required={required} reserve={reserve}", context.device_id, cached.rows);
+                self.enable_cpu_hot_layer(context, layer, hot_rows)?;
+            }
+            return Ok(());
+        }
         if rows <= MLA_HOT_LOG_ROWS || self.stage_decode == Some(true) || ops::hip::options().prefill_attention_cpu {
             return Ok(());
         }
@@ -445,7 +601,9 @@ impl RocmKvCache {
     }
 
     pub(super) fn append_mla(&mut self, context: &RocmContext, layer: usize, latent: &RocmTensor, rope: &RocmTensor) -> Result<(), BackendError> {
-        self.append_mla_inner(context, layer, latent, rope, None)
+        let result = self.append_mla_inner(context, layer, latent, rope, None);
+        self.resident_append = None;
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -461,7 +619,9 @@ impl RocmKvCache {
         cos: &[f32],
         sin: &[f32],
     ) -> Result<(), BackendError> {
-        self.append_mla_inner(context, layer, latent, rope, Some((position, rotary_dim, layout, cos, sin)))
+        let result = self.append_mla_inner(context, layer, latent, rope, Some((position, rotary_dim, layout, cos, sin)));
+        self.resident_append = None;
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -845,6 +1005,16 @@ impl RocmKvCache {
         // 仍按 committed 容量分配。复制排在 peer default stream，随后 peer
         // attention 同流消费，不引入 host synchronize。
         for (layer, cached) in self.paged_layers.iter().enumerate().filter_map(|(layer, slot)| slot.as_ref().map(|cached| (layer, cached))) {
+            if let Some(hot) = &cached.cpu_hot {
+                let mut hot = hot.lock().map_err(|_| compute_error(format!("L{layer} operator owner hot 锁中毒")))?;
+                hot.flush_log_feed(owner.device_id)?;
+                hot.finish_pending()?;
+                if hot.mirror.rows != cached.rows {
+                    return Err(compute_error(format!("L{layer} operator hot mirror={}/{} 缺行", hot.mirror.rows, cached.rows)));
+                }
+                peer_cache.restore_cpu_hot_layer(peer, layer, hot.mirror.clone())?;
+                continue;
+            }
             if cached.latent.device_id() != owner.device_id || cached.rope.device_id() != owner.device_id || cached.rows > cached.committed_rows || cached.cpu_hot.is_some() {
                 return Err(compute_error(format!(
                     "L{layer} operator KV owner cache 非法: device={}/{} rows={}/{} cpu_hot={}",
@@ -906,6 +1076,15 @@ impl RocmKvCache {
                 return Err(compute_error(format!("L{layer} operator KV 同时存在 device 与 pending snapshot")));
             }
             let record = join_pair_record(record, layer)?;
+            let hot_rows = ops::hip::options().mla_cpu_hot_rows;
+            if hot_rows != 0 && record.rows > hot_rows && record.latent_group_size != 0 {
+                // 旧 parity 快照合并后同样遵守热窗上限，不能因来源布局不同
+                // 在恢复 operator pair 时意外上传完整长历史。
+                self.restore_cpu_hot_layer(owner, layer, record.clone())?;
+                peer_cache.restore_cpu_hot_layer(peer, layer, record)?;
+                self.pending_pair_layers[layer] = None;
+                continue;
+            }
             let committed_rows = reserved_rows.max(record.rows);
             let latent_element_bytes = if record.latent_group_size == 0 { 2 } else { 1 };
             let latent_capacity = committed_rows * record.latent_cols * latent_element_bytes;
@@ -1072,7 +1251,11 @@ impl RocmKvCache {
             if cache.ownership != RocmKvOwnership::Full || cache.capacity != self.capacity {
                 return Err(compute_error(format!("L{layer} operator peer KV ownership/capacity 非法")));
             }
-            cache.prepare_mla_append(peer, layer, rows)?;
+            // owner 已按两卡最小余量决定本轮使用完整布局。提交 peer query
+            // 后再独立判压会把目标切成热窗，破坏已经选定的 packed 复制协议。
+            if !gpu_hot_prefill_enabled() {
+                cache.prepare_mla_append(peer, layer, rows)?;
+            }
             let slot = cache.paged_layers.get_mut(layer).ok_or(BackendError::UnsupportedLayer { layer })?;
             if slot.is_none() {
                 let latent_bytes = committed_rows.checked_mul(latent_row_bytes).ok_or_else(|| compute_error(format!("L{layer} operator peer latent 大小溢出")))?;
@@ -1309,7 +1492,7 @@ impl RocmKvCache {
         Ok(())
     }
 
-    pub(super) fn prefetch_selected_layers(&mut self, context: &RocmContext, layers: std::ops::Range<usize>, selection: &[u32], position: usize, rows: usize) -> Result<(), BackendError> {
+    pub(super) fn prefetch_selected_layers(&mut self, context: &RocmContext, layers: std::ops::Range<usize>, selection: &[u32], position: usize, rows: usize, prepare_residency: bool) -> Result<(), BackendError> {
         let hot_rows = ops::hip::options().mla_cpu_hot_rows;
         if hot_rows == 0 || rows != 1 || self.ownership != RocmKvOwnership::Full || (self.stage_decode == Some(false) && !ops::hip::options().prefill_attention_cpu) {
             return Ok(());
@@ -1325,7 +1508,18 @@ impl RocmKvCache {
             if cached.rows != position || cached.rows <= hot_rows || cached.latent_group_size == 0 {
                 continue;
             }
-            self.enable_cpu_hot_layer(context, layer, hot_rows)?;
+            if gpu_hot_prefill_enabled() {
+                // pair 的 peer 只预取已有热窗，换出决定归 owner；否则两卡
+                // 并发预取时也可能把 Full owner 与 Hot peer 组合到一起。
+                if prepare_residency {
+                    self.prepare_mla_append(context, layer, rows)?;
+                }
+                if !self.operator_layer_is_hot(layer) {
+                    continue;
+                }
+            } else {
+                self.enable_cpu_hot_layer(context, layer, hot_rows)?;
+            }
             let cached = self.paged_layers[layer].as_ref().expect("预取层已校验");
             let mut hot = cached.cpu_hot.as_ref().expect("预取 hot 已创建").lock().map_err(|_| compute_error(format!("L{layer} ROCm MLA hot 预取锁中毒")))?;
             if hot.prefetched.as_ref().is_some_and(|(start, _, _)| *start == position) {
@@ -1720,12 +1914,12 @@ impl RocmKvCache {
         }
         self.prepare_mla_append(context, layer, latent.rows)?;
         let hot_rows = ops::hip::options().mla_cpu_hot_rows;
-        // GPU prefill 始终写普通 paged cache 并建立 CPU mirror；只有 CPU-prefill
-        // 模式才从首个多行 chunk 直接建立 hot 窗口。混用两种语义会在长
-        // prefill 跨过窗口容量后把仍被 selection pin 的槽位当作 append 目标。
+        // 普通 GPU prefill 保留完整 paged 历史；选集模式由 prepare_mla_append
+        // 在历史越过热窗后切换。大块新增 KV 使用独立 staging，避免覆盖选集槽。
         if hot_rows != 0 && ops::hip::options().prefill_attention_cpu && self.paged_layers.get(layer).is_some_and(Option::is_none) && latent.rows > 1 {
             self.initialize_cpu_hot_layer(context, layer, hot_rows, latent.cols, rope.cols)?;
         } else if hot_rows != 0
+            && !gpu_hot_prefill_enabled()
             && (self.stage_decode != Some(false) || ops::hip::options().prefill_attention_cpu)
             && (latent.rows == 1 || gpu_hot_selection(latent.rows))
             && self.paged_layers.get(layer).and_then(Option::as_ref).is_some_and(|cached| cached.rows > hot_rows && cached.cpu_hot.is_none())
@@ -1907,6 +2101,11 @@ struct RocmMlaCpuMirror {
 const MLA_MIRROR_FEED_BATCH_ROWS: usize = 64;
 const MLA_HOT_LOG_ROWS: usize = 64;
 
+pub(super) fn gpu_hot_prefill_enabled() -> bool {
+    let options = ops::hip::options();
+    options.mla_gpu_resident_reserve_bytes.is_some() && !options.kv_f16 && gpu_hot_selection(1)
+}
+
 pub(super) fn gpu_hot_selection(rows: usize) -> bool {
     let options = ops::hip::options();
     options.mla_cpu_hot_rows != 0 && !options.dsa_cpu_select && !options.prefill_attention_cpu && (1..=MLA_HOT_LOG_ROWS).contains(&rows)
@@ -1916,6 +2115,148 @@ pub(super) fn gpu_hot_selection(rows: usize) -> bool {
 mod tests {
     use super::*;
     use crate::backend::{Backend, BackendResources};
+
+    #[test]
+    fn minimum_reservation_includes_map_growth_and_fixed_hot_storage() {
+        let bytes = |rows| RocmKvCache::minimum_reservation_bytes(rows, 1_048_576, 32768, 512, 64).unwrap();
+        assert_eq!(bytes(524288), 32768 * 656 + (524288 + 2 * (32768 - 64) + 1) * 4);
+        assert_eq!(bytes(524289) - bytes(524288), 524288 * 4);
+        assert!(bytes(64) > 64 * 656);
+    }
+
+    #[test]
+    #[ignore = "需要两张 ROCm GPU，单独进程执行"]
+    fn mla_physical_reservation_preserves_lazy_full_history_and_peer_bytes() {
+        const HOT: usize = 2304;
+        ops::hip::configure(ops::hip::RocmOptions { mla_cpu_hot_rows: HOT, mla_gpu_resident_reserve_bytes: Some(0), memory_pool: true, ..Default::default() }).unwrap();
+        let owner = RocmContext::new(0).unwrap();
+        let peer = RocmContext::new(1).unwrap();
+        let mut cache = RocmKvCache::with_capacity(1, 8192);
+        let quoted = cache.operator_reservation_bytes(0..1, 4358, 512, 64).unwrap();
+        assert_eq!(quoted[0], RocmKvCache::minimum_reservation_bytes(4358, 8192, HOT, 512, 64).unwrap());
+        assert_eq!(quoted[0], quoted[1]);
+        cache.reserve_operator_rows(&owner, &peer, 0..1, 4358, 512, 64).unwrap();
+        assert_eq!(cache.operator_reservation_bytes(0..1, 4358, 512, 64).unwrap(), [0, 0]);
+        let replica = cache.ensure_operator_peer(&owner, &peer).unwrap();
+        let mut position = 0;
+        for rows in [4097, 1, 257, 3] {
+            owner.activate().unwrap();
+            cache.set_stage_decode(rows <= 3).unwrap();
+            let latent = owner.tensor_from_f32((0..rows * 512).map(|i| (((i + position * 512) * 29 % 127) as f32 - 63.0) / 64.0).collect(), rows, 512).unwrap();
+            let rope = owner.tensor_from_f32((0..rows * 64).map(|i| (((i + position * 64) * 13 % 127) as f32 - 63.0) / 128.0).collect(), rows, 64).unwrap();
+            cache.append_mla(&owner, 0, &latent, &rope).unwrap();
+            let _sources = cache.replicate_operator_mla_append(&owner, &peer, 0, position, rows).unwrap();
+            peer.activate().unwrap();
+            replica.lock().unwrap().feed_peer_mirror_layer(&peer, 0).unwrap();
+            position += rows;
+            assert!(!cache.operator_layer_is_hot(0), "预留元数据不能提前换出 Full MLA");
+            let expected = cache.download_layers().unwrap().remove(0).unwrap();
+            let actual = replica.lock().unwrap().download_layers().unwrap().remove(0).unwrap();
+            assert_eq!(actual.latent, expected.latent);
+            assert_eq!(actual.latent_scales, expected.latent_scales);
+            assert_eq!(actual.rope, expected.rope);
+        }
+    }
+
+    #[test]
+    #[ignore = "需要两张 ROCm GPU"]
+    fn mla_lazy_eviction_keeps_resident_prefix_when_memory_is_available() {
+        const HOT: usize = 2304;
+        ops::hip::configure(ops::hip::RocmOptions { mla_cpu_hot_rows: HOT, mla_gpu_resident_reserve_bytes: Some(0), memory_pool: true, ..Default::default() }).unwrap();
+        let owner = RocmContext::new(0).unwrap();
+        let peer = RocmContext::new(1).unwrap();
+        let mut cache = RocmKvCache::with_capacity(1, 8192);
+        let replica = cache.ensure_operator_peer(&owner, &peer).unwrap();
+        let mut position = 0;
+        for (decode, rows) in [(false, 4097), (true, 1), (true, 3), (false, 257)] {
+            owner.activate().unwrap();
+            cache.set_stage_decode(decode).unwrap();
+            let latent = owner.tensor_from_f32((0..rows * 512).map(|i| (((i + position * 512) * 29 % 127) as f32 - 63.0) / 64.0).collect(), rows, 512).unwrap();
+            let rope = owner.tensor_from_f32((0..rows * 64).map(|i| (((i + position * 64) * 13 % 127) as f32 - 63.0) / 128.0).collect(), rows, 64).unwrap();
+            cache.append_mla(&owner, 0, &latent, &rope).unwrap();
+            let _sources = cache.replicate_operator_mla_append(&owner, &peer, 0, position, rows).unwrap();
+            peer.activate().unwrap();
+            replica.lock().unwrap().feed_peer_mirror_layer(&peer, 0).unwrap();
+            position += rows;
+            assert!(!cache.operator_layer_is_hot(0), "正常负载不能提前换出 owner");
+            assert!(!replica.lock().unwrap().operator_layer_is_hot(0), "正常负载不能提前换出 peer");
+            let record = cache.download_layers().unwrap().remove(0).unwrap();
+            for actual in [cache.paged_layers[0].as_ref().unwrap(), replica.lock().unwrap().paged_layers[0].as_ref().unwrap()] {
+                assert!(actual.cpu_mirror.as_ref().unwrap().lock().unwrap().gpu.is_none(), "正常驻留不能预付未使用的主存注册开销");
+                for (buffer, expected) in [(&actual.latent, &record.latent), (actual.latent_scales.as_ref().unwrap(), record.latent_scales.as_ref().unwrap()), (&actual.rope, &record.rope)] {
+                    let mut bytes = vec![0; expected.len()];
+                    buffer.copy_to_host(&mut bytes).unwrap();
+                    assert_eq!(&bytes, expected, "完整历史仍可直接在 GPU 使用");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要两张 ROCm GPU"]
+    fn mla_packed_peer_keeps_owner_decision_when_pressure_changes() {
+        const HOT: usize = 2304;
+        ops::hip::configure(ops::hip::RocmOptions { mla_cpu_hot_rows: HOT, mla_gpu_resident_reserve_bytes: Some(usize::MAX), memory_pool: true, ..Default::default() }).unwrap();
+        let owner = RocmContext::new(0).unwrap();
+        let peer = RocmContext::new(1).unwrap();
+        let mut cache = RocmKvCache::with_capacity(1, 8192);
+        let replica = cache.ensure_operator_peer(&owner, &peer).unwrap();
+        let mut position = 0;
+        for rows in [4097, 1, 257, 3] {
+            owner.activate().unwrap();
+            cache.set_stage_decode(rows <= 3).unwrap();
+            if position != 0 && rows != 3 {
+                // 模拟 owner 检查时余量充足、peer query 入队后压力升高。
+                // MAX reserve 会让任何第二次独立检查立即换出。
+                cache.resident_append = Some((0, position, rows));
+            }
+            let latent = owner.tensor_from_f32((0..rows * 512).map(|i| (((i + position * 512) * 29 % 127) as f32 - 63.0) / 64.0).collect(), rows, 512).unwrap();
+            let rope = owner.tensor_from_f32((0..rows * 64).map(|i| (((i + position * 64) * 13 % 127) as f32 - 63.0) / 128.0).collect(), rows, 64).unwrap();
+            cache.append_mla(&owner, 0, &latent, &rope).unwrap();
+            let _sources = cache.replicate_operator_mla_append(&owner, &peer, 0, position, rows).unwrap();
+            peer.activate().unwrap();
+            replica.lock().unwrap().feed_peer_mirror_layer(&peer, 0).unwrap();
+            position += rows;
+            assert_eq!(cache.operator_layer_is_hot(0), rows == 3);
+            assert_eq!(replica.lock().unwrap().operator_layer_is_hot(0), rows == 3);
+            if rows == 1 {
+                replica.lock().unwrap().prefetch_selected_layers(&peer, 0..1, &[0, 1], position, 1, false).unwrap();
+                assert!(!replica.lock().unwrap().operator_layer_is_hot(0), "peer 预取不能独立换出");
+            }
+            let expected = cache.download_layers().unwrap().remove(0).unwrap();
+            let actual = replica.lock().unwrap().download_layers().unwrap().remove(0).unwrap();
+            assert_eq!(actual.latent, expected.latent);
+            assert_eq!(actual.latent_scales, expected.latent_scales);
+            assert_eq!(actual.rope, expected.rope);
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn mla_growth_budget_excludes_hot_and_already_grown_layers() {
+        const HOT: usize = 2304;
+        ops::hip::configure(ops::hip::RocmOptions { mla_cpu_hot_rows: HOT, mla_gpu_resident_reserve_bytes: Some(0), memory_pool: true, ..Default::default() }).unwrap();
+        let context = RocmContext::new(0).unwrap();
+        let mut cache = RocmKvCache::with_capacity(3, 16384);
+        // L0 尚待扩容，L1 已换成固定热窗，L2 已执行本分块；只预留 L0 的增长。
+        for layer in 0..3 {
+            let rows = 8192;
+            context.activate().unwrap();
+            let latent = context.tensor_from_f32(vec![0.25; rows * 512], rows, 512).unwrap();
+            let rope = context.tensor_from_f32(vec![0.5; rows * 64], rows, 64).unwrap();
+            cache.append_mla(&context, layer, &latent, &rope).unwrap();
+        }
+        context.activate().unwrap();
+        let latent = context.tensor_from_f32(vec![0.25; 512], 1, 512).unwrap();
+        let rope = context.tensor_from_f32(vec![0.5; 64], 1, 64).unwrap();
+        cache.append_mla(&context, 2, &latent, &rope).unwrap();
+        cache.enable_cpu_hot_layer(&context, 1, HOT).unwrap();
+        assert_eq!(cache.paged_layers[0].as_ref().unwrap().committed_rows, 8192);
+        assert!(cache.operator_layer_is_hot(1));
+        assert_eq!(cache.paged_layers[2].as_ref().unwrap().committed_rows, 16384);
+        assert_eq!(cache.resident_mla_growth_bytes(8193).unwrap(), 8192 * 656);
+        assert_eq!(cache.resident_mla_growth_bytes(8192).unwrap(), 0);
+    }
 
     #[test]
     #[ignore = "需要 ROCm GPU"]
@@ -1942,6 +2283,93 @@ mod tests {
         let hot = layer.cpu_hot.as_ref().unwrap().lock().unwrap();
         assert_eq!(hot.transfer.allocation_bytes(), 656);
         assert_eq!(cache.allocated_bytes(), (HOT * 656) as u64);
+    }
+
+    #[test]
+    #[ignore = "需要两张 ROCm GPU"]
+    fn mla_host_transfer_restores_only_hot_windows_on_both_devices() {
+        const HOT: usize = 2304;
+        const ROWS: usize = 4097;
+        const CAPACITY: usize = 8192;
+        ops::hip::configure(ops::hip::RocmOptions { mla_cpu_hot_rows: HOT, mla_gpu_resident_reserve_bytes: Some(0), memory_pool: true, ..Default::default() }).unwrap();
+        ops::hip::enable_device_buffer_reuse();
+        let owner = RocmContext::new(0).unwrap();
+        let peer = RocmContext::new(1).unwrap();
+        let record = MlaLayerSerde {
+            rows: ROWS,
+            ownership: RocmKvOwnership::Full,
+            latent_cols: 512,
+            rope_cols: 64,
+            latent_group_size: 64,
+            latent: (0..ROWS * 512).map(|i| (i % 127) as u8).collect(),
+            latent_scales: Some(vec![0x38; ROWS * 16]),
+            rope: vec![0x30; ROWS * 128],
+        };
+        {
+            let compact = |bytes: &[u8], row_bytes: usize| {
+                let mut result = Vec::with_capacity(bytes.len());
+                for parity in 0..2 {
+                    for row in (0..ROWS).filter(|row| (row / ROCM_KV_BLOCK_SIZE) & 1 == parity) {
+                        result.extend_from_slice(&bytes[row * row_bytes..(row + 1) * row_bytes]);
+                    }
+                }
+                result
+            };
+            let mut paired = record.clone();
+            paired.ownership = RocmKvOwnership::InterleavedPair;
+            paired.latent = compact(&record.latent, 512);
+            paired.latent_scales = Some(compact(record.latent_scales.as_ref().unwrap(), 16));
+            paired.rope = compact(&record.rope, 128);
+            let mut legacy = RocmKvCache::with_capacity(1, CAPACITY);
+            legacy.upload_layers(&owner, &[Some(paired)], CAPACITY).unwrap();
+            assert!(legacy.paged_layers[0].is_none(), "旧布局延迟到 pair 建立时恢复");
+            let legacy_peer = legacy.ensure_operator_peer(&owner, &peer).unwrap();
+            assert_eq!(legacy.allocated_bytes(), (2 * HOT * 656) as u64, "旧分片快照同样不能恢复完整 GPU 历史");
+            for actual in [legacy.download_layers().unwrap(), legacy_peer.lock().unwrap().download_layers().unwrap()] {
+                let actual = actual[0].as_ref().unwrap();
+                assert_eq!(actual.latent, record.latent);
+                assert_eq!(actual.latent_scales, record.latent_scales);
+                assert_eq!(actual.rope, record.rope);
+            }
+        }
+        let mut cache = RocmKvCache::with_capacity(1, CAPACITY);
+        cache.upload_layers(&owner, &[Some(record.clone())], CAPACITY).unwrap();
+        let original_pointer = cache.paged_layers[0].as_ref().unwrap().cpu_hot.as_ref().unwrap().lock().unwrap().mirror.latent.as_ptr();
+        let mut saved = cache.prepare_host_layers().unwrap();
+        assert!(saved[0].is_none(), "prepare 只等待 mirror 尾部，不复制历史");
+        cache.take_prepared_host_layers(&mut saved);
+        assert_eq!(saved[0].as_ref().unwrap().latent.as_ptr(), original_pointer, "必须转移原 allocation");
+        drop(cache);
+        let mut cache = RocmKvCache::with_capacity(1, CAPACITY);
+        cache.upload_layers(&owner, &saved, CAPACITY).unwrap();
+        cache.prepare_restored_hot_history(&owner, Some(&peer), ROWS + 1).unwrap();
+        let replica = cache.ensure_operator_peer(&owner, &peer).unwrap();
+        assert_eq!(cache.allocated_bytes(), (2 * HOT * 656) as u64, "两卡都只能恢复热窗，不能上传整段历史");
+        for actual in [cache.download_layers().unwrap(), replica.lock().unwrap().download_layers().unwrap()] {
+            let actual = actual[0].as_ref().unwrap();
+            assert_eq!(actual.latent, record.latent);
+            assert_eq!(actual.latent_scales, record.latent_scales);
+            assert_eq!(actual.rope, record.rope);
+        }
+        cache.set_stage_decode(true).unwrap();
+        owner.activate().unwrap();
+        let latent = owner.tensor_from_f32(vec![0.25; 3 * 512], 3, 512).unwrap();
+        let rope = owner.tensor_from_f32(vec![0.5; 3 * 64], 3, 64).unwrap();
+        cache.append_mla(&owner, 0, &latent, &rope).unwrap();
+        let _sources = cache.replicate_operator_mla_append(&owner, &peer, 0, ROWS, 3).unwrap();
+        peer.activate().unwrap();
+        replica.lock().unwrap().feed_peer_mirror_layer(&peer, 0).unwrap();
+        owner.synchronize().unwrap();
+        peer.synchronize().unwrap();
+        let owner_layers = cache.download_layers().unwrap();
+        let peer_layers = replica.lock().unwrap().download_layers().unwrap();
+        let owner_record = owner_layers[0].as_ref().unwrap();
+        let peer_record = peer_layers[0].as_ref().unwrap();
+        assert_eq!(owner_record.rows, ROWS + 3);
+        assert_eq!(owner_record.latent, peer_record.latent);
+        assert_eq!(owner_record.latent_scales, peer_record.latent_scales);
+        assert_eq!(owner_record.rope, peer_record.rope);
+        assert_eq!(&owner_record.latent[..record.latent.len()], record.latent);
     }
 
     #[test]
@@ -2171,9 +2599,9 @@ impl RocmMlaCpuMirror {
     /// 全量期的批量喂养入口：多行 chunk 立即整段入队，单行 decode 累积到
     /// 批量边界才发一次 D2H。
     fn feed(&mut self, device_id: i32, capacity: usize, cached_rows: usize, latent: &ops::hip::DeviceBuffer, scales: &ops::hip::DeviceBuffer, rope: &ops::hip::DeviceBuffer) -> Result<(), BackendError> {
-        // 历史真正超过热窗时才注册，在余下 GPU prefill 中准备好 RAM 读取；
-        // 短请求不会为尚未使用的换出路径支付页锁定成本。
-        if gpu_hot_selection(1) && self.gpu.is_none() && cached_rows > ops::hip::options().mla_cpu_hot_rows {
+        // 延迟换出期间完整 GPU 历史可直接使用，只有实际切换热窗才需要注册。
+        // 兼容模式保留预注册时机；低负载 lazy 路径不预付页锁定与注销开销。
+        if !gpu_hot_prefill_enabled() && gpu_hot_selection(1) && self.gpu.is_none() && cached_rows > ops::hip::options().mla_cpu_hot_rows {
             let mut gpu = super::kv_cache_gpu_hot::GpuHotCache::new(device_id, ops::hip::options().mla_cpu_hot_rows - MLA_HOT_LOG_ROWS)?;
             gpu.register_history(device_id, &mut self.mirror, capacity, cached_rows)?;
             self.gpu = Some(gpu);
@@ -2390,7 +2818,7 @@ impl RocmMlaCpuHotLayer {
     }
 
     fn prepare_append_gpu_mode(&mut self, device_id: i32, rows: usize, cache: [&Arc<ops::hip::DeviceBuffer>; 3]) -> Result<(), BackendError> {
-        let enabled = gpu_hot_selection(rows);
+        let enabled = gpu_hot_selection(rows) || (gpu_hot_prefill_enabled() && rows > MLA_HOT_LOG_ROWS);
         let row_bytes = [self.mirror.latent_cols, self.mirror.latent_cols / self.mirror.latent_group_size * 2, self.mirror.rope_cols * 2];
         if enabled != self.gpu.is_some() {
             self.flush_log_feed(device_id)?;
@@ -2905,8 +3333,42 @@ impl RocmMlaCpuHotLayer {
 }
 
 impl RocmKvCache {
+    /// GPU token map 按二次幂扩容，逐 token 按不到两项预留；slot tag/pin
+    /// 与游标则是每层固定开销。recent 环借用 hot KV，不再重复计算日志。
+    pub(crate) fn gpu_hot_metadata_budget(hot_rows: usize) -> (usize, usize) {
+        let word = std::mem::size_of::<u32>();
+        (2 * word, hot_rows.saturating_sub(MLA_HOT_LOG_ROWS).saturating_mul(2 * word).saturating_add(word))
+    }
+
     /// 把所有已填充层 D2H 到 host blob。空层（slot None）对应 `None`。
     pub fn download_layers(&self) -> Result<Vec<Option<MlaLayerSerde>>, BackendError> {
+        self.snapshot_layers(true)
+    }
+
+    /// 先补齐异步 mirror 尾部并下载没有主存镜像的层；成功后才允许转移所有权。
+    pub fn prepare_host_layers(&self) -> Result<Vec<Option<MlaLayerSerde>>, BackendError> {
+        self.snapshot_layers(false)
+    }
+
+    /// 调用方已完成全部层的 prepare，且会话已经停止执行。转移已有 Vec，
+    /// 不为 GPU 换出再复制一遍完整 MLA 历史；随后必须释放或重置设备会话。
+    pub fn take_prepared_host_layers(&mut self, prepared: &mut [Option<MlaLayerSerde>]) {
+        for (cached, record) in self.paged_layers.iter_mut().zip(prepared) {
+            let Some(cached) = cached else { continue };
+            if let Some(hot) = cached.cpu_hot.take() {
+                let mut hot = hot.into_inner().expect("prepare 已校验 hot 锁");
+                // 先注销 GPU 对主存 allocation 的借用，再交出 mirror。
+                hot.gpu = None;
+                *record = Some(hot.mirror);
+            } else if let Some(mirror) = cached.cpu_mirror.take() {
+                let mut mirror = mirror.into_inner().expect("prepare 已校验 mirror 锁");
+                mirror.gpu = None;
+                *record = Some(mirror.mirror);
+            }
+        }
+    }
+
+    fn snapshot_layers(&self, copy_mirrors: bool) -> Result<Vec<Option<MlaLayerSerde>>, BackendError> {
         fn download_device(cached: &RocmPagedMlaLayer, rows: usize, ownership: RocmKvOwnership) -> Result<MlaLayerSerde, BackendError> {
             let element_bytes = if cached.latent_group_size == 0 { 2 } else { 1 };
             let latent_bytes = rows.checked_mul(cached.latent_cols).and_then(|n| n.checked_mul(element_bytes)).ok_or_else(|| compute_error("ROCm MLA latent 字节溢出"))?;
@@ -2940,7 +3402,7 @@ impl RocmKvCache {
                     if hot.mirror.rows != cached.rows {
                         return Err(compute_error(format!("ROCm MLA CPU mirror rows={}，cache rows={}", hot.mirror.rows, cached.rows)));
                     }
-                    return Ok(Some(hot.mirror.clone()));
+                    return Ok(copy_mirrors.then(|| hot.mirror.clone()));
                 }
                 if let Some(mirror) = &cached.cpu_mirror {
                     let mut mirror = mirror.lock().map_err(|_| compute_error("ROCm MLA mirror 锁中毒"))?;
@@ -2948,7 +3410,7 @@ impl RocmKvCache {
                     if mirror.mirror.rows != cached.rows {
                         return Err(compute_error(format!("ROCm MLA CPU mirror rows={}，cache rows={}", mirror.mirror.rows, cached.rows)));
                     }
-                    return Ok(Some(mirror.mirror.clone()));
+                    return Ok(copy_mirrors.then(|| mirror.mirror.clone()));
                 }
                 if self.ownership == RocmKvOwnership::BlockParity(0) {
                     let peer = self.cooperative_peer.as_ref().and_then(|peer| peer.cache.paged_layers.get(layer)).and_then(Option::as_ref).ok_or_else(|| compute_error(format!("L{layer} pair KV peer shard 缺失")))?;
@@ -2972,6 +3434,73 @@ impl RocmKvCache {
                 Ok(Some(download_device(cached, cached.rows, RocmKvOwnership::Full)?))
             })
             .collect()
+    }
+
+    /// 恢复阶段并行准备已存在的主存镜像，不上传完整 MLA 历史。
+    pub(crate) fn prepare_restored_hot_history(&mut self, context: &RocmContext, peer: Option<&RocmContext>, reserved_rows: usize) -> Result<(), BackendError> {
+        if !gpu_hot_prefill_enabled() {
+            return Ok(());
+        }
+        let peer_cache = peer.map(|peer| self.ensure_operator_peer(context, peer)).transpose()?;
+        // 两卡拥有独立的主存镜像。注册前不需要 query/selection，把注册移出
+        // 首次 attention，并与另一卡重叠；全部结束后才交给计算线程。
+        std::thread::scope(|scope| {
+            let peer_job = peer.zip(peer_cache).map(|(peer, cache)| {
+                scope.spawn(move || {
+                    peer.activate().map_err(compute_error)?;
+                    cache.lock().map_err(|_| compute_error("准备恢复 MLA peer 锁中毒"))?.prepare_hot_history_registration(peer, reserved_rows)
+                })
+            });
+            let local = self.prepare_hot_history_registration(context, reserved_rows);
+            // 本卡失败也必须等待 peer，保证返回后没有线程继续借用恢复中的状态。
+            let remote = match peer_job {
+                Some(job) => job.join().map_err(|_| compute_error("准备恢复 MLA peer 线程 panic")).and_then(|result| result),
+                None => Ok(()),
+            };
+            local?;
+            remote
+        })
+    }
+
+    fn prepare_hot_history_registration(&mut self, context: &RocmContext, reserved_rows: usize) -> Result<(), BackendError> {
+        context.activate().map_err(compute_error)?;
+        for cached in self.paged_layers.iter_mut().flatten() {
+            let Some(hot) = &mut cached.cpu_hot else { continue };
+            let mut hot = hot.lock().map_err(|_| compute_error("准备恢复 MLA hot 锁中毒"))?;
+            let rows = hot.mirror.rows.max(reserved_rows).min(self.capacity);
+            let cache_rows = hot.slot_to_token.len() - MLA_HOT_LOG_ROWS;
+            let RocmMlaCpuHotLayer { gpu, mirror, .. } = &mut *hot;
+            if gpu.is_none() {
+                *gpu = Some(super::kv_cache_gpu_hot::GpuHotCache::new(context.device_id, cache_rows)?);
+            }
+            gpu.as_mut().expect("已创建 GPU hot").register_history(context.device_id, mirror, self.capacity, rows)?;
+        }
+        Ok(())
+    }
+
+    /// 主存已有完整历史时直接建立空热窗，首轮 selection 只上传命中的行。
+    fn restore_cpu_hot_layer(&mut self, context: &RocmContext, layer: usize, record: MlaLayerSerde) -> Result<(), BackendError> {
+        let hot_rows = ops::hip::options().mla_cpu_hot_rows;
+        let latent_cols = record.latent_cols;
+        let rope_cols = record.rope_cols;
+        let group_size = record.latent_group_size;
+        let rows = record.rows;
+        let hot = RocmMlaCpuHotLayer::new(context.device_id, self.capacity, hot_rows, record, None, None, None)?;
+        // 使用有上界的缓存分配，不能从软池借回旧的 1M prefill 大块。
+        let allocate = |bytes| ops::hip::DeviceBuffer::allocate_cache(context.device_id, bytes).map(Arc::new).map_err(compute_error);
+        self.paged_layers[layer] = Some(RocmPagedMlaLayer {
+            latent: allocate(hot_rows * latent_cols)?,
+            latent_scales: Some(allocate(hot_rows * (latent_cols / group_size) * 2)?),
+            latent_group_size: group_size,
+            rope: allocate(hot_rows * rope_cols * 2)?,
+            rows,
+            latent_cols,
+            rope_cols,
+            committed_rows: hot_rows,
+            cpu_mirror: None,
+            cpu_hot: Some(std::sync::Mutex::new(hot)),
+        });
+        Ok(())
     }
 
     /// 从 host blob H2D 重建每层（allocate + upload）。空 slot 跳过。
@@ -3015,6 +3544,11 @@ impl RocmKvCache {
                 }
                 RocmKvOwnership::Full => {}
                 RocmKvOwnership::BlockParity(_) => return Err(compute_error(format!("ROCm MLA restore L{index} 不接受单独 parity shard"))),
+            }
+            let hot_rows = ops::hip::options().mla_cpu_hot_rows;
+            if hot_rows != 0 && record.rows > hot_rows && record.latent_group_size != 0 {
+                self.restore_cpu_hot_layer(context, index, record.clone())?;
+                continue;
             }
             let committed_rows = reserved_rows.max(record.rows);
             let latent_capacity = committed_rows.checked_mul(record.latent_cols).and_then(|n| n.checked_mul(latent_element_bytes)).ok_or_else(|| compute_error("ROCm MLA restore latent 容量溢出"))?;
@@ -3069,6 +3603,16 @@ impl RocmKvCache {
 #[cfg(test)]
 mod ownership_tests {
     use super::*;
+
+    #[test]
+    fn gpu_hot_budget_covers_map_power_of_two_boundaries() {
+        let hot_rows = 32768;
+        let (per_token, fixed) = RocmKvCache::gpu_hot_metadata_budget(hot_rows);
+        for rows in [1_usize, 63, 64, 32768, 32769, 50013, 131072, 131073, 500000, 1048576] {
+            let actual = (rows.next_power_of_two() + (hot_rows - MLA_HOT_LOG_ROWS) * 2 + 1) * std::mem::size_of::<u32>();
+            assert!(per_token * rows + fixed >= actual, "token map 容量不能低估 rows={rows}");
+        }
+    }
 
     #[test]
     fn glm_mla_q8_replica_is_656_bytes_per_token_layer() {

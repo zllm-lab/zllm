@@ -13,12 +13,16 @@ pub(super) struct Glm52BatchTask {
     pub(super) kv_reservation: ResidencyReservation,
     pub(super) states: Vec<Glm52StageState>,
     pub(super) last_hidden: Option<RocmTensor>,
+    /// append prefill 取消时回到原 cache 边界，不能发布消息中间的部分 prompt。
+    pub(super) prefill_prefix_last_hidden: Option<RocmTensor>,
     pub(super) prompt_last_hidden: Option<RocmTensor>,
     pub(super) cached_tokens: Vec<u32>,
     pub(super) prefill_position: usize,
     pub(super) tail_prefill_position: usize,
     pub(super) prefill_suffix_start: usize,
     pub(super) prefill_policy: AdaptiveChunkPolicy,
+    /// 每轮从热调配置刷新；不会改变已提交的 prefill/verify 工作。
+    pub(super) runtime_mtp_draft_tokens: usize,
     /// 下游拒绝已有缓存时，保留原采样配置以便按完整 prefill 重新排队。
     pub(super) open_cache: Option<(String, SamplingConfig)>,
     pub(super) response_text: String,
@@ -42,6 +46,8 @@ pub(super) struct Glm52BatchTask {
     pub(super) mtp_verify_rows: Vec<(usize, RocmTensor)>,
     pub(super) dspark_aux_history: Option<RocmTensor>,
     pub(super) dspark_aux_history_start: usize,
+    pub(super) prefill_prefix_dspark_aux_history: Option<RocmTensor>,
+    pub(super) prefill_prefix_dspark_aux_history_start: usize,
     pub(super) prompt_dspark_aux_history: Option<RocmTensor>,
     pub(super) prompt_dspark_aux_history_start: usize,
     pub(super) dspark_target_cache: DsparkTargetCache<RocmTensor>,
@@ -138,6 +144,8 @@ impl Glm52DsparkCpuFlight {
 
 pub(super) struct Glm52PendingTask {
     pub(super) input: NodeBatchRequest,
+    /// 排队期间 request 不变，边界 hash 只算一次；驻留状态仍在准入时检查。
+    pub(super) resume: TerminalResume,
     pub(super) tokens: Vec<u32>,
     pub(super) max_tokens: usize,
     pub(super) reserved_tokens: usize,
@@ -149,7 +157,7 @@ pub(super) struct Glm52PendingTask {
     pub(super) force_new: bool,
 }
 
-pub(super) type Glm52SwapPrefetchResult = Result<Option<(Glm52CacheSnapshot, Option<usize>)>, String>;
+pub(super) type Glm52SwapPrefetchResult = Result<Option<(Arc<Glm52CacheSnapshot>, Option<usize>)>, String>;
 
 /// SSD 只在 host 线程并行读取；GPU session 的创建和 H2D 恢复仍由引擎线程顺序执行。
 /// `Ready` 缓存 try_recv 的结果，避免动态 intake 为检查就绪状态而丢失 channel 值。

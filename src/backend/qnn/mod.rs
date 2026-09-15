@@ -448,9 +448,7 @@ pub mod engine {
     }
 
     fn dispatch(entry: unsafe extern "C" fn(i32, *const *const std::ffi::c_char) -> i32) -> i32 {
-        let owned: Vec<std::ffi::CString> = std::env::args_os()
-            .map(|argument| unsafe { std::ffi::CString::from_vec_unchecked(argument.into_encoded_bytes()) })
-            .collect();
+        let owned: Vec<std::ffi::CString> = std::env::args_os().map(|argument| unsafe { std::ffi::CString::from_vec_unchecked(argument.into_encoded_bytes()) }).collect();
         let mut argv: Vec<*const std::ffi::c_char> = owned.iter().map(|argument| argument.as_ptr()).collect();
         argv.push(std::ptr::null());
         unsafe { entry((argv.len() - 1) as i32, argv.as_ptr()) }

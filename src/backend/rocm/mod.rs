@@ -55,6 +55,7 @@ use crate::weight::{
 };
 
 pub use dsa::{DsaLayerSerde, RocmDsaSelection, RocmDsaState};
+pub use compressed_sparse::RocmCsaSelection;
 pub use expert::RocmPrefillExperts;
 pub use gated_delta_net::RocmGatedDeltaNetStorage;
 pub use kda::RocmKdaStorage;
@@ -405,6 +406,10 @@ impl RocmContext {
         Ok(Self { device_id: self.device_id, allow_cpu_reference_fallback: self.allow_cpu_reference_fallback, compute_stream: ops::hip::independent_compute_stream(self.device_id)? })
     }
 
+    pub(crate) fn with_background_stream(&self) -> Result<Self, String> {
+        Ok(Self { device_id: self.device_id, allow_cpu_reference_fallback: self.allow_cpu_reference_fallback, compute_stream: ops::hip::background_stage_stream(self.device_id)? })
+    }
+
     pub(crate) fn require_cpu_reference_fallback(&self, operation: &str) -> Result<(), BackendError> {
         if self.allow_cpu_reference_fallback { Ok(()) } else { Err(compute_error(format!("ROCm {operation} 尚无设备实现；如需使用慢速 CPU reference，请在 backend 中设置 allow_cpu_reference_fallback: true"))) }
     }
@@ -453,6 +458,46 @@ impl RocmContext {
         Ok(RocmTensor { data, rows, cols, dtype: RocmTensorDType::F32, layout: RocmTensorLayout::RowMajor, device: Some(Arc::new(device)), replica: None })
     }
 
+    /// Engram WKV 留在 CPU，提前投影只上传当前 chunk，并在 resident hidden 上完成门控。
+    pub(crate) fn apply_engram_projected(
+        &self,
+        current: RocmTensor,
+        projected: Vec<f32>,
+        qk_weight: &[f32],
+        rows: usize,
+        hc: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<RocmTensor, BackendError> {
+        if current.rows != rows || current.cols != hc.checked_mul(dim).ok_or_else(|| compute_error("ROCm Engram hidden shape 溢出"))? {
+            return Err(compute_error(format!("ROCm Engram hidden shape [{},{}]，期望 [{rows},{}]", current.rows, current.cols, hc * dim)));
+        }
+        let current = self.tensor_as_f32(current)?;
+        let projected_bytes = unsafe { std::slice::from_raw_parts(projected.as_ptr().cast::<u8>(), std::mem::size_of_val(projected.as_slice())) };
+        // L14 表和投影页位于 NUMA1，而 GPU2 位于 NUMA0。先复制到消费
+        // stage 本地分配的 pinned 槽，再异步 H2D，避免 GPU 跨 socket 读取 pageable 页。
+        let projected = CPU_PREFILL_BF16_UPLOADS.with(|uploads| {
+            let mut uploads = uploads.borrow_mut();
+            if !uploads.contains_key(&self.device_id) {
+                uploads.insert(self.device_id, ops::hip::AsyncHostUpload::new(self.device_id, projected_bytes.len()).map_err(compute_error)?);
+            }
+            uploads.get_mut(&self.device_id).expect("Engram projected H2D 已插入").upload(projected_bytes).map_err(compute_error)
+        })?;
+        let qk_weight = ops::hip::DeviceBuffer::upload_f32(self.device_id, qk_weight).map_err(compute_error)?;
+        ops::hip::try_engram_apply_projected_f32(
+            self.device_id,
+            &projected,
+            &qk_weight,
+            current.device.as_deref().ok_or_else(|| compute_error("ROCm Engram hidden 缺少 device buffer"))?,
+            rows,
+            hc,
+            dim,
+            eps,
+        )
+        .map_err(compute_error)?;
+        Ok(current)
+    }
+
     /// 从 fused QKV 中抽取连续 head 区间，输出仍按 `[Q|K|V]` 排列。
     pub(crate) fn compact_qkv_heads(&self, tensor: &RocmTensor, total_heads: usize, heads: std::ops::Range<usize>, head_dim: usize) -> Result<RocmTensor, BackendError> {
         if tensor.dtype != RocmTensorDType::F32 || heads.start >= heads.end || heads.end > total_heads {
@@ -497,6 +542,27 @@ impl RocmContext {
             return Ok(device_tensor_with_dtype(device, rows, cols, tensor.dtype));
         }
         self.tensor_from_f32(tensor_data(&tensor)?, rows, cols).map_err(compute_error)
+    }
+
+    /// 两张卡先同时记录 producer ready event，再在各自 stream 排入对向复制。
+    /// 返回顺序为 `(left_on_right, right_on_left)`；调用方在一轮 all-to-all 中
+    /// 成对提交，避免单向调用把后一个 producer event 排在入向复制之后。
+    pub(crate) fn exchange_stable_tensors_ordered(left: &RocmTensor, right: &RocmTensor, completion_device_id: i32) -> Result<(RocmTensor, RocmTensor), BackendError> {
+        let left_device = left.device.as_ref().ok_or_else(|| compute_error("ROCm ordered tensor exchange 缺少 left device buffer"))?;
+        let right_device = right.device.as_ref().ok_or_else(|| compute_error("ROCm ordered tensor exchange 缺少 right device buffer"))?;
+        if left_device.device_id() == right_device.device_id() || left_device.is_async_allocated() || right_device.is_async_allocated() {
+            return Err(compute_error(format!(
+                "ROCm ordered tensor exchange 要求不同 device 的 stable buffer: left={} async={} right={} async={}",
+                left_device.device_id(),
+                left_device.is_async_allocated(),
+                right_device.device_id(),
+                right_device.is_async_allocated()
+            )));
+        }
+        let (left_on_right, right_on_left) = ops::hip::DeviceBuffer::exchange_stable_groups_ordered_async_retained_by(std::slice::from_ref(left_device), std::slice::from_ref(right_device), completion_device_id).map_err(compute_error)?;
+        let left_on_right = left_on_right.into_iter().next().expect("单 tensor exchange 必有 left 输出");
+        let right_on_left = right_on_left.into_iter().next().expect("单 tensor exchange 必有 right 输出");
+        Ok((device_tensor_with_dtype(left_on_right, left.rows, left.cols, left.dtype), device_tensor_with_dtype(right_on_left, right.rows, right.cols, right.dtype)))
     }
 
     pub(crate) fn retire_ordered_p2p_sources(&self) {

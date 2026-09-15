@@ -168,6 +168,18 @@ impl RocmPairStageCompletion {
         self.completion.wait().map_err(compute_error)
     }
 
+    pub(crate) fn query_fired(&self) -> Result<bool, BackendError> {
+        self.completion.query_fired().map_err(compute_error)
+    }
+
+    pub(crate) fn wait_fired(&self) -> Result<(), BackendError> {
+        self.completion.wait_fired().map_err(compute_error)
+    }
+
+    pub(crate) fn retire_now(&self) {
+        self.completion.retire_now();
+    }
+
     pub(crate) fn retire_ordered(&self) -> Result<(), BackendError> {
         // 通用单链 runner 只等待最后一个 owner stage；不同逻辑 stage 的
         // peer 不在 owner hidden 依赖链上，不能据此假定更早 peer 已完成。

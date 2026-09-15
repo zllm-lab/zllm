@@ -104,21 +104,42 @@ pub fn gelu(x: &[f32], out: &mut [f32]) {
     }
 }
 
-/// 稳定 SIMD tanh:`1 - 2/(e^{2x}+1)`。大正负输入分别收敛到 ±1，不产生 NaN。
+/// wide::exp 的正向溢出返回零；指数只取非正数，保证大幅值仍趋近 ±1。
 fn tanh_v(x: f32x8) -> f32x8 {
     let one = f32x8::splat(1.0);
     let two = f32x8::splat(2.0);
-    one - two / ((two * x).exp() + one)
+    let e = (-two * x.abs()).exp();
+    let result = ((one - e) / (one + e)).copysign(x);
+    x.is_nan().blend(x, result)
 }
 
-fn sigmoid_v(x: f32x8) -> f32x8 {
+pub(super) fn sigmoid_v(x: f32x8) -> f32x8 {
     let one = f32x8::splat(1.0);
-    one / (one + (-x).exp())
+    let e = (-x.abs()).exp();
+    let denominator = one + e;
+    let result = x.sign_bit().blend(e / denominator, one / denominator);
+    x.is_nan().blend(x, result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{SIMD_LANES, gelu, gelu_tanh_mul, silu_clamped_mul, situ_mul, swiglu_oai_mul};
+
+    #[test]
+    fn large_finite_activations_match_scalar_reference() {
+        let input = [10.0, 12.0, 100.0, 1e10, -100.0, -1e10, -10.0, 3.0, 100.0, -100.0];
+        let mut gelu_output = vec![0.0; input.len()];
+        gelu(&input, &mut gelu_output);
+        let mut silu_output = vec![0.0; input.len()];
+        super::silu_mul(&input, &vec![1.0; input.len()], &mut silu_output);
+        for (index, &value) in input.iter().enumerate() {
+            let x = value as f64;
+            let gelu_expected = 0.5 * x * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x.powi(3))).tanh());
+            let silu_expected = x / (1.0 + (-x).exp());
+            assert!((gelu_output[index] as f64 - gelu_expected).abs() <= 1e-5, "GELU {value}: {} != {gelu_expected}", gelu_output[index]);
+            assert!((silu_output[index] as f64 - silu_expected).abs() <= 1e-5, "SiLU {value}: {} != {silu_expected}", silu_output[index]);
+        }
+    }
 
     #[test]
     fn deepseek_swiglu限制gate和up但不平移up() {

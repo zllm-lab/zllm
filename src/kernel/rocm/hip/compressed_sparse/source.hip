@@ -20,6 +20,21 @@ __device__ __forceinline__ unsigned int csa_ordered_score(float value)
 }
 
 // 与 ROCm paged KV/DSA 共用 Q8G 编码：i8 codes + 每组一个 BF16 scale。
+__device__ __forceinline__ float csa_q8_element_rc(
+    const signed char* values,
+    const unsigned short* scales,
+    unsigned long long row,
+    unsigned int column,
+    unsigned int width,
+    unsigned int group_size)
+{
+    const unsigned long long index = row * width + column;
+    const float scale = __uint_as_float((unsigned int)scales[row * (width / group_size) + column / group_size] << 16);
+    return (float)values[index] * scale;
+}
+
+// 旧 wave 小维度路径仍传扁平索引；V4.1 的 512 维 tiled 路径使用上面的
+// row/column 入口，避免在 packed cache 热循环中做 64 位除法。
 __device__ __forceinline__ float csa_q8_element(
     const signed char* values,
     const unsigned short* scales,
@@ -28,6 +43,144 @@ __device__ __forceinline__ float csa_q8_element(
 {
     const float scale = __uint_as_float((unsigned int)scales[index / group_size] << 16);
     return (float)values[index] * scale;
+}
+
+__device__ __forceinline__ float csa_e4m3_to_f32(unsigned char bits)
+{
+    const unsigned int exponent = (bits >> 3u) & 15u;
+    const unsigned int mantissa = bits & 7u;
+    const unsigned int sign = ((unsigned int)bits & 128u) << 24u;
+    const float normal = __uint_as_float(sign | ((exponent + 120u) << 23u) | (mantissa << 20u));
+    const float subnormal = __uint_as_float(sign | __float_as_uint((float)mantissa * 0.001953125f));
+    const float finite = exponent == 0u ? subnormal : normal;
+    return exponent == 15u && mantissa == 7u ? 0.0f : finite;
+}
+
+__device__ __forceinline__ unsigned char csa_f32_to_e4m3(float value)
+{
+    const unsigned int sign = signbit(value) ? 128u : 0u;
+    float magnitude = fabsf(value);
+    if (!isfinite(magnitude)) magnitude = 448.0f;
+    if (magnitude >= 448.0f) return (unsigned char)(sign | 126u);
+    if (magnitude < 0.015625f) {
+        const unsigned int mantissa = min(8u, (unsigned int)rintf(magnitude * 512.0f));
+        return (unsigned char)(sign | mantissa);
+    }
+    int exponent = (int)floorf(log2f(magnitude));
+    unsigned int encoded_exponent = (unsigned int)(exponent + 7);
+    unsigned int mantissa = (unsigned int)rintf((ldexpf(magnitude, -exponent) - 1.0f) * 8.0f);
+    if (mantissa == 8u) {
+        mantissa = 0u;
+        ++encoded_exponent;
+    }
+    if (encoded_exponent >= 15u && mantissa >= 7u) return (unsigned char)(sign | 126u);
+    return (unsigned char)(sign | (encoded_exponent << 3u) | mantissa);
+}
+
+__device__ __forceinline__ float csa_e2m1_to_f32(unsigned int bits)
+{
+    const float magnitude[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+    const float value = magnitude[bits & 7u];
+    return (bits & 8u) != 0u ? -value : value;
+}
+
+__device__ __forceinline__ unsigned int csa_f32_to_e2m1(float value)
+{
+    const unsigned int sign = signbit(value) ? 8u : 0u;
+    const float magnitude = fminf(fabsf(value), 6.0f);
+    // IEEE RNE：正中点选择低位为 0 的编码，而不是一律增大幅值。
+    const unsigned int code = magnitude <= 0.25f ? 0u : magnitude < 0.75f ? 1u : magnitude <= 1.25f ? 2u : magnitude < 1.75f ? 3u : magnitude <= 2.5f ? 4u : magnitude < 3.5f ? 5u : magnitude <= 5.0f ? 6u : 7u;
+    return sign | code;
+}
+
+// format=0:滑窗 E4M3+E8M0(group32)，1:压缩 KV E2M1+E4M3(group16)，
+// 2:index K E2M1+E8M0(group32)。每个 block 独立量化一行内的一个 group。
+extern "C" __global__ void csa_quantize_official_f32(
+    const float* input,
+    unsigned char* codes,
+    unsigned char* scales,
+    unsigned int row_offset,
+    unsigned int rows,
+    unsigned int width,
+    unsigned int format)
+{
+    const unsigned int group_size = format == 1u ? 16u : 32u;
+    const unsigned int groups_per_row = width / group_size;
+    const unsigned int group_index = blockIdx.x;
+    const unsigned int input_row = group_index / groups_per_row;
+    const unsigned int group = group_index % groups_per_row;
+    const unsigned int lane = threadIdx.x;
+    if (input_row >= rows || lane >= 32u) return;
+    const unsigned long long input_base = (unsigned long long)input_row * width + group * group_size;
+    const float input_value = lane < group_size
+        ? zllm_bf16_to_f32(zllm_f32_to_bf16(input[input_base + lane]))
+        : 0.0f;
+    float maximum = fabsf(input_value);
+    for (unsigned int offset = 16u; offset > 0u; offset >>= 1u) maximum = fmaxf(maximum, __shfl_down(maximum, offset));
+    maximum = __shfl(maximum, 0u);
+    const float quant_max = format == 0u ? 448.0f : 6.0f;
+    float scale;
+    unsigned char scale_code;
+    if (format == 1u) {
+        scale = fmaxf(maximum, 6.0f * 0.001953125f) / quant_max;
+        scale_code = csa_f32_to_e4m3(scale);
+        scale = csa_e4m3_to_f32(scale_code);
+    } else {
+        const float minimum = format == 0u ? 1.0e-4f : ldexpf(6.0f, -126);
+        scale = exp2f(ceilf(log2f(fmaxf(maximum, minimum) / quant_max)));
+        const int exponent = max(-127, min(127, (int)lrintf(log2f(scale))));
+        scale_code = (unsigned char)(exponent + 127);
+        scale = ldexpf(1.0f, exponent);
+    }
+    if (lane == 0u) scales[(unsigned long long)(row_offset + input_row) * groups_per_row + group] = scale_code;
+    const unsigned long long output_row = row_offset + input_row;
+    if (format == 0u) {
+        if (lane < group_size) codes[output_row * width + group * group_size + lane] = csa_f32_to_e4m3(input_value / scale);
+    } else if (lane < group_size / 2u) {
+        const unsigned int column = lane * 2u;
+        const float low_value = zllm_bf16_to_f32(zllm_f32_to_bf16(input[input_base + column]));
+        const float high_value = zllm_bf16_to_f32(zllm_f32_to_bf16(input[input_base + column + 1u]));
+        const unsigned int low = csa_f32_to_e2m1(low_value / scale);
+        const unsigned int high = csa_f32_to_e2m1(high_value / scale);
+        codes[output_row * (width / 2u) + (group * group_size + column) / 2u] = (unsigned char)(low | (high << 4u));
+    }
+}
+
+__device__ __forceinline__ float csa_official_element(
+    const signed char* values,
+    const unsigned short* scales,
+    unsigned long long row,
+    unsigned int column,
+    unsigned int width,
+    unsigned int format)
+{
+    const unsigned char* codes_u8 = (const unsigned char*)values;
+    const unsigned char* scales_u8 = (const unsigned char*)scales;
+    if (format == 1u) {
+        const unsigned int nibble = (codes_u8[row * (width / 2u) + column / 2u] >> ((column & 1u) * 4u)) & 15u;
+        return csa_e2m1_to_f32(nibble) * csa_e4m3_to_f32(scales_u8[row * (width / 16u) + column / 16u]);
+    }
+    const unsigned int scale_code = scales_u8[row * (width / 32u) + column / 32u];
+    const float scale = scale_code == 0u ? 0x1p-127f : __uint_as_float(scale_code << 23u);
+    if (format == 2u) {
+        const unsigned int nibble = (codes_u8[row * (width / 2u) + column / 2u] >> ((column & 1u) * 4u)) & 15u;
+        return csa_e2m1_to_f32(nibble) * scale;
+    }
+    return csa_e4m3_to_f32(codes_u8[row * width + column]) * scale;
+}
+
+__device__ __forceinline__ float csa_cache_element_rc(
+    const signed char* values,
+    const unsigned short* scales,
+    unsigned long long row,
+    unsigned int column,
+    unsigned int width,
+    unsigned int q8_group_size,
+    unsigned int cache_format,
+    unsigned int compressed)
+{
+    if (cache_format == 0u) return csa_q8_element_rc(values, scales, row, column, width, q8_group_size);
+    return csa_official_element(values, scales, row, column, width, compressed != 0u ? 1u : 0u);
 }
 
 typedef unsigned short __attribute__((ext_vector_type(2))) csa_bf16x2;
@@ -138,6 +291,129 @@ extern "C" __global__ void csa_gated_compress_f32(
     }
 }
 
+extern "C" __global__ void csa_compress_v41_f32(
+    const float* pending_key,
+    const float* pending_gate,
+    const float* key,
+    const float* gate,
+    const float* norm,
+    const float* wk,
+    const float* k_norm,
+    const float* cos_table,
+    const float* sin_table,
+    float* output,
+    float* index_output,
+    unsigned int pending_rows,
+    unsigned int windows,
+    unsigned int ratio,
+    unsigned int width,
+    unsigned int channels,
+    unsigned int entry_start,
+    unsigned int rotary_dim,
+    unsigned int index_dim,
+    unsigned int index_rotary_dim,
+    unsigned int use_gate,
+    float eps)
+{
+    const unsigned int window = blockIdx.x;
+    const unsigned int lane = threadIdx.x;
+    if (window >= windows) return;
+    __shared__ float pooled_shared[1024];
+    __shared__ float reduced[1024];
+    __shared__ float normalized[1024];
+    // V4.1:无 ape、无 overlap;ratio=1 时 gate 恒 0,softmax 单元素退化为直通。
+    float pooled = 0.0f;
+    if (lane < width) {
+        float maximum = -3.402823466e+38F;
+        for (unsigned int slot = 0; slot < ratio; ++slot) {
+            const unsigned int row = window * ratio + slot;
+            const float logit = use_gate != 0 ? csa_input(pending_gate, gate, pending_rows, channels, row, lane) : 0.0f;
+            maximum = fmaxf(maximum, logit);
+        }
+        float denominator = 0.0f;
+        for (unsigned int slot = 0; slot < ratio; ++slot) {
+            const unsigned int row = window * ratio + slot;
+            const float value = csa_input(pending_key, key, pending_rows, channels, row, lane);
+            const float logit = use_gate != 0 ? csa_input(pending_gate, gate, pending_rows, channels, row, lane) : 0.0f;
+            const float weight = expf(logit - maximum);
+            denominator += weight;
+            pooled += value * weight;
+        }
+        // 官方 Compressor 在 FP32 pooling 后先恢复输入 dtype(BF16)，RMSNorm
+        // 再以这个 BF16 latent 作为输入；不能把 F32 一直保留到最终 cache 量化。
+        pooled = zllm_bf16_to_f32(zllm_f32_to_bf16(pooled / denominator));
+        pooled_shared[lane] = pooled;
+        reduced[lane] = pooled * pooled;
+    } else {
+        reduced[lane] = 0.0f;
+    }
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (lane < stride) reduced[lane] += reduced[lane + stride];
+        __syncthreads();
+    }
+    if (lane < width) {
+        const float value = pooled_shared[lane] * rsqrtf(reduced[0] / (float)width + eps) * norm[lane];
+        // RMSNorm 返回与输入相同的 BF16 dtype，随后才进入 RoPE。
+        normalized[lane] = zllm_bf16_to_f32(zllm_f32_to_bf16(value));
+    }
+    __syncthreads();
+    if (lane < width) {
+        float result = normalized[lane];
+        const unsigned int rotary_start = width - rotary_dim;
+        if (lane >= rotary_start) {
+            const unsigned int relative = lane - rotary_start;
+            const unsigned int pair = relative >> 1;
+            const unsigned int partner = rotary_start + (relative ^ 1u);
+            const unsigned long long table = (unsigned long long)(entry_start + window) * ratio * (rotary_dim >> 1) + pair;
+            const float cosine = cos_table[table];
+            const float sine = sin_table[table];
+            result = (relative & 1u) == 0
+                ? normalized[lane] * cosine - normalized[partner] * sine
+                : normalized[lane] * cosine + normalized[partner] * sine;
+        }
+        output[(unsigned long long)window * width + lane] = result;
+    }
+    // index key 路：官方 Indexer 接收 compressor RMSNorm 后、attention RoPE 前的
+    // BF16 latent，再做 wk、k_norm 与压缩行位置(组首 token)的 suffix RoPE。
+    if (lane < index_dim) {
+        float dot = 0.0f;
+        for (unsigned int column = 0; column < width; ++column) {
+            dot += wk[(unsigned long long)lane * width + column] * normalized[column];
+        }
+        normalized[lane] = dot;
+        reduced[lane] = dot * dot;
+    } else if (lane < blockDim.x) {
+        reduced[lane] = 0.0f;
+    }
+    __syncthreads();
+    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (lane < stride) reduced[lane] += reduced[lane + stride];
+        __syncthreads();
+    }
+    if (lane < index_dim) {
+        const float projected = normalized[lane] * rsqrtf(reduced[0] / (float)index_dim + eps) * k_norm[lane];
+        normalized[lane] = projected;
+    }
+    __syncthreads();
+    if (lane < index_dim) {
+        float result = normalized[lane];
+        const unsigned int rotary_start = index_dim - index_rotary_dim;
+        if (lane >= rotary_start) {
+            const unsigned int relative = lane - rotary_start;
+            const unsigned int pair = relative >> 1;
+            const unsigned int partner = rotary_start + (relative ^ 1u);
+            const unsigned long long table = (unsigned long long)(entry_start + window) * ratio * (index_rotary_dim >> 1) + pair;
+            const float cosine = cos_table[table];
+            const float sine = sin_table[table];
+            result = (relative & 1u) == 0
+                ? normalized[lane] * cosine - normalized[partner] * sine
+                : normalized[lane] * cosine + normalized[partner] * sine;
+        }
+        index_output[(unsigned long long)window * index_dim + lane] = result;
+    }
+}
+
 extern "C" __global__ void csa_store_overlap_f32(
     const float* pending_key,
     const float* pending_gate,
@@ -214,6 +490,51 @@ extern "C" __global__ void csa_index_scores_f32(
         for (unsigned int offset = warpSize >> 1; offset > 0; offset >>= 1) {
             dot += __shfl_down(dot, offset, warpSize);
         }
+        if (lane == 0) subtotal += head_weights[(unsigned long long)query_row * head_count + head]
+            * fmaxf(0.0f, dot * rsqrtf((float)head_dim));
+    }
+    if (lane == 0) partial[wave] = subtotal;
+    __syncthreads();
+    if (thread == 0) {
+        float total = 0.0f;
+        for (unsigned int index = 0; index < waves; ++index) total += partial[index];
+        score_keys[(unsigned long long)query_row * compressed_rows + key_row]
+            = csa_ordered_score(total * rsqrtf((float)head_count));
+    }
+}
+
+extern "C" __global__ void csa_index_scores_official_f32(
+    const signed char* query,
+    const unsigned short* query_scales,
+    const signed char* keys,
+    const unsigned short* key_scales,
+    const float* head_weights,
+    const unsigned int* visible_counts,
+    unsigned int* score_keys,
+    unsigned int query_rows,
+    unsigned int compressed_rows,
+    unsigned int head_count,
+    unsigned int head_dim)
+{
+    const unsigned int key_row = blockIdx.x;
+    const unsigned int query_row = blockIdx.y;
+    const unsigned int thread = threadIdx.x;
+    if (query_row >= query_rows || key_row >= visible_counts[query_row]) return;
+    const unsigned int wave = thread / warpSize;
+    const unsigned int lane = thread % warpSize;
+    const unsigned int waves = blockDim.x / warpSize;
+    __shared__ float partial[16];
+    float subtotal = 0.0f;
+    const unsigned int query_width = head_count * head_dim;
+    for (unsigned int head = wave; head < head_count; head += waves) {
+        float dot = 0.0f;
+        const unsigned int query_column = head * head_dim;
+        for (unsigned int column = lane; column < head_dim; column += warpSize) {
+            const float q = csa_official_element(query, query_scales, query_row, query_column + column, query_width, 2u);
+            const float k = csa_official_element(keys, key_scales, key_row, column, head_dim, 2u);
+            dot += q * k;
+        }
+        for (unsigned int offset = warpSize >> 1; offset > 0; offset >>= 1) dot += __shfl_down(dot, offset, warpSize);
         if (lane == 0) subtotal += head_weights[(unsigned long long)query_row * head_count + head]
             * fmaxf(0.0f, dot * rsqrtf((float)head_dim));
     }
@@ -469,6 +790,7 @@ extern "C" __global__ void csa_attention_wave_q8(
     unsigned int head_dim,
     unsigned int window_size,
     unsigned int q8_group_size,
+    unsigned int cache_format,
     unsigned int has_sink)
 {
     const unsigned int wave = threadIdx.x / warpSize;
@@ -573,7 +895,9 @@ __device__ __forceinline__ void csa_attention_wave_tile_tiled(
     float tile_denominator = 0.0f;
     #pragma unroll
     for (unsigned int tile_row = 0; tile_row < CSA_TILE_ROWS; ++tile_row) {
-        const float weight = tile_row < tile_rows ? expf(scores[tile_row] - next_maximum) : 0.0f;
+        const float weight = tile_row < tile_rows
+            ? __builtin_amdgcn_exp2f((scores[tile_row] - next_maximum) * 1.4426950408889634f)
+            : 0.0f;
         weights[tile_row] = weight;
         tile_denominator += weight;
     }
@@ -624,6 +948,7 @@ __device__ __forceinline__ void csa_attention_kv_element(
     unsigned int kv_head,
     unsigned int head_dim,
     unsigned int q8_group_size,
+    unsigned int cache_format,
     unsigned int item,
     unsigned int column,
     unsigned int load_value,
@@ -635,7 +960,9 @@ __device__ __forceinline__ void csa_attention_kv_element(
     const signed char* value_source;
     const unsigned short* value_scale_source;
     unsigned int row;
+    unsigned int compressed = 0u;
     if (item < compressed_count) {
+        compressed = 1u;
         row = selection_top_k == 0 ? item : selection[(unsigned long long)query_row * selection_top_k + item];
         key_source = compressed_key;
         key_scale_source = compressed_key_scales;
@@ -655,11 +982,11 @@ __device__ __forceinline__ void csa_attention_kv_element(
         value_source = batch_value;
         value_scale_source = batch_value_scales;
     }
-    const unsigned long long base = ((unsigned long long)row * kv_head_count + kv_head) * head_dim;
-    const float key_value = csa_q8_element(key_source, key_scale_source, base + column, q8_group_size);
+    const unsigned long long cache_row = (unsigned long long)row * kv_head_count + kv_head;
+    const float key_value = csa_cache_element_rc(key_source, key_scale_source, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, compressed);
     *key_result = key_value;
     if (load_value != 0) {
-        *value_result = key_source == value_source && key_scale_source == value_scale_source ? key_value : csa_q8_element(value_source, value_scale_source, base + column, q8_group_size);
+        *value_result = key_source == value_source && key_scale_source == value_scale_source ? key_value : csa_cache_element_rc(value_source, value_scale_source, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, compressed);
     }
 }
 
@@ -696,6 +1023,7 @@ extern "C" __global__ void csa_attention_wmma_q8(
     unsigned int head_dim,
     unsigned int window_size,
     unsigned int q8_group_size,
+    unsigned int cache_format,
     unsigned int has_sink)
 {
     const unsigned int head_groups = head_count / CSA_ATTN_HEAD_TILE;
@@ -750,7 +1078,7 @@ extern "C" __global__ void csa_attention_wmma_q8(
             const unsigned int column = index - key_local * head_dim;
             float key_value = 0.0f;
             float ignored_value = 0.0f;
-            if (key_local < tile_rows) csa_attention_kv_element(compressed_key, compressed_key_scales, compressed_value, compressed_value_scales, selection, recent_key, recent_key_scales, recent_value, recent_value_scales, batch_key, batch_key_scales, batch_value, batch_value_scales, selection_top_k, query_row, compressed_count, recent_begin, recent_count, batch_begin, recent_start, window_size, kv_head_count, kv_head, head_dim, q8_group_size, key_start + key_local, column, 0, &key_value, &ignored_value);
+            if (key_local < tile_rows) csa_attention_kv_element(compressed_key, compressed_key_scales, compressed_value, compressed_value_scales, selection, recent_key, recent_key_scales, recent_value, recent_value_scales, batch_key, batch_key_scales, batch_value, batch_value_scales, selection_top_k, query_row, compressed_count, recent_begin, recent_count, batch_begin, recent_start, window_size, kv_head_count, kv_head, head_dim, q8_group_size, cache_format, key_start + key_local, column, 0, &key_value, &ignored_value);
             key_tile[index] = static_cast<Bf16>(key_value);
         }
         __syncthreads();
@@ -796,7 +1124,7 @@ extern "C" __global__ void csa_attention_wmma_q8(
             const unsigned int column = index - key_local * head_dim;
             float key_value = 0.0f;
             float value = 0.0f;
-            if (key_local < tile_rows) csa_attention_kv_element(compressed_key, compressed_key_scales, compressed_value, compressed_value_scales, selection, recent_key, recent_key_scales, recent_value, recent_value_scales, batch_key, batch_key_scales, batch_value, batch_value_scales, selection_top_k, query_row, compressed_count, recent_begin, recent_count, batch_begin, recent_start, window_size, kv_head_count, kv_head, head_dim, q8_group_size, key_start + key_local, column, 1, &key_value, &value);
+            if (key_local < tile_rows) csa_attention_kv_element(compressed_key, compressed_key_scales, compressed_value, compressed_value_scales, selection, recent_key, recent_key_scales, recent_value, recent_value_scales, batch_key, batch_key_scales, batch_value, batch_value_scales, selection_top_k, query_row, compressed_count, recent_begin, recent_count, batch_begin, recent_start, window_size, kv_head_count, kv_head, head_dim, q8_group_size, cache_format, key_start + key_local, column, 1, &key_value, &value);
             key_tile[index] = static_cast<Bf16>(key_value);
             value_tile[index] = static_cast<Bf16>(value);
         }
@@ -933,6 +1261,7 @@ extern "C" __global__ void csa_attention_tiled_q8(
     unsigned int runtime_head_dim,
     unsigned int window_size,
     unsigned int q8_group_size,
+    unsigned int cache_format,
     unsigned int has_sink)
 {
     if (runtime_head_dim != CSA_TILED_HEAD_DIM) return;
@@ -975,10 +1304,10 @@ extern "C" __global__ void csa_attention_tiled_q8(
             const unsigned int column = index - tile_row * head_dim;
             const unsigned int slot = base + tile_row;
             const unsigned int row = selection_top_k == 0 ? slot : selection[(unsigned long long)query_row * selection_top_k + slot];
-            const unsigned long long kv_base = ((unsigned long long)row * kv_head_count + kv_head) * head_dim;
-            const float key_value = csa_q8_element(compressed_key, compressed_key_scales, kv_base + column, q8_group_size);
+            const unsigned long long cache_row = (unsigned long long)row * kv_head_count + kv_head;
+            const float key_value = csa_cache_element_rc(compressed_key, compressed_key_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 1u);
             key_tile[index] = zllm_f32_to_bf16(key_value);
-            value_tile[index] = compressed_shared ? key_value : csa_q8_element(compressed_value, compressed_value_scales, kv_base + column, q8_group_size);
+            value_tile[index] = compressed_shared ? key_value : csa_cache_element_rc(compressed_value, compressed_value_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 1u);
         }
         __syncthreads();
         if (active) csa_attention_wave_tile_tiled(query_values, value_sums, key_tile, value_tile, tile_rows, lane, head_dim, score_scale, &maximum, &denominator);
@@ -999,10 +1328,10 @@ extern "C" __global__ void csa_attention_tiled_q8(
             const unsigned int column = index - tile_row * head_dim;
             const unsigned int logical = base + tile_row;
             const unsigned int physical = (recent_start + logical) % window_size;
-            const unsigned long long kv_base = ((unsigned long long)physical * kv_head_count + kv_head) * head_dim;
-            const float key_value = csa_q8_element(recent_key, recent_key_scales, kv_base + column, q8_group_size);
+            const unsigned long long cache_row = (unsigned long long)physical * kv_head_count + kv_head;
+            const float key_value = csa_cache_element_rc(recent_key, recent_key_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 0u);
             key_tile[index] = zllm_f32_to_bf16(key_value);
-            value_tile[index] = recent_shared ? key_value : csa_q8_element(recent_value, recent_value_scales, kv_base + column, q8_group_size);
+            value_tile[index] = recent_shared ? key_value : csa_cache_element_rc(recent_value, recent_value_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 0u);
         }
         __syncthreads();
         if (active) csa_attention_wave_tile_tiled(query_values, value_sums, key_tile, value_tile, tile_rows, lane, head_dim, score_scale, &maximum, &denominator);
@@ -1017,10 +1346,10 @@ extern "C" __global__ void csa_attention_tiled_q8(
             const unsigned int tile_row = index / head_dim;
             const unsigned int column = index - tile_row * head_dim;
             const unsigned int row = base + tile_row;
-            const unsigned long long kv_base = ((unsigned long long)row * kv_head_count + kv_head) * head_dim;
-            const float key_value = csa_q8_element(batch_key, batch_key_scales, kv_base + column, q8_group_size);
+            const unsigned long long cache_row = (unsigned long long)row * kv_head_count + kv_head;
+            const float key_value = csa_cache_element_rc(batch_key, batch_key_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 0u);
             key_tile[index] = zllm_f32_to_bf16(key_value);
-            value_tile[index] = batch_shared ? key_value : csa_q8_element(batch_value, batch_value_scales, kv_base + column, q8_group_size);
+            value_tile[index] = batch_shared ? key_value : csa_cache_element_rc(batch_value, batch_value_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 0u);
         }
         __syncthreads();
         if (active) csa_attention_wave_tile_tiled(query_values, value_sums, key_tile, value_tile, tile_rows, lane, head_dim, score_scale, &maximum, &denominator);
@@ -1048,6 +1377,7 @@ extern "C" __global__ void csa_attention_segmented_tiled_q8(
     unsigned int runtime_head_dim,
     unsigned int window_size,
     unsigned int q8_group_size,
+    unsigned int cache_format,
     unsigned int has_sink)
 {
     if (runtime_head_dim != CSA_TILED_HEAD_DIM) return;
@@ -1106,10 +1436,10 @@ extern "C" __global__ void csa_attention_segmented_tiled_q8(
             const unsigned int column = index - tile_row * head_dim;
             const unsigned int slot = base + tile_row;
             const unsigned int row = descriptor->selection_top_k == 0 ? slot : selection[(unsigned long long)query_row * descriptor->selection_top_k + slot];
-            const unsigned long long kv_base = ((unsigned long long)row * kv_head_count + kv_head) * head_dim;
-            const float key_value = csa_q8_element(compressed_key, compressed_key_scales, kv_base + column, q8_group_size);
+            const unsigned long long cache_row = (unsigned long long)row * kv_head_count + kv_head;
+            const float key_value = csa_cache_element_rc(compressed_key, compressed_key_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 1u);
             key_tile[index] = zllm_f32_to_bf16(key_value);
-            value_tile[index] = compressed_shared ? key_value : csa_q8_element(compressed_value, compressed_value_scales, kv_base + column, q8_group_size);
+            value_tile[index] = compressed_shared ? key_value : csa_cache_element_rc(compressed_value, compressed_value_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 1u);
         }
         __syncthreads();
         if (active) csa_attention_wave_tile_tiled(query_values, value_sums, key_tile, value_tile, tile_rows, lane, head_dim, score_scale, &maximum, &denominator);
@@ -1129,10 +1459,10 @@ extern "C" __global__ void csa_attention_segmented_tiled_q8(
             const unsigned int tile_row = index / head_dim;
             const unsigned int column = index - tile_row * head_dim;
             const unsigned int physical = (descriptor->recent_start + base + tile_row) % window_size;
-            const unsigned long long kv_base = ((unsigned long long)physical * kv_head_count + kv_head) * head_dim;
-            const float key_value = csa_q8_element(recent_key, recent_key_scales, kv_base + column, q8_group_size);
+            const unsigned long long cache_row = (unsigned long long)physical * kv_head_count + kv_head;
+            const float key_value = csa_cache_element_rc(recent_key, recent_key_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 0u);
             key_tile[index] = zllm_f32_to_bf16(key_value);
-            value_tile[index] = recent_shared ? key_value : csa_q8_element(recent_value, recent_value_scales, kv_base + column, q8_group_size);
+            value_tile[index] = recent_shared ? key_value : csa_cache_element_rc(recent_value, recent_value_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 0u);
         }
         __syncthreads();
         if (active) csa_attention_wave_tile_tiled(query_values, value_sums, key_tile, value_tile, tile_rows, lane, head_dim, score_scale, &maximum, &denominator);
@@ -1147,10 +1477,10 @@ extern "C" __global__ void csa_attention_segmented_tiled_q8(
             const unsigned int tile_row = index / head_dim;
             const unsigned int column = index - tile_row * head_dim;
             const unsigned int row = base + tile_row;
-            const unsigned long long kv_base = ((unsigned long long)row * kv_head_count + kv_head) * head_dim;
-            const float key_value = csa_q8_element(batch_key, batch_key_scales, kv_base + column, q8_group_size);
+            const unsigned long long cache_row = (unsigned long long)row * kv_head_count + kv_head;
+            const float key_value = csa_cache_element_rc(batch_key, batch_key_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 0u);
             key_tile[index] = zllm_f32_to_bf16(key_value);
-            value_tile[index] = batch_shared ? key_value : csa_q8_element(batch_value, batch_value_scales, kv_base + column, q8_group_size);
+            value_tile[index] = batch_shared ? key_value : csa_cache_element_rc(batch_value, batch_value_scales, cache_row, column, kv_head_count * head_dim, q8_group_size, cache_format, 0u);
         }
         __syncthreads();
         if (active) csa_attention_wave_tile_tiled(query_values, value_sums, key_tile, value_tile, tile_rows, lane, head_dim, score_scale, &maximum, &denominator);
@@ -1203,6 +1533,7 @@ extern "C" __global__ void csa_attention_decode_partial_q8(
     unsigned int head_dim,
     unsigned int window_size,
     unsigned int q8_group_size,
+    unsigned int cache_format,
     unsigned int has_sink,
     unsigned int segments)
 {
@@ -1258,7 +1589,7 @@ extern "C" __global__ void csa_attention_decode_partial_q8(
             const unsigned int column = index - tile_row * head_dim;
             float key_value = 0.0f;
             float value = 0.0f;
-            csa_attention_kv_element(compressed_key, compressed_key_scales, compressed_value, compressed_value_scales, selection, recent_key, recent_key_scales, recent_value, recent_value_scales, batch_key, batch_key_scales, batch_value, batch_value_scales, selection_top_k, query_row, compressed_count, recent_begin, recent_end - recent_begin, batch_begin, recent_start, window_size, kv_head_count, kv_head, head_dim, q8_group_size, base + tile_row, column, 1, &key_value, &value);
+            csa_attention_kv_element(compressed_key, compressed_key_scales, compressed_value, compressed_value_scales, selection, recent_key, recent_key_scales, recent_value, recent_value_scales, batch_key, batch_key_scales, batch_value, batch_value_scales, selection_top_k, query_row, compressed_count, recent_begin, recent_end - recent_begin, batch_begin, recent_start, window_size, kv_head_count, kv_head, head_dim, q8_group_size, cache_format, base + tile_row, column, 1, &key_value, &value);
             key_tile[index] = key_value;
             value_tile[index] = value;
         }
@@ -1296,6 +1627,7 @@ extern "C" __global__ void csa_attention_segmented_decode_partial_q8(
     unsigned int head_dim,
     unsigned int window_size,
     unsigned int q8_group_size,
+    unsigned int cache_format,
     unsigned int has_sink,
     unsigned int split_segments)
 {
@@ -1365,7 +1697,7 @@ extern "C" __global__ void csa_attention_segmented_decode_partial_q8(
             const unsigned int column = index - tile_row * head_dim;
             float key_value = 0.0f;
             float value = 0.0f;
-            csa_attention_kv_element(compressed_key, compressed_key_scales, compressed_value, compressed_value_scales, selection, recent_key, recent_key_scales, recent_value, recent_value_scales, batch_key, batch_key_scales, batch_value, batch_value_scales, descriptor->selection_top_k, query_row, compressed_count, recent_begin, recent_end - recent_begin, batch_begin, descriptor->recent_start, window_size, kv_head_count, kv_head, head_dim, q8_group_size, base + tile_row, column, 1, &key_value, &value);
+            csa_attention_kv_element(compressed_key, compressed_key_scales, compressed_value, compressed_value_scales, selection, recent_key, recent_key_scales, recent_value, recent_value_scales, batch_key, batch_key_scales, batch_value, batch_value_scales, descriptor->selection_top_k, query_row, compressed_count, recent_begin, recent_end - recent_begin, batch_begin, descriptor->recent_start, window_size, kv_head_count, kv_head, head_dim, q8_group_size, cache_format, base + tile_row, column, 1, &key_value, &value);
             key_tile[index] = key_value;
             value_tile[index] = value;
         }

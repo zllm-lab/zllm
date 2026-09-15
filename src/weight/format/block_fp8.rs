@@ -64,4 +64,16 @@ mod tests {
         let matrix = BlockFp8Matrix::new(vec![0x38, 0x38], vec![128], 1, 2, 128, 128).unwrap();
         assert_eq!(matrix.decode(), vec![2.0, 2.0]);
     }
+
+    #[test]
+    fn decodes_independent_32_by_32_scale_tiles() {
+        let rows = 64;
+        let cols = 64;
+        let matrix = BlockFp8Matrix::new(vec![0x38; rows * cols], vec![127, 128, 129, 130], rows, cols, 32, 32).unwrap();
+        let decoded = matrix.decode();
+        assert_eq!(decoded[0], 1.0);
+        assert_eq!(decoded[32], 2.0);
+        assert_eq!(decoded[32 * cols], 4.0);
+        assert_eq!(decoded[32 * cols + 32], 8.0);
+    }
 }

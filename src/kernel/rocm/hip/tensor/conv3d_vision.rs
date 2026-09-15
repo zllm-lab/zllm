@@ -99,12 +99,260 @@ pub fn try_conv3d_resident_f32(
     arguments.extend(dims.iter_mut().map(|value| (value as *mut u32).cast()));
     let output_elements = u32::try_from(output_elements).map_err(|_| "HIP Conv3D output 元素数超过 u32".to_owned())?;
     let profile_started = options().kernel_profile.then(std::time::Instant::now);
-    launch_tensor_kernel(functions.conv3d, output_elements.div_ceil(256), 256, &mut arguments, "HIP Conv3D")?;
+    let (function, grid) = conv3d_function_grid(&functions, input_channels, output_channels, output_shape, output_elements)?;
+    launch_tensor_kernel(function, grid, 256, &mut arguments, "HIP Conv3D")?;
     if let Some(started) = profile_started {
         synchronize_device(device_id, "HIP Conv3D profile")?;
         eprintln!("[rocm-vae] conv3d in={input_channels} out={output_channels} input={input_shape:?} kernel={kernel:?} stride={stride:?} output={output_shape:?} wall={:.6}s", started.elapsed().as_secs_f64());
     }
     Ok(output)
+}
+
+// 先完整完成展开/GEMM再决定是否回退；异常输入重算F32，不延长history生命周期。
+#[allow(clippy::too_many_arguments)]
+fn try_conv3d_columns(
+    device_id: i32,
+    input: &DeviceBuffer,
+    history: Option<&DeviceBuffer>,
+    weight: &DeviceBuffer,
+    bias: Option<&DeviceBuffer>,
+    output: &DeviceBuffer,
+    spec: &crate::vae::Conv3dSpec,
+    head: usize,
+    spatial: usize,
+) -> Result<bool, String> {
+    let functions = tensor_functions(device_id)?;
+    let pointwise = spec.kernel == [1; 3];
+    let pack = if pointwise { functions.conv3d_pointwise_columns } else { functions.conv3d_history_columns };
+    let (Some(pack), Some(gemm)) = (pack, functions.conv3d_columns_gemm) else { return Ok(false) };
+    let tile = if pointwise {
+        16384usize
+    } else {
+        match spec.output_channels {
+            128 => 8192usize,
+            256 => 16384,
+            _ => 2048,
+        }
+    };
+    let k = spec.input_channels.checked_mul(if pointwise { 1 } else { 27 }).ok_or("Conv3D columns K 溢出")?;
+    let scratch_bytes = k.checked_mul(tile).and_then(|n| n.checked_mul(2)).ok_or("Conv3D columns 工作区溢出")?;
+    let columns = DeviceBuffer::allocate_reusable(device_id, scratch_bytes)?;
+    let flag = DeviceBuffer::upload(device_id, &[0; 4])?;
+    let mut d_input = input.pointer;
+    let mut d_history = history.map_or(ptr::null_mut(), |h| h.pointer);
+    let mut d_columns = columns.pointer;
+    let mut d_flag = flag.pointer;
+    let mut d_weight = weight.pointer;
+    let mut d_bias = bias.map_or(ptr::null_mut(), |b| b.pointer);
+    let mut d_output = output.pointer;
+    let mut depth = u32::try_from(spec.input_shape[0]).map_err(|_| "Conv3D columns depth 超过 u32")?;
+    let mut height = u32::try_from(spec.input_shape[1]).map_err(|_| "Conv3D columns height 超过 u32")?;
+    let mut width = u32::try_from(spec.input_shape[2]).map_err(|_| "Conv3D columns width 超过 u32")?;
+    let mut channels = u32::try_from(spec.input_channels).map_err(|_| "Conv3D columns channels 超过 u32")?;
+    let mut head = u32::try_from(head).map_err(|_| "Conv3D columns head 超过 u32")?;
+    let mut co = u32::try_from(spec.output_channels).map_err(|_| "Conv3D columns output channels 超过 u32")?;
+    let mut reduction = u32::try_from(k).map_err(|_| "Conv3D columns K 超过 u32")?;
+    let mut total = spatial as u64;
+    let mut has_bias = u32::from(bias.is_some());
+    for start in (0..spatial).step_by(tile) {
+        let mut start = start as u64;
+        let mut n = u32::try_from(tile.min(spatial - start as usize)).map_err(|_| "Conv3D columns tile 超过 u32")?;
+        let mut pack_args = [
+            (&mut d_input as *mut *mut c_void).cast(),
+            (&mut d_history as *mut *mut c_void).cast(),
+            (&mut d_columns as *mut *mut c_void).cast(),
+            (&mut d_flag as *mut *mut c_void).cast(),
+            (&mut depth as *mut u32).cast(),
+            (&mut height as *mut u32).cast(),
+            (&mut width as *mut u32).cast(),
+            (&mut channels as *mut u32).cast(),
+            (&mut head as *mut u32).cast(),
+            (&mut start as *mut u64).cast(),
+            (&mut n as *mut u32).cast(),
+        ];
+        let pack_grid = u32::try_from((k * n as usize).div_ceil(256)).map_err(|_| "Conv3D columns grid 超过 u32")?;
+        if pointwise {
+            let mut pointwise_args = [
+                (&mut d_input as *mut *mut c_void).cast(),
+                (&mut d_history as *mut *mut c_void).cast(),
+                (&mut d_columns as *mut *mut c_void).cast(),
+                (&mut d_flag as *mut *mut c_void).cast(),
+                (&mut channels as *mut u32).cast(),
+                (&mut total as *mut u64).cast(),
+                (&mut start as *mut u64).cast(),
+                (&mut n as *mut u32).cast(),
+            ];
+            launch_tensor_kernel(pack, pack_grid, 256, &mut pointwise_args, "HIP Conv3D checked pointwise columns")?;
+        } else {
+            launch_tensor_kernel(pack, pack_grid, 256, &mut pack_args, "HIP Conv3D checked columns")?;
+        }
+        let mut gemm_args = [
+            (&mut d_columns as *mut *mut c_void).cast(),
+            (&mut d_weight as *mut *mut c_void).cast(),
+            (&mut d_bias as *mut *mut c_void).cast(),
+            (&mut d_output as *mut *mut c_void).cast(),
+            (&mut co as *mut u32).cast(),
+            (&mut reduction as *mut u32).cast(),
+            (&mut n as *mut u32).cast(),
+            (&mut start as *mut u64).cast(),
+            (&mut total as *mut u64).cast(),
+            (&mut has_bias as *mut u32).cast(),
+        ];
+        let gemm_grid = n.div_ceil(64).checked_mul(co.div_ceil(64)).ok_or("Conv3D columns GEMM grid 溢出")?;
+        launch_tensor_kernel(gemm, gemm_grid, 256, &mut gemm_args, "HIP Conv3D columns GEMM")?;
+    }
+    let mut invalid = [0u8; 4];
+    flag.copy_to_host(&mut invalid)?;
+    Ok(invalid == [0; 4])
+}
+
+/// 双输入时间窗口与紧凑尾部；F16片段路径需由调用方确认权重无损可表示F16。
+#[allow(clippy::too_many_arguments)]
+pub fn try_conv3d_with_history_resident_f32(
+    device_id: i32,
+    input: &DeviceBuffer,
+    mut history: Option<std::sync::Arc<DeviceBuffer>>,
+    weight: &DeviceBuffer,
+    bias: Option<&DeviceBuffer>,
+    spec: &crate::vae::Conv3dSpec,
+    history_frames: Option<usize>,
+    spatial_pad_after: [usize; 2],
+    allow_f16_wmma: bool,
+) -> Result<(DeviceBuffer, Option<DeviceBuffer>), String> {
+    let (head, keep, output_shape) = crate::vae::conv3d_history_layout(spec, history_frames, spatial_pad_after)?;
+    if history.is_some() != history_frames.is_some() {
+        return Err("HIP Conv3D history buffer 与帧数不匹配".to_owned());
+    }
+    let plane = spec.input_shape[1].checked_mul(spec.input_shape[2]).ok_or("HIP Conv3D history plane 溢出")?;
+    let input_elements = spec.input_channels.checked_mul(spec.input_spatial()?).ok_or("HIP Conv3D history input 溢出")?;
+    let k_count = spec.kernel.into_iter().try_fold(spec.input_channels, |n, d| n.checked_mul(d).ok_or("HIP Conv3D history K 溢出"))?;
+    let weight_elements = spec.output_channels.checked_mul(k_count).ok_or("HIP Conv3D history weight 溢出")?;
+    let spatial = output_shape.into_iter().try_fold(1usize, |n, d| n.checked_mul(d).ok_or("HIP Conv3D history output spatial 溢出"))?;
+    let elements = spec.output_channels.checked_mul(spatial).ok_or("HIP Conv3D history output elements 溢出")?;
+    let tail_elements = spec.input_channels.checked_mul(keep).and_then(|n| n.checked_mul(plane)).ok_or("HIP Conv3D history tail 溢出")?;
+    let bytes = |n: usize| n.checked_mul(4).ok_or("HIP Conv3D history 字节溢出");
+    validate_resident(input, device_id, bytes(input_elements)?, "Conv3D history input")?;
+    validate_resident(weight, device_id, bytes(weight_elements)?, "Conv3D history weight")?;
+    if let Some(history) = history.as_deref() {
+        validate_resident(history, device_id, bytes(tail_elements)?, "Conv3D history tail")?;
+    }
+    if let Some(bias) = bias {
+        validate_resident(bias, device_id, bytes(spec.output_channels)?, "Conv3D history bias")?;
+    }
+    // 复用既有标量/tiled的32位维度与K迭代，所有allocation/地址字节另以usize/64位校验。
+    u32::try_from(k_count).map_err(|_| "HIP Conv3D history K 超过 u32")?;
+    let output_elements = u32::try_from(elements).map_err(|_| "HIP Conv3D history output 元素数超过 u32")?;
+    let depth = spec.input_shape[0].checked_add(head).ok_or("HIP Conv3D history depth 溢出")?;
+    let mut dims = [
+        spec.input_channels,
+        spec.output_channels,
+        depth,
+        spec.input_shape[1],
+        spec.input_shape[2],
+        spec.kernel[0],
+        spec.kernel[1],
+        spec.kernel[2],
+        spec.stride[0],
+        spec.stride[1],
+        spec.stride[2],
+        usize::from(bias.is_some()),
+        0,
+        spec.padding[1],
+        spec.padding[2],
+        spatial_pad_after[0],
+        spatial_pad_after[1],
+        0,
+        0,
+        output_shape[0],
+        output_shape[1],
+        output_shape[2],
+    ]
+    .map(|v| u32::try_from(v).map_err(|_| "HIP Conv3D history 维度超过 u32"))
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
+    set_device(device_id)?;
+    let functions = tensor_functions(device_id)?;
+    let (_, mut grid) = conv3d_function_grid(&functions, spec.input_channels, spec.output_channels, output_shape, output_elements)?;
+    let mut function = if spec.input_channels >= 16 && spec.output_channels >= 16 && spatial >= 16 { functions.conv3d_history_tiled } else { functions.conv3d_history };
+    if allow_f16_wmma
+        && spec.input_channels != 512
+        && let Some(wmma) = functions.conv3d_history_wmma
+    {
+        grid = u32::try_from(spatial.div_ceil(16).checked_mul(spec.output_channels.div_ceil(128)).ok_or("HIP Conv3D history WMMA grid 溢出")?).map_err(|_| "HIP Conv3D history WMMA grid 超过 u32")?;
+        function = wmma;
+    }
+    let output = DeviceBuffer::allocate(device_id, bytes(elements)?)?;
+    // try_unwrap原子地取得唯一所有权；view即使外层Arc唯一也仍可能与owner别名。
+    let reusable_history = if history.as_ref().is_some_and(|h| h.owner.is_none()) {
+        match std::sync::Arc::try_unwrap(history.take().expect("已检查history")) {
+            Ok(buffer) => Some(buffer),
+            Err(shared) => {
+                history = Some(shared);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut d_input = input.pointer;
+    let mut d_history = reusable_history.as_ref().or(history.as_deref()).map_or(ptr::null_mut(), |h| h.pointer);
+    let mut d_weight = weight.pointer;
+    let mut d_bias = bias.map_or(ptr::null_mut(), |b| b.pointer);
+    let mut d_output = output.pointer;
+    let mut head_u32 = u32::try_from(head).map_err(|_| "HIP Conv3D history head 超过 u32")?;
+    let mut args: Vec<*mut c_void> = vec![(&mut d_input as *mut *mut c_void).cast(), (&mut d_weight as *mut *mut c_void).cast(), (&mut d_bias as *mut *mut c_void).cast(), (&mut d_output as *mut *mut c_void).cast()];
+    args.extend(dims.iter_mut().map(|v| (v as *mut u32).cast()));
+    args.extend([(&mut d_history as *mut *mut c_void).cast(), (&mut head_u32 as *mut u32).cast()]);
+    let profile_started = if options().kernel_profile {
+        synchronize_device(device_id, "HIP Conv3D history profile begin")?;
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    let columns_done = allow_f16_wmma
+        && matches!(spec.input_channels, 128 | 256 | 512)
+        && ((spec.kernel == [3; 3] && spec.padding == [0, 1, 1]) || (spec.kernel == [1; 3] && spec.padding == [0; 3] && head == 0))
+        && spec.stride == [1; 3]
+        && !spec.causal
+        && spatial_pad_after == [0; 2]
+        && try_conv3d_columns(device_id, input, reusable_history.as_ref().or(history.as_deref()), weight, bias, &output, spec, head, spatial)?;
+    if !columns_done {
+        launch_tensor_kernel(function, grid, 256, &mut args, if Some(function) == functions.conv3d_history_wmma { "HIP Conv3D history F16 WMMA" } else { "HIP Conv3D history F32" })?;
+    }
+    if let Some(started) = profile_started {
+        synchronize_device(device_id, "HIP Conv3D history profile end")?;
+        eprintln!(
+            "[rocm-vae] history-conv3d device={device_id} columns={columns_done} in={} out={} input={:?} kernel={:?} wall={:.6}s",
+            spec.input_channels,
+            spec.output_channels,
+            spec.input_shape,
+            spec.kernel,
+            started.elapsed().as_secs_f64()
+        );
+    }
+    let tail = if keep == 0 {
+        None
+    } else {
+        let tail = if let Some(history) = reusable_history { history } else { DeviceBuffer::allocate(device_id, bytes(tail_elements)?)? };
+        let mut d_tail = tail.pointer;
+        let mut current_depth = u32::try_from(spec.input_shape[0]).map_err(|_| "HIP Conv3D history current depth 超过 u32")?;
+        let mut keep_u32 = u32::try_from(keep).map_err(|_| "HIP Conv3D history keep 超过 u32")?;
+        let mut plane_u64 = plane as u64;
+        let mut elements_u64 = tail_elements as u64;
+        let mut args = [
+            (&mut d_input as *mut *mut c_void).cast(),
+            (&mut d_history as *mut *mut c_void).cast(),
+            (&mut d_tail as *mut *mut c_void).cast(),
+            (&mut current_depth as *mut u32).cast(),
+            (&mut head_u32 as *mut u32).cast(),
+            (&mut keep_u32 as *mut u32).cast(),
+            (&mut plane_u64 as *mut u64).cast(),
+            (&mut elements_u64 as *mut u64).cast(),
+        ];
+        launch_tensor_kernel(functions.conv3d_history_tail, u32::try_from((tail_elements / keep).div_ceil(256)).map_err(|_| "HIP Conv3D history tail grid 超过 u32")?, 256, &mut args, "HIP Conv3D compact history tail")?;
+        Some(tail)
+    };
+    Ok((output, tail))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -194,7 +442,8 @@ pub fn try_encoder_conv3d_resident_f32(
         let output_groups = u32::try_from(output_channels.div_ceil(128)).map_err(|_| "HIP encoder Conv3D output groups 超过 u32")?;
         (functions.conv3d_single_frame_wmma, position_tiles.checked_mul(output_groups).ok_or("HIP encoder Conv3D WMMA grid 溢出")?, "HIP encoder single-frame Conv3D WMMA")
     } else {
-        (functions.conv3d, output_elements.div_ceil(256), "HIP encoder Conv3D")
+        let (function, grid) = conv3d_function_grid(&functions, input_channels, output_channels, output_shape, output_elements)?;
+        (function, grid, "HIP encoder Conv3D")
     };
     let profile_started = options().kernel_profile.then(std::time::Instant::now);
     launch_tensor_kernel(function, grid, 256, &mut arguments, label)?;
@@ -206,6 +455,16 @@ pub fn try_encoder_conv3d_resident_f32(
         );
     }
     Ok(output)
+}
+
+fn conv3d_function_grid(functions: &TensorFunctions, input_channels: usize, output_channels: usize, output_shape: [usize; 3], elements: u32) -> Result<(usize, u32), String> {
+    let spatial = output_shape.into_iter().try_fold(1usize, |n, d| n.checked_mul(d).ok_or("HIP Conv3D spatial溢出"))?;
+    if input_channels >= 16 && output_channels >= 16 && spatial >= 16 {
+        let tiles = spatial.div_ceil(16).checked_mul(output_channels.div_ceil(64)).ok_or("HIP Conv3D tiled grid溢出")?;
+        Ok((functions.conv3d_tiled, u32::try_from(tiles).map_err(|_| "HIP Conv3D tiled grid超过u32")?))
+    } else {
+        Ok((functions.conv3d, elements.div_ceil(256)))
+    }
 }
 
 pub fn try_vision_rope_resident_f32(

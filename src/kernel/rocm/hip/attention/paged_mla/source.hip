@@ -635,18 +635,18 @@ extern "C" __global__ void dsa_kpool_compress_q8(
 // recent ring。四份数据共享行映射，合成一个 launch 可避免四次短 D2D copy。
 extern "C" __global__ void q8_cache_copy_pair(
     const signed char* source_key,
-    const unsigned short* source_key_scales,
+    const unsigned char* source_key_scales,
     const signed char* source_value,
-    const unsigned short* source_value_scales,
+    const unsigned char* source_value_scales,
     signed char* target_key,
-    unsigned short* target_key_scales,
+    unsigned char* target_key_scales,
     signed char* target_value,
-    unsigned short* target_value_scales,
+    unsigned char* target_value_scales,
     unsigned int source_row,
     unsigned int target_row,
     unsigned int rows,
     unsigned int columns,
-    unsigned int scale_columns,
+    unsigned int scale_row_bytes,
     unsigned int target_capacity)
 {
     const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -659,12 +659,12 @@ extern "C" __global__ void q8_cache_copy_pair(
         target_key[target] = source_key[source];
         target_value[target] = source_value[source];
     }
-    const unsigned int scale_elements = rows * scale_columns;
+    const unsigned int scale_elements = rows * scale_row_bytes;
     if (index < scale_elements) {
-        const unsigned int row = index / scale_columns;
-        const unsigned int column = index - row * scale_columns;
-        const unsigned long long source = (unsigned long long)(source_row + row) * scale_columns + column;
-        const unsigned long long target = (unsigned long long)((target_row + row) % target_capacity) * scale_columns + column;
+        const unsigned int row = index / scale_row_bytes;
+        const unsigned int column = index - row * scale_row_bytes;
+        const unsigned long long source = (unsigned long long)(source_row + row) * scale_row_bytes + column;
+        const unsigned long long target = (unsigned long long)((target_row + row) % target_capacity) * scale_row_bytes + column;
         target_key_scales[target] = source_key_scales[source];
         target_value_scales[target] = source_value_scales[source];
     }
@@ -1239,17 +1239,18 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
                 = candidate_base + key_wave * 16u + (lane & 15u);
             const unsigned int compact_token = tile * tile_rows + candidate_slot;
             const unsigned int token = paged_shard_global_token(compact_token, block_size, shard_parity);
+            const unsigned int score_token = shard_parity < 2u ? compact_token : token;
             if (candidate_slot < tile_rows && token < context_rows) {
                 const unsigned long long stride = score_stride;
                 if (query_row < query_rows && token < (query_start + query_row + 1u) / visibility_divisor) {
                     const unsigned int key = dsa_ordered_score(score0);
                     if constexpr (PrefixOnly) {
                         ((unsigned char*)score_output)[
-                            (unsigned long long)query_row * stride + token]
+                            (unsigned long long)query_row * stride + score_token]
                             = (unsigned char)(key >> 24);
                     } else {
                         ((unsigned int*)score_output)[
-                            (unsigned long long)query_row * stride + token] = key;
+                            (unsigned long long)query_row * stride + score_token] = key;
                     }
                     if (collect_histogram) {
                         atomicAdd(&coarse_histogram[query_offset * 256u + (key >> 24)], 1u);
@@ -1260,11 +1261,11 @@ __device__ __forceinline__ void dsa_score_tiles_native_wmma_q8_impl(
                         const unsigned int key = dsa_ordered_score(score1);
                         if constexpr (PrefixOnly) {
                             ((unsigned char*)score_output)[
-                                (unsigned long long)query_row1 * stride + token]
+                                (unsigned long long)query_row1 * stride + score_token]
                                 = (unsigned char)(key >> 24);
                         } else {
                             ((unsigned int*)score_output)[
-                                (unsigned long long)query_row1 * stride + token] = key;
+                                (unsigned long long)query_row1 * stride + score_token] = key;
                         }
                         if (collect_histogram) {
                             atomicAdd(&coarse_histogram[(query_offset + 2u) * 256u + (key >> 24)], 1u);
@@ -2145,6 +2146,19 @@ extern "C" __global__ void dsa_gather_selection_scores(
     }
 }
 
+__device__ __forceinline__ unsigned int dsa_merge_token_rank(
+    const unsigned int* tokens, unsigned int count, unsigned int token)
+{
+    unsigned int begin = 0u;
+    unsigned int end = count;
+    while (begin < end) {
+        const unsigned int middle = begin + (end - begin) / 2u;
+        if (tokens[middle] < token) begin = middle + 1u;
+        else end = middle;
+    }
+    return begin;
+}
+
 // 每个 sequence shard 的局部 Top-K 已足以覆盖全局 Top-K。先按
 // (score desc, token asc) 精确选出成员，再按 token 升序恢复原 compact
 // selection 的稳定消费顺序，避免改变后续 attention 的归约次序。
@@ -2167,6 +2181,132 @@ extern "C" __global__ void dsa_merge_sequence_shard_topk(
     unsigned int padded = 1u;
     while (padded < candidates) padded <<= 1u;
     __shared__ unsigned long long ranks[capacity];
+    if (owner_width == output_width && peer_width == output_width
+        && output_width <= capacity / 2u) {
+        // 局部 compact Top-K 按“高于阈值的 token 升序、等于阈值的 token
+        // 升序”输出。全局阈值不低于两侧局部阈值，所以过滤后的两组仍有序。
+        // 用四字节 radix 找阈值，再合并有序 token，避免两次 4096 元素排序。
+        unsigned int* tokens = reinterpret_cast<unsigned int*>(ranks);
+        unsigned int* histogram = tokens + capacity;
+        unsigned int* control = histogram + 256u;
+        unsigned int* wave_offsets = control + 9u;
+        const unsigned long long owner_base = (unsigned long long)row * owner_width;
+        const unsigned long long peer_base = (unsigned long long)row * peer_width;
+        if (threadIdx.x == 0u) {
+            control[0] = 0u;
+            control[1] = 0u;
+            control[2] = output_width - 1u;
+        }
+        __syncthreads();
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            histogram[threadIdx.x] = 0u;
+            __syncthreads();
+            for (unsigned int index = threadIdx.x; index < output_width; index += blockDim.x) {
+                const unsigned int a = owner_scores[owner_base + index];
+                const unsigned int b = peer_scores[peer_base + index];
+                if ((a & control[1]) == control[0]) atomicAdd(&histogram[(a >> shift) & 255u], 1u);
+                if ((b & control[1]) == control[0]) atomicAdd(&histogram[(b >> shift) & 255u], 1u);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0u) {
+                for (int bucket = 255; bucket >= 0; --bucket) {
+                    if (control[2] < histogram[bucket]) {
+                        control[0] |= (unsigned int)bucket << shift;
+                        control[1] |= 255u << shift;
+                        break;
+                    }
+                    control[2] -= histogram[bucket];
+                }
+            }
+            __syncthreads();
+        }
+        const unsigned int threshold = control[0];
+        constexpr unsigned int slots = capacity / 2u / 256u;
+        unsigned int local_tokens[2][slots];
+        unsigned int local_flags[2][slots];
+        unsigned int counts[2] = {0u, 0u};
+        for (unsigned int tile = 0u; tile < slots; ++tile) {
+            const unsigned int index = tile * blockDim.x + threadIdx.x;
+            for (unsigned int side = 0u; side < 2u; ++side) {
+                unsigned int flag = 0u;
+                unsigned int token = 0u;
+                if (index < output_width) {
+                    const unsigned int score = side == 0u
+                        ? owner_scores[owner_base + index] : peer_scores[peer_base + index];
+                    token = side == 0u ? owner_tokens[owner_base + index] : peer_tokens[peer_base + index];
+                    flag = score > threshold ? 1u : (score == threshold ? 0x10000u : 0u);
+                }
+                local_tokens[side][tile] = token;
+                local_flags[side][tile] = flag;
+                counts[side] += flag;
+            }
+        }
+        if (threadIdx.x == 0u) {
+            for (unsigned int index = 3u; index < 9u; ++index) control[index] = 0u;
+        }
+        __syncthreads();
+        atomicAdd(&control[3], counts[0]);
+        atomicAdd(&control[4], counts[1]);
+        __syncthreads();
+        const unsigned int greater[2] = {control[3] & 0xffffu, control[4] & 0xffffu};
+        const unsigned int equal[2] = {control[3] >> 16u, control[4] >> 16u};
+        const unsigned int lane = threadIdx.x % warpSize;
+        const unsigned int wave = threadIdx.x / warpSize;
+        const unsigned int waves = blockDim.x / warpSize;
+        for (unsigned int tile = 0u; tile * blockDim.x < output_width; ++tile) {
+            unsigned int exclusive[2];
+            for (unsigned int side = 0u; side < 2u; ++side) {
+                unsigned int scan = local_flags[side][tile];
+                for (unsigned int delta = 1u; delta < warpSize; delta <<= 1u) {
+                    const unsigned int previous = __shfl_up(scan, delta);
+                    if (lane >= delta) scan += previous;
+                }
+                exclusive[side] = scan - local_flags[side][tile];
+                if (lane + 1u == warpSize) wave_offsets[side * 8u + wave] = scan;
+            }
+            __syncthreads();
+            if (threadIdx.x == 0u) {
+                for (unsigned int side = 0u; side < 2u; ++side) {
+                    unsigned int sum = 0u;
+                    for (unsigned int current = 0u; current < waves; ++current) {
+                        const unsigned int count = wave_offsets[side * 8u + current];
+                        wave_offsets[side * 8u + current] = sum;
+                        sum += count;
+                    }
+                    control[7u + side] = control[5u + side];
+                    control[5u + side] += sum;
+                }
+            }
+            __syncthreads();
+            for (unsigned int side = 0u; side < 2u; ++side) {
+                const unsigned int offset = control[7u + side]
+                    + wave_offsets[side * 8u + wave] + exclusive[side];
+                const unsigned int flag = local_flags[side][tile];
+                if (flag != 0u) {
+                    const unsigned int index = flag == 1u
+                        ? (offset & 0xffffu) : greater[side] + (offset >> 16u);
+                    tokens[side * output_width + index] = local_tokens[side][tile];
+                }
+            }
+            __syncthreads();
+        }
+        const unsigned int total_greater = greater[0] + greater[1];
+        const unsigned int needed_equal = output_width - total_greater;
+        for (unsigned int side = 0u; side < 2u; ++side) {
+            const unsigned int other = side ^ 1u;
+            for (unsigned int index = threadIdx.x; index < greater[side]; index += blockDim.x) {
+                const unsigned int token = tokens[side * output_width + index];
+                const unsigned int rank = index + dsa_merge_token_rank(tokens + other * output_width, greater[other], token);
+                output[(unsigned long long)row * output_width + rank] = token;
+            }
+            for (unsigned int index = threadIdx.x; index < equal[side]; index += blockDim.x) {
+                const unsigned int token = tokens[side * output_width + greater[side] + index];
+                const unsigned int rank = index + dsa_merge_token_rank(tokens + other * output_width + greater[other], equal[other], token);
+                if (rank < needed_equal) output[(unsigned long long)row * output_width + total_greater + rank] = token;
+            }
+        }
+        return;
+    }
     for (unsigned int index = threadIdx.x; index < padded; index += blockDim.x) {
         unsigned int token = 0xffffffffu;
         unsigned int score = 0u;
@@ -2585,16 +2725,26 @@ extern "C" __global__ void dsa_compact_radix_select_topk(
     const unsigned int* score_keys,
     const unsigned int* coarse_histograms,
     unsigned int* selection,
+    unsigned int* selected_scores,
     unsigned int query_rows,
     unsigned int score_stride,
     unsigned int query_start,
     unsigned int top_k,
-    unsigned int visibility_divisor)
+    unsigned int visibility_divisor,
+    unsigned int block_size,
+    unsigned int shard_parity)
 {
     constexpr unsigned int candidate_capacity = 4096u;
     const unsigned int row = blockIdx.x;
     if (row >= query_rows) return;
-    const unsigned int visible = (query_start + row + 1u) / visibility_divisor;
+    const unsigned int global_visible = (query_start + row + 1u) / visibility_divisor;
+    // 分片 score 按本卡紧凑行存储；因果边界仍由全局 query 位置决定。
+    const unsigned int blocks = global_visible / block_size;
+    const unsigned int tail = global_visible % block_size;
+    const unsigned int visible = shard_parity < 2u
+        ? (blocks / 2u) * block_size + (blocks % 2u > shard_parity ? block_size : 0u)
+            + (blocks % 2u == shard_parity ? tail : 0u)
+        : global_visible;
     const unsigned int target_count = top_k < visible ? top_k : visible;
     const unsigned long long row_base = (unsigned long long)row * score_stride;
 
@@ -2764,15 +2914,17 @@ extern "C" __global__ void dsa_compact_radix_select_topk(
             const unsigned int bit = 1u << item;
             if (greater_mask & bit) {
                 if (greater_position < greater_total) {
-                    selection[(unsigned long long)row * top_k + greater_position]
-                        = token + item;
+                    const unsigned long long output_index = (unsigned long long)row * top_k + greater_position;
+                    selection[output_index] = paged_shard_global_token(token + item, block_size, shard_parity);
+                    if (selected_scores) selected_scores[output_index] = score_keys[row_base + token + item];
                 }
                 ++greater_position;
             }
             if (equal_mask & bit) {
                 if (equal_position < equal_needed) {
-                    selection[(unsigned long long)row * top_k + greater_total
-                        + equal_position] = token + item;
+                    const unsigned long long output_index = (unsigned long long)row * top_k + greater_total + equal_position;
+                    selection[output_index] = paged_shard_global_token(token + item, block_size, shard_parity);
+                    if (selected_scores) selected_scores[output_index] = threshold;
                 }
                 ++equal_position;
             }

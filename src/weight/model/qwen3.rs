@@ -5,7 +5,7 @@
 //! F32 全局 scale,见 `weight::format::nvfp4::load_modelopt_matrix`);norm/q_norm/k_norm/
 //! embed_tokens/lm_head 为 BF16。LM head 独立(tie_word_embeddings=false)。
 
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use crate::model_spec::qwen3_vl::Qwen3VlConfig;
 
@@ -132,6 +132,100 @@ impl Qwen3TextSource for Qwen3Weights {
 
     fn lm_head(&self) -> Result<TensorData, String> {
         let tensor = self.store.load("lm_head.weight")?;
+        tensor.expect_shape(&[self.config.vocab_size, self.config.hidden_size])?;
+        Ok(tensor)
+    }
+}
+
+/// 标准 BF16/F16 Qwen3 权重源，供只消费逐层 hidden state 的编码器复用。
+pub struct Qwen3DenseWeights {
+    store: Arc<SafetensorStore>,
+    config: Qwen3VlConfig,
+}
+
+impl Qwen3DenseWeights {
+    pub fn open(root: impl AsRef<Path>, config: Qwen3VlConfig) -> Result<Self, String> {
+        config.validate()?;
+        if config.vision.is_some() {
+            return Err("dense Qwen3 权重不应携带 vision 规格".to_owned());
+        }
+        let store = SafetensorStore::open(root)?;
+        for marker in ["model.embed_tokens.weight", "model.layers.0.self_attn.q_proj.weight", "model.layers.0.mlp.gate_proj.weight"] {
+            if !store.has(marker) {
+                return Err(format!("dense Qwen3 权重缺少 {marker}"));
+            }
+        }
+        Ok(Self { store: Arc::new(store), config })
+    }
+
+    pub fn embedding_rows_f32(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        let rows = tokens
+            .iter()
+            .map(|&token| {
+                let row = token as usize;
+                (row < self.config.vocab_size).then_some(row).ok_or_else(|| format!("dense Qwen3 token {row} 超出 vocab {}", self.config.vocab_size))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tensor = self.store.load_rows("model.embed_tokens.weight", &rows)?;
+        tensor.expect_shape(&[rows.len(), self.config.hidden_size])?;
+        tensor.to_f32()
+    }
+
+    fn load_layer(&self, layer: usize) -> Result<Qwen3VlLayerWeights, String> {
+        if layer >= self.config.layer_count {
+            return Err(format!("dense Qwen3 layer {layer} 越界，共 {} 层", self.config.layer_count));
+        }
+        let prefix = format!("model.layers.{layer}");
+        let attention = format!("{prefix}.self_attn");
+        let mlp = format!("{prefix}.mlp");
+        let query_columns = self.config.num_heads * self.config.head_dim;
+        let kv_columns = self.config.num_kv_heads * self.config.head_dim;
+        Ok(Qwen3VlLayerWeights {
+            input_norm: self.load_vector(&format!("{prefix}.input_layernorm.weight"), self.config.hidden_size)?,
+            query: self.load_matrix(&format!("{attention}.q_proj.weight"), query_columns, self.config.hidden_size)?,
+            query_norm: self.load_vector(&format!("{attention}.q_norm.weight"), self.config.head_dim)?,
+            key: self.load_matrix(&format!("{attention}.k_proj.weight"), kv_columns, self.config.hidden_size)?,
+            key_norm: self.load_vector(&format!("{attention}.k_norm.weight"), self.config.head_dim)?,
+            value: self.load_matrix(&format!("{attention}.v_proj.weight"), kv_columns, self.config.hidden_size)?,
+            output: self.load_matrix(&format!("{attention}.o_proj.weight"), self.config.hidden_size, query_columns)?,
+            post_attention_norm: self.load_vector(&format!("{prefix}.post_attention_layernorm.weight"), self.config.hidden_size)?,
+            gate: self.load_matrix(&format!("{mlp}.gate_proj.weight"), self.config.intermediate_size, self.config.hidden_size)?,
+            up: self.load_matrix(&format!("{mlp}.up_proj.weight"), self.config.intermediate_size, self.config.hidden_size)?,
+            down: self.load_matrix(&format!("{mlp}.down_proj.weight"), self.config.hidden_size, self.config.intermediate_size)?,
+        })
+    }
+
+    fn load_matrix(&self, name: &str, rows: usize, cols: usize) -> Result<Qwen3VlMatrix, String> {
+        let tensor = self.store.load(name)?;
+        tensor.expect_shape(&[rows, cols])?;
+        if !matches!(tensor.dtype.as_str(), "BF16" | "F16" | "F32") {
+            return Err(format!("dense Qwen3 matrix {name} dtype={} 不受支持", tensor.dtype));
+        }
+        Ok(Qwen3VlMatrix::Dense(tensor))
+    }
+
+    fn load_vector(&self, name: &str, size: usize) -> Result<Vec<f32>, String> {
+        let tensor = self.store.load(name)?;
+        tensor.expect_shape(&[size])?;
+        tensor.to_f32()
+    }
+}
+
+impl Qwen3TextSource for Qwen3DenseWeights {
+    fn text_layer(&self, layer: usize) -> Result<Qwen3VlLayerWeights, String> {
+        self.load_layer(layer)
+    }
+
+    fn final_norm(&self) -> Result<Vec<f32>, String> {
+        self.load_vector("model.norm.weight", self.config.hidden_size)
+    }
+
+    fn lm_head(&self) -> Result<TensorData, String> {
+        let name = if self.store.has("lm_head.weight") { "lm_head.weight" } else { "model.embed_tokens.weight" };
+        let tensor = self.store.load(name)?;
         tensor.expect_shape(&[self.config.vocab_size, self.config.hidden_size])?;
         Ok(tensor)
     }

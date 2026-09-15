@@ -23,6 +23,22 @@ pub struct KvCompressionSpec {
     pub selection: CompressedSelection,
 }
 
+/// V4.1 两级选择的第一级:压缩条目按块聚合分数粗筛,再在候选块内 indexer 精选。
+#[derive(Debug, Clone, Copy)]
+pub struct CandidateSpec {
+    pub topk_blocks: usize,
+    pub block_size: usize,
+}
+
+/// CSA cache 的常驻编码。`Fp8WindowFp4Compressed` 对应训练时的量化语义：
+/// 滑窗 K/V 为 E4M3+E8M0(group 32)，压缩 K/V 为 E2M1+E4M3(group 16)，
+/// index K 为 E2M1+E8M0(group 32)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressedKvFormat {
+    Q8,
+    Fp8WindowFp4Compressed,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct CompressedSparseAttentionSpec {
     pub num_heads: usize,
@@ -35,12 +51,34 @@ pub struct CompressedSparseAttentionSpec {
     pub rope: RopeSpec,
     pub compression: Option<KvCompressionSpec>,
     pub attention_sink: bool,
+    pub kv_format: CompressedKvFormat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionStream {
     Attention,
     Indexer,
+}
+
+/// V4.1 组内广播的本批压缩项视图:源层产生一次,组内所有层共享。
+pub struct SharedCompressedBatch<'a, T> {
+    pub visible_positions: &'a [usize],
+    pub key: &'a T,
+    pub value: &'a T,
+    pub index_key: Option<&'a T>,
+}
+
+/// V4.1 共享路径输出:attention 结果与 index 层发布的逐 query 行 selection。
+pub struct SharedCsaOutput<T, S> {
+    pub attended: T,
+    /// `None` 表示本层未发布(非 index 层复用上层结果)。
+    pub selection: Option<S>,
+}
+
+/// `compress_v41` 的输出:attention 流(norm+RoPE 完成)与可选的 index key 流。
+pub struct V41Compressed<T> {
+    pub attention: CompressedBatch<T>,
+    pub index_key: Option<CompressedBatch<T>>,
 }
 
 pub struct CompressedBatch<T> {
@@ -262,14 +300,16 @@ impl CompressedSparseAttentionSpec {
             return Err(format!("压缩稀疏注意力 RoPE {} 超过 head_dim {}", self.rope.rotary_dim(), self.head_dim));
         }
         if let Some(compression) = self.compression {
-            if compression.ratio < 2 {
+            // ratio=1 合法:V4.1 后半段层为不折减的全选滑窗(1:1 全存)。
+            if compression.ratio == 0 {
                 return Err(format!("KV compression ratio={} 非法", compression.ratio));
             }
             if compression.overlap && compression.ratio != 4 {
                 return Err(format!("KV overlap 仅适用于 ratio=4，实际为 {}", compression.ratio));
             }
             if let CompressedSelection::LearnedIndexer(indexer) = compression.selection
-                && (compression.ratio != 4 || indexer.num_heads == 0 || indexer.head_dim == 0 || indexer.top_k == 0 || indexer.rope_dim > indexer.head_dim)
+                // V4 ratio=4 / V4.1 ratio=2(压缩)与 ratio=1(1:1 KV 上 topk)均合法
+                && (compression.ratio == 0 || indexer.num_heads == 0 || indexer.head_dim == 0 || indexer.top_k == 0 || indexer.rope_dim > indexer.head_dim)
             {
                 return Err(format!("压缩 KV indexer 非法: ratio={} heads={} head_dim={} rope_dim={} top_k={}", compression.ratio, indexer.num_heads, indexer.head_dim, indexer.rope_dim, indexer.top_k,));
             }
@@ -501,6 +541,57 @@ impl CompressedKvState {
         indexer: Option<DsaSpec>,
         sink: Option<&[f32]>,
     ) -> Result<Vec<f32>, String> {
+        self.attend_batch_preset_f32(
+            queries,
+            rows,
+            recent_positions,
+            causal_batch,
+            recent_keys,
+            recent_values,
+            compressed_positions,
+            compressed_keys,
+            compressed_values,
+            compressed_index_keys,
+            index_queries,
+            index_head_weights,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            indexer,
+            None,
+            sink,
+        )
+    }
+
+    /// `attend_batch_f32` 的 V4.1 形态:`preset_selection` 提供逐 query 行已选好的
+    /// 压缩行下标(非 index 层复用 index 层发布的 selection),缺行回落到自算。
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_batch_preset_f32(
+        &self,
+        queries: &[f32],
+        rows: usize,
+        recent_positions: &[usize],
+        causal_batch: bool,
+        recent_keys: &[f32],
+        recent_values: &[f32],
+        compressed_positions: &[usize],
+        compressed_keys: &[f32],
+        compressed_values: &[f32],
+        compressed_index_keys: Option<&[f32]>,
+        index_queries: Option<&[f32]>,
+        index_head_weights: Option<&[f32]>,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        indexer: Option<DsaSpec>,
+        preset_selection: Option<&[Vec<usize>]>,
+        sink: Option<&[f32]>,
+    ) -> Result<Vec<f32>, String> {
+        if let Some(preset) = preset_selection
+            && preset.len() != rows
+        {
+            return Err(format!("preset selection 行数={}，期望 {rows}", preset.len()));
+        }
         if num_heads == 0
             || num_kv_heads == 0
             || !num_heads.is_multiple_of(num_kv_heads)
@@ -523,10 +614,12 @@ impl CompressedKvState {
         let index_head_weights = index_head_weights.unwrap_or(&[]);
         let indexer = match indexer {
             Some(indexer) => {
+                // preset 选择路径不需要 index query/weights(非 index 层没有 indexer 权重)。
                 if indexer.top_k == 0
-                    || index_queries.len() != rows * indexer.num_heads * indexer.head_dim
-                    || index_head_weights.len() != rows * indexer.num_heads
-                    || (compressed_rows > 0 && compressed_index_keys.len() != compressed_rows * indexer.head_dim)
+                    || (preset_selection.is_none()
+                        && (index_queries.len() != rows * indexer.num_heads * indexer.head_dim
+                            || index_head_weights.len() != rows * indexer.num_heads
+                            || (compressed_rows > 0 && compressed_index_keys.len() != compressed_rows * indexer.head_dim)))
                 {
                     return Err(format!("因果 CSA indexer 维度非法: top_k={} query={} weights={} keys={}", indexer.top_k, index_queries.len(), index_head_weights.len(), compressed_index_keys.len(),));
                 }
@@ -540,9 +633,10 @@ impl CompressedKvState {
             let query_position = recent_positions[row];
             let visible_position = if causal_batch { query_position } else { *recent_positions.last().expect("rows 已非零") };
             let visible_compressed: Vec<usize> = compressed_positions.iter().enumerate().filter_map(|(index, &position)| (position <= visible_position).then_some(index)).collect();
-            // c4a 层按 indexer top-k 进一步筛选
-            let selected: Vec<usize> = match indexer {
-                Some(indexer) => {
+            // c4a 层按 indexer top-k 进一步筛选;V4.1 非 index 层复用发布的 selection
+            let selected: Vec<usize> = match (indexer, preset_selection) {
+                (Some(_), Some(preset)) => preset[row].clone(),
+                (Some(indexer), None) => {
                     let query_width = indexer.num_heads * indexer.head_dim;
                     let iq = &index_queries[row * query_width..(row + 1) * query_width];
                     let weights = &index_head_weights[row * indexer.num_heads..(row + 1) * indexer.num_heads];
@@ -552,7 +646,7 @@ impl CompressedKvState {
                     }
                     topk_indexer_f32(iq, &keys, weights, &indexer, indexer.top_k)?.into_iter().map(|local| visible_compressed[local]).collect()
                 }
-                None => visible_compressed,
+                (None, _) => visible_compressed,
             };
             for head in 0..num_heads {
                 let kv_head = head * num_kv_heads / num_heads;
@@ -615,6 +709,14 @@ impl CompressedKvState {
 
 /// 压缩稀疏注意力的窄后端能力。状态的物理位置和选择实现由 backend 拥有。
 pub trait CompressedSparseKernel: Backend {
+    /// V4.1 index selection 的 backend-native 表示。GPU 后端必须允许它跨
+    /// stage 保持 resident，避免经 host 往返。
+    type SharedSelection: Send;
+
+    fn stabilize_shared_selection(&self, selection: Self::SharedSelection) -> Result<Self::SharedSelection, BackendError> {
+        Ok(selection)
+    }
+
     type CompressedKvStorage;
 
     fn allocate_compressed_kv(&self, spec: &CompressedSparseAttentionSpec) -> Result<Self::CompressedKvStorage, BackendError>;
@@ -727,6 +829,80 @@ pub trait CompressedSparseKernel: Backend {
     ) -> Result<Self::Tensor, BackendError>
     where
         Self: Sized;
+
+    /// DeepSeek-V4.1 的压缩管线:一次完成 gated 池化(ratio=1 无 gate 直通)、
+    /// attention 流的 norm+RoPE,以及(owns_k 源层)`wk` 投影 + k_norm + 压缩行
+    /// 位置 RoPE 的 index key。V4.1 无 ape,bias 恒为 0。
+    #[allow(clippy::too_many_arguments)]
+    fn compress_v41(
+        &self,
+        storage: &mut Self::CompressedKvStorage,
+        positions: &[usize],
+        kv: &Self::Tensor,
+        gate: Option<&Self::Tensor>,
+        norm: &Self::Weight,
+        index_key_projection: Option<(&Self::Weight, &Self::Weight)>,
+        compression: KvCompressionSpec,
+        width: usize,
+        rotary_dim: usize,
+        index_rope_dim: usize,
+        cos: &[f32],
+        sin: &[f32],
+        eps: f32,
+    ) -> Result<V41Compressed<Self::Tensor>, BackendError> {
+        let _ = (storage, positions, kv, gate, norm, index_key_projection, compression, width, rotary_dim, index_rope_dim, cos, sin, eps);
+        Err(BackendError::Compute { msg: "backend 尚未实现 V4.1 compress_v41".to_owned() })
+    }
+
+    /// DeepSeek-V4.1 的共享 CSA prefill:滑窗 recent 归本层 storage(写入本批 KV),
+    /// 压缩历史读 `shared`(组源层 storage,只读;`None` 表示本层即源层,
+    /// 历史与写入都在 `recent` 指向的 storage 内)。`batch` 是本 chunk 源层产出的
+    /// 压缩项,组内所有层都参与 attention;index 层自算 selection 并随输出发布,
+    /// 非 index 层经 `preset_selection` 复用。候选块参数 `candidate` 仅对
+    /// candidate_source 之后的 index 层生效。
+    #[allow(clippy::too_many_arguments)]
+    fn compressed_sparse_prefill_shared(
+        &self,
+        recent: &mut Self::CompressedKvStorage,
+        shared: Option<&Self::CompressedKvStorage>,
+        positions: &[usize],
+        causal_batch: bool,
+        query: &Self::Tensor,
+        key: &Self::Tensor,
+        value: &Self::Tensor,
+        batch: Option<SharedCompressedBatch<'_, Self::Tensor>>,
+        index_query: Option<&Self::Tensor>,
+        index_head_weights: Option<&Self::Tensor>,
+        preset_selection: Option<&Self::SharedSelection>,
+        candidate: Option<CandidateSpec>,
+        sink: Option<&Self::Weight>,
+        spec: &CompressedSparseAttentionSpec,
+    ) -> Result<SharedCsaOutput<Self::Tensor, Self::SharedSelection>, BackendError> {
+        let _ = (recent, shared, positions, causal_batch, query, key, value, batch, index_query, index_head_weights, preset_selection, candidate, sink, spec);
+        Err(BackendError::Compute { msg: "backend 尚未实现 V4.1 共享 CSA prefill".to_owned() })
+    }
+
+    /// `compressed_sparse_prefill_shared` 的单 token decode 形态。
+    #[allow(clippy::too_many_arguments)]
+    fn compressed_sparse_decode_shared(
+        &self,
+        recent: &mut Self::CompressedKvStorage,
+        shared: Option<&Self::CompressedKvStorage>,
+        position: usize,
+        query: &Self::Tensor,
+        key: &Self::Tensor,
+        value: &Self::Tensor,
+        batch: Option<SharedCompressedBatch<'_, Self::Tensor>>,
+        index_query: Option<&Self::Tensor>,
+        index_head_weights: Option<&Self::Tensor>,
+        preset_selection: Option<&Self::SharedSelection>,
+        candidate: Option<CandidateSpec>,
+        sink: Option<&Self::Weight>,
+        spec: &CompressedSparseAttentionSpec,
+    ) -> Result<SharedCsaOutput<Self::Tensor, Self::SharedSelection>, BackendError> {
+        let _ = (recent, shared, position, query, key, value, batch, index_query, index_head_weights, preset_selection, candidate, sink, spec);
+        Err(BackendError::Compute { msg: "backend 尚未实现 V4.1 共享 CSA decode".to_owned() })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -859,6 +1035,33 @@ pub fn normalize_rope_compressed_f32(values: &[f32], visible_positions: &[usize]
     Ok(output)
 }
 
+/// V4.1 index key:对池化后 pre-norm 的压缩 latent 做 wk 投影、k_norm 与
+/// 压缩行位置(组首 token)的 suffix RoPE。
+#[allow(clippy::too_many_arguments)]
+pub fn index_key_compressed_f32(latents: &[f32], visible_positions: &[usize], ratio: usize, width: usize, wk: &[f32], k_norm: &[f32], eps: f32, rotary_dim: usize, cos: &[f32], sin: &[f32]) -> Result<(usize, Vec<f32>), String> {
+    let index_dim = k_norm.len();
+    if ratio == 0 || latents.len() != visible_positions.len() * width || wk.len() != index_dim * width || index_dim == 0 {
+        return Err(format!("V4.1 index key 维度非法: latents={} positions={} width={width} wk={} index_dim={index_dim}", latents.len(), visible_positions.len(), wk.len()));
+    }
+    let mut output = Vec::with_capacity(visible_positions.len() * index_dim);
+    for (row, &visible_position) in latents.chunks_exact(width).zip(visible_positions) {
+        let rope_position = (visible_position + 1).checked_sub(ratio).ok_or_else(|| format!("V4.1 index key rope 位置下溢: visible={visible_position} ratio={ratio}"))?;
+        for index_row in wk.chunks_exact(width) {
+            output.push(row.iter().zip(index_row).map(|(value, weight)| value * weight).sum());
+        }
+        let begin = output.len() - index_dim;
+        let variance = output[begin..].iter().map(|value| value * value).sum::<f32>() / index_dim as f32;
+        let scale = (variance + eps).sqrt().recip();
+        for (value, weight) in output[begin..].iter_mut().zip(k_norm) {
+            *value = *value * scale * weight;
+        }
+        let rotated = crate::attention::rope::apply_f32(&output[begin..], 1, index_dim, 1, rotary_dim, rope_position, cos, sin, crate::attention::rope::RotaryLayout::Interleaved, crate::attention::rope::RotaryPlacement::Suffix)?;
+        output.truncate(begin);
+        output.extend(rotated);
+    }
+    Ok((index_dim, output))
+}
+
 #[cfg(test)]
 fn topk_dot_f32(query: &[f32], keys: &[f32], top_k: usize) -> Result<Vec<usize>, String> {
     if query.is_empty() || top_k == 0 || !keys.len().is_multiple_of(query.len()) {
@@ -870,30 +1073,79 @@ fn topk_dot_f32(query: &[f32], keys: &[f32], top_k: usize) -> Result<Vec<usize>,
     Ok(scores.into_iter().map(|(index, _)| index).collect())
 }
 
-fn topk_indexer_f32(query: &[f32], keys: &[f32], head_weights: &[f32], spec: &DsaSpec, top_k: usize) -> Result<Vec<usize>, String> {
+/// indexer 的逐压缩行分数:逐头 ReLU 点积 × 学习头权重的加权求和。
+pub fn indexer_row_scores_f32(query: &[f32], keys: &[f32], head_weights: &[f32], spec: &DsaSpec) -> Result<Vec<f32>, String> {
     let query_width = spec.num_heads.checked_mul(spec.head_dim).ok_or("indexer query 宽度溢出")?;
-    if query.len() != query_width || head_weights.len() != spec.num_heads || spec.head_dim == 0 || top_k == 0 || !keys.len().is_multiple_of(spec.head_dim) {
-        return Err(format!("V4 indexer 维度非法: query={} keys={} weights={} heads={} dim={} top_k={top_k}", query.len(), keys.len(), head_weights.len(), spec.num_heads, spec.head_dim));
+    if query.len() != query_width || head_weights.len() != spec.num_heads || spec.head_dim == 0 || !keys.len().is_multiple_of(spec.head_dim) {
+        return Err(format!("V4 indexer 维度非法: query={} keys={} weights={} heads={} dim={}", query.len(), keys.len(), head_weights.len(), spec.num_heads, spec.head_dim));
     }
     let dot_scale = (spec.head_dim as f32).sqrt().recip();
     let weight_scale = (spec.num_heads as f32).sqrt().recip();
-    let mut scores = keys
+    Ok(keys
         .chunks_exact(spec.head_dim)
-        .enumerate()
-        .map(|(index, key)| {
-            let score: f32 = (0..spec.num_heads)
+        .map(|key| {
+            (0..spec.num_heads)
                 .map(|head| {
                     let q = &query[head * spec.head_dim..(head + 1) * spec.head_dim];
                     let dot = q.iter().zip(key).map(|(query, key)| query * key).sum::<f32>();
                     head_weights[head] * weight_scale * dot.max(0.0) * dot_scale
                 })
-                .sum();
-            (index, score)
+                .sum()
+        })
+        .collect())
+}
+
+pub fn topk_indexer_f32(query: &[f32], keys: &[f32], head_weights: &[f32], spec: &DsaSpec, top_k: usize) -> Result<Vec<usize>, String> {
+    let scores = indexer_row_scores_f32(query, keys, head_weights, spec)?;
+    Ok(topk_from_scores(scores, top_k))
+}
+
+fn topk_from_scores(scores: Vec<f32>, top_k: usize) -> Vec<usize> {
+    let mut ranked = scores.into_iter().enumerate().collect::<Vec<_>>();
+    ranked.sort_unstable_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked.truncate(top_k);
+    ranked.into_iter().map(|(index, _)| index).collect()
+}
+
+/// V4.1 两级选择第一级:压缩行分数按块取最大值粗筛 `topk_blocks` 个块,
+/// 最新块(覆盖 query 最近历史的)始终保留。
+pub fn candidate_blocks_f32(row_scores: &[f32], candidate: CandidateSpec) -> Vec<usize> {
+    if row_scores.is_empty() || candidate.topk_blocks == 0 || candidate.block_size == 0 {
+        return Vec::new();
+    }
+    let blocks = row_scores.len().div_ceil(candidate.block_size);
+    let mut block_scores = (0..blocks)
+        .map(|block| {
+            let begin = block * candidate.block_size;
+            let end = begin.min(row_scores.len());
+            (block, row_scores[begin..end].iter().copied().fold(f32::NEG_INFINITY, f32::max))
         })
         .collect::<Vec<_>>();
-    scores.sort_unstable_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    scores.truncate(top_k.min(scores.len()));
-    Ok(scores.into_iter().map(|(index, _)| index).collect())
+    // 最新块总是可见且最相关,pin 进候选避免被分数挤出。
+    let last_block = blocks - 1;
+    let pinned = block_scores[last_block].1;
+    block_scores[last_block].1 = f32::INFINITY;
+    let mut selected = topk_from_scores(block_scores.iter().map(|(_, score)| *score).collect(), candidate.topk_blocks);
+    block_scores[last_block].1 = pinned;
+    selected.sort_unstable();
+    selected
+}
+
+/// V4.1 两级选择第二级:在候选块的行内做 indexer top-k,返回压缩行下标。
+pub fn topk_indexer_candidate_f32(query: &[f32], keys: &[f32], head_weights: &[f32], spec: &DsaSpec, top_k: usize, candidate: CandidateSpec) -> Result<Vec<usize>, String> {
+    let scores = indexer_row_scores_f32(query, keys, head_weights, spec)?;
+    let blocks = candidate_blocks_f32(&scores, candidate);
+    let mut allowed = vec![false; scores.len()];
+    for block in blocks {
+        let begin = block * candidate.block_size;
+        let end = (begin + candidate.block_size).min(scores.len());
+        allowed[begin..end].fill(true);
+    }
+    let ranked = scores.into_iter().enumerate().filter(|(index, _)| allowed[*index]).collect::<Vec<_>>();
+    let mut ranked = ranked;
+    ranked.sort_unstable_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked.truncate(top_k);
+    Ok(ranked.into_iter().map(|(index, _)| index).collect())
 }
 
 #[cfg(test)]
@@ -931,6 +1183,7 @@ mod tests {
                 selection: CompressedSelection::LearnedIndexer(DsaSpec { num_heads: 64, head_dim: 128, rope_dim: 64, top_k: 512, rotary_layout: crate::attention::rope::RotaryLayout::Interleaved, kpool: 0, always_select_tail: false }),
             }),
             attention_sink: true,
+            kv_format: crate::attention::compressed_sparse::CompressedKvFormat::Q8,
         };
         spec.validate().unwrap();
         assert_eq!(spec.cache_rows(1_024).unwrap(), 384);

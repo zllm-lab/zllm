@@ -59,6 +59,15 @@ impl BatchScheduler {
         self.initial_batch_released
     }
 
+    /// 热调只影响下一次 wave 选择；已经提交的工作保持原边界。
+    pub fn set_decode_batch_limit(&mut self, limit: usize) -> Result<(), String> {
+        if limit == 0 {
+            return Err("decode batch limit 必须大于 0".to_owned());
+        }
+        self.decode_batch_limit = limit;
+        Ok(())
+    }
+
     /// 只安排已经收到输入的 ready 请求；Pending 不占槽，也不阻塞其他 ready 工作。
     /// 每轮同时推进 decode 和一份公平轮转的 prefill 预算，避免两类任务互相饿死。
     pub fn next(&mut self, phases: &[RequestPhase]) -> Option<BatchPlan> {

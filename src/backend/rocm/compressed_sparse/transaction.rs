@@ -29,6 +29,7 @@ impl RocmCompressedKvStorage {
             transaction.indexer = self.indexer.snapshot(context.device_id, Some(transaction.indexer))?;
             transaction.attention_replays.clear();
             transaction.compressor_replays.clear();
+            transaction.v41_compressor_replays.clear();
             transaction.indexer_replays.clear();
             transaction
         } else {
@@ -52,6 +53,7 @@ impl RocmCompressedKvStorage {
                 indexer: self.indexer.snapshot(context.device_id, None)?,
                 attention_replays: Vec::new(),
                 compressor_replays: Vec::new(),
+                v41_compressor_replays: Vec::new(),
                 indexer_replays: Vec::new(),
             }
         };
@@ -71,6 +73,7 @@ impl RocmCompressedKvStorage {
         if retained_rows == rows.len() {
             transaction.attention_replays.clear();
             transaction.compressor_replays.clear();
+            transaction.v41_compressor_replays.clear();
             transaction.indexer_replays.clear();
             self.transaction_pool = Some(transaction);
             return Ok(());
@@ -102,7 +105,16 @@ impl RocmCompressedKvStorage {
                 }
                 Ok(positions)
             };
-            let compressor_positions = replay_compression(&mut self.compressor, &mut transaction.compressor_replays)?;
+            let mut compressor_positions = replay_compression(&mut self.compressor, &mut transaction.compressor_replays)?;
+            let mut remaining = retained_rows;
+            for replay in transaction.v41_compressor_replays.drain(..) {
+                let rows = remaining.min(replay.key.rows);
+                compressor_positions.extend(self.compressor.replay_v41_prefix(context, replay, rows)?);
+                remaining -= rows;
+                if remaining == 0 {
+                    break;
+                }
+            }
             let indexer_positions = replay_compression(&mut self.indexer, &mut transaction.indexer_replays)?;
             if !compressor_positions.is_empty() && !indexer_positions.is_empty() && compressor_positions != indexer_positions {
                 return Err(compute(format!("V4 ROCm speculative compressor/indexer replay 位置不一致: {compressor_positions:?} / {indexer_positions:?}")));
@@ -128,6 +140,7 @@ impl RocmCompressedKvStorage {
         }
         transaction.attention_replays.clear();
         transaction.compressor_replays.clear();
+        transaction.v41_compressor_replays.clear();
         transaction.indexer_replays.clear();
         self.transaction_pool = Some(transaction);
         Ok(())

@@ -247,10 +247,9 @@ fn sum_v(slice: &[f32]) -> f32 {
 /// SiLU 激活:`x * sigmoid(x)`,f32x8。
 pub fn silu(input: &[f32]) -> Vec<f32> {
     let mut output = vec![0.0_f32; input.len()];
-    let one = f32x8::splat(1.0);
     for (chunk, out_chunk) in input.chunks_exact(SIMD_LANES).zip(output.chunks_exact_mut(SIMD_LANES)) {
         let v = f32x8::from(<[f32; SIMD_LANES]>::try_from(chunk).unwrap());
-        let sigmoid = one / (one + (-v).exp());
+        let sigmoid = super::silu::sigmoid_v(v);
         let value: [f32; SIMD_LANES] = (v * sigmoid).into();
         out_chunk.copy_from_slice(&value);
     }
@@ -607,6 +606,12 @@ mod tests {
         assert!((silu(&[0.0])[0]).abs() < 1e-6);
         assert!((silu(&[1.0])[0] - 0.7310).abs() < 1e-3);
         assert!((silu(&[-1.0])[0] + 0.2689).abs() < 1e-3);
+        let input = [-100.0, 100.0, -1e10, 1e10, -10.0, 10.0, -1.0, 1.0, -100.0];
+        let output = silu(&input);
+        for (&actual, &x) in output.iter().zip(&input) {
+            let x = x as f64;
+            assert!((actual as f64 - x / (1.0 + (-x).exp())).abs() < 1e-5);
+        }
     }
 
     #[test]

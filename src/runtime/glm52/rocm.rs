@@ -3,7 +3,7 @@
 use crate::kernel::rocm as ops;
 use crate::runtime::{generation, pipeline, stage_artifact};
 
-use crate::runtime::glm52::rocm_swap::{Glm52CacheIdentity, Glm52CacheSnapshot, Glm52MtpCache, Glm52SwapStore, download_glm52_session, upload_glm52_session};
+use crate::runtime::glm52::rocm_swap::{Glm52CacheIdentity, Glm52CacheSnapshot, Glm52HotHistoryPrepare, Glm52MtpCache, Glm52SwapStore, download_glm52_session, take_glm52_session, upload_glm52_session};
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -359,6 +359,29 @@ impl RocmMtpSession {
         })
     }
 
+    pub(super) fn pair_reservation_bytes(&self, runtime: &RocmMtpRuntime, cfg: &Glm52Config, rows: usize) -> Result<[usize; 2], String> {
+        // MTP 只拥有自己的辅助层，不能把前面的 target 层再次预留一遍。
+        let layers = cfg.layer_count..cfg.layer_count + 1;
+        let mut bytes = self.cache.operator_reservation_bytes(layers.clone(), rows, cfg.kv_lora_rank, cfg.qk_rope_head_dim).map_err(|error| format!("MTP MLA reservation: {error:?}"))?;
+        if runtime.weights.layer.indexer.is_some() {
+            let dsa = self.dsa.sequence_shard_reservation_bytes(layers, rows).map_err(|error| format!("MTP DSA reservation: {error:?}"))?;
+            for parity in 0..2 {
+                bytes[parity] = bytes[parity].saturating_add(dsa[parity]);
+            }
+        }
+        Ok(bytes)
+    }
+
+    pub(super) fn reserve_pair_rows(&mut self, runtime: &RocmMtpRuntime, cfg: &Glm52Config, rows: usize) -> Result<(), String> {
+        let peer = runtime.experts.operator_peer_context().ok_or("MTP GPU reservation 需要 operator pair")?;
+        let layers = cfg.layer_count..cfg.layer_count + 1;
+        self.cache.reserve_operator_rows(&runtime.backend, &peer, layers.clone(), rows, cfg.kv_lora_rank, cfg.qk_rope_head_dim).map_err(|error| format!("预留 MTP MLA 热窗及元数据: {error:?}"))?;
+        if runtime.weights.layer.indexer.is_some() {
+            self.dsa.reserve_sequence_shard_rows(&runtime.backend, &peer, layers, rows).map_err(|error| format!("预留 MTP DSA 两分块: {error:?}"))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn begin_request(&mut self, target_position: usize, prompt_tokens: Vec<u32>, max_decode: usize, draft_tokens: usize) -> Result<(), String> {
         if max_decode == 0 || draft_tokens == 0 || target_position > prompt_tokens.len() {
             return Err(format!("MTP context 非法: target_position={target_position} prompt={} max_decode={max_decode} drafts={draft_tokens}", prompt_tokens.len()));
@@ -416,16 +439,26 @@ impl RocmMtpSession {
         })
     }
 
-    pub(super) fn restore(snapshot: Glm52MtpCache, context: &RocmContext, cfg: &Glm52Config, max_seq_len: usize, reserved_rows: usize, head: &Glm52OutputHead<RocmWeight>, terminal_hidden: &RocmTensor) -> Result<Self, String> {
+    pub(super) fn restore(
+        snapshot: Glm52MtpCache,
+        context: &RocmContext,
+        cfg: &Glm52Config,
+        max_seq_len: usize,
+        reserved_rows: usize,
+        dsa_sequence_sharded: bool,
+        head: &Glm52OutputHead<RocmWeight>,
+        terminal_hidden: &RocmTensor,
+    ) -> Result<Self, String> {
         let layers = cfg.layer_count + cfg.mtp_layer_count;
         if snapshot.pending_hidden.len() != cfg.hidden_size || snapshot.kv.len() > layers || snapshot.dsa.len() > layers {
             return Err(format!("MTP snapshot shape 非法: hidden={}/{} kv={}/{} dsa={}/{}", snapshot.pending_hidden.len(), cfg.hidden_size, snapshot.kv.len(), layers, snapshot.dsa.len(), layers));
         }
         context.activate().map_err(|error| format!("激活 MTP ROCm device {}: {error}", context.device_id()))?;
         let mut session = Self::fresh(cfg, max_seq_len)?;
-        let interleaved_pair = snapshot.kv.iter().flatten().any(|layer| layer.ownership == crate::backend::rocm::RocmKvOwnership::InterleavedPair);
         session.cache.upload_layers(context, &snapshot.kv, reserved_rows).map_err(|error| format!("恢复 MTP KV: {error:?}"))?;
-        session.dsa.upload_layers(context, &snapshot.dsa, reserved_rows, interleaved_pair).map_err(|error| format!("恢复 MTP DSA: {error:?}"))?;
+        // operator pair 的 MLA 是完整镜像；DSA 必须按当前执行配置重建两块，
+        // 不能从 MLA ownership 推断，否则恢复后首个 append 才切分就太晚了。
+        session.dsa.upload_layers(context, &snapshot.dsa, reserved_rows, dsa_sequence_sharded).map_err(|error| format!("恢复 MTP DSA: {error:?}"))?;
         session.position = snapshot.position;
         // 旧 terminal 文件误存过未归一化的 pending hidden。以同一位置的 target
         // 残差重新计算，兼容两类旧值，也避免 normalized hidden 的 BF16 往返误差。
@@ -439,6 +472,45 @@ impl RocmMtpSession {
 #[cfg(test)]
 mod mtp_session_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "需要两张 ROCm GPU"]
+    fn mtp_restore_full_mla_preserves_dsa_pair_history() {
+        use crate::backend::rocm::{DsaLayerSerde, MlaLayerSerde, RocmKvOwnership};
+        let owner = RocmContext::new(0).unwrap();
+        let peer = RocmContext::new(1).unwrap();
+        let mut cfg = Glm52Config::standard();
+        cfg.hidden_size = 128;
+        cfg.vocab_size = 16;
+        cfg.index_head_dim = 128;
+        let head = prepare_glm52_output_head(&owner, &cfg, &vec![1.0; cfg.hidden_size], LinearWeight::F32(&vec![0.0; cfg.vocab_size * cfg.hidden_size])).unwrap();
+        let hidden = owner.tensor_from_f32(vec![0.25; cfg.hidden_size], 1, cfg.hidden_size).unwrap();
+        let layer = cfg.layer_count;
+        for rows in [65, 4097] {
+            let record = DsaLayerSerde { rows, key_group_size: 128, hadamard: false, keys: (0..rows * 128).map(|i| (i * 17 + i / 128) as u8).collect(), scales: (0..rows * 2).map(|i| (i * 31 + 7) as u8).collect() };
+            // 主存保存完整逻辑历史；同一快照既能恢复单卡，也能按执行配置恢复双卡。
+            // MLA 保持 Full，刻意覆盖旧代码错误推断为单卡 DSA 的生产形态。
+            for sharded in [false, true] {
+                let mut kv = vec![None; layer + 1];
+                kv[layer] = Some(MlaLayerSerde { rows, ownership: RocmKvOwnership::Full, latent_cols: 16, rope_cols: 16, latent_group_size: 0, latent: vec![0; rows * 16 * 2], latent_scales: None, rope: vec![0; rows * 16 * 2] });
+                let mut dsa = vec![None; layer + 1];
+                dsa[layer] = Some(record.clone());
+                let snapshot = Glm52MtpCache { position: rows, pending_hidden: vec![0; cfg.hidden_size], prompt_tokens: vec![1; rows + 1], kv, dsa };
+                let mut restored = RocmMtpSession::restore(snapshot, &owner, &cfg, 12288, rows, sharded, &head, &hidden).unwrap();
+                if sharded {
+                    // 两分块从 host 重建后再跨 4096 页增长，已有 key/scale 必须逐字节保持。
+                    restored.dsa.reserve_sequence_shard_rows(&owner, &peer, layer..layer + 1, rows + 4096).unwrap();
+                    assert_eq!(restored.dsa.sequence_shard_reservation_bytes(layer..layer + 1, rows + 4096).unwrap(), [0, 0]);
+                }
+                let saved = restored.snapshot(&owner).unwrap();
+                let actual = saved.dsa[layer].as_ref().unwrap();
+                assert_eq!(actual.rows, rows);
+                assert_eq!(actual.keys, record.keys, "rows={rows} sharded={sharded}");
+                assert_eq!(actual.scales, record.scales, "rows={rows} sharded={sharded}");
+                assert_eq!(saved.kv[layer].as_ref().unwrap().ownership, RocmKvOwnership::Full);
+            }
+        }
+    }
 
     #[test]
     #[ignore = "需要 ROCm device 0"]
@@ -467,7 +539,7 @@ mod mtp_session_tests {
                 // 旧文件写入 raw BF16；恢复仍须由 target 残差得到同一 normalized 值。
                 snapshot.pending_hidden = context.tensor_to_bf16_bits(&hidden).unwrap();
             }
-            let restored = RocmMtpSession::restore(snapshot, &context, &cfg, 4096, 0, &head, &hidden).unwrap();
+            let restored = RocmMtpSession::restore(snapshot, &context, &cfg, 4096, 0, false, &head, &hidden).unwrap();
             let prefix = context.tensor_from_f32(vec![0.25; 2047 * cfg.hidden_size], 2047, cfg.hidden_size).unwrap();
             for pending in [session.pending_hidden.as_ref().unwrap(), restored.pending_hidden.as_ref().unwrap()] {
                 let appended = context.concat_token_rows(&[pending, &prefix]).unwrap();
@@ -486,7 +558,7 @@ mod mtp_session_tests {
 #[path = "rocm_tail.rs"]
 mod rocm_tail;
 use rocm_tail::*;
-pub(super) use rocm_tail::{RocmMtpCatchUp, RocmMtpDraftBatch, gather_embedding_rows, load_resident_embedding, mtp_catch_up_batch, mtp_draft_batch, prepare_head_output_runtime};
+pub(super) use rocm_tail::{RocmMtpCatchUp, RocmMtpDraftBatch, gather_embedding_rows, load_resident_embedding, mtp_catch_up_batch, mtp_draft_batch, pair_session_reservation, prepare_head_output_runtime, reserve_pair_session};
 enum StageLink {
     Listen(IrohConfig),
     Connect { ticket: String, iroh: IrohConfig },
@@ -605,13 +677,11 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
         ..
     } = entry;
     let args = parsed;
-    let scheduler_policy = crate::runtime::glm52::stage::Glm52SchedulerPolicy {
+    let mut scheduler_policy = crate::runtime::glm52::stage::Glm52SchedulerPolicy {
         execution_slots: scheduling.execution_slots,
         decode_execution_slots: scheduling.decode_execution_slots,
         pipeline_work_window: scheduling.pipeline_work_window,
-        prefill_admission_burst: scheduling.prefill_admission_burst,
-        decode_batch_limit: scheduling.decode_batch_limit,
-        prefill_batch_limit: scheduling.prefill_batch_limit,
+        decode_batch_limit: if alternate_layer_ends.is_empty() { usize::MAX } else { 1 },
         profile_completion: scheduling.profile_completion,
     };
     let profile_completion = scheduling.profile_completion;
@@ -1040,6 +1110,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                 });
             }
         }
+        let memory_indexer_layers = if ops::hip::options().mla_gpu_resident_reserve_bytes.is_some() { tail_indexer_layer_counts(&templates, &device_memory)? } else { Vec::new() };
         let cache_dir = args.cache_dir.as_ref().ok_or("GLM decode 后继必须设置 model.cache_directory")?;
         let cache_identity = Glm52CacheIdentity::new(&weights, kv_cache_format, stage_start, stage_end, false, args.max_seq_len, dflash2_directory.as_deref().or(dspark_directory.as_deref())).with_dflash2(dflash2_directory.as_deref())?;
         let swap = Arc::new(Glm52SwapStore::open(cache_dir.join("glm52").join(format!("stage-{stage_start}-{stage_end}")), &cache_identity)?);
@@ -1076,6 +1147,13 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
             };
             let request_id = frame.request_id;
             match frame.message {
+                StageMessage::RuntimeConfig(config) => {
+                    crate::kernel::rocm::hip::set_device_buffer_pool_limit(config.device_buffer_pool_bytes)?;
+                    scheduler_policy.execution_slots = config.execution_slots;
+                    scheduler_policy.decode_execution_slots = config.decode_execution_slots;
+                    scheduler_policy.pipeline_work_window = config.pipeline_work_window;
+                    eprintln!("[glm52-tail-runtime-applied] boundary=next_batch config={config:?}");
+                }
                 StageMessage::ContinuousStream { requests } => {
                     if requests.is_empty() {
                         return Err("tail 在 continuous stream 外收到结束帧".into());
@@ -1231,6 +1309,39 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                 progressed = true;
                                 let frame_request_id = frame.request_id;
                                 match frame.message {
+                                    StageMessage::RuntimeConfig(config) => {
+                                        crate::kernel::rocm::hip::set_device_buffer_pool_limit(config.device_buffer_pool_bytes).map_err(|msg| crate::backend::BackendError::Compute { msg })?;
+                                        pipeline.update_runtime_policy(crate::runtime::prefill_scheduler::StageSchedulerRuntimePolicy {
+                                            execution_slots: config.execution_slots,
+                                            decode_execution_slots: config.decode_execution_slots,
+                                            pipeline_work_window: config.pipeline_work_window,
+                                            prefill_admission_burst: 1,
+                                            decode_batch_limit: scheduler_policy.decode_batch_limit,
+                                        })?;
+                                        pipeline.set_profile_completion(config.profile_completion);
+                                        scheduler_policy.execution_slots = config.execution_slots;
+                                        scheduler_policy.decode_execution_slots = config.decode_execution_slots;
+                                        scheduler_policy.pipeline_work_window = config.pipeline_work_window;
+                                        scheduler_policy.profile_completion = config.profile_completion;
+                                        eprintln!("[glm52-tail-runtime-applied] boundary=next_stage_dispatch config={config:?}");
+                                    }
+                                    StageMessage::MemoryQuery { cache_request_id, reserved_rows } => {
+                                        report_tail_memory_requirement(
+                                            &mut link,
+                                            &mut device_memory,
+                                            &mut resident,
+                                            &swap,
+                                            &output_context,
+                                            &templates,
+                                            &cfg,
+                                            args.max_seq_len,
+                                            cache_request_id,
+                                            reserved_rows,
+                                            &memory_indexer_layers,
+                                            &pending_opens,
+                                        )
+                                        .map_err(backend_error)?;
+                                    }
                                     StageMessage::ContinuousStream { requests } if requests.is_empty() => {
                                         stream_ended = true;
                                         stream_control_id = Some(frame_request_id);
@@ -1255,6 +1366,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                         accepted_positions.insert(frame_request_id, tail.position);
                                     }
                                     StageMessage::Open { cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling, tail_sampling: _ } => {
+                                        trim_tail_gpu_cache(&mut resident, &swap, &output_context, &device_memory, &cfg, 0, cache_request_id).map_err(backend_error)?;
                                         begin_tail_stage_open(
                                             &mut link,
                                             &mut active,
@@ -1273,6 +1385,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                         return Err(backend_error("MTP 已驻留 head 首卡,tail 不再接受 MtpContext".to_owned()));
                                     }
                                     StageMessage::Prefill { position, rows, cols, values, selection, aux_values, aux_taps } => {
+                                        trim_tail_gpu_cache(&mut resident, &swap, &output_context, &device_memory, &cfg, rows, None).map_err(backend_error)?;
                                         let session = request_sessions.get(&frame_request_id).copied().ok_or_else(|| backend_error(format!("tail continuous prefill request={frame_request_id} 尚未 Assign")))?;
                                         let expected = accepted_positions.get_mut(&frame_request_id).ok_or_else(|| backend_error(format!("tail continuous prefill request={frame_request_id} 缺少 position")))?;
                                         if position != *expected || cols != cfg.hidden_size {
@@ -1292,6 +1405,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                         pipeline.submit_glm52_aux(session, position, false, hidden, selection, aux_hidden, aux_taps)?;
                                     }
                                     StageMessage::Decode { cohort, cohort_size, position, cols, values, selection, aux_values, aux_taps } => {
+                                        trim_tail_gpu_cache(&mut resident, &swap, &output_context, &device_memory, &cfg, 1, None).map_err(backend_error)?;
                                         let session = request_sessions.get(&frame_request_id).copied().ok_or_else(|| backend_error(format!("tail continuous decode request={frame_request_id} 尚未 Assign")))?;
                                         if diagnostics.trace_stage_events {
                                             crate::runtime::prefill_scheduler::record_stage_trace(format!(
@@ -1352,6 +1466,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                         }
                                     }
                                     StageMessage::Verify { cohort, cohort_size, position, rows, cols, values, selection, aux_values, aux_taps } => {
+                                        trim_tail_gpu_cache(&mut resident, &swap, &output_context, &device_memory, &cfg, rows, None).map_err(backend_error)?;
                                         let session = request_sessions.get(&frame_request_id).copied().ok_or_else(|| backend_error(format!("tail continuous verify request={frame_request_id} 尚未 Assign")))?;
                                         if diagnostics.trace_stage_events {
                                             crate::runtime::prefill_scheduler::record_stage_trace(format!(
@@ -1437,6 +1552,8 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                         }
                                     }
                                     StageMessage::Delete => {
+                                        // 析构等待注册线程结束，删除 ACK 之后不允许后台 Open 复活。
+                                        pending_opens.retain(|item| item.request.request_id != frame_request_id);
                                         if let Some(&session) = request_sessions.get(&frame_request_id) {
                                             if pending_controls.insert(frame_request_id, TailControl::Delete).is_some() {
                                                 return Err(backend_error(format!("tail continuous request={frame_request_id} 重复控制")));
@@ -1460,7 +1577,8 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                                     | StageMessage::Sampled { .. }
                                     | StageMessage::Speculative { .. }
                                     | StageMessage::Ready { .. }
-                                    | StageMessage::DeviceMemory { .. } => {
+                                    | StageMessage::DeviceMemory { .. }
+                                    | StageMessage::MemoryRequirement { .. } => {
                                         return Err(backend_error(format!("tail continuous request={frame_request_id} 收到非法 frame={:?}", frame.message,)));
                                     }
                                 }
@@ -1481,7 +1599,20 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                         }
                         Ok(())
                     })
-                    .map_err(|error| format!("ROCm distributed tail continuous stream: {error:?}"))?;
+                    .map_err(|error| {
+                        eprintln!("[stage-continuous-error] {error:?}");
+                        // 已完成的 RAM 快照与失败的 active state 无关，先落盘，
+                        // 避免异常退出丢掉整个主存缓存层；保留最初的计算错误。
+                        match swap.persist_host_all() {
+                            Ok(count) => eprintln!("[stage-error-persist-host] 已保存 {count} 个完成缓存"),
+                            Err(persist) => eprintln!("[stage-error-persist-host] {persist}"),
+                        }
+                        match tail_stage_persist_all(&mut resident, &swap, &output_context) {
+                            Ok(count) => eprintln!("[stage-error-persist-resident] 已保存 {count} 个完成缓存"),
+                            Err(persist) => eprintln!("[stage-error-persist-resident] {persist}"),
+                        }
+                        format!("ROCm distributed tail continuous stream: {error:?}")
+                    })?;
                     if crate::kernel::rocm::hip::options().kernel_profile || profile_completion {
                         crate::kernel::rocm::hip::report_device_profiles(0, request_sessions.len());
                     }
@@ -1511,6 +1642,9 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                         args.max_seq_len,
                         TailOpenRequest { request_id, cache_request_id, cached_tokens, reserved_rows, cache_hit, sampling },
                     )?;
+                }
+                StageMessage::MemoryQuery { cache_request_id, reserved_rows } => {
+                    report_tail_memory_requirement(&mut link, &mut device_memory, &mut resident, &swap, &output_context, &templates, &cfg, args.max_seq_len, cache_request_id, reserved_rows, &memory_indexer_layers, &pending_opens)?;
                 }
                 StageMessage::MtpContext { .. } => {
                     return Err("MTP 已驻留 head 首卡,tail 不再接受 MtpContext".into());
@@ -1580,6 +1714,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                     tail_stage_persist(&mut resident, &swap, &output_context, request_id)?;
                 }
                 StageMessage::Shutdown { persist } => {
+                    pending_opens.clear();
                     if !active.is_empty() {
                         eprintln!("[stage-shutdown-warn] 优雅退出时仍有 {} 个 active session，将由进程退出释放", active.len());
                     }
@@ -1591,6 +1726,7 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                     std::process::exit(0);
                 }
                 StageMessage::Delete => {
+                    pending_opens.retain(|item| item.request.request_id != request_id);
                     // 初始 Open 的缓存重建和空闲期淘汰也等待释放完成，与 continuous 保持一致。
                     let position = tail_stage_delete(&mut active, &mut resident, &swap, request_id)?;
                     link.send_ready(request_id, position)?;
@@ -1603,7 +1739,8 @@ fn run_glm52_entry(ctx: &RocmContext, entry: RocmEntry) -> Result<(), Box<dyn st
                 | StageMessage::Sampled { .. }
                 | StageMessage::Speculative { .. }
                 | StageMessage::Ready { .. }
-                | StageMessage::DeviceMemory { .. } => {
+                | StageMessage::DeviceMemory { .. }
+                | StageMessage::MemoryRequirement { .. } => {
                     return Err("tail stage 收到 stream 外控制或反向 frame".into());
                 }
             }

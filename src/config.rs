@@ -85,6 +85,19 @@ pub struct SchedulerHttpConfig {
     pub public_base_url: String,
     #[serde(default)]
     pub api_keys: Vec<String>,
+    #[serde(default)]
+    pub account: Option<SchedulerAccountConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulerAccountConfig {
+    pub postgres: String,
+    /// 微信小程序一键登录（jscode2session）；未配置时 /api/auth/wechat-login 返回 503。
+    #[serde(default)]
+    pub wechat_appid: Option<String>,
+    #[serde(default)]
+    pub wechat_secret: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,6 +170,9 @@ pub struct NodeSchedulerConfig {
 #[serde(deny_unknown_fields)]
 pub struct NodeServiceConfig {
     pub cache_directory: PathBuf,
+    /// 与主模型共用物理设备和唯一执行槽，切换前释放旧模型。
+    #[serde(default)]
+    pub alternate_models: Vec<NodeModelConfig>,
     /// KV cache 换出与优雅退出时是否写入 SSD。关闭后 resident cache
     /// 仍可在内存/显存中复用，但退出状态直接释放，也不从 SSD 恢复。
     #[serde(default = "default_true")]
@@ -206,10 +222,30 @@ pub enum NodeModelConfig {
     Glm52(Glm52NodeModelConfig),
     Glm53Flash(Glm53FlashNodeModelConfig),
     MinimaxH3(H3NodeModelConfig),
+    Flux2Klein(Flux2KleinNodeModelConfig),
+    Seedvr2(SeedVr2NodeModelConfig),
     K2Horizon(K2HorizonNodeModelConfig),
     Mistral(MistralNodeModelConfig),
     MiniCpm5(MiniCpm5NodeModelConfig),
     Qwen4Exp(Qwen4ExpNodeModelConfig),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Flux2KleinNodeModelConfig {
+    pub weights_directory: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeedVr2NodeModelConfig {
+    pub weights_directory: PathBuf,
+    #[serde(default = "default_seedvr2_batch_frames")]
+    pub batch_frames: usize,
+}
+
+fn default_seedvr2_batch_frames() -> usize {
+    33
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -325,6 +361,9 @@ pub struct DeepSeekV4NodeExecutionConfig {
     pub decode_priority_prefill_chunk_ceiling: usize,
     #[serde(default = "default_deepseek_v4_pool_gib")]
     pub device_pool_gib: usize,
+    /// TLSF arena 每卡段尺寸（GiB）；0 保持关闭，便于与原精确桶池做 A/B。
+    #[serde(default)]
+    pub device_arena_gib: usize,
     /// KV 准入的 reservation 页大小（token 数）；节点上报每卡 KV token 容量后，
     /// 调度器按 min(卡容量)/page_tokens 对最大并发封顶，而不是只数请求数。
     #[serde(default = "default_kv_reservation_page_tokens")]
@@ -350,6 +389,8 @@ pub struct DeepSeekV4NodeExecutionConfig {
     pub decode_batch_limit: usize,
     #[serde(default)]
     pub score_expert_top_k: Option<usize>,
+    #[serde(default = "default_true")]
+    pub engram_enabled: bool,
     #[serde(default)]
     pub profile: bool,
 }
@@ -362,6 +403,7 @@ impl Default for DeepSeekV4NodeExecutionConfig {
             decode_priority_prefill_chunk_size: default_decode_priority_prefill_chunk_size(),
             decode_priority_prefill_chunk_ceiling: default_decode_priority_prefill_chunk_ceiling(),
             device_pool_gib: default_deepseek_v4_pool_gib(),
+            device_arena_gib: 0,
             kv_reservation_page_tokens: default_kv_reservation_page_tokens(),
             memory_reserve_bytes: default_memory_reserve_bytes(),
             long_prefill_threshold_tokens: None,
@@ -373,6 +415,7 @@ impl Default for DeepSeekV4NodeExecutionConfig {
             decode_batch_limit: default_deepseek_v4_decode_batch_limit(),
             score_expert_top_k: None,
             profile: false,
+            engram_enabled: true,
         }
     }
 }
@@ -904,17 +947,11 @@ pub struct Glm52SchedulingConfig {
     pub decode_execution_slots: usize,
     #[serde(default = "default_pipeline_work_window")]
     pub pipeline_work_window: usize,
-    #[serde(default = "default_prefill_admission_burst")]
-    pub prefill_admission_burst: usize,
-    #[serde(default = "default_decode_batch_limit")]
-    pub decode_batch_limit: usize,
-    #[serde(default = "default_prefill_batch_limit")]
-    pub prefill_batch_limit: usize,
     #[serde(default = "default_append_prefill_chunk_size")]
     pub append_prefill_chunk_size: usize,
-    #[serde(default = "default_decode_priority_prefill_chunk_size")]
+    #[serde(default = "default_glm52_prefill_chunk_size")]
     pub decode_priority_prefill_chunk_size: usize,
-    #[serde(default = "default_decode_priority_prefill_chunk_ceiling")]
+    #[serde(default = "default_glm52_prefill_chunk_size")]
     pub decode_priority_prefill_chunk_ceiling: usize,
     #[serde(default = "default_long_prefill_threshold_tokens")]
     pub long_prefill_threshold_tokens: usize,
@@ -930,12 +967,9 @@ impl Default for Glm52SchedulingConfig {
             execution_slots: default_stage_execution_slots(),
             decode_execution_slots: default_stage_execution_slots(),
             pipeline_work_window: default_pipeline_work_window(),
-            prefill_admission_burst: default_prefill_admission_burst(),
-            decode_batch_limit: default_decode_batch_limit(),
-            prefill_batch_limit: default_prefill_batch_limit(),
             append_prefill_chunk_size: default_append_prefill_chunk_size(),
-            decode_priority_prefill_chunk_size: default_decode_priority_prefill_chunk_size(),
-            decode_priority_prefill_chunk_ceiling: default_decode_priority_prefill_chunk_ceiling(),
+            decode_priority_prefill_chunk_size: default_glm52_prefill_chunk_size(),
+            decode_priority_prefill_chunk_ceiling: default_glm52_prefill_chunk_size(),
             long_prefill_threshold_tokens: default_long_prefill_threshold_tokens(),
             long_prefill_chunk_size: default_long_prefill_chunk_size(),
             profile_completion: false,
@@ -973,6 +1007,28 @@ pub struct H3NodeModelConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct H3NodeExecutionConfig {
+    /// 低开销记录 Ulysses attention 的 QKV A2A、attention 与 inverse A2A
+    /// 设备区间；只增加 HIP event，不改变原有同步边界。
+    #[serde(default)]
+    pub profile_boundaries: bool,
+    /// 在 DiT 准备前启动视频 decoder 准备；增加 denoise 阶段的显存驻留量。
+    #[serde(default)]
+    pub overlap_decoder_prepare: bool,
+    /// Qwen 图片 processor 的面积上限；独立于 VisualVAE，缺省使用模型配置。
+    #[serde(default)]
+    pub qwen_image_max_pixels: Option<usize>,
+    /// 各 DiT rank 的权重准备并行；不改变 denoise 的同步契约。
+    #[serde(default)]
+    pub parallel_prepare: bool,
+    /// Qwen 文本层准备的 host 工作线程数；所有权重仍位于主卡。
+    #[serde(default = "default_h3_qwen_prepare_threads")]
+    pub qwen_prepare_threads: usize,
+    /// 各 DiT rank 分摊 VAE 空间 tiles；缺省只在主卡解码。
+    #[serde(default)]
+    pub parallel_video_vae: bool,
+    /// VisualVAE 图片参考面积上限；缺省保留短边 2048，设置后只缩小并向下对齐 32。
+    #[serde(default)]
+    pub reference_image_max_pixels: Option<usize>,
     #[serde(default = "default_h3_steps")]
     pub steps: usize,
     #[serde(default = "default_h3_stream_chunk_layers")]
@@ -984,12 +1040,56 @@ pub struct H3NodeExecutionConfig {
     /// 默认关闭；启用后允许以第 0 层残差判据跳过相似时间步的其余 DiT block。
     #[serde(default)]
     pub block_cache: Option<H3BlockCacheConfig>,
+    /// 显式池每卡软上限（GiB）；必须 ≥ 相位工作集（VAE 实测 11.5 GiB）。
+    /// 缺省保持 hip 层编译默认 3 GiB。
+    #[serde(default)]
+    pub device_pool_gib: Option<usize>,
+    /// arena 总上界（GiB）；段按请求尺寸的 2 的幂动态扩展（受上界与空闲
+    /// 显存半数约束），不预分配大段。缺省 0 = 关闭（实机门禁前保守）。
+    #[serde(default)]
+    pub device_arena_gib: Option<usize>,
+    /// 池化边界（GiB）：超过该尺寸的可复用块直接走非池化驱动分配（≤2 GiB
+    /// 进驱动异步池，自管复用/trim/抗碎片），不进 L1 也不钉 arena VA。缺省
+    /// 编译默认 384 MiB。需要大块 L1 精确复用的负载（VAE 1.35 GiB 相位
+    /// cache，fast4 配方实测）显式调大到 ≥2。
+    #[serde(default)]
+    pub device_pool_max_block_gib: Option<usize>,
+    /// 是否在 H3 建组前启用自研显式池。默认 true；大块已按
+    /// `device_pool_max_block_gib` 边界非池化化后，15s/1MP U8 负载可在
+    /// 默认池下运行（2026-09-14 在 8 卡 ROCm 主机验证）。
+    #[serde(default = "default_h3_device_buffer_reuse")]
+    pub device_buffer_reuse: bool,
 }
 
 impl Default for H3NodeExecutionConfig {
     fn default() -> Self {
-        Self { steps: default_h3_steps(), stream_chunk_layers: default_h3_stream_chunk_layers(), save_latent: false, ffmpeg: default_ffmpeg(), block_cache: None }
+        Self {
+            profile_boundaries: false,
+            overlap_decoder_prepare: false,
+            qwen_image_max_pixels: None,
+            parallel_prepare: false,
+            qwen_prepare_threads: 1,
+            parallel_video_vae: false,
+            reference_image_max_pixels: None,
+            steps: default_h3_steps(),
+            stream_chunk_layers: default_h3_stream_chunk_layers(),
+            save_latent: false,
+            ffmpeg: default_ffmpeg(),
+            block_cache: None,
+            device_pool_gib: None,
+            device_arena_gib: None,
+            device_pool_max_block_gib: None,
+            device_buffer_reuse: true,
+        }
     }
+}
+
+const fn default_h3_device_buffer_reuse() -> bool {
+    true
+}
+
+const fn default_h3_qwen_prepare_threads() -> usize {
+    1
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -1547,6 +1647,9 @@ pub struct RocmBackendConfig {
     /// CPU 保存全量 MLA，GPU 每层只保留固定行数的精确 hot cache；0 表示关闭。
     #[serde(default)]
     pub mla_cpu_hot_rows: usize,
+    /// 显存可用量低于预留字节时才缩为 MLA 热窗；None 保留原有热窗策略。
+    #[serde(default)]
+    pub mla_gpu_resident_reserve_bytes: Option<usize>,
     /// Prefill 的 DSA selection 与 MLA attention 由 CPU 执行；GPU 只生成当前 chunk 投影并接回 attention 输出。
     #[serde(default)]
     pub prefill_attention_cpu: bool,
@@ -1604,7 +1707,18 @@ impl SchedulerProcessConfig {
         };
         Ok((
             self.http.listen,
-            ServerConfig { api_keys, anonymous_cache_namespace: None, node_api_key: nonempty(self.scheduler.node_api_key.as_deref()), models, anthropic_family_tiers: self.scheduler.anthropic_family_tiers.clone(), model_aliases, scheduler },
+            ServerConfig {
+                api_keys,
+                anonymous_cache_namespace: None,
+                node_api_key: nonempty(self.scheduler.node_api_key.as_deref()),
+                models,
+                model_aliases,
+                anthropic_family_tiers: self.scheduler.anthropic_family_tiers.clone(),
+                account_postgres: self.http.account.as_ref().map(|account| account.postgres.trim().to_owned()),
+                wechat_appid: self.http.account.as_ref().and_then(|account| account.wechat_appid.clone()),
+                wechat_secret: self.http.account.as_ref().and_then(|account| account.wechat_secret.clone()),
+                scheduler,
+            },
         ))
     }
 
@@ -1612,6 +1726,9 @@ impl SchedulerProcessConfig {
         validate_version(self.version)?;
         if self.http.public_base_url.trim().is_empty() {
             return Err(ConfigError::Invalid("http.public_base_url 不能为空".to_owned()));
+        }
+        if self.http.account.as_ref().is_some_and(|account| account.postgres.trim().is_empty()) {
+            return Err(ConfigError::Invalid("http.account.postgres 不能为空".to_owned()));
         }
         Ok(())
     }
@@ -1623,6 +1740,9 @@ impl NodeProcessConfig {
     fn resolve_and_validate(&mut self, base: &Path) -> Result<(), ConfigError> {
         resolve_path(base, &mut self.node.cache_directory);
         resolve_node_model_backend(base, &mut self.model, &mut self.backend);
+        for model in &mut self.node.alternate_models {
+            resolve_node_model_backend(base, model, &mut self.backend);
+        }
         self.validate()
     }
 
@@ -1655,6 +1775,21 @@ impl NodeProcessConfig {
             return Err(ConfigError::Invalid("node.model_alias 不能为空字符串".to_owned()));
         }
         self.backend.validate()?;
+        if !self.node.alternate_models.is_empty() {
+            if self.node.max_concurrency != Some(1) || self.node.model_alias.is_some() {
+                return Err(ConfigError::Invalid("切换模型节点要求 max_concurrency: 1，且不能配置 model_alias".to_owned()));
+            }
+            if !matches!(&self.backend, NodeBackendConfig::Rocm(backend) if backend.devices.len() == 8 && !backend.allow_cpu_reference_fallback) {
+                return Err(ConfigError::Invalid("切换模型节点要求原生 ROCm 单机八卡".to_owned()));
+            }
+            let models = std::iter::once(&self.model).chain(self.node.alternate_models.iter()).collect::<Vec<_>>();
+            if models.len() != 2 || models.iter().filter(|model| matches!(model, NodeModelConfig::MinimaxH3(_))).count() != 1 || models.iter().filter(|model| matches!(model, NodeModelConfig::Seedvr2(_))).count() != 1 {
+                return Err(ConfigError::Invalid("切换模型节点当前要求 H3 和 SeedVR2 各一个配置".to_owned()));
+            }
+            for model in &self.node.alternate_models {
+                validate_node_model_backend(model, &self.backend)?;
+            }
+        }
         validate_node_model_backend(&self.model, &self.backend)
     }
 }
@@ -1700,6 +1835,8 @@ fn resolve_node_model_backend(base: &Path, model: &mut NodeModelConfig, backend:
             resolve_path(base, &mut model.qwen_weights_directory);
             resolve_optional_path(base, &mut model.qwen_tokenizer_directory);
         }
+        NodeModelConfig::Flux2Klein(model) => resolve_path(base, &mut model.weights_directory),
+        NodeModelConfig::Seedvr2(model) => resolve_path(base, &mut model.weights_directory),
         NodeModelConfig::Mistral(model) => resolve_path(base, &mut model.weights_directory),
         NodeModelConfig::K2Horizon(model) => resolve_path(base, &mut model.weights_directory),
         NodeModelConfig::MiniCpm5(model) => resolve_path(base, &mut model.weights_directory),
@@ -1742,12 +1879,25 @@ fn validate_node_model_backend(model: &NodeModelConfig, backend: &NodeBackendCon
             Ok(())
         }
         (NodeModelConfig::MinimaxH3(_), NodeBackendConfig::Rocm(_)) => Err(ConfigError::Invalid("MiniMax-H3 Node 的 backend.devices 数量必须是 1/2/4/8".to_owned())),
+        (NodeModelConfig::Flux2Klein(_), NodeBackendConfig::Rocm(backend)) if backend.devices.len() == 1 => Ok(()),
+        (NodeModelConfig::Flux2Klein(_), NodeBackendConfig::Rocm(_)) => Err(ConfigError::Invalid("FLUX.2 Klein Node 当前要求恰好一个 ROCm device".to_owned())),
+        (NodeModelConfig::Seedvr2(model), NodeBackendConfig::Rocm(backend)) => {
+            if backend.devices.len() != 8 || backend.allow_cpu_reference_fallback {
+                return Err(ConfigError::Invalid("SeedVR2 正式视频路径要求 8 张 ROCm 卡，且禁用 CPU reference fallback".to_owned()));
+            }
+            if model.batch_frames < 5 || model.batch_frames > 361 || !(model.batch_frames - 1).is_multiple_of(4) {
+                return Err(ConfigError::Invalid("SeedVR2 batch_frames 必须为 5..=361 内的 4n+1".to_owned()));
+            }
+            Ok(())
+        }
         (NodeModelConfig::Gemma4(_), _) => Err(ConfigError::Invalid("Gemma 4 Node 当前支持 Metal/CUDA backend".to_owned())),
         (NodeModelConfig::Qwen36(_), _) => Err(ConfigError::Invalid("Qwen3.6/Qwen3.8 Node 当前支持 Metal/CUDA backend".to_owned())),
         (NodeModelConfig::DeepseekV4(_), _) => Err(ConfigError::Invalid("DeepSeek-V4 Node 当前只支持 ROCm backend".to_owned())),
         (NodeModelConfig::Glm53Flash(_), _) => Err(ConfigError::Invalid("GLM-5.3-Flash Node 当前只支持 ROCm backend".to_owned())),
         (NodeModelConfig::Glm52(_), _) => Err(ConfigError::Invalid("GLM-5.2 Node 当前只支持 ROCm backend".to_owned())),
         (NodeModelConfig::MinimaxH3(_), _) => Err(ConfigError::Invalid("MiniMax-H3 Node 当前只支持 ROCm backend".to_owned())),
+        (NodeModelConfig::Flux2Klein(_), _) => Err(ConfigError::Invalid("FLUX.2 Klein Node 当前只支持 ROCm backend".to_owned())),
+        (NodeModelConfig::Seedvr2(_), _) => Err(ConfigError::Invalid("SeedVR2 Node 只支持原生 ROCm backend".to_owned())),
         (NodeModelConfig::Mistral(model), NodeBackendConfig::Metal(_) | NodeBackendConfig::Cuda(_)) => validate_mistral(model),
         (NodeModelConfig::Mistral(_), _) => Err(ConfigError::Invalid("Mistral Node 当前支持 Metal/CUDA backend".to_owned())),
         (NodeModelConfig::K2Horizon(model), NodeBackendConfig::Metal(_)) => validate_k2_horizon(model),
@@ -1885,6 +2035,9 @@ impl StandaloneProcessConfig {
                 models: Vec::new(),
                 anthropic_family_tiers: Default::default(),
                 model_aliases: Default::default(),
+                account_postgres: None,
+                wechat_appid: None,
+                wechat_secret: None,
                 scheduler,
             },
         ))
@@ -2104,9 +2257,6 @@ fn validate_scheduling(scheduling: &Glm52SchedulingConfig) -> Result<(), ConfigE
     if scheduling.execution_slots == 0
         || scheduling.decode_execution_slots == 0
         || scheduling.pipeline_work_window == 0
-        || scheduling.prefill_admission_burst == 0
-        || scheduling.decode_batch_limit == 0
-        || scheduling.prefill_batch_limit == 0
         || scheduling.append_prefill_chunk_size == 0
         || scheduling.decode_priority_prefill_chunk_size == 0
         || scheduling.decode_priority_prefill_chunk_ceiling < scheduling.decode_priority_prefill_chunk_size
@@ -2224,7 +2374,8 @@ fn validate_glm52(model: &Glm52NodeModelConfig, backend: &RocmBackendConfig) -> 
 }
 
 fn validate_deepseek_v4(model: &DeepSeekV4NodeModelConfig, backend: &RocmBackendConfig) -> Result<(), ConfigError> {
-    const LAYERS: usize = 43;
+    // V4=43 层 / V4.1=40 层,配置阶段未定版本,两者皆接受(engine load 时按权重目录探测)
+    const LAYERS: [usize; 2] = [40, 43];
     let execution = &model.execution;
     if model.max_sequence_length == 0
         || execution.core_cache_gib == 0
@@ -2250,8 +2401,8 @@ fn validate_deepseek_v4(model: &DeepSeekV4NodeModelConfig, backend: &RocmBackend
     if !matches!((execution.long_prefill_threshold_tokens, execution.long_prefill_chunk_size), (None, None) | (Some(1..), Some(1..))) {
         return Err(ConfigError::Invalid("DeepSeek-V4 long prefill threshold/chunk 必须同时省略或同时大于 0".to_owned()));
     }
-    if model.layer_ends.len() != backend.devices.len() || model.layer_ends.last().copied() != Some(LAYERS) || model.layer_ends.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(ConfigError::Invalid(format!("DeepSeek-V4 layer_ends 必须与 backend.devices 一一对应、严格递增，最后等于 {LAYERS}")));
+    if model.layer_ends.len() != backend.devices.len() || !LAYERS.contains(&model.layer_ends.last().copied().unwrap_or(0)) || model.layer_ends.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(ConfigError::Invalid(format!("DeepSeek-V4 layer_ends 必须与 backend.devices 一一对应、严格递增，最后等于 {LAYERS:?}")));
     }
     Ok(())
 }
@@ -2327,9 +2478,6 @@ fn validate_stage_glm52(model: &Glm52StageModelConfig, backend: &RocmBackendConf
         if resident_layers.iter().any(|device| device.iter().filter(|&&resident| resident).count() > MAX_PLACEMENT_LAYERS_PER_DEVICE) {
             return Err(ConfigError::Invalid(format!("Stage 多 placement 的常驻权重并集单设备不能超过 {MAX_PLACEMENT_LAYERS_PER_DEVICE} 层")));
         }
-    }
-    if !layers.alternate_device_layer_ends.is_empty() && (model.execution.scheduling.decode_batch_limit != 1 || model.execution.scheduling.prefill_batch_limit != 1) {
-        return Err(ConfigError::Invalid("Stage 多 placement 当前要求 decode_batch_limit=1 且 prefill_batch_limit=1".to_owned()));
     }
     if layers.start == 0 && !layers.alternate_device_layer_ends.is_empty() {
         return Err(ConfigError::Invalid("Stage 多 placement 当前只支持同机 tail，不能改变跨机边界".to_owned()));
@@ -2466,7 +2614,7 @@ const fn default_terminal_cache_prefix_rounds() -> usize {
     4
 }
 const fn default_glm52_prefill_chunk_size() -> usize {
-    2048
+    4096
 }
 const fn default_unlimited_entries() -> usize {
     usize::MAX
@@ -2483,17 +2631,8 @@ const fn default_stage_execution_slots() -> usize {
 const fn default_pipeline_work_window() -> usize {
     8
 }
-const fn default_prefill_admission_burst() -> usize {
-    1
-}
-const fn default_decode_batch_limit() -> usize {
-    4
-}
-const fn default_prefill_batch_limit() -> usize {
-    4
-}
 const fn default_append_prefill_chunk_size() -> usize {
-    2048
+    4096
 }
 const fn default_decode_priority_prefill_chunk_size() -> usize {
     32
@@ -2505,7 +2644,7 @@ const fn default_long_prefill_threshold_tokens() -> usize {
     128 * 1024
 }
 const fn default_long_prefill_chunk_size() -> usize {
-    2048
+    4096
 }
 const fn default_h3_steps() -> usize {
     20
@@ -2529,7 +2668,7 @@ const fn default_glm52_max_sequence_length() -> usize {
     1_048_576
 }
 const fn default_stage_prefill_chunk_size() -> usize {
-    2048
+    4096
 }
 const fn default_stage_max_concurrency() -> usize {
     64
@@ -2663,8 +2802,6 @@ mod tests {
         let RuntimeProcessConfig::Stage(tail) = RuntimeProcessConfig::load(Path::new("config/stage-glm52-tail.yaml")).unwrap() else { unreachable!() };
         let StageModelConfig::Glm52(mut model) = tail.model else { unreachable!() };
         let BackendConfig::Rocm(backend) = tail.backend else { unreachable!() };
-        model.execution.scheduling.decode_batch_limit = 1;
-        model.execution.scheduling.prefill_batch_limit = 1;
         model.layers.device_layer_ends = vec![43, 49, 54, 59, 64, 69, 73, 77];
         model.layers.alternate_device_layer_ends = vec![vec![43, 48, 54, 59, 64, 69, 73, 77]];
         assert!(validate_stage_glm52(&model, &backend).is_ok());
@@ -2735,8 +2872,10 @@ mod tests {
     #[test]
     fn glm52_reasoning_defaults_remain_backward_compatible() {
         let execution: Glm52NodeExecutionConfig = serde_yaml::from_str("{}").unwrap();
-        assert_eq!(execution.prefill_chunk_size, 2048);
-        assert_eq!(execution.scheduling.append_prefill_chunk_size, 2048);
+        assert_eq!(execution.prefill_chunk_size, 4096);
+        assert_eq!(execution.scheduling.append_prefill_chunk_size, 4096);
+        assert_eq!(execution.scheduling.decode_priority_prefill_chunk_size, 4096);
+        assert_eq!(execution.scheduling.decode_priority_prefill_chunk_ceiling, 4096);
         assert_eq!(execution.reasoning_effort, Glm52ReasoningEffort::Max);
         assert_eq!(execution.thinking_token_budget, None);
         assert_eq!(execution.dspark_backend, Glm52DsparkExecutionBackend::Rocm);
@@ -2753,12 +2892,43 @@ mod tests {
         let execution: Glm52NodeExecutionConfig = serde_yaml::from_str("dspark_confidence_threshold: 0.7\n").unwrap();
         assert_eq!(execution.dspark_confidence_threshold, Some(0.7));
         let stage = Glm52StageExecutionConfig::default();
-        assert_eq!(stage.prefill_chunk_size, 2048);
-        assert_eq!(stage.scheduling.append_prefill_chunk_size, 2048);
+        assert_eq!(stage.prefill_chunk_size, 4096);
+        assert_eq!(stage.scheduling.append_prefill_chunk_size, 4096);
         assert_eq!(stage.dspark_weight_quantization, ResidentWeightQuantization::Native);
         let stage: Glm52StageExecutionConfig = serde_yaml::from_str("dspark_weight_quantization: q8g128\n").unwrap();
         assert_eq!(stage.dspark_weight_quantization, ResidentWeightQuantization::Q8g128);
         assert!(serde_yaml::from_str::<Glm52NodeExecutionConfig>("reasoning_effort: medium\n").is_err());
+    }
+
+    #[test]
+    fn seedvr2_full_clip_batches_keep_native_eight_gpu_contract() {
+        let parse = |frames: usize, devices: &str, fallback: bool| {
+            serde_yaml::from_str::<NodeProcessConfig>(&format!("version: 1\nscheduler:\n  ticket: embedded\nnode:\n  cache_directory: ./cache\nmodel:\n  architecture: seedvr2\n  weights_directory: ./w\n  batch_frames: {frames}\nbackend:\n  kind: rocm\n  devices: {devices}\n  allow_cpu_reference_fallback: {fallback}\n")).unwrap()
+        };
+        for frames in [5, 33, 65, 129, 361] {
+            parse(frames, "[0,1,2,3,4,5,6,7]", false).validate().unwrap();
+        }
+        for frames in [0, 1, 4, 64, 360, 365] {
+            assert!(parse(frames, "[0,1,2,3,4,5,6,7]", false).validate().is_err());
+        }
+        assert!(parse(361, "[0,1,2,3]", false).validate().is_err());
+        assert!(parse(361, "[0,1,2,3,4,5,6,7]", true).validate().is_err());
+    }
+
+    #[test]
+    fn 视频切换节点强制单机八卡和共享单名额() {
+        let mut config: NodeProcessConfig = serde_yaml::from_str(&include_str!("../config/node-video-rocm.yaml").replace("kind: node\n", "")).unwrap();
+        config.validate().unwrap();
+        config.node.max_concurrency = Some(2);
+        assert!(config.validate().is_err());
+        config.node.max_concurrency = Some(1);
+        config.node.model_alias = Some("test".to_owned());
+        assert!(config.validate().is_err());
+        config.node.model_alias = None;
+        if let NodeBackendConfig::Rocm(backend) = &mut config.backend {
+            backend.devices.truncate(4);
+        }
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -2854,6 +3024,7 @@ mod tests {
             dsa_hisa_shadow_samples: 0,
             dsa_cpu_select: false,
             mla_cpu_hot_rows: 0,
+            mla_gpu_resident_reserve_bytes: None,
             prefill_attention_cpu: false,
             mla_hot_trace: false,
             grouped_down_route_buffer: false,

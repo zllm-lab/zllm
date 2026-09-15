@@ -40,6 +40,28 @@ impl BlockAttentionSpec {
     pub fn full(geometry: GqaGeometry, query_rows: usize, kv_rows: usize, score_scale: f32) -> Self {
         Self { geometry, score_scale, visible: vec![0..kv_rows; query_rows] }
     }
+
+    /// 两组前缀和定义隔离序列；Q/K 长度可以不同，但不能漏行或含空序列。
+    pub fn varlen(geometry: GqaGeometry, query_rows: usize, kv_rows: usize, query_offsets: &[usize], kv_offsets: &[usize], score_scale: f32) -> Result<Self, String> {
+        if query_offsets.len() < 2
+            || query_offsets.len() != kv_offsets.len()
+            || query_offsets.first() != Some(&0)
+            || kv_offsets.first() != Some(&0)
+            || query_offsets.last() != Some(&query_rows)
+            || kv_offsets.last() != Some(&kv_rows)
+            || query_offsets.windows(2).any(|pair| pair[0] >= pair[1])
+            || kv_offsets.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(format!("varlen attention offsets 非法: Q={query_rows} KV={kv_rows} query={query_offsets:?} kv={kv_offsets:?}"));
+        }
+        let mut visible = Vec::with_capacity(query_rows);
+        for (query, kv) in query_offsets.windows(2).zip(kv_offsets.windows(2)) {
+            visible.extend(std::iter::repeat_n(kv[0]..kv[1], query[1] - query[0]));
+        }
+        let spec = Self { geometry, score_scale, visible };
+        spec.validate(query_rows, kv_rows)?;
+        Ok(spec)
+    }
 }
 
 pub fn attention_f32(query: &[f32], key: &[f32], value: &[f32], query_rows: usize, kv_rows: usize, spec: &BlockAttentionSpec) -> Result<Vec<f32>, String> {
@@ -99,6 +121,17 @@ pub fn attention_f32(query: &[f32], key: &[f32], value: &[f32], query_rows: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn varlen_offsets_preserve_asymmetric_boundaries() {
+        let geometry = GqaGeometry { num_heads: 1, num_kv_heads: 1, head_dim: 1 };
+        let spec = BlockAttentionSpec::varlen(geometry, 3, 5, &[0, 2, 3], &[0, 3, 5], 1.0).unwrap();
+        let output = attention_f32(&[0.0; 3], &[0.0; 5], &[2.0, 4.0, 6.0, 20.0, 40.0], 3, 5, &spec).unwrap();
+        assert_eq!(output, [4.0, 4.0, 30.0]);
+        for (q, k) in [(&[0, 2][..], &[0, 5][..]), (&[0, 0, 3], &[0, 3, 5]), (&[1, 2, 3], &[0, 3, 5]), (&[0, 4, 3], &[0, 3, 5]), (&[0, 2, 3], &[0, 5]), (&[0, 2, 3], &[0, 5, 5])] {
+            assert!(BlockAttentionSpec::varlen(geometry, 3, 5, q, k, 1.0).is_err());
+        }
+    }
 
     #[test]
     fn asymmetric_visibility_is_respected() {

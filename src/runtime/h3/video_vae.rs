@@ -1,6 +1,6 @@
 //! H3 视频 VAE 权重准备、解码与时空分块。
 
-use super::{linear_bias, patchify_video, prepare_h3_video_vae_weight, unpatchify_video};
+use super::{linear_bias, patchify_video, prepare_h3_video_vae_weight};
 use crate::{
     backend::{Backend, BackendError, DiffusionBackend, VaeBackend},
     moe::Activation,
@@ -113,7 +113,14 @@ fn video_vae_block<B: DiffusionBackend + VaeBackend>(backend: &B, hidden: &B::Te
     backend.scaled_residual_bias(&hidden, &update, &weights.down_bias, &weights.scale2)
 }
 
-fn decode_video_vae_batched<B: DiffusionBackend + VaeBackend>(backend: &B, _source: &H3VideoVaeSource, global: &H3PreparedVideoVae<B::Weight>, latents: &[B::Tensor], shape: [usize; 3], patch: [usize; 3]) -> Result<B::Tensor, BackendError> {
+pub(crate) fn decode_video_vae_batched<B: DiffusionBackend + VaeBackend>(
+    backend: &B,
+    _source: &H3VideoVaeSource,
+    global: &H3PreparedVideoVae<B::Weight>,
+    latents: &[B::Tensor],
+    shape: [usize; 3],
+    patch: [usize; 3],
+) -> Result<B::Tensor, BackendError> {
     let spec = H3VideoVaeSpec::standard();
     let batch = latents.len();
     let rows = shape.iter().product::<usize>();
@@ -200,23 +207,12 @@ fn split_video_tiles(input: usize, ratio: usize) -> Result<(Vec<usize>, Vec<usiz
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_video_spatial_tiled<B: DiffusionBackend + VaeBackend>(
-    backend: &B,
-    source: &H3VideoVaeSource,
-    global: &H3PreparedVideoVae<B::Weight>,
-    clip: &[f32],
-    clip_t: usize,
-    latent_h: usize,
-    latent_w: usize,
-    patch: [usize; 3],
-    spec: &H3VideoVaeSpec,
-) -> Result<Vec<f32>, String> {
+fn prepare_video_spatial_tiles(clip: &[f32], clip_t: usize, latent_h: usize, latent_w: usize, patch: [usize; 3], spec: &H3VideoVaeSpec) -> Result<(Vec<Vec<f32>>, [usize; 3]), String> {
     let ratio = spec.spatial_compression;
     let pixel_h = latent_h * ratio;
     let pixel_w = latent_w * ratio;
-    let frames = clip_t * spec.temporal_compression;
-    let (y_starts, y_lengths, y_overlaps) = split_video_tiles(pixel_h, ratio)?;
-    let (x_starts, x_lengths, x_overlaps) = split_video_tiles(pixel_w, ratio)?;
+    let (y_starts, y_lengths, _) = split_video_tiles(pixel_h, ratio)?;
+    let (x_starts, x_lengths, _) = split_video_tiles(pixel_w, ratio)?;
     let batch_tile_h = y_lengths[0];
     let batch_tile_w = x_lengths[0];
     if y_lengths.iter().any(|&length| length != batch_tile_h) || x_lengths.iter().any(|&length| length != batch_tile_w) {
@@ -226,9 +222,9 @@ fn decode_video_spatial_tiled<B: DiffusionBackend + VaeBackend>(
     let tile_latent_w = batch_tile_w / ratio;
     let tile_count = y_starts.len() * x_starts.len();
     let mut inputs = Vec::with_capacity(tile_count);
-    for (tile_y, &pixel_y) in y_starts.iter().enumerate() {
+    for &pixel_y in &y_starts {
         let latent_y = pixel_y / ratio;
-        for (tile_x, &pixel_x) in x_starts.iter().enumerate() {
+        for &pixel_x in &x_starts {
             let latent_x = pixel_x / ratio;
             let mut tile_latent = vec![0.0f32; spec.latent_channels * clip_t * tile_latent_h * tile_latent_w];
             for channel in 0..spec.latent_channels {
@@ -241,121 +237,159 @@ fn decode_video_spatial_tiled<B: DiffusionBackend + VaeBackend>(
                 }
             }
             let rows = patchify_video(&tile_latent, [1, spec.latent_channels, clip_t, tile_latent_h, tile_latent_w], patch)?;
-            inputs.push(
-                backend
-                    .vae_tensor_from_f32(rows, clip_t * (tile_latent_h / patch[1]) * (tile_latent_w / patch[2]), spec.latent_channels * patch.into_iter().product::<usize>())
-                    .map_err(|error| format!("上传 H3 spatial VAE tile ({tile_y},{tile_x}): {error:?}"))?,
-            );
+            inputs.push(rows);
         }
     }
-    let blocks = decode_video_vae_batched(backend, source, global, &inputs, [clip_t, tile_latent_h, tile_latent_w], patch).map_err(|error| format!("H3 batched spatial VAE: {error:?}"))?;
-    let blocks = backend.vae_tensor_to_f32(&blocks).map_err(|error| format!("读取 H3 batched spatial VAE: {error:?}"))?;
-    if blocks.len() % tile_count != 0 {
-        return Err(format!("H3 batched spatial VAE output={} 不能按 {tile_count} tiles 拆分", blocks.len()));
+    Ok((inputs, [clip_t, tile_latent_h, tile_latent_w]))
+}
+
+fn blend_video_spatial_tiles(blocks: &[Vec<f32>], clip_t: usize, latent_h: usize, latent_w: usize, spec: &H3VideoVaeSpec) -> Result<Vec<f32>, String> {
+    let ratio = spec.spatial_compression;
+    let pixel_h = latent_h * ratio;
+    let pixel_w = latent_w * ratio;
+    let frames = clip_t * spec.temporal_compression;
+    let (y_starts, y_lengths, y_overlaps) = split_video_tiles(pixel_h, ratio)?;
+    let (x_starts, x_lengths, x_overlaps) = split_video_tiles(pixel_w, ratio)?;
+    let batch_tile_h = y_lengths[0];
+    let batch_tile_w = x_lengths[0];
+    let tile_count = y_starts.len() * x_starts.len();
+    let tile_block_elements = 3 * frames * batch_tile_h * batch_tile_w;
+    let output_elements = blocks.iter().map(Vec::len).sum::<usize>();
+    if output_elements != tile_count * tile_block_elements || blocks.iter().any(|batch| !batch.len().is_multiple_of(tile_block_elements)) {
+        return Err(format!("H3 batched spatial VAE output={output_elements}，期望 {tile_count} tiles × {tile_block_elements} elements"));
     }
-    let tile_block_elements = blocks.len() / tile_count;
-    let mut block_tiles = blocks.chunks_exact(tile_block_elements);
+    // 各卡回读保持独立分配，避免每个时间块再复制整个空间 batch。
+    let block_tiles = blocks.iter().flat_map(|batch| batch.chunks_exact(tile_block_elements)).collect::<Vec<_>>();
     let mut canvas = vec![0.0f32; 3 * frames * pixel_h * pixel_w];
-    let mut row_tails = Vec::<Vec<f32>>::new();
-    let mut out_y = 0;
+    // 各 plane 的空间融合互不依赖；每个 plane 内仍先做上下融合，再做左右融合。
+    let blend = |first_plane: usize, canvas: &mut [f32]| -> Result<(), String> {
+        let planes = canvas.len() / (pixel_h * pixel_w);
+        let mut row_tails = Vec::<Vec<f32>>::new();
+        let mut out_y = 0;
 
-    for (tile_y, (&_pixel_y, &tile_pixel_h)) in y_starts.iter().zip(&y_lengths).enumerate() {
-        let mut new_tails = Vec::<Vec<f32>>::new();
-        let mut left_tail: Option<Vec<f32>> = None;
-        let mut out_x = 0;
-        let mut visible_h = 0;
+        for (tile_y, (&_pixel_y, &tile_pixel_h)) in y_starts.iter().zip(&y_lengths).enumerate() {
+            let mut new_tails = Vec::<Vec<f32>>::new();
+            let mut left_tail: Option<Vec<f32>> = None;
+            let mut out_x = 0;
+            let mut visible_h = 0;
 
-        for (tile_x, (&_pixel_x, &tile_pixel_w)) in x_starts.iter().zip(&x_lengths).enumerate() {
-            let tile_blocks = block_tiles.next().ok_or("H3 batched spatial VAE 缺少 tile output")?;
-            let mut tile = unpatchify_video(tile_blocks, [1, 3, frames, tile_pixel_h, tile_pixel_w], [spec.temporal_compression, ratio, ratio])?;
+            for (tile_x, (&_pixel_x, &tile_pixel_w)) in x_starts.iter().zip(&x_lengths).enumerate() {
+                let tile_blocks = block_tiles[tile_y * x_lengths.len() + tile_x];
+                let mut tile = vec![0.0f32; planes * tile_pixel_h * tile_pixel_w];
+                let pt = spec.temporal_compression;
+                let patch_columns = 3 * pt * ratio * ratio;
+                for plane in 0..planes {
+                    let original_plane = first_plane + plane;
+                    let channel = original_plane / frames;
+                    let frame = original_plane % frames;
+                    for row in 0..tile_pixel_h {
+                        for x in 0..tile_pixel_w / ratio {
+                            let token = ((frame / pt * (tile_pixel_h / ratio) + row / ratio) * (tile_pixel_w / ratio)) + x;
+                            let column = ((channel * pt + frame % pt) * ratio + row % ratio) * ratio;
+                            let source = token * patch_columns + column;
+                            let target = (plane * tile_pixel_h + row) * tile_pixel_w + x * ratio;
+                            tile[target..target + ratio].copy_from_slice(&tile_blocks[source..source + ratio]);
+                        }
+                    }
+                }
 
-            let next_bottom = if tile_y + 1 < y_starts.len() {
-                let extent = y_overlaps[tile_y];
-                let mut tail = vec![0.0f32; 3 * frames * extent * tile_pixel_w];
-                for channel in 0..3 {
-                    for frame in 0..frames {
+                let next_bottom = if tile_y + 1 < y_starts.len() {
+                    let extent = y_overlaps[tile_y];
+                    let mut tail = vec![0.0f32; planes * extent * tile_pixel_w];
+                    for plane in 0..planes {
                         for row in 0..extent {
-                            let source_offset = ((channel * frames + frame) * tile_pixel_h + tile_pixel_h - extent + row) * tile_pixel_w;
-                            let target_offset = ((channel * frames + frame) * extent + row) * tile_pixel_w;
+                            let source_offset = (plane * tile_pixel_h + tile_pixel_h - extent + row) * tile_pixel_w;
+                            let target_offset = (plane * extent + row) * tile_pixel_w;
                             tail[target_offset..target_offset + tile_pixel_w].copy_from_slice(&tile[source_offset..source_offset + tile_pixel_w]);
                         }
                     }
-                }
-                Some(tail)
-            } else {
-                None
-            };
-            let next_right = if tile_x + 1 < x_starts.len() {
-                let extent = x_overlaps[tile_x];
-                let mut tail = vec![0.0f32; 3 * frames * tile_pixel_h * extent];
-                for channel in 0..3 {
-                    for frame in 0..frames {
+                    Some(tail)
+                } else {
+                    None
+                };
+                let next_right = if tile_x + 1 < x_starts.len() {
+                    let extent = x_overlaps[tile_x];
+                    let mut tail = vec![0.0f32; planes * tile_pixel_h * extent];
+                    for plane in 0..planes {
                         for row in 0..tile_pixel_h {
-                            let source_offset = ((channel * frames + frame) * tile_pixel_h + row) * tile_pixel_w + tile_pixel_w - extent;
-                            let target_offset = ((channel * frames + frame) * tile_pixel_h + row) * extent;
+                            let source_offset = (plane * tile_pixel_h + row) * tile_pixel_w + tile_pixel_w - extent;
+                            let target_offset = (plane * tile_pixel_h + row) * extent;
                             tail[target_offset..target_offset + extent].copy_from_slice(&tile[source_offset..source_offset + extent]);
                         }
                     }
-                }
-                Some(tail)
-            } else {
-                None
-            };
+                    Some(tail)
+                } else {
+                    None
+                };
 
-            if tile_y > 0 {
-                let extent = y_overlaps[tile_y - 1];
-                let previous = &row_tails[tile_x];
-                for channel in 0..3 {
-                    for frame in 0..frames {
+                if tile_y > 0 {
+                    let extent = y_overlaps[tile_y - 1];
+                    let previous = &row_tails[tile_x];
+                    for plane in 0..planes {
                         for row in 0..extent {
                             let weight_b = row as f32 / extent as f32;
                             let weight_a = 1.0 - weight_b;
                             for column in 0..tile_pixel_w {
-                                let tile_index = ((channel * frames + frame) * tile_pixel_h + row) * tile_pixel_w + column;
-                                let tail_index = ((channel * frames + frame) * extent + row) * tile_pixel_w + column;
+                                let tile_index = (plane * tile_pixel_h + row) * tile_pixel_w + column;
+                                let tail_index = (plane * extent + row) * tile_pixel_w + column;
                                 tile[tile_index] = previous[tail_index] * weight_a + tile[tile_index] * weight_b;
                             }
                         }
                     }
                 }
-            }
-            if tile_x > 0 {
-                let extent = x_overlaps[tile_x - 1];
-                let previous = left_tail.as_ref().ok_or("H3 VAE 缺少左侧 overlap")?;
-                for channel in 0..3 {
-                    for frame in 0..frames {
+                if tile_x > 0 {
+                    let extent = x_overlaps[tile_x - 1];
+                    let previous = left_tail.as_ref().ok_or("H3 VAE 缺少左侧 overlap")?;
+                    for plane in 0..planes {
                         for row in 0..tile_pixel_h {
                             for column in 0..extent {
                                 let weight_b = column as f32 / extent as f32;
                                 let weight_a = 1.0 - weight_b;
-                                let tile_index = ((channel * frames + frame) * tile_pixel_h + row) * tile_pixel_w + column;
-                                let tail_index = ((channel * frames + frame) * tile_pixel_h + row) * extent + column;
+                                let tile_index = (plane * tile_pixel_h + row) * tile_pixel_w + column;
+                                let tail_index = (plane * tile_pixel_h + row) * extent + column;
                                 tile[tile_index] = previous[tail_index] * weight_a + tile[tile_index] * weight_b;
                             }
                         }
                     }
                 }
-            }
 
-            visible_h = tile_pixel_h - if tile_y + 1 < y_starts.len() { y_overlaps[tile_y] } else { 0 };
-            let visible_w = tile_pixel_w - if tile_x + 1 < x_starts.len() { x_overlaps[tile_x] } else { 0 };
-            for channel in 0..3 {
-                for frame in 0..frames {
+                visible_h = tile_pixel_h - if tile_y + 1 < y_starts.len() { y_overlaps[tile_y] } else { 0 };
+                let visible_w = tile_pixel_w - if tile_x + 1 < x_starts.len() { x_overlaps[tile_x] } else { 0 };
+                for plane in 0..planes {
                     for row in 0..visible_h {
-                        let source_offset = ((channel * frames + frame) * tile_pixel_h + row) * tile_pixel_w;
-                        let target_offset = ((channel * frames + frame) * pixel_h + out_y + row) * pixel_w + out_x;
+                        let source_offset = (plane * tile_pixel_h + row) * tile_pixel_w;
+                        let target_offset = (plane * pixel_h + out_y + row) * pixel_w + out_x;
                         canvas[target_offset..target_offset + visible_w].copy_from_slice(&tile[source_offset..source_offset + visible_w]);
                     }
                 }
+                if let Some(tail) = next_bottom {
+                    new_tails.push(tail);
+                }
+                left_tail = next_right;
+                out_x += visible_w;
             }
-            if let Some(tail) = next_bottom {
-                new_tails.push(tail);
-            }
-            left_tail = next_right;
-            out_x += visible_w;
+            row_tails = new_tails;
+            out_y += visible_h;
         }
-        row_tails = new_tails;
-        out_y += visible_h;
+
+        Ok(())
+    };
+    let workers = std::thread::available_parallelism().map_or(1, |count| count.get()).min(4).min(3 * frames).min((canvas.len() / 65536).max(1));
+    if workers == 1 {
+        blend(0, &mut canvas)?;
+    } else {
+        let planes_per_worker = (3 * frames).div_ceil(workers);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(workers);
+            for (part, canvas) in canvas.chunks_mut(planes_per_worker * pixel_h * pixel_w).enumerate() {
+                let blend = &blend;
+                handles.push(scope.spawn(move || blend(part * planes_per_worker, canvas)));
+            }
+            for handle in handles {
+                handle.join().map_err(|_| "H3 VAE spatial blend 线程 panic".to_owned())??;
+            }
+            Ok::<_, String>(())
+        })?;
     }
     Ok(canvas)
 }
@@ -372,6 +406,107 @@ pub fn decode_video_vae_tiled_temporal<B: DiffusionBackend + VaeBackend>(
     output_frames: usize,
     patch: [usize; 3],
 ) -> Result<Vec<f32>, String> {
+    decode_video_vae_tiled_temporal_with_tiles(
+        &mut |tiles, shape, patch| {
+            let spec = H3VideoVaeSpec::standard();
+            let rows = (0..3).map(|axis| shape[axis] / patch[axis]).product::<usize>();
+            let cols = spec.latent_channels * patch.into_iter().product::<usize>();
+            let inputs = tiles.iter().map(|tile| backend.vae_tensor_from_f32(tile.clone(), rows, cols)).collect::<Result<Vec<_>, _>>().map_err(|error| format!("上传 H3 spatial VAE tiles: {error:?}"))?;
+            let blocks = decode_video_vae_batched(backend, source, global, &inputs, shape, patch).map_err(|error| format!("H3 batched spatial VAE: {error:?}"))?;
+            backend.vae_tensor_to_f32(&blocks).map(|output| vec![output]).map_err(|error| format!("读取 H3 batched spatial VAE: {error:?}"))
+        },
+        latent,
+        latent_t,
+        latent_h,
+        latent_w,
+        output_frames,
+        patch,
+    )
+}
+
+/// 分块及融合保持唯一实现；设备组合只负责独立 tile batch 的执行与回读。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_video_vae_tiled_temporal_with_tiles(
+    decode_tiles: &mut impl FnMut(&[Vec<f32>], [usize; 3], [usize; 3]) -> Result<Vec<Vec<f32>>, String>,
+    latent: &[f32],
+    latent_t: usize,
+    latent_h: usize,
+    latent_w: usize,
+    output_frames: usize,
+    patch: [usize; 3],
+) -> Result<Vec<f32>, String> {
+    let spec = H3VideoVaeSpec::standard();
+    let clips = video_temporal_clips(latent, [latent_t, latent_h, latent_w])?;
+    let decoded = clips.enumerate().map(|(chunk, (clip_t, clip))| {
+        let result = (|| {
+            let (inputs, shape) = prepare_video_spatial_tiles(&clip, clip_t, latent_h, latent_w, patch, &spec)?;
+            let blocks = decode_tiles(&inputs, shape, patch)?;
+            let pixels = blend_video_spatial_tiles(&blocks, clip_t, latent_h, latent_w, &spec)?;
+            Ok((clip_t * spec.temporal_compression, pixels))
+        })();
+        result.map_err(|error: String| format!("H3 temporal VAE chunk {chunk}: {error}"))
+    });
+    blend_video_temporal_chunks(decoded, latent_h, latent_w, output_frames, &mut |_, _| Ok(()))
+}
+
+/// 零容量握手：consumer 融合当前块时，producer 最多准备并解码下一块。
+/// 队列只交接已回读的主存数据；错误退出必须先关 receiver，再等待 producer。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_video_vae_tiled_temporal_pipelined_with_tiles(
+    decode_tiles: &mut (impl FnMut(&[Vec<f32>], [usize; 3], [usize; 3]) -> Result<Vec<Vec<f32>>, String> + Send),
+    latent: &[f32],
+    latent_t: usize,
+    latent_h: usize,
+    latent_w: usize,
+    output_frames: usize,
+    patch: [usize; 3],
+    cancellation: &std::sync::atomic::AtomicBool,
+    on_decoded: &mut dyn FnMut(&[f32], usize) -> Result<(), String>,
+) -> Result<Vec<f32>, String> {
+    use std::sync::{atomic::Ordering, mpsc::sync_channel};
+    if cancellation.load(Ordering::Acquire) {
+        return Err("H3 VAE 任务已取消".to_owned());
+    }
+    let clips = video_temporal_clips(latent, [latent_t, latent_h, latent_w])?;
+    let spec = H3VideoVaeSpec::standard();
+    std::thread::scope(|scope| {
+        let (sender, receiver) = sync_channel(0);
+        let producer = scope.spawn(move || {
+            for (chunk, (clip_t, clip)) in clips.enumerate() {
+                let decoded = (|| {
+                    if cancellation.load(Ordering::Acquire) {
+                        return Err("H3 VAE 任务已取消".to_owned());
+                    }
+                    let (inputs, shape) = prepare_video_spatial_tiles(&clip, clip_t, latent_h, latent_w, patch, &H3VideoVaeSpec::standard())?;
+                    decode_tiles(&inputs, shape, patch).map(|blocks| (clip_t, blocks))
+                })()
+                .map_err(|error| format!("H3 temporal VAE chunk {chunk}: {error}"));
+                drop(clip);
+                let failed = decoded.is_err();
+                if sender.send(decoded).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        let decoded = receiver.iter().enumerate().map(|(chunk, result)| {
+            let (clip_t, blocks) = result?;
+            if cancellation.load(Ordering::Acquire) {
+                return Err("H3 VAE 任务已取消".to_owned());
+            }
+            blend_video_spatial_tiles(&blocks, clip_t, latent_h, latent_w, &spec).map(|pixels| (clip_t * spec.temporal_compression, pixels)).map_err(|error| format!("H3 temporal VAE chunk {chunk}: {error}"))
+        });
+        let output = blend_video_temporal_chunks(decoded, latent_h, latent_w, output_frames, on_decoded);
+        drop(receiver);
+        producer.join().map_err(|_| "H3 VAE producer 线程 panic".to_owned())?;
+        output
+    })
+}
+
+fn video_temporal_clips(latent: &[f32], shape: [usize; 3]) -> Result<impl Iterator<Item = (usize, Vec<f32>)> + use<>, String> {
+    let [latent_t, latent_h, latent_w] = shape;
+    if shape.contains(&0) {
+        return Err(format!("H3 temporal VAE latent shape={shape:?} 必须非零"));
+    }
     let spec = H3VideoVaeSpec::standard();
     let frame_elements = latent_h.checked_mul(latent_w).ok_or("H3 latent frame 大小溢出")?;
     let expected = spec.latent_channels.checked_mul(latent_t).and_then(|value| value.checked_mul(frame_elements)).ok_or("H3 latent 大小溢出")?;
@@ -381,9 +516,6 @@ pub fn decode_video_vae_tiled_temporal<B: DiffusionBackend + VaeBackend>(
 
     let tokens_per_chunk = spec.temporal_clip_length.div_ceil(spec.temporal_compression);
     let token_overlap = (tokens_per_chunk - spec.temporal_token_drop % tokens_per_chunk) % tokens_per_chunk;
-    let frame_pre_padding = (spec.temporal_compression - spec.temporal_clip_length % spec.temporal_compression) % spec.temporal_compression;
-    let frame_overlap = token_overlap * spec.temporal_compression - frame_pre_padding;
-    let chunk_decoded_frames = tokens_per_chunk * spec.temporal_compression;
     let mut pseudo_tokens = latent_t + spec.temporal_token_drop;
     let mut pad_tokens = (tokens_per_chunk - pseudo_tokens % tokens_per_chunk) % tokens_per_chunk;
     pseudo_tokens += pad_tokens;
@@ -403,21 +535,7 @@ pub fn decode_video_vae_tiled_temporal<B: DiffusionBackend + VaeBackend>(
         }
     }
 
-    let pixel_height = latent_h * spec.spatial_compression;
-    let pixel_width = latent_w * spec.spatial_compression;
-    let pixel_area = pixel_height * pixel_width;
-    let extract_frame = |pixels: &[f32], frames: usize, frame: usize| {
-        let mut output = vec![0.0f32; 3 * pixel_area];
-        for channel in 0..3 {
-            let source = (channel * frames + frame) * pixel_area;
-            output[channel * pixel_area..(channel + 1) * pixel_area].copy_from_slice(&pixels[source..source + pixel_area]);
-        }
-        output
-    };
-
-    let mut decoded = Vec::<Vec<f32>>::new();
-    let mut overlap: Option<Vec<Vec<f32>>> = None;
-    for chunk in 0..chunks {
+    Ok((0..chunks).map(move |chunk| {
         let start = chunk * tokens_per_chunk;
         let end = (start + tokens_per_chunk + token_overlap).min(padded_t);
         let clip_t = end - start;
@@ -427,37 +545,274 @@ pub fn decode_video_vae_tiled_temporal<B: DiffusionBackend + VaeBackend>(
             let target = channel * clip_t * frame_elements;
             clip[target..target + clip_t * frame_elements].copy_from_slice(&padded[source..source + clip_t * frame_elements]);
         }
-        let clip_frames = clip_t * spec.temporal_compression;
-        let pixels = decode_video_spatial_tiled(backend, source, global, &clip, clip_t, latent_h, latent_w, patch, &spec).map_err(|error| format!("H3 temporal VAE chunk {chunk}: {error}"))?;
+        (clip_t, clip)
+    }))
+}
+
+fn blend_video_temporal_chunks(
+    decoded: impl Iterator<Item = Result<(usize, Vec<f32>), String>>,
+    latent_h: usize,
+    latent_w: usize,
+    output_frames: usize,
+    on_decoded: &mut dyn FnMut(&[f32], usize) -> Result<(), String>,
+) -> Result<Vec<f32>, String> {
+    let spec = H3VideoVaeSpec::standard();
+    let tokens_per_chunk = spec.temporal_clip_length.div_ceil(spec.temporal_compression);
+    let token_overlap = (tokens_per_chunk - spec.temporal_token_drop % tokens_per_chunk) % tokens_per_chunk;
+    let frame_pre_padding = (spec.temporal_compression - spec.temporal_clip_length % spec.temporal_compression) % spec.temporal_compression;
+    let frame_overlap = token_overlap * spec.temporal_compression - frame_pre_padding;
+    let chunk_decoded_frames = tokens_per_chunk * spec.temporal_compression;
+    let pixel_height = latent_h * spec.spatial_compression;
+    let pixel_width = latent_w * spec.spatial_compression;
+    let pixel_area = pixel_height * pixel_width;
+    // 直接写入最终 [C,T,H,W]，不再先累积逐帧 Vec 后复制整段视频。
+    let mut output = vec![0.0f32; 3 * output_frames * pixel_area];
+    let mut decoded_frames = 0;
+    let mut overlap: Option<(Vec<f32>, usize, usize)> = None;
+    for chunk in decoded {
+        let (clip_frames, pixels) = chunk?;
         let first_end = chunk_decoded_frames.min(clip_frames);
-        let mut first = (frame_pre_padding..first_end).map(|frame| extract_frame(&pixels, clip_frames, frame)).collect::<Vec<_>>();
-        if let Some(previous) = overlap.take() {
-            let extent = frame_overlap.min(previous.len()).min(first.len());
-            for frame in 0..extent {
-                let weight_b = frame as f32 / extent as f32;
-                let weight_a = 1.0 - weight_b;
-                for (value, &old) in first[frame].iter_mut().zip(&previous[previous.len() - extent + frame]) {
-                    *value = old * weight_a + *value * weight_b;
+        let first_frames = first_end.saturating_sub(frame_pre_padding);
+        for frame in 0..first_frames.min(output_frames.saturating_sub(decoded_frames)) {
+            for channel in 0..3 {
+                let source = (channel * clip_frames + frame_pre_padding + frame) * pixel_area;
+                let target = (channel * output_frames + decoded_frames + frame) * pixel_area;
+                let current = &pixels[source..source + pixel_area];
+                let destination = &mut output[target..target + pixel_area];
+                let previous = overlap.as_ref().filter(|(_, frames, start)| frame < frame_overlap.min(frames - start).min(first_frames));
+                if let Some((previous, previous_frames, previous_start)) = previous {
+                    let extent = frame_overlap.min(previous_frames - previous_start).min(first_frames);
+                    let previous_source = (channel * previous_frames + previous_frames - extent + frame) * pixel_area;
+                    let weight_b = frame as f32 / extent as f32;
+                    let weight_a = 1.0 - weight_b;
+                    for ((value, &old), &current) in destination.iter_mut().zip(&previous[previous_source..previous_source + pixel_area]).zip(current) {
+                        *value = old * weight_a + current * weight_b;
+                    }
+                } else {
+                    destination.copy_from_slice(current);
                 }
             }
         }
-        decoded.extend(first);
+        decoded_frames += first_frames;
+        on_decoded(&output, decoded_frames.min(output_frames))?;
         let second_start = (chunk_decoded_frames + frame_pre_padding).min(clip_frames);
-        overlap = Some((second_start..clip_frames).map(|frame| extract_frame(&pixels, clip_frames, frame)).collect());
+        // 下一块只读取尾部重叠帧；保留当前 canvas 可省去单独提取尾帧的复制。
+        overlap = Some((pixels, clip_frames, second_start));
     }
-    if let Some(overlap) = overlap {
-        decoded.extend(overlap);
-    }
-    if decoded.len() < output_frames {
-        return Err(format!("H3 temporal VAE decoded frames={}，期望至少 {output_frames}", decoded.len()));
-    }
-    decoded.truncate(output_frames);
-    let mut output = vec![0.0f32; 3 * output_frames * pixel_area];
-    for (frame, pixels) in decoded.iter().enumerate() {
-        for channel in 0..3 {
-            let target = (channel * output_frames + frame) * pixel_area;
-            output[target..target + pixel_area].copy_from_slice(&pixels[channel * pixel_area..(channel + 1) * pixel_area]);
+    if let Some((pixels, frames, start)) = overlap {
+        for frame in 0..(frames - start).min(output_frames.saturating_sub(decoded_frames)) {
+            for channel in 0..3 {
+                let source = (channel * frames + start + frame) * pixel_area;
+                let target = (channel * output_frames + decoded_frames + frame) * pixel_area;
+                output[target..target + pixel_area].copy_from_slice(&pixels[source..source + pixel_area]);
+            }
         }
+        decoded_frames += frames - start;
+        on_decoded(&output, decoded_frames.min(output_frames))?;
+    }
+    if decoded_frames < output_frames {
+        return Err(format!("H3 temporal VAE decoded frames={decoded_frames}，期望至少 {output_frames}"));
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spatial_unpatch_preserves_channel_and_frame_layout() {
+        let blocks = (0..3 * 28 * 64 * 64).map(|index| ((index % 997) as f32 - 498.0) / 497.0).collect::<Vec<_>>();
+        let expected = super::super::unpatchify_video(&blocks, [1, 3, 28, 64, 64], [4, 16, 16]).unwrap();
+        let actual = blend_video_spatial_tiles(&[blocks], 7, 4, 4, &H3VideoVaeSpec::standard()).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn temporal_output_preserves_spatial_and_temporal_overlaps() {
+        let latent = vec![0.0; 24 * 12 * 4 * 20];
+        for output_frames in [22, 39] {
+            let mut chunk = 0;
+            let pixels = decode_video_vae_tiled_temporal_with_tiles(
+                &mut |tiles, shape, _| {
+                    assert_eq!(tiles.len(), 2);
+                    let elements = 3 * shape[0] * 4 * 64 * 256;
+                    let outputs = (0..2).map(|tile| vec![(1 + tile + chunk * 10) as f32; elements]).collect();
+                    chunk += 1;
+                    Ok(outputs)
+                },
+                &latent,
+                12,
+                4,
+                20,
+                output_frames,
+                [1, 2, 2],
+            )
+            .unwrap();
+            assert_eq!(pixels.len(), 3 * output_frames * 64 * 320);
+            for channel in 0..3 {
+                let pixel = |frame, x| pixels[(channel * output_frames + frame) * 64 * 320 + x];
+                assert_eq!(pixel(0, 0), 1.0);
+                assert_eq!(pixel(0, 160), 1.5);
+                assert_eq!(pixel(0, 319), 2.0);
+                assert_eq!(pixel(17, 0), 1.0);
+                assert_eq!(pixel(18, 0), 1.0 * 0.8 + 11.0 * 0.2);
+                assert_eq!(pixel(21, 0), 1.0 * (1.0 - 0.8) + 11.0 * 0.8);
+                if output_frames == 39 {
+                    assert_eq!(pixel(22, 0), 11.0);
+                    assert_eq!(pixel(38, 319), 12.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_output_rejects_rank_buffers_that_split_a_tile() {
+        let error = blend_video_spatial_tiles(&[vec![0.0; 3 * 4 * 32 * 32 - 1], vec![0.0]], 1, 2, 2, &H3VideoVaeSpec::standard()).unwrap_err();
+        assert!(error.contains("1 tiles × 12288 elements"), "{error}");
+    }
+
+    fn within_deadline<T: Send + 'static>(run: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || sender.send(run()).is_ok());
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(10)).expect("H3 VAE pipeline 未在超时内结束");
+        assert!(worker.join().unwrap());
+        result
+    }
+
+    fn dummy_tile_outputs(tiles: &[Vec<f32>], shape: [usize; 3], chunk: usize) -> Vec<Vec<f32>> {
+        let elements = 3 * shape[0] * 4 * shape[1] * 16 * shape[2] * 16;
+        tiles.iter().enumerate().map(|(tile, input)| (0..elements).map(|index| input[index % input.len()] + ((index * 7 + tile * 31 + chunk * 11) % 251) as f32 / 64.0).collect()).collect()
+    }
+
+    #[test]
+    fn pipeline_matches_serial_with_overlaps_and_truncated_tail() {
+        within_deadline(|| {
+            let latent = (0..24 * 12 * 4 * 20).map(|index| (index % 127) as f32 / 128.0).collect::<Vec<_>>();
+            for frames in [22, 39] {
+                let mut serial_chunk = 0;
+                let serial = decode_video_vae_tiled_temporal_with_tiles(
+                    &mut |tiles, shape, _| {
+                        let output = dummy_tile_outputs(tiles, shape, serial_chunk);
+                        serial_chunk += 1;
+                        Ok(output)
+                    },
+                    &latent,
+                    12,
+                    4,
+                    20,
+                    frames,
+                    [1, 2, 2],
+                )
+                .unwrap();
+                let mut pipeline_chunk = 0;
+                let mut decoded_progress = Vec::new();
+                let pipeline = decode_video_vae_tiled_temporal_pipelined_with_tiles(
+                    &mut |tiles, shape, _| {
+                        let output = dummy_tile_outputs(tiles, shape, pipeline_chunk);
+                        pipeline_chunk += 1;
+                        Ok(output)
+                    },
+                    &latent,
+                    12,
+                    4,
+                    20,
+                    frames,
+                    [1, 2, 2],
+                    &std::sync::atomic::AtomicBool::new(false),
+                    &mut |_, decoded_frames| {
+                        decoded_progress.push(decoded_frames);
+                        Ok(())
+                    },
+                )
+                .unwrap();
+                assert_eq!(pipeline_chunk, serial_chunk);
+                assert_eq!(decoded_progress.last(), Some(&frames));
+                assert!(decoded_progress.windows(2).all(|pair| pair[0] <= pair[1]));
+                assert!(pipeline.iter().zip(&serial).all(|(actual, expected)| actual.to_bits() == expected.to_bits()));
+                assert_eq!(pipeline.len(), serial.len());
+            }
+        });
+    }
+
+    #[test]
+    fn pipeline_errors_and_producer_panic_release_the_sender() {
+        within_deadline(|| {
+            let latent = vec![0.0; 24 * 12 * 2 * 2];
+            let cancellation = std::sync::atomic::AtomicBool::new(false);
+            for mode in 0..3 {
+                let mut calls = 0;
+                let error = decode_video_vae_tiled_temporal_pipelined_with_tiles(
+                    &mut |tiles, shape, _| {
+                        calls += 1;
+                        match mode {
+                            0 if calls == 2 => Err("injected producer failure".to_owned()),
+                            1 => Ok(vec![vec![0.0]]),
+                            2 => panic!("injected producer panic"),
+                            _ => Ok(dummy_tile_outputs(tiles, shape, calls)),
+                        }
+                    },
+                    &latent,
+                    12,
+                    2,
+                    2,
+                    39,
+                    [1, 2, 2],
+                    &cancellation,
+                    &mut |_, _| Ok(()),
+                )
+                .unwrap_err();
+                let expected = ["injected producer failure", "batched spatial VAE output=1", "producer 线程 panic"][mode];
+                assert!(error.contains(expected), "{error}");
+                assert!((1..=2).contains(&calls), "零容量交接不允许积压更多未来块");
+            }
+        });
+    }
+
+    #[test]
+    fn pipeline_cancellation_during_decode_allows_another_call() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc::sync_channel,
+        };
+        let cancellation = Arc::new(AtomicBool::new(false));
+        let worker_cancellation = Arc::clone(&cancellation);
+        let (entered_sender, entered_receiver) = sync_channel(0);
+        let (release_sender, release_receiver) = sync_channel(0);
+        let (result_sender, result_receiver) = sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let mut calls = 0;
+            let result = decode_video_vae_tiled_temporal_pipelined_with_tiles(
+                &mut move |tiles, shape, _| {
+                    calls += 1;
+                    if calls == 1 {
+                        entered_sender.send(()).unwrap();
+                        release_receiver.recv().unwrap();
+                    }
+                    Ok(dummy_tile_outputs(tiles, shape, calls))
+                },
+                &vec![0.0; 24 * 12 * 2 * 2],
+                12,
+                2,
+                2,
+                39,
+                [1, 2, 2],
+                &worker_cancellation,
+                &mut |_, _| Ok(()),
+            );
+            result_sender.send(result).unwrap();
+        });
+        let timeout = std::time::Duration::from_secs(10);
+        entered_receiver.recv_timeout(timeout).expect("producer 未进入受控 decode");
+        cancellation.store(true, Ordering::Release);
+        release_sender.send(()).unwrap();
+        assert!(result_receiver.recv_timeout(timeout).expect("取消后 pipeline 未退出").unwrap_err().contains("已取消"));
+        worker.join().unwrap();
+        cancellation.store(false, Ordering::Release);
+        within_deadline(move || {
+            let result = decode_video_vae_tiled_temporal_pipelined_with_tiles(&mut |tiles, shape, _| Ok(dummy_tile_outputs(tiles, shape, 0)), &vec![0.0; 24 * 12 * 2 * 2], 12, 2, 2, 39, [1, 2, 2], &cancellation, &mut |_, _| Ok(())).unwrap();
+            assert_eq!(result.len(), 3 * 39 * 32 * 32);
+        });
+    }
 }

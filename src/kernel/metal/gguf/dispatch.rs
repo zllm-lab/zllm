@@ -60,11 +60,23 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
             "gguf_gemm_q6k_fused_f16"
         } else if use_iq4xs_mpp {
             // skinny M 换小 tile:M=42 填充到 128 会浪费 86% MMA FLOP。
-            if input.rows <= 32 { "gguf_gemm_iq4xs_mpp32_f16" } else if input.rows <= 64 { "gguf_gemm_iq4xs_mpp64_f16" } else { "gguf_gemm_iq4xs_mpp_f16" }
+            if input.rows <= 32 {
+                "gguf_gemm_iq4xs_mpp32_f16"
+            } else if input.rows <= 64 {
+                "gguf_gemm_iq4xs_mpp64_f16"
+            } else {
+                "gguf_gemm_iq4xs_mpp_f16"
+            }
         } else if use_iq4xs_fused {
             "gguf_gemm_iq4xs_fused_f16"
         } else if use_iq3s_mpp {
-            if input.rows <= 32 { "gguf_gemm_iq3s_mpp32_f16" } else if input.rows <= 64 { "gguf_gemm_iq3s_mpp64_f16" } else { "gguf_gemm_iq3s_mpp_f16" }
+            if input.rows <= 32 {
+                "gguf_gemm_iq3s_mpp32_f16"
+            } else if input.rows <= 64 {
+                "gguf_gemm_iq3s_mpp64_f16"
+            } else {
+                "gguf_gemm_iq3s_mpp_f16"
+            }
         } else if use_iq3s_fused {
             "gguf_gemm_iq3s_fused_f16"
         } else if ctx.metal4_available() {
@@ -77,7 +89,13 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
         // 回 F16。half 累加器与"float 累加 + half 目的隐式转换 store"两条消除
         // cast 的捷径均已被证伪(见 kernel 注释与 docs 追记)。
         let output = if use_mpp {
-            let pool_tag = if use_iq4xs_mpp { "gguf_iq4xs_mpp_f32" } else if use_iq3s_mpp { "gguf_iq3s_mpp_f32" } else { "gguf_iq4nl_mpp_f32" };
+            let pool_tag = if use_iq4xs_mpp {
+                "gguf_iq4xs_mpp_f32"
+            } else if use_iq3s_mpp {
+                "gguf_iq3s_mpp_f32"
+            } else {
+                "gguf_iq4nl_mpp_f32"
+            };
             ctx.tensor_pooled_f32(pool_tag, input.rows, weight_rows)
         } else {
             ctx.tensor_kernel_output(input.rows, weight_rows)
@@ -98,7 +116,13 @@ pub fn gguf_matmul_tensor_resident(ctx: &MetalContext, input: &MetalTensor, blob
         set_bytes(&encoder, 5, &n);
         set_bytes(&encoder, 6, &k);
         set_bytes(&encoder, 7, &row_bytes_u32);
-        let mpp_tile_rows: usize = if kernel_name.ends_with("mpp32_f16") { 32 } else if kernel_name.ends_with("mpp64_f16") { 64 } else { 128 };
+        let mpp_tile_rows: usize = if kernel_name.ends_with("mpp32_f16") {
+            32
+        } else if kernel_name.ends_with("mpp64_f16") {
+            64
+        } else {
+            128
+        };
         let groups = if use_mpp {
             MTLSize::new(input.rows.div_ceil(mpp_tile_rows) as u64, weight_rows.div_ceil(64) as u64, 1)
         } else if use_iq4nl_fused || use_iq4xs_fused || use_iq3s_fused {

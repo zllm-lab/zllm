@@ -17,7 +17,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,16 +26,22 @@ use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 
 use scheduler::{DispatchError, InferenceEvent, SCHEDULER_ALPN, Scheduler, SchedulerService};
 
+mod account;
 mod anthropic;
 mod chat;
 use chat::chat_completions;
 mod h3;
+mod image;
 pub mod iroh;
 pub mod node;
+mod prompt;
 mod responses;
 pub mod scheduler;
+mod seedvr2;
 pub mod stage_transport;
+mod studio;
 use h3::{create_video_generation, delete_video_generation, download_artifact, list_video_generation, query_video_generation};
+use image::{create_image_generation, delete_image_generation, list_image_generation, query_image_generation};
 
 const MAX_REQUEST_BYTES: usize = 80 * 1024 * 1024;
 
@@ -49,6 +55,11 @@ pub struct ServerConfig {
     /// 对外别名 -> 后台真实模型；请求模型命中别名时重写后再调度（见 `resolve_model_alias`）。
     pub model_aliases: std::collections::HashMap<String, String>,
     pub anthropic_family_tiers: std::collections::HashMap<String, String>,
+    /// H3 网站账户库；未配置时账户接口返回 503，不影响推理 API。
+    pub account_postgres: Option<String>,
+    /// 微信小程序一键登录（jscode2session 的 appid/secret）；未配置时 /api/auth/wechat-login 返回 503。
+    pub wechat_appid: Option<String>,
+    pub wechat_secret: Option<String>,
     pub scheduler: scheduler::SchedulerConfig,
 }
 
@@ -195,6 +206,8 @@ struct ChatCompletionRequest {
     repeat_loop_breaker: Option<bool>,
     /// 单请求 prefill chunk 上限；不会超过 YAML 最大值，也不改变 KV 布局。
     prefill_chunk_size: Option<usize>,
+    /// 单请求 MTP 深度上限；不会超过节点启动时已经加载的 draft 深度。
+    mtp_draft_tokens: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -274,8 +287,22 @@ fn router_with_scheduler(config: ServerConfig, scheduler: Scheduler, scheduler_t
         ServerState { config: Arc::new(config), scheduler, scheduler_ticket: scheduler_ticket.map(Arc::from), created, request_sequence: Arc::new(AtomicU64::new(1)), response_continuations: Arc::new(Mutex::new(response_continuations)) };
     Router::new()
         .route("/health", get(health))
+        .route("/api/auth/register", post(account::register))
+        .route("/api/auth/login", post(account::login))
+        .route("/api/auth/wechat-login", post(account::wechat_login))
+        .route("/api/auth/logout", post(account::logout))
+        .route("/api/me", get(account::me))
+        .route("/api/prompts/enhance", post(prompt::enhance))
+        .route("/api/generations", post(studio::create_generation).get(studio::list_generations))
+        .route("/api/generations/{task_id}", get(studio::get_generation))
+        .route("/api/generations/{task_id}/cancel", post(studio::cancel_generation))
+        .route("/api/generations/{task_id}/hd", post(studio::create_hd))
+        .route("/api/assets", post(studio::upload_asset).get(studio::list_assets))
+        .route("/api/assets/{asset_id}", delete(studio::delete_asset))
+        .route("/api/assets/{asset_id}/content", get(studio::asset_content))
         .route("/v1/models", get(models))
         .route("/v1/nodes", get(nodes))
+        .route("/v1/nodes/{node_id}/runtime", patch(update_node_runtime))
         .route("/v1/caches/{cache_id}", get(cache_lookup))
         .route("/v1/scheduler", get(scheduler_info))
         .route("/v1/chat/completions", post(chat::chat_completions))
@@ -286,6 +313,13 @@ fn router_with_scheduler(config: ServerConfig, scheduler: Scheduler, scheduler_t
         .route("/v2/query/video_generation", get(list_video_generation))
         .route("/v2/query/video_generation/{task_id}", get(query_video_generation))
         .route("/v2/video_generation/{task_id}", delete(delete_video_generation))
+        .route("/v2/image_generation", post(create_image_generation))
+        .route("/v2/query/image_generation", get(list_image_generation))
+        .route("/v2/query/image_generation/{task_id}", get(query_image_generation))
+        .route("/v2/image_generation/{task_id}", delete(delete_image_generation))
+        .route("/v2/video_super_resolution", post(seedvr2::create))
+        .route("/v2/query/video_super_resolution/{task_id}", get(seedvr2::query))
+        .route("/v2/video_super_resolution/{task_id}", delete(seedvr2::cancel))
         .route("/v1/artifacts/{task_id}/{artifact_id}", get(download_artifact))
         .fallback(drain_not_found)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -293,6 +327,8 @@ fn router_with_scheduler(config: ServerConfig, scheduler: Scheduler, scheduler_t
 }
 
 pub async fn serve(listener: tokio::net::TcpListener, config: ServerConfig) -> std::io::Result<()> {
+    account::initialize(&config).await.map_err(std::io::Error::other)?;
+    studio::initialize(&config).await.map_err(std::io::Error::other)?;
     let scheduler_service = SchedulerService::bind(config.node_api_key.clone(), config.scheduler.clone()).await.map_err(std::io::Error::other)?;
     let ticket = scheduler_service.ticket().to_owned();
     println!("zLLM iroh scheduler ticket: {ticket}");
@@ -399,6 +435,22 @@ async fn nodes(State(state): State<ServerState>, headers: HeaderMap) -> Response
         "data": &nodes,
     });
     with_request_id(Json(summary).into_response(), &request_id)
+}
+
+/// `PATCH /v1/nodes/{node_id}/runtime` — 把部分配置下发给仍在运行的节点。
+/// 修改接口沿用服务 API key；实际生效值和校验错误从 `/v1/nodes` 回读。
+async fn update_node_runtime(State(state): State<ServerState>, Path(node_id): Path<String>, mut headers: HeaderMap, Json(patch): Json<Value>) -> Response {
+    let request_id = state.request_id();
+    if let Err(error) = authorize(&state.config, &mut headers) {
+        return error.into_response(&request_id);
+    }
+    if !patch.is_object() {
+        return ApiError::invalid("runtime patch 必须是 JSON object", "body").into_response(&request_id);
+    }
+    match state.scheduler.update_runtime_config(&node_id, patch).await {
+        Ok(()) => with_request_id(Json(json!({ "node_id": node_id, "status": "queued" })).into_response(), &request_id),
+        Err(_) => ApiError { status: StatusCode::NOT_FOUND, message: format!("节点 {node_id} 不存在或已断开"), kind: "not_found", param: Some("node_id".to_owned()), code: "node_not_found" }.into_response(&request_id),
+    }
 }
 
 /// `GET /v1/caches/{cache_id}` — 查 cache 当前在哪个 node（含已换出到 swap 的仍算该 owner 持有）。
@@ -1713,5 +1765,36 @@ mod tests {
         assert_eq!(nodes[0]["node_id"], "n1");
         assert_eq!(nodes[0]["max_load"], 8);
         assert_eq!(nodes[0]["current_load"], 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_patch_requires_auth_and_reaches_selected_node() {
+        let mut config = ServerConfig::default();
+        config.api_keys = vec!["sk-zllm-test".to_owned()];
+        let state = ServerState { config: Arc::new(config), ..test_state() };
+        let mut channels = state.scheduler.attach_local_node("hot-node".to_owned());
+        channels
+            .messages
+            .send(scheduler::NodeMessage::Register {
+                protocol_version: scheduler::SCHEDULER_PROTOCOL_VERSION,
+                api_key: None,
+                model: "glm-5.2".to_owned(),
+                max_concurrency: 12,
+                caches: Vec::new(),
+                capabilities: scheduler::NodeCapabilities::default(),
+                runtime: scheduler::NodeRuntime::default(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(channels.commands.recv().await, Some(scheduler::LocalNodeCommand::Wire(scheduler::SchedulerMessage::Registered { .. }))));
+
+        let rejected = update_node_runtime(State(state.clone()), Path("hot-node".to_owned()), HeaderMap::new(), Json(json!({"max_concurrency": 6}))).await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer sk-zllm-test"));
+        let accepted = update_node_runtime(State(state), Path("hot-node".to_owned()), headers, Json(json!({"max_concurrency": 6}))).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert!(matches!(channels.commands.recv().await, Some(scheduler::LocalNodeCommand::Wire(scheduler::SchedulerMessage::UpdateRuntimeConfig { patch })) if patch["max_concurrency"] == 6));
     }
 }

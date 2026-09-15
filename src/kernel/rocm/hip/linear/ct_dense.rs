@@ -389,9 +389,8 @@ fn try_ct_quantized_matmul_bf16_epilogue(
     let use_w8 = !use_wmma && bits == 8 && group_size % 4 == 0 && input_columns % 4 == 0;
     let g32_rows_shared_occupancy_limited = group_size == 32 && input_columns / group_size >= 128 && output_rows >= 8192;
     // 合批和 verify 尾组也会产生奇数行；G128 大矩阵共享权重读取，保持逐行累加次序。
-    let use_w8_rows_shared = use_w8
-        && functions.wavefront_size == 32
-        && (group_size == 32 && matches!(input_rows, 4 | 6 | 8) && !g32_rows_shared_occupancy_limited || group_size == 128 && (3..=8).contains(&input_rows) && input_columns / group_size >= 32);
+    let use_w8_rows_shared =
+        use_w8 && functions.wavefront_size == 32 && (group_size == 32 && matches!(input_rows, 4 | 6 | 8) && !g32_rows_shared_occupancy_limited || group_size == 128 && (3..=8).contains(&input_rows) && input_columns / group_size >= 32);
     let use_w8_row_pairs = use_w8 && !use_w8_rows_shared && matches!(input_rows, 2 | 4 | 6 | 8) && matches!(group_size, 32 | 128) && functions.wavefront_size == 32;
     let use_w4_rows_shared = !use_wmma && bits == 4 && (2..=8).contains(&input_rows) && group_size == 128 && functions.wavefront_size == 32;
     if let Some(residual) = residual {

@@ -23,6 +23,10 @@ pub(crate) enum CpuExpertArchive {
     Nvfp4(NvidiaNvfp4Experts),
     Gguf(Arc<dyn GgufExpertSource>),
     Ct(CompressedTensorsSource),
+    /// 全部层专家常驻内存的 F32 形态;CPU oracle / 无文件测试用。
+    F32Resident {
+        layers: Vec<Vec<ExpertF32>>,
+    },
 }
 
 pub struct CpuPrefillExperts {
@@ -44,6 +48,11 @@ impl CpuPrefillExperts {
 
     pub fn ct(source: CompressedTensorsSource) -> Self {
         Self { archive: CpuExpertArchive::Ct(source) }
+    }
+
+    /// `layers[layer][expert]` 的 (gate, up, down) 行主序 F32 权重全部常驻内存。
+    pub fn f32_resident(layers: Vec<Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>>) -> Self {
+        Self { archive: CpuExpertArchive::F32Resident { layers: layers.into_iter().map(|experts| experts.into_iter().map(|(gate, up, down)| ExpertF32 { gate, up, down }).collect()).collect() } }
     }
 }
 
@@ -69,6 +78,10 @@ impl ExpertPrefillBackend for CpuContext {
                     let up = source.load_matrix(&format!("model.layers.{layer}.mlp.experts.{e}.up_proj.weight")).and_then(|m| m.decode()).map_err(BackendError::ExpertLoad)?;
                     let down = source.load_matrix(&format!("model.layers.{layer}.mlp.experts.{e}.down_proj.weight")).and_then(|m| m.decode()).map_err(BackendError::ExpertLoad)?;
                     Ok(CpuPrefillExpert::F32(ExpertF32 { gate, up, down }))
+                }
+                CpuExpertArchive::F32Resident { layers } => {
+                    let expert = layers.get(layer).and_then(|experts| experts.get(item.expert)).ok_or_else(|| BackendError::ExpertLoad(format!("CPU F32 resident expert L{layer}#{} 越界", item.expert)))?;
+                    Ok(CpuPrefillExpert::F32(ExpertF32 { gate: expert.gate.clone(), up: expert.up.clone(), down: expert.down.clone() }))
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;

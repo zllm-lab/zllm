@@ -5,9 +5,11 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
@@ -22,8 +24,6 @@ use crate::{
 
 use crate::backend::rocm::{DsaLayerSerde, MlaLayerSerde, RocmContext, RocmKvOwnership};
 
-pub(super) const MIN_PERSIST_TOKENS: usize = 2048;
-
 const VERSION: u32 = 9;
 const INFO_MAGIC: [u8; 8] = *b"ZGLM5I01";
 const MANIFEST_MAGIC: [u8; 8] = *b"ZGLM5M01";
@@ -36,6 +36,7 @@ pub struct Glm52StageCache {
 }
 
 /// MTP L78 跨请求继续 draft 所需的稳定状态；本轮临时参数不落盘。
+#[derive(Clone)]
 pub struct Glm52MtpCache {
     pub position: usize,
     pub pending_hidden: Vec<u16>,
@@ -45,6 +46,7 @@ pub struct Glm52MtpCache {
 }
 
 /// DSpark 恢复 draft 投影所需的最近一段归一化 target aux hidden。
+#[derive(Clone)]
 pub struct Glm52DsparkAuxCache {
     pub start_position: usize,
     pub rows: usize,
@@ -53,18 +55,21 @@ pub struct Glm52DsparkAuxCache {
 }
 
 /// DSpark target K/V 必须保持运行时 F32，避免 SSD 恢复改变 draft acceptance。
+#[derive(Clone)]
 pub struct Glm52DsparkTargetTensor {
     pub rows: usize,
     pub columns: usize,
     pub values: Vec<f32>,
 }
 
+#[derive(Clone)]
 pub struct Glm52DsparkTargetLayerCache {
     pub start_position: usize,
     pub key: Glm52DsparkTargetTensor,
     pub value: Glm52DsparkTargetTensor,
 }
 
+#[derive(Clone)]
 pub struct Glm52DsparkTargetCache {
     pub layers: Vec<Glm52DsparkTargetLayerCache>,
 }
@@ -83,21 +88,133 @@ pub fn download_glm52_session(states: &[Glm52StageState<RocmContext>]) -> Result
         .collect()
 }
 
+/// 所有下载成功后才移走 MLA 镜像；任一 DSA 分块下载失败均保留原会话。
+pub fn take_glm52_session(states: &mut [Glm52StageState<RocmContext>]) -> Result<Vec<Glm52StageCache>, String> {
+    let mut snapshots = states
+        .iter()
+        .map(|state| {
+            state.backend.activate().map_err(|error| format!("激活 ROCm device {}: {error}", state.backend.device_id()))?;
+            Ok(Glm52StageCache {
+                layer_start: state.layer_start,
+                dsa: state.dsa.download_layers().map_err(|error| format!("换出 L{} DSA 两分块: {error:?}", state.layer_start))?,
+                kv: state.cache.prepare_host_layers().map_err(|error| format!("准备 L{} MLA 主存镜像: {error:?}", state.layer_start))?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for (state, snapshot) in states.iter_mut().zip(&mut snapshots) {
+        state.cache.take_prepared_host_layers(&mut snapshot.kv);
+    }
+    Ok(snapshots)
+}
+
 pub fn upload_glm52_session(states: &mut [Glm52StageState<RocmContext>], snapshot: &[Glm52StageCache], cfg: &Glm52Config, max_seq_len: usize, reserved_rows: usize) -> Result<(), String> {
     if states.len() != snapshot.len() {
         return Err(format!("GLM stage cache 数量={}，当前 device stage={}", snapshot.len(), states.len()));
     }
-    for (state, cached) in states.iter_mut().zip(snapshot) {
+    for (state, cached) in states.iter().zip(snapshot) {
         if cached.layer_start != state.layer_start {
             return Err(format!("GLM stage cache layer_start={}，当前 stage={}", cached.layer_start, state.layer_start));
         }
-        state.backend.activate().map_err(|error| format!("激活 ROCm device {}: {error}", state.backend.device_id()))?;
-        state.reset_session(cfg, max_seq_len).map_err(|error| format!("重置 L{} session: {error:?}", state.layer_start))?;
-        let interleaved_pair = cached.kv.iter().flatten().any(|layer| layer.ownership == RocmKvOwnership::InterleavedPair);
-        state.cache.upload_layers(&state.backend, &cached.kv, reserved_rows).map_err(|error| format!("恢复 L{} KV: {error:?}", state.layer_start))?;
-        state.dsa.upload_layers(&state.backend, &cached.dsa, reserved_rows, interleaved_pair).map_err(|error| format!("恢复 L{} DSA: {error:?}", state.layer_start))?;
     }
-    Ok(())
+    let started = std::time::Instant::now();
+    let count = states.len();
+    // 每个 stage 独占自己的 cache 和设备；互不依赖的恢复不必串行。
+    // 线程数仅随物理 stage 数增长，错误返回前仍等待全部借用结束。
+    let result = std::thread::scope(|scope| {
+        let jobs = states
+            .iter_mut()
+            .zip(snapshot)
+            .map(|(state, cached)| {
+                scope.spawn(move || -> Result<(), String> {
+                    let started = std::time::Instant::now();
+                    state.backend.activate().map_err(|error| format!("激活 ROCm device {}: {error}", state.backend.device_id()))?;
+                    state.reset_session(cfg, max_seq_len).map_err(|error| format!("重置 L{} session: {error:?}", state.layer_start))?;
+                    let reset_ms = started.elapsed().as_secs_f64() * 1e3;
+                    let interleaved_pair = state.experts.lock().map_err(|_| format!("恢复 L{} expert 锁中毒", state.layer_start))?.dsa_sequence_sharded();
+                    state.cache.upload_layers(&state.backend, &cached.kv, reserved_rows).map_err(|error| format!("恢复 L{} KV: {error:?}", state.layer_start))?;
+                    let kv_ms = started.elapsed().as_secs_f64() * 1e3 - reset_ms;
+                    state.dsa.upload_layers(&state.backend, &cached.dsa, reserved_rows, interleaved_pair).map_err(|error| format!("恢复 L{} DSA: {error:?}", state.layer_start))?;
+                    let total_ms = started.elapsed().as_secs_f64() * 1e3;
+                    eprintln!("[glm52-cache-upload] device={} layer_start={} reset_ms={reset_ms:.3} mla_ms={kv_ms:.3} dsa_ms={:.3} total_ms={total_ms:.3}", state.backend.device_id(), state.layer_start, total_ms - reset_ms - kv_ms);
+                    Ok(())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut error = None;
+        for job in jobs {
+            if let Err(message) = job.join().map_err(|_| "GLM stage cache 恢复线程 panic".to_owned()).and_then(|result| result) {
+                error.get_or_insert(message);
+            }
+        }
+        error.map_or(Ok(()), Err)
+    });
+    eprintln!("[glm52-cache-upload-batch] stages={count} wall_ms={:.3} success={}", started.elapsed().as_secs_f64() * 1e3, result.is_ok());
+    result
+}
+
+/// Open 已发出后准备本机历史，让两端注册重叠；返回前等待所有设备完成。
+pub(super) fn prepare_glm52_hot_history(states: &mut [Glm52StageState<RocmContext>], reserved_rows: usize) -> Result<(), String> {
+    let options = crate::kernel::rocm::hip::options();
+    if options.mla_gpu_resident_reserve_bytes.is_none() || options.mla_cpu_hot_rows <= 64 {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let result = std::thread::scope(|scope| {
+        let jobs = states
+            .iter_mut()
+            .map(|state| {
+                scope.spawn(move || {
+                    let peer = state.experts.lock().map_err(|_| format!("准备 L{} 主存历史 expert 锁中毒", state.layer_start))?.operator_peer_context();
+                    state.cache.prepare_restored_hot_history(&state.backend, peer.as_ref(), reserved_rows).map_err(|error| format!("准备 L{} 主存历史注册: {error:?}", state.layer_start))
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut error = None;
+        for job in jobs {
+            if let Err(message) = job.join().map_err(|_| "GLM 主存历史准备线程 panic".to_owned()).and_then(|result| result) {
+                error.get_or_insert(message);
+            }
+        }
+        error.map_or(Ok(()), Err)
+    });
+    eprintln!("[glm52-cache-prepare] wall_ms={:.3} success={}", started.elapsed().as_secs_f64() * 1e3, result.is_ok());
+    result
+}
+
+/// 注册任务独占尚未交给流水线的缓存；取消或异常析构也等待借用结束。
+pub(super) struct Glm52HotHistoryPrepare {
+    worker: Option<std::thread::JoinHandle<(Vec<Glm52StageState<RocmContext>>, Result<(), String>)>>,
+}
+
+impl Glm52HotHistoryPrepare {
+    pub(super) fn start(mut states: Vec<Glm52StageState<RocmContext>>, rows: usize) -> Result<Self, String> {
+        let worker = std::thread::Builder::new()
+            .name("glm52-host-ready".into())
+            .spawn(move || {
+                let result = prepare_glm52_hot_history(&mut states, rows);
+                (states, result)
+            })
+            .map_err(|error| format!("启动 GLM 主存准备线程: {error}"))?;
+        Ok(Self { worker: Some(worker) })
+    }
+
+    pub(super) fn is_finished(&self) -> bool {
+        self.worker.as_ref().is_some_and(std::thread::JoinHandle::is_finished)
+    }
+
+    pub(super) fn finish(mut self) -> Result<Vec<Glm52StageState<RocmContext>>, String> {
+        let (states, result) = self.worker.take().ok_or("GLM 主存准备已经取走")?.join().map_err(|_| "GLM 主存准备线程 panic")?;
+        result?;
+        Ok(states)
+    }
+}
+
+impl Drop for Glm52HotHistoryPrepare {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 pub struct Glm52CacheSnapshot {
@@ -388,6 +505,12 @@ fn read_blob(reader: &mut SnapshotReader<'_>, what: &str) -> Result<FjallBlob, S
 pub struct Glm52SwapStore {
     store: FjallCacheStore,
     cache_revision: AtomicU64,
+    // 多会话共享四条读通道，避免每份快照并行后临时分块随请求数膨胀。
+    read_lanes: [Mutex<()>; 4],
+    // 主存快照拥有已结束会话；prefetch 用 Arc 保持换入期间的数据寿命。
+    host: Mutex<BTreeMap<String, (Arc<Glm52CacheSnapshot>, Glm52SwapInfo)>>,
+    host_budget: AtomicU64,
+    host_reserve: u64,
 }
 
 pub struct Glm52CacheIdentity {
@@ -438,7 +561,86 @@ impl Glm52SwapStore {
         let dir = dir.into();
         let store = FjallCacheStore::open(dir.join("fjall"))?;
         store.bind_metadata(&identity.metadata)?;
-        Ok(Self { store, cache_revision: AtomicU64::new(0) })
+        let available = crate::runtime::rocm_chain::host_available_bytes()?;
+        Ok(Self {
+            store,
+            cache_revision: AtomicU64::new(0),
+            host: Mutex::new(BTreeMap::new()),
+            read_lanes: std::array::from_fn(|_| Mutex::new(())),
+            // 另一半留给运行中的完整 MLA 镜像与 prefill；实际 MemAvailable 再兜底。
+            host_budget: AtomicU64::new(available / 2),
+            host_reserve: (available / 8).max(8 << 30),
+        })
+    }
+
+    /// 换出完成后的唯一主存所有者。提交 SSD 失败也不能丢掉这份快照。
+    pub fn cache_host(&self, snapshot: Arc<Glm52CacheSnapshot>, completed_unix: u64) {
+        let info = Glm52SwapInfo { cache_id: snapshot.cache_id.clone(), token_count: snapshot.token_count, resident_bytes: snapshot.resident_bytes(), file_bytes: 0, modified_unix: completed_unix };
+        self.host.lock().unwrap_or_else(|error| error.into_inner()).insert(info.cache_id.clone(), (snapshot, info));
+        self.cache_revision.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn host_infos(&self) -> Vec<Glm52SwapInfo> {
+        self.host.lock().unwrap_or_else(|error| error.into_inner()).values().map(|(_, info)| info.clone()).collect()
+    }
+
+    pub fn load(&self, cache_id: &str) -> Result<Option<Arc<Glm52CacheSnapshot>>, String> {
+        if let Some((snapshot, _)) = self.host.lock().map_err(|_| "GLM host cache 锁中毒")?.get(cache_id) {
+            eprintln!("[glm52-host-hit] cache_id={cache_id} tokens={}", snapshot.token_count);
+            return Ok(Some(Arc::clone(snapshot)));
+        }
+        self.get(cache_id).map(|snapshot| snapshot.map(Arc::new))
+    }
+
+    /// SSD 成功提交后才释放主存。持锁保证同 id 的新快照不会被旧写入覆盖。
+    pub fn spill_host(&self, required_bytes: u64) -> Result<usize, String> {
+        let mut host = self.host.lock().map_err(|_| "GLM host cache 锁中毒")?;
+        let mut written = 0;
+        loop {
+            let bytes = host.values().fold(0u64, |bytes, (_, info)| bytes.saturating_add(info.resident_bytes));
+            let available = crate::runtime::rocm_chain::host_available_bytes()?;
+            if bytes <= self.host_budget.load(Ordering::Acquire) && available >= self.host_reserve.saturating_add(required_bytes) {
+                break;
+            }
+            let Some(id) = host.iter().min_by_key(|(_, (_, info))| info.modified_unix).map(|(id, _)| id.clone()) else { break };
+            let (snapshot, info) = &host[&id];
+            self.put_completed(snapshot, info.modified_unix)?;
+            eprintln!("[glm52-host-spill] cache_id={id} tokens={} bytes={} host_bytes={bytes}", info.token_count, info.resident_bytes);
+            host.remove(&id);
+            self.cache_revision.fetch_add(1, Ordering::Release);
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    pub fn persist_host(&self, cache_id: &str) -> Result<bool, String> {
+        let host = self.host.lock().map_err(|_| "GLM host cache 锁中毒")?;
+        let Some((snapshot, info)) = host.get(cache_id) else { return Ok(false) };
+        self.put_completed(snapshot, info.modified_unix)?;
+        Ok(true)
+    }
+
+    /// 退出逐个提交时交接所有权，避免稍后的全表落盘再次写同一份大历史。
+    pub(super) fn persist_host_and_release(&self, cache_id: &str) -> Result<bool, String> {
+        let mut host = self.host.lock().map_err(|_| "GLM host cache 锁中毒")?;
+        let Some((snapshot, info)) = host.get(cache_id) else { return Ok(false) };
+        self.put_completed(snapshot, info.modified_unix)?;
+        host.remove(cache_id);
+        self.cache_revision.fetch_add(1, Ordering::Release);
+        Ok(true)
+    }
+
+    pub fn persist_host_all(&self) -> Result<usize, String> {
+        let mut host = self.host.lock().map_err(|_| "GLM host cache 锁中毒")?;
+        let mut count = 0;
+        while let Some(id) = host.keys().next().cloned() {
+            let (snapshot, info) = &host[&id];
+            self.put_completed(snapshot, info.modified_unix)?;
+            host.remove(&id);
+            self.cache_revision.fetch_add(1, Ordering::Release);
+            count += 1;
+        }
+        Ok(count)
     }
 
     pub(super) fn cache_revision(&self) -> u64 {
@@ -588,10 +790,19 @@ impl Glm52SwapStore {
             generation, cache_id, cache_namespace, tokens, token_count, pending_tokens, last_hidden, stages: stage_manifests, mtp: mtp_manifest, dspark_aux: dspark_aux_manifest, dspark_target: dspark_target_manifest, ..
         } = manifest;
         let mtp_stage_index = stage_manifests.len();
-        let mut stages = Vec::with_capacity(stage_manifests.len());
-        for (stage_index, stage) in stage_manifests.into_iter().enumerate() {
-            stages.push(self.restore_stage(&cache_id, generation, stage_index, stage)?);
-        }
+        let stages = std::thread::scope(|scope| {
+            let jobs = stage_manifests
+                .into_iter()
+                .enumerate()
+                .map(|(index, stage)| {
+                    let cache_id = &cache_id;
+                    scope.spawn(move || self.restore_stage(cache_id, generation, index, stage).map_err(|error| format!("读取 GLM cache={cache_id} generation={generation} stage={index}: {error}")))
+                })
+                .collect::<Vec<_>>();
+            // 先等待每个 reader，再传播失败；返回后不得遗留正在借用 store 的线程。
+            let results = jobs.into_iter().map(|job| job.join().map_err(|_| format!("读取 GLM cache={cache_id} stage 线程 panic")).and_then(|result| result)).collect::<Vec<_>>();
+            results.into_iter().collect::<Result<Vec<_>, _>>()
+        })?;
         let mtp = mtp_manifest
             .map(|mtp| {
                 let Glm52MtpManifest { position, pending_hidden, prompt_tokens, kv, dsa } = mtp;
@@ -609,10 +820,15 @@ impl Glm52SwapStore {
     /// SSD miss 路径才扫描 manifest；大块 KV 仍只恢复最终选中的最长前缀。
     /// 旧 manifest 没有 namespace，只允许 exact cache_id 路径恢复，避免跨 API key 复用。
     pub fn longest_prefix_cache_id(&self, cache_namespace: Option<&str>, tokens: &[u32]) -> Result<Option<String>, String> {
-        let mut best = None::<(usize, String)>;
+        let host = self.host.lock().map_err(|_| "GLM host cache 锁中毒")?;
+        let mut best = host
+            .values()
+            .filter(|(snapshot, _)| snapshot.cache_namespace.as_deref() == cache_namespace && !snapshot.tokens.is_empty() && tokens.starts_with(&snapshot.tokens))
+            .max_by_key(|(snapshot, _)| snapshot.tokens.len())
+            .map(|(snapshot, _)| (snapshot.tokens.len(), snapshot.cache_id.clone()));
         for bytes in self.store.manifest_values()? {
             let Ok(manifest) = decode_manifest(&bytes) else { continue };
-            if manifest.cache_namespace.as_deref() != cache_namespace || manifest.tokens.is_empty() || !tokens.starts_with(&manifest.tokens) {
+            if host.contains_key(&manifest.cache_id) || manifest.cache_namespace.as_deref() != cache_namespace || manifest.tokens.is_empty() || !tokens.starts_with(&manifest.tokens) {
                 continue;
             }
             if best.as_ref().is_none_or(|(length, _)| manifest.tokens.len() > *length) {
@@ -623,7 +839,12 @@ impl Glm52SwapStore {
     }
 
     fn restore_stage(&self, cache_id: &str, generation: u64, stage_index: usize, stage: Glm52StageManifest) -> Result<Glm52StageCache, String> {
+        let started = std::time::Instant::now();
+        let started_us = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_micros();
+        let _read_lane = self.read_lanes[stage_index % self.read_lanes.len()].lock().map_err(|_| format!("GLM cache={cache_id} stage={stage_index} 读通道锁中毒"))?;
+        let queued = started.elapsed();
         let Glm52StageManifest { layer_start, kv: kv_manifests, dsa: dsa_manifests } = stage;
+        let bytes = kv_manifests.iter().chain(&dsa_manifests).flatten().fold(0u64, |sum, blob| sum.saturating_add(blob.bytes));
         let mut kv = Vec::with_capacity(kv_manifests.len());
         for (layer_index, blob) in kv_manifests.into_iter().enumerate() {
             let layer = match blob {
@@ -653,6 +874,14 @@ impl Glm52SwapStore {
                 }
             };
             dsa.push(layer);
+        }
+        let elapsed = started.elapsed();
+        if elapsed.as_millis() >= 20 {
+            eprintln!(
+                "[glm52-swap-stage-read] cache_id={cache_id} stage={stage_index} layer_start={layer_start} bytes={bytes} started_us={started_us} queue_ms={:.3} read_ms={:.3}",
+                queued.as_secs_f64() * 1e3,
+                elapsed.saturating_sub(queued).as_secs_f64() * 1e3
+            );
         }
         Ok(Glm52StageCache { layer_start, kv, dsa })
     }
@@ -698,6 +927,9 @@ impl Glm52SwapStore {
     }
 
     pub fn delete(&self, cache_id: &str) -> Result<(), String> {
+        if self.host.lock().map_err(|_| "GLM host cache 锁中毒")?.remove(cache_id).is_some() {
+            self.cache_revision.fetch_add(1, Ordering::Release);
+        }
         let Some(manifest) = self.manifest(cache_id)? else { return Ok(()) };
         let removed = self.store.remove_entry(cache_id);
         self.cache_revision.fetch_add(1, Ordering::Release);
@@ -708,6 +940,9 @@ impl Glm52SwapStore {
 
     /// 重试换出只需确认已提交的元数据，不能重新读取整份 KV。
     pub fn info(&self, cache_id: &str) -> Result<Option<Glm52SwapInfo>, String> {
+        if let Some((_, info)) = self.host.lock().map_err(|_| "GLM host cache 锁中毒")?.get(cache_id) {
+            return Ok(Some(info.clone()));
+        }
         if self.manifest(cache_id)?.is_none() {
             return Ok(None);
         }
@@ -975,7 +1210,115 @@ impl<R: Read> CacheReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_host_prepare_joins_when_dropped_or_failed() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let completed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&completed);
+        let worker = std::thread::spawn(move || {
+            flag.store(true, Ordering::Release);
+            (Vec::new(), Err("预期注册失败".to_owned()))
+        });
+        assert_eq!(Glm52HotHistoryPrepare { worker: Some(worker) }.finish().err().as_deref(), Some("预期注册失败"));
+        assert!(completed.load(Ordering::Acquire));
+
+        let (release, wait) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            wait.recv().unwrap();
+            (Vec::new(), Ok(()))
+        });
+        let prepare = Glm52HotHistoryPrepare { worker: Some(worker) };
+        let (entered, started) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let dropping = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            drop(prepare);
+            done.send(()).unwrap();
+        });
+        started.recv().unwrap();
+        // worker 尚未获准退出，取消 Open 的析构不能提前报告资源已释放。
+        assert!(matches!(finished.recv_timeout(std::time::Duration::from_millis(50)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+        release.send(()).unwrap();
+        finished.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        dropping.join().unwrap();
+    }
+
     use std::sync::Arc;
+
+    #[test]
+    #[ignore = "需要两张 ROCm GPU"]
+    fn parallel_stage_restore_preserves_device_history_and_joins_on_error() {
+        use crate::backend::rocm::{RocmDsaState, RocmKvCache, RocmPrefillExperts};
+        struct NoExperts;
+        impl crate::weight::expert_source::Fp8ExpertSource for NoExperts {
+            fn intermediate(&self) -> usize {
+                1
+            }
+            fn hidden(&self) -> usize {
+                1
+            }
+            fn load_expert_fp8(&self, _: usize, _: usize) -> Result<crate::weight::format::official_fp8::Fp8ExpertWeights, String> {
+                Err("缓存恢复测试不能读取权重".to_owned())
+            }
+        }
+        let mut cfg = Glm52Config::standard();
+        cfg.layer_count = 2;
+        cfg.index_head_dim = 16;
+        cfg.index_top_k = 2;
+        let mut states = (0..2)
+            .map(|stage| Glm52StageState {
+                backend: RocmContext::new(stage as i32).unwrap(),
+                layer_start: stage,
+                layers: Arc::new(Vec::new()),
+                experts: Arc::new(Mutex::new(RocmPrefillExperts::fp8_source(Arc::new(NoExperts)))),
+                cache: RocmKvCache::with_capacity(2, 8192),
+                dsa: RocmDsaState::new(2, 8192, 16, 2).unwrap(),
+                decode_active: false,
+                hidden_projectors: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let mut snapshots = (0..2)
+            .map(|stage| {
+                let rows = 17 + stage * 20;
+                let mut kv = vec![None, None];
+                kv[stage] = Some(MlaLayerSerde {
+                    rows,
+                    ownership: RocmKvOwnership::Full,
+                    latent_cols: 32,
+                    rope_cols: 8,
+                    latent_group_size: 32,
+                    latent: (0..rows * 32).map(|i| ((i + stage * 7) % 127) as u8).collect(),
+                    latent_scales: Some(vec![0x38; rows * 2]),
+                    rope: vec![stage as u8 + 1; rows * 16],
+                });
+                let mut dsa = vec![None, None];
+                dsa[stage] = Some(DsaLayerSerde { rows, key_group_size: 16, hadamard: false, keys: (0..rows * 16).map(|i| ((i + stage * 11) % 127) as u8).collect(), scales: vec![0x38; rows * 2] });
+                Glm52StageCache { layer_start: stage, kv, dsa }
+            })
+            .collect::<Vec<_>>();
+        upload_glm52_session(&mut states, &snapshots, &cfg, 8192, 4096).unwrap();
+        let restored = download_glm52_session(&states).unwrap();
+        for (stage, (actual, expected)) in restored.iter().zip(&snapshots).enumerate() {
+            let actual_kv = actual.kv[stage].as_ref().unwrap();
+            let expected_kv = expected.kv[stage].as_ref().unwrap();
+            assert_eq!(actual_kv.rows, expected_kv.rows);
+            assert_eq!(actual_kv.latent, expected_kv.latent);
+            assert_eq!(actual_kv.latent_scales, expected_kv.latent_scales);
+            assert_eq!(actual_kv.rope, expected_kv.rope);
+            assert_eq!(actual.dsa[stage].as_ref().unwrap().keys, expected.dsa[stage].as_ref().unwrap().keys);
+            assert_eq!(actual.dsa[stage].as_ref().unwrap().scales, expected.dsa[stage].as_ref().unwrap().scales);
+            assert!(actual.kv[1 - stage].is_none());
+            assert!(actual.dsa[1 - stage].is_none());
+        }
+        snapshots[0].dsa[0].as_mut().unwrap().keys.pop();
+        let error = upload_glm52_session(&mut states, &snapshots, &cfg, 8192, 4096).unwrap_err();
+        assert!(error.contains("恢复 L0 DSA"), "{error}");
+        // 一路失败也必须等待另一设备恢复结束，返回后可立即读取或释放。
+        states[1].backend.activate().unwrap();
+        let restored = states[1].dsa.download_layers().unwrap();
+        assert_eq!(restored[1].as_ref().unwrap().keys, snapshots[1].dsa[1].as_ref().unwrap().keys);
+    }
 
     fn identity() -> Glm52CacheIdentity {
         Glm52CacheIdentity { metadata: vec![("schema_version".to_owned(), "test".to_owned())] }
@@ -1010,6 +1353,128 @@ mod tests {
                 }],
             }),
         }
+    }
+
+    #[test]
+    fn parallel_disk_restore_preserves_stage_order_and_rejects_missing_generation() {
+        let root = std::env::temp_dir().join(format!("zllm-glm52-parallel-read-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let store = Glm52SwapStore::open(&root, &identity()).unwrap();
+        let mut saved = snapshot();
+        saved.stages = (0..6)
+            .map(|index| {
+                let mut stage = snapshot().stages.pop().unwrap();
+                stage.layer_start += index;
+                stage.kv[0].as_mut().unwrap().latent.fill(index as u8 + 10);
+                stage.dsa[0].as_mut().unwrap().keys.fill(index as u8 + 20);
+                stage.dsa[0].as_mut().unwrap().scales.fill(index as u8 + 30);
+                stage.kv.push(None);
+                stage.dsa.push(None);
+                stage
+            })
+            .collect();
+        store.put(&saved).unwrap();
+        // 超过四个 stage 仍必须保留 manifest 顺序及各层两类历史。
+        let restored = store.get("session-a").unwrap().unwrap();
+        assert_eq!(restored.stages.len(), saved.stages.len());
+        for (actual, expected) in restored.stages.iter().zip(&saved.stages) {
+            assert_eq!(actual.layer_start, expected.layer_start);
+            assert_eq!(actual.kv[0].as_ref().unwrap().latent, expected.kv[0].as_ref().unwrap().latent);
+            assert_eq!(actual.dsa[0].as_ref().unwrap().keys, expected.dsa[0].as_ref().unwrap().keys);
+            assert_eq!(actual.dsa[0].as_ref().unwrap().scales, expected.dsa[0].as_ref().unwrap().scales);
+            assert!(actual.kv[1].is_none() && actual.dsa[1].is_none());
+        }
+        assert_eq!(restored.mtp.unwrap().dsa[0].as_ref().unwrap().keys, saved.mtp.as_ref().unwrap().dsa[0].as_ref().unwrap().keys);
+        let generation = store.manifest("session-a").unwrap().unwrap().generation;
+        store.store.remove_generation("session-a", generation).unwrap();
+        let error = store.get("session-a").err().expect("manifest 引用的历史丢失必须拒绝恢复");
+        assert!(error.contains("cache=session-a") && error.contains("stage="), "{error}");
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn host_pressure_persists_oldest_and_keeps_prefetch_alive() {
+        let root = std::env::temp_dir().join(format!("zllm-glm52-host-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let store = Glm52SwapStore::open(&root, &identity()).unwrap();
+        let first = Arc::new(snapshot());
+        let mut next = snapshot();
+        next.cache_id = "session-b".into();
+        let second = Arc::new(next);
+        store.host_budget.store(second.resident_bytes(), Ordering::Release);
+        store.cache_host(first.clone(), 100);
+        store.cache_host(second.clone(), 200);
+        assert!(store.infos().is_empty(), "主存未满前不能写 SSD");
+        let prefetched = store.load("session-a").unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &prefetched), "主存命中不能复制整份历史");
+        assert_eq!(store.spill_host(0).unwrap(), 1);
+        assert_eq!(store.host_infos()[0].cache_id, "session-b");
+        assert_eq!(store.get("session-a").unwrap().unwrap().stages[0].dsa[0].as_ref().unwrap().keys, vec![3; 6]);
+        assert_eq!(prefetched.pending_tokens, Some(vec![4]), "溢写不能破坏已经开始的换入");
+        assert_eq!(store.persist_host_all().unwrap(), 1);
+        assert!(store.host_infos().is_empty());
+        drop(store);
+        let store = Glm52SwapStore::open(&root, &identity()).unwrap();
+        assert_eq!(store.infos().len(), 2);
+        assert_eq!(store.info("session-a").unwrap().unwrap().modified_unix, 100);
+        assert_eq!(store.info("session-b").unwrap().unwrap().modified_unix, 200);
+    }
+
+    #[test]
+    fn host_latest_prefix_is_namespaced_and_shadows_old_disk() {
+        let root = std::env::temp_dir().join(format!("zllm-glm52-host-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let store = Glm52SwapStore::open(&root, &identity()).unwrap();
+        store.put(&snapshot()).unwrap();
+        let mut latest = snapshot();
+        latest.tokens = vec![4, 5, 6];
+        latest.mtp = None;
+        store.cache_host(Arc::new(latest), 321);
+        assert!(store.longest_prefix_cache_id(Some("tenant-a"), &[1, 2, 3, 7]).unwrap().is_none());
+        assert!(store.longest_prefix_cache_id(Some("tenant-b"), &[4, 5, 6, 7]).unwrap().is_none());
+        assert_eq!(store.longest_prefix_cache_id(Some("tenant-a"), &[4, 5, 6, 7]).unwrap().as_deref(), Some("session-a"));
+        assert_eq!(store.load("session-a").unwrap().unwrap().tokens, vec![4, 5, 6]);
+        store.delete("session-a").unwrap();
+        assert!(store.load("session-a").unwrap().is_none());
+        assert!(store.host_infos().is_empty());
+    }
+
+    #[test]
+    fn host_failed_persistence_retains_snapshot() {
+        let root = std::env::temp_dir().join(format!("zllm-glm52-host-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let store = Glm52SwapStore::open(&root, &identity()).unwrap();
+        // 提交前校验失败与 SSD I/O 失败走相同的保留分支。
+        let mut invalid = snapshot();
+        invalid.token_count += 1;
+        let saved = Arc::new(invalid);
+        store.cache_host(saved.clone(), 123);
+        store.host_budget.store(0, Ordering::Release);
+        assert!(store.spill_host(0).is_err());
+        assert!(Arc::ptr_eq(&saved, &store.load("session-a").unwrap().unwrap()));
+        assert!(store.infos().is_empty());
+        assert!(store.persist_host_and_release("session-a").is_err());
+        assert!(Arc::ptr_eq(&saved, &store.load("session-a").unwrap().unwrap()));
+        assert!(store.persist_host_all().is_err());
+        assert_eq!(store.host_infos().len(), 1);
+    }
+
+    #[test]
+    fn host_shutdown_does_not_rewrite_already_committed_snapshot() {
+        let root = std::env::temp_dir().join(format!("zllm-glm52-host-exit-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let store = Glm52SwapStore::open(&root, &identity()).unwrap();
+        let first = Arc::new(snapshot());
+        let mut second = snapshot();
+        second.cache_id = "session-b".into();
+        store.cache_host(first.clone(), 100);
+        store.cache_host(Arc::new(second), 200);
+        let prefetched = store.load("session-a").unwrap().unwrap();
+        assert!(store.persist_host_and_release("session-a").unwrap());
+        let generation = store.manifest("session-a").unwrap().unwrap().generation;
+        assert_eq!(store.persist_host_all().unwrap(), 1);
+        assert_eq!(store.manifest("session-a").unwrap().unwrap().generation, generation);
+        assert!(store.host_infos().is_empty());
+        assert_eq!(store.infos().len(), 2);
+        assert_eq!(prefetched.stages[0].dsa[0].as_ref().unwrap().keys, first.stages[0].dsa[0].as_ref().unwrap().keys);
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

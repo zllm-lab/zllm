@@ -69,12 +69,27 @@ pub struct NodeCapabilities {
     pub kv_reservation_page_tokens: usize,
     #[serde(default)]
     pub task_kinds: Vec<String>,
+    /// 一个物理执行器可切换的模型及其任务类型；所有条目共用节点并发额度。
+    #[serde(default)]
+    pub task_models: std::collections::BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub input_modalities: Vec<String>,
     #[serde(default)]
     pub output_modalities: Vec<String>,
     #[serde(default)]
     pub artifact_streaming: bool,
+    /// 节点支持瘦身 resume 请求(server 已验证边界后只发 [边界 assistant, ...增量]):
+    /// 引擎能跳过全量渲染/全量 hash 重算直接命中 terminal cache,miss 时上报
+    /// `TERMINAL_RESUME_MISS` 让 server 重发完整请求。旧节点/未接入引擎缺省
+    /// false,server 不对它瘦身,行为与完整请求完全一致。
+    #[serde(default)]
+    pub terminal_resume_delta: bool,
+}
+
+impl NodeCapabilities {
+    pub fn supports_task(&self, primary: &str, model: &str, kind: &str) -> bool {
+        (primary == model && self.task_kinds.iter().any(|value| value == kind)) || self.task_models.get(model).is_some_and(|kinds| kinds.iter().any(|value| value == kind))
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -94,6 +109,15 @@ pub struct RuntimeStatus {
     pub kv_cache_allocated_bytes: u64,
     pub kv_cache_used_bytes: u64,
     pub kv_bytes_per_token: u64,
+    /// 最近一次实时准入核算：每卡扣除工作区保留量后的余量与新增会话 token 容量。
+    #[serde(default)]
+    pub kv_cache_headroom: Vec<KvCacheDeviceCapacity>,
+    #[serde(default)]
+    pub kv_cache_available_tokens: Option<usize>,
+    #[serde(default)]
+    pub kv_cache_reserve_bytes: u64,
+    #[serde(default)]
+    pub kv_cache_headroom_unix_ms: u64,
     pub current_batch_tokens: usize,
     /// 正在执行完整新会话 prefill 的 session 数。
     #[serde(default)]
@@ -107,6 +131,18 @@ pub struct RuntimeStatus {
     /// 当前实际采用的 DSpark draft token 数；0 表示本轮未启用 DSpark。
     #[serde(default)]
     pub dspark_draft_tokens: usize,
+    /// 节点当前生效的热调配置 revision；0 表示该模型不支持运行时调参。
+    #[serde(default)]
+    pub runtime_config_revision: u64,
+    /// 模型返回的当前生效配置。字段由模型定义，server 只负责透传与展示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_config: Option<Value>,
+    /// 最近一次热调失败原因；下一次成功应用后清空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_config_error: Option<String>,
+    /// 当前节点接收新任务的动态上限；不超过启动时探测出的物理并发容量。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_max_concurrency: Option<usize>,
     /// 当前可直接恢复的内存终点 cache。
     #[serde(default)]
     pub memory_cache_ids: Vec<String>,
@@ -123,8 +159,7 @@ impl RuntimeStatus {
     pub const MAX_CONCURRENT_SESSIONS: usize = Self::APPEND_DECODE_LIMIT + 1;
 
     pub fn can_admit_prefill(&self, append: bool) -> bool {
-        self.new_prefill == 0 && self.append_prefill == 0
-            && if append { self.decode <= Self::APPEND_DECODE_LIMIT } else { self.decode.saturating_add(4) <= Self::MAX_SCHEDULING_PRESSURE }
+        self.new_prefill == 0 && self.append_prefill == 0 && if append { self.decode <= Self::APPEND_DECODE_LIMIT } else { self.decode.saturating_add(4) <= Self::MAX_SCHEDULING_PRESSURE }
     }
 
     pub fn scheduling_pressure(&self) -> usize {
@@ -143,7 +178,8 @@ pub fn effective_mtp_draft_tokens(configured: usize, decode: usize, prefill: usi
         0 => 0,
         1..=3 => 5,
         4..=5 => 3,
-        _ => 1,
+        6..=8 => 1,
+        _ => 0,
     })
 }
 
@@ -530,14 +566,22 @@ impl ReasoningStream {
         let mut content = String::new();
         loop {
             if let Some((start, tag)) = TAGS.iter().filter_map(|tag| self.pending.find(tag).map(|start| (start, *tag))).min_by_key(|(start, _)| *start) {
-                if self.in_reasoning { reasoning.push_str(&self.pending[..start]); } else { content.push_str(&self.pending[..start]); }
+                if self.in_reasoning {
+                    reasoning.push_str(&self.pending[..start]);
+                } else {
+                    content.push_str(&self.pending[..start]);
+                }
                 self.pending.drain(..start + tag.len());
                 self.in_reasoning = !tag.contains("/think");
                 continue;
             }
             let hold = (1..TAGS.iter().map(|tag| tag.len()).max().unwrap()).rev().find(|&n| TAGS.iter().any(|tag| n < tag.len() && self.pending.ends_with(&tag[..n]))).unwrap_or(0);
             let end = self.pending.len() - hold;
-            if self.in_reasoning { reasoning.push_str(&self.pending[..end]); } else { content.push_str(&self.pending[..end]); }
+            if self.in_reasoning {
+                reasoning.push_str(&self.pending[..end]);
+            } else {
+                content.push_str(&self.pending[..end]);
+            }
             self.pending.drain(..end);
             break;
         }
@@ -732,24 +776,93 @@ pub fn conversation_hash(model: &str, messages: &[Value]) -> Result<String, serd
     serde_json::to_vec(&(model, normalized)).map(|bytes| blake3::hash(&bytes).to_hex().to_string())
 }
 
-fn request_conversation_hash(request: &Value, messages: &[Value]) -> Result<String, String> {
+/// 会话链折叠的域分隔标记:与历史全量 hash 的输入形状区分,避免跨版本碰撞。
+const CHAIN_DOMAIN: &[u8] = b"zllm-conversation-chain-v2";
+
+/// 节点对瘦身 resume 请求终态 miss 时返回的哨兵前缀。scheduler 据此识别并
+/// 重发完整请求,而不是把 miss 当普通错误终止会话。
+pub const TERMINAL_RESUME_MISS: &str = "TERMINAL_RESUME_MISS";
+
+/// 参与会话 hash 的请求级上下文(model 与 tools/thinking 等渲染参数)。上下文
+/// 变化会改变 prompt 渲染,链式折叠在每次折叠点都带上它,与全量 hash 行为
+/// 一致:客户端中途修改 tools 会让下一轮 boundary 失配而走全量重建。
+fn request_hash_context(request: &Value) -> Result<(String, Vec<(String, Value)>), String> {
     let model = request.get("model").and_then(Value::as_str).ok_or("model 必须是字符串")?;
     let context = ["tools", "tool_choice", "parallel_tool_calls", "reasoning_effort", "thinking_token_budget", "thinking", "enable_thinking"]
         .into_iter()
         .filter_map(|key| request.get(key).filter(|value| !value.is_null()).map(|value| (key.to_owned(), value.clone())))
-        .collect::<serde_json::Map<_, _>>();
+        .collect::<Vec<_>>();
+    Ok((model.to_owned(), context))
+}
+
+/// 首个 assistant 边界的折叠:从该边界(含)之前的全部消息一次性计算。
+fn chain_head(context: &(String, Vec<(String, Value)>), messages: &[Value]) -> Result<String, String> {
     let normalized: Vec<Value> = messages.iter().map(strip_null_fields).collect();
-    serde_json::to_vec(&(model, normalized, context)).map(|bytes| blake3::hash(&bytes).to_hex().to_string()).map_err(|error| format!("计算 conversation hash: {error}"))
+    serde_json::to_vec(&(CHAIN_DOMAIN, 0u8, context, normalized)).map(|bytes| blake3::hash(&bytes).to_hex().to_string()).map_err(|error| format!("计算会话链头 hash: {error}"))
+}
+
+/// 后续 assistant 边界的折叠:上一折叠锚 + 该边界前暂存的非 assistant 消息 + 边界消息。
+fn chain_step(previous: &str, context: &(String, Vec<(String, Value)>), messages: &[Value]) -> Result<String, String> {
+    let normalized: Vec<Value> = messages.iter().map(strip_null_fields).collect();
+    serde_json::to_vec(&(CHAIN_DOMAIN, 1u8, previous, context, normalized)).map(|bytes| blake3::hash(&bytes).to_hex().to_string()).map_err(|error| format!("折叠会话链 hash: {error}"))
+}
+
+/// 按 assistant 消息折叠会话链:每遇到一条 assistant(连同其前暂存的非
+/// assistant 消息)折叠一次。持有完整 messages 的一侧(server 或节点)总能
+/// 重算出同一结果;持有上一次折叠锚(`anchor`)的一侧可以只凭增量消息继续
+/// 折叠——瘦身请求只发增量、节点仍能算出与完整请求一致的下一轮 cache_id,
+/// 依据就在这里。`closing` 是生成完成后追加的最终 assistant 消息(response),
+/// 触发收尾折叠;messages 与 closing 都没有 assistant 时返回 None(无边界)。
+fn fold_conversation_chain(request: &Value, anchor: Option<&str>, messages: &[Value], closing: Option<&Value>) -> Result<Option<String>, String> {
+    let context = request_hash_context(request)?;
+    let mut acc = anchor.map(str::to_owned);
+    let mut buffer: Vec<Value> = Vec::new();
+    for message in messages.iter().chain(closing) {
+        buffer.push(strip_null_fields(message));
+        if message.get("role").and_then(Value::as_str) == Some("assistant") {
+            acc = Some(match acc {
+                None => chain_head(&context, &buffer)?,
+                Some(previous) => chain_step(&previous, &context, &buffer)?,
+            });
+            buffer.clear();
+        }
+    }
+    Ok(acc)
 }
 
 pub fn terminal_cache_id(request: &Value, response: &str, tool_calls: &[ToolCall]) -> Result<String, String> {
     let source = request.get("messages").and_then(Value::as_array).ok_or("messages 必须是数组")?;
-    let mut messages = source.clone();
     let response = client_replayable_response(request, response);
     let content = if response.is_empty() && !tool_calls.is_empty() { Value::Null } else { Value::String(response.to_owned()) };
-    messages.push(serde_json::json!({ "role": "assistant", "content": content, "reasoning_content": null, "name": null, "tool_call_id": null, "tool_calls": if tool_calls.is_empty() { Value::Null } else { serde_json::json!(tool_calls) } }));
-    let cache_id = request_conversation_hash(request, &messages)?;
+    let closing = serde_json::json!({ "role": "assistant", "content": content, "reasoning_content": null, "name": null, "tool_call_id": null, "tool_calls": if tool_calls.is_empty() { Value::Null } else { serde_json::json!(tool_calls) } });
+    // 瘦身请求只携带 [边界 assistant, ...增量]:从 server 注入的折叠锚接链,
+    // 增量中的 assistant 消息与收尾 response 各触发一次折叠,与 server 对
+    // 完整请求的折叠结果一致。
+    let folded = if let Some(anchor) = request.get("_zllm_resume_hash").and_then(Value::as_str) {
+        (source.len() >= 1).then_some(()).ok_or("瘦身请求必须携带边界 assistant 消息")?;
+        fold_conversation_chain(request, Some(anchor), &source[1..], Some(&closing))?
+    } else {
+        fold_conversation_chain(request, None, source, Some(&closing))?
+    };
+    let cache_id = folded.ok_or("会话链折叠没有产生边界")?;
     Ok(scoped_cache_id(request.get("_zllm_cache_namespace").and_then(Value::as_str), &cache_id))
+}
+
+/// 把验证 Match 的完整请求截为瘦身 resume 请求:messages 只保留 [边界
+/// assistant, ...增量],注入 `_zllm_resume`(resume 的 cache_id)与
+/// `_zllm_resume_hash`(边界折叠锚)。tools/采样参数等渲染上下文原样保留;
+/// `cache_id` 字段保留供引擎命中路径读取。
+pub fn slim_resume_request(request: &Value, cache_id: &str, assistant: usize) -> Result<Value, String> {
+    let source = request.get("messages").and_then(Value::as_array).ok_or("messages 必须是数组")?;
+    if source.get(assistant).and_then(|message| message.get("role")).and_then(Value::as_str) != Some("assistant") {
+        return Err(format!("resume 边界 {assistant} 不是 assistant 消息"));
+    }
+    let anchor = fold_conversation_chain(request, None, &source[..=assistant], None)?.ok_or("resume 边界折叠没有产生锚")?;
+    let mut slim = request.clone();
+    slim["messages"] = Value::Array(std::iter::once(source[assistant].clone()).chain(source[assistant + 1..].iter().cloned()).collect());
+    slim["_zllm_resume"] = Value::String(cache_id.to_owned());
+    slim["_zllm_resume_hash"] = Value::String(anchor);
+    Ok(slim)
 }
 
 pub fn client_replayable_response(request: &Value, response: &str) -> String {
@@ -774,11 +887,21 @@ pub enum TerminalResume {
 pub fn request_resume_boundary(request: &Value) -> Result<Option<(String, usize)>, String> {
     let source = request.get("messages").and_then(Value::as_array).ok_or("messages 必须是数组")?;
     let Some(assistant) = source.iter().rposition(|message| message.get("role").and_then(Value::as_str) == Some("assistant")) else { return Ok(None) };
-    let hash = request_conversation_hash(request, &source[..=assistant])?;
+    let hash = fold_conversation_chain(request, None, &source[..=assistant], None)?.ok_or("存在 assistant 边界但折叠没有结果")?;
     Ok(Some((scoped_cache_id(request.get("_zllm_cache_namespace").and_then(Value::as_str), &hash), assistant)))
 }
 
 pub fn request_terminal_resume(request: &Value) -> Result<TerminalResume, String> {
+    // 瘦身请求:server 已对完整请求验证过会话边界并截为 [边界 assistant,
+    // ...增量],这里按标记直接命中,不再重算 hash——节点没有全文,重算必失配。
+    // 信任链等价:server 与节点用的是同一个纯函数,server 已验证过完整请求。
+    if let Some(cache_id) = request.get("_zllm_resume").and_then(Value::as_str) {
+        let source = request.get("messages").and_then(Value::as_array).ok_or("messages 必须是数组")?;
+        if source.first().and_then(|message| message.get("role")).and_then(Value::as_str) != Some("assistant") {
+            return Err("瘦身 resume 请求首条消息必须是边界 assistant".to_owned());
+        }
+        return Ok(TerminalResume::Match { cache_id: cache_id.to_owned(), assistant: 0 });
+    }
     let Some(requested) = request.get("cache_id").and_then(Value::as_str) else { return Ok(TerminalResume::None) };
     let Some((expected, assistant)) = request_resume_boundary(request)? else { return Ok(TerminalResume::None) };
     Ok(if requested == expected { TerminalResume::Match { cache_id: requested.to_owned(), assistant } } else { TerminalResume::Mismatch { requested: requested.to_owned(), expected } })
@@ -851,6 +974,11 @@ pub fn activate_terminal_append<S: crate::kv_cache::terminal_cache::TerminalSnap
             eprintln!("[zllm-runtime] terminal cache 拼接命中 cached={} new={}", cached.len(), suffix.len());
             Some((state, suffix))
         }
+        // 瘦身请求没有完整 messages,miss 后不能退回全量渲染(会产出残缺
+        // prompt);返回哨兵让 scheduler 重发完整请求走全量 prefill。
+        (None, _) if request.get("_zllm_resume").is_some() => {
+            return Err(format!("{TERMINAL_RESUME_MISS} {}", cache_id.as_deref().unwrap_or_default()));
+        }
         _ => None,
     };
     Ok((resumed, reservation))
@@ -858,6 +986,128 @@ pub fn activate_terminal_append<S: crate::kv_cache::terminal_cache::TerminalSnap
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn 链式折叠与瘦身锚接链跨多轮一致() {
+        // 三轮会话:增量里夹带 tool 消息与中间 assistant,覆盖逐消息折叠规则。
+        let round1 = json!({"model": "m", "messages": [{"role": "user", "content": "问1"}]});
+        let id1 = terminal_cache_id(&round1, "答1", &[]).unwrap();
+        let round2 = json!({"model": "m", "messages": [
+            {"role": "user", "content": "问1"},
+            {"role": "assistant", "content": "答1"},
+            {"role": "user", "content": "工具结果"},
+            {"role": "user", "content": "问2"},
+        ], "cache_id": id1});
+        assert_eq!(request_terminal_resume(&round2).unwrap(), TerminalResume::Match { cache_id: id1.clone(), assistant: 1 });
+        let id2 = terminal_cache_id(&round2, "答2", &[]).unwrap();
+        let round3 = json!({"model": "m", "messages": [
+            {"role": "user", "content": "问1"},
+            {"role": "assistant", "content": "答1"},
+            {"role": "user", "content": "工具结果"},
+            {"role": "user", "content": "问2"},
+            {"role": "assistant", "content": "答2"},
+            {"role": "user", "content": "问3前半"},
+            {"role": "user", "content": "问3"},
+        ], "cache_id": id2});
+        assert_eq!(request_terminal_resume(&round3).unwrap(), TerminalResume::Match { cache_id: id2.clone(), assistant: 4 });
+        let full_id3 = terminal_cache_id(&round3, "答3", &[]).unwrap();
+
+        // 瘦身:server 只发 [边界 assistant, ...增量],节点从锚接链算出的
+        // 下一轮 id 必须与对完整请求的计算一致。
+        let slim3 = slim_resume_request(&round3, &id2, 4).unwrap();
+        assert_eq!(slim3.get("messages").and_then(Value::as_array).map(Vec::len), Some(3));
+        assert_eq!(slim3.get("_zllm_resume").and_then(Value::as_str), Some(id2.as_str()));
+        assert_eq!(terminal_cache_id(&slim3, "答3", &[]).unwrap(), full_id3);
+
+        // 下一轮完整请求的 boundary 等于本轮(完整与瘦身两条路径)算出的 id。
+        let mut round4_messages = round3["messages"].as_array().unwrap().clone();
+        round4_messages.push(json!({"role": "assistant", "content": "答3"}));
+        round4_messages.push(json!({"role": "user", "content": "问4"}));
+        let round4 = json!({"model": "m", "messages": round4_messages, "cache_id": full_id3});
+        assert_eq!(request_terminal_resume(&round4).unwrap(), TerminalResume::Match { cache_id: full_id3, assistant: 7 });
+
+        // 增量里夹带 assistant 时 resume 边界会后移(Mismatch 走全量重建),但
+        // 两侧的下一轮 id 计算仍必须逐消息折叠等价——锚接链不丢中间折叠点。
+        let mut gapped = round3.clone();
+        gapped["messages"].as_array_mut().unwrap().insert(6, json!({"role": "assistant", "content": "插入的助手消息"}));
+        let slim_gapped = slim_resume_request(&gapped, &id2, 4).unwrap();
+        assert_eq!(terminal_cache_id(&slim_gapped, "答3", &[]).unwrap(), terminal_cache_id(&gapped, "答3", &[]).unwrap());
+    }
+
+    #[test]
+    fn 瘦身请求识别与非法形态报错() {
+        let request = json!({"model": "m", "messages": [
+            {"role": "user", "content": "问"},
+            {"role": "assistant", "content": "答"},
+            {"role": "user", "content": "续"},
+        ], "cache_id": "c"});
+        let slim = slim_resume_request(&request, "c", 1).unwrap();
+        assert_eq!(request_terminal_resume(&slim).unwrap(), TerminalResume::Match { cache_id: "c".to_owned(), assistant: 0 });
+
+        let mut broken = slim.clone();
+        broken["messages"] = json!([{"role": "user", "content": "没有边界"}]);
+        assert!(request_terminal_resume(&broken).is_err());
+    }
+
+    #[test]
+    fn 会话上下文漂移断链() {
+        // tools 属于折叠上下文:客户端中途修改 tools,下一轮 boundary 必失配。
+        let first = json!({"model": "m", "tools": [{"type": "function", "function": {"name": "f"}}], "messages": [{"role": "user", "content": "问"}]});
+        let id = terminal_cache_id(&first, "答", &[]).unwrap();
+        let same_tools = json!({"model": "m", "tools": [{"type": "function", "function": {"name": "f"}}], "messages": [
+            {"role": "user", "content": "问"}, {"role": "assistant", "content": "答"}, {"role": "user", "content": "续"},
+        ], "cache_id": id});
+        assert!(matches!(request_terminal_resume(&same_tools).unwrap(), TerminalResume::Match { .. }));
+        let changed_tools = json!({"model": "m", "tools": [{"type": "function", "function": {"name": "g"}}], "messages": [
+            {"role": "user", "content": "问"}, {"role": "assistant", "content": "答"}, {"role": "user", "content": "续"},
+        ], "cache_id": id});
+        assert!(matches!(request_terminal_resume(&changed_tools).unwrap(), TerminalResume::Mismatch { .. }));
+    }
+
+    /// 最小快照:只实现 terminal_tokens 与 info,encode/decode 不参与(无 swap)。
+    struct AlignedState(Vec<u32>);
+    impl crate::kv_cache::terminal_cache::TerminalSnapshot for AlignedState {
+        type Resources = ();
+        fn encode(&self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn decode(_bytes: &[u8], _resources: &()) -> Result<Self, String> {
+            unreachable!()
+        }
+        fn terminal_tokens(&self) -> &[u32] {
+            &self.0
+        }
+        fn info(&self) -> &TerminalInfo {
+            static EMPTY: std::sync::OnceLock<TerminalInfo> = std::sync::OnceLock::new();
+            EMPTY.get_or_init(TerminalInfo::default)
+        }
+    }
+
+    #[test]
+    fn 瘦身miss返回哨兵错误() {
+        let request = json!({"model": "m", "messages": [
+            {"role": "user", "content": "问"},
+            {"role": "assistant", "content": "答"},
+            {"role": "user", "content": "续"},
+        ], "cache_id": "absent"});
+        let slim = slim_resume_request(&request, "absent", 1).unwrap();
+        let mut sessions = crate::kv_cache::terminal_cache::TerminalSessions::<AlignedState>::new(2, None);
+        let budget = crate::kv_cache::terminal_cache::ResidencyBudget::new(1024);
+        let error = match activate_terminal_append(&mut sessions, &budget, 1, &slim, |_| Ok(vec![7u32]), &()) {
+            Err(error) => error,
+            Ok((resumed, _)) => panic!("瘦身 miss 应返回哨兵错误,实际 resumed={}", resumed.is_some()),
+        };
+        assert!(error.starts_with(TERMINAL_RESUME_MISS), "error={error}");
+        assert!(error.ends_with("absent"));
+
+        // 完整请求 miss 维持现状:返回 None 走全量渲染,不报哨兵。
+        let (resumed, _) = activate_terminal_append(&mut sessions, &budget, 1, &request, |_| Ok(vec![7u32]), &()).unwrap();
+        assert!(resumed.is_none());
+    }
+
     #[test]
     fn terminal_cache_matches_http_filtered_reasoning_boundaries() {
         for raw in ["分析</think>正文", "分析\\</think>正文", "<think>分析</think>正文"] {
@@ -906,8 +1156,6 @@ mod tests {
             }
         }
     }
-
-    use super::*;
 
     #[test]
     fn 本地图片路径支持中英文成对引号() {
@@ -996,17 +1244,19 @@ mod tests {
         assert_eq!(effective_mtp_draft_tokens(5, 6, 0), 1);
         assert_eq!(effective_mtp_draft_tokens(5, 7, 0), 1);
         assert_eq!(effective_mtp_draft_tokens(5, 8, 0), 1);
-        assert_eq!(effective_mtp_draft_tokens(5, 9, 0), 1);
-        assert_eq!(effective_mtp_draft_tokens(5, 12, 0), 1);
-        assert_eq!(effective_mtp_draft_tokens(5, 14, 0), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 9, 0), 0);
+        assert_eq!(effective_mtp_draft_tokens(5, 10, 0), 0);
+        assert_eq!(effective_mtp_draft_tokens(5, 12, 0), 0);
+        assert_eq!(effective_mtp_draft_tokens(5, 14, 0), 0);
         assert_eq!(effective_mtp_draft_tokens(5, 0, 1), 3);
         assert_eq!(effective_mtp_draft_tokens(5, 1, 1), 3);
         assert_eq!(effective_mtp_draft_tokens(5, 2, 1), 1);
         assert_eq!(effective_mtp_draft_tokens(5, 3, 1), 1);
         assert_eq!(effective_mtp_draft_tokens(5, 4, 1), 1);
-        assert_eq!(effective_mtp_draft_tokens(5, 5, 1), 1);
-        assert_eq!(effective_mtp_draft_tokens(5, 8, 1), 1);
-        assert_eq!(effective_mtp_draft_tokens(5, 9, 1), 1);
+        assert_eq!(effective_mtp_draft_tokens(5, 5, 1), 0);
+        assert_eq!(effective_mtp_draft_tokens(5, 8, 1), 0);
+        assert_eq!(effective_mtp_draft_tokens(5, 9, 1), 0);
+        assert_eq!(effective_mtp_draft_tokens(5, usize::MAX, usize::MAX), 0);
         assert_eq!(effective_mtp_draft_tokens(0, 7, 0), 0);
         assert_eq!(effective_mtp_draft_tokens(3, 1, 0), 3);
         assert_eq!(effective_mtp_draft_tokens(2, 1, 0), 2);

@@ -407,6 +407,7 @@ pub(super) fn response_chat_request(request: &ResponsesRequest, previous: Option
         cache_id: previous.map(|previous| previous.cache_id.clone()).or_else(|| request.cache_id.clone()),
         repeat_loop_breaker: None,
         prefill_chunk_size: None,
+        mtp_draft_tokens: None,
     })
 }
 
@@ -791,11 +792,15 @@ fn spawn_response_producer(
                     reasoning_text.push_str(&reasoning_tail);
                     if !text_tail.is_empty() {
                         if !message_started {
-                            if !start_response_message(&mut tx, &message_id, output.len()).await { break 'inference; }
+                            if !start_response_message(&mut tx, &message_id, output.len()).await {
+                                break 'inference;
+                            }
                             message_started = true;
                         }
                         text.push_str(&text_tail);
-                        if !send_response_event(&mut tx, "response.output_text.delta", json!({"type": "response.output_text.delta", "item_id": message_id, "output_index": output.len(), "content_index": 0, "delta": text_tail})).await { break 'inference; }
+                        if !send_response_event(&mut tx, "response.output_text.delta", json!({"type": "response.output_text.delta", "item_id": message_id, "output_index": output.len(), "content_index": 0, "delta": text_tail})).await {
+                            break 'inference;
+                        }
                     }
                     let (text, parsed_tool_calls) = ToolDialect::Auto.split_output(&text, &tool_schemas);
                     let native_tool_count = tool_calls.len();

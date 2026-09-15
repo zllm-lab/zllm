@@ -23,7 +23,7 @@ use tokio::{
 };
 
 pub const SCHEDULER_ALPN: &[u8] = b"zllm/scheduler/1";
-pub const SCHEDULER_PROTOCOL_VERSION: u32 = 9;
+pub const SCHEDULER_PROTOCOL_VERSION: u32 = 10;
 const MAX_MESSAGE_BYTES: usize = 80 * 1024 * 1024;
 pub(super) const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 static ARTIFACT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -33,18 +33,50 @@ type DynError = Box<dyn Error + Send + Sync>;
 pub use crate::kv_cache::terminal_cache::TerminalInfo as CacheInfo;
 pub use crate::runtime::session::{AtomicCounterU64, KvCacheDeviceCapacity, NodeCapabilities, RuntimeStatus as NodeRuntime, ToolCall, ToolCallDelta, ToolFunction};
 pub use crate::runtime::session::{
-    TerminalResume, activate_terminal_append, client_replayable_response, conversation_hash, request_resume_boundary, request_terminal_resume, resume_terminal_append, resume_terminal_session, retain_terminal_session, terminal_cache_id,
+    TerminalResume, activate_terminal_append, client_replayable_response, conversation_hash, request_resume_boundary, request_terminal_resume, resume_terminal_append, resume_terminal_session, retain_terminal_session, slim_resume_request,
+    terminal_cache_id,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum NodeMessage {
-    Register { protocol_version: u32, api_key: Option<String>, model: String, max_concurrency: usize, caches: Vec<CacheInfo>, capabilities: NodeCapabilities, runtime: NodeRuntime },
-    Heartbeat { caches: Vec<CacheInfo>, runtime: NodeRuntime },
-    RuntimeChanged { runtime: NodeRuntime },
-    Event { request_id: String, event: InferenceEvent },
-    TaskStatus { task_id: String, status: String, error: Option<String>, outputs: Vec<ArtifactDescriptor> },
-    TaskProgress { task_id: String, progress: TaskProgress },
+    Register {
+        protocol_version: u32,
+        api_key: Option<String>,
+        model: String,
+        max_concurrency: usize,
+        caches: Vec<CacheInfo>,
+        capabilities: NodeCapabilities,
+        runtime: NodeRuntime,
+    },
+    Heartbeat {
+        caches: Vec<CacheInfo>,
+        runtime: NodeRuntime,
+    },
+    RuntimeChanged {
+        runtime: NodeRuntime,
+    },
+    Event {
+        request_id: String,
+        event: InferenceEvent,
+    },
+    /// 瘦身 resume 请求在节点终态 miss(cache 已被驱逐/换出且不可恢复)时上报。
+    /// 不是 InferenceEvent:订阅者不应看到 miss,scheduler 用保存的完整请求
+    /// 去掉 cache_id 重发,事件流对 HTTP 层保持无感。
+    CacheMiss {
+        request_id: String,
+        cache_id: String,
+    },
+    TaskStatus {
+        task_id: String,
+        status: String,
+        error: Option<String>,
+        outputs: Vec<ArtifactDescriptor>,
+    },
+    TaskProgress {
+        task_id: String,
+        progress: TaskProgress,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -81,6 +113,10 @@ pub enum SchedulerMessage {
     UnpinCache {
         cache_id: String,
     },
+    /// 在不重载权重的前提下修改模型运行参数；模型负责字段与物理上限校验。
+    UpdateRuntimeConfig {
+        patch: Value,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +126,16 @@ pub struct TaskProgress {
     pub total: usize,
     pub elapsed_seconds: f64,
     pub phase_eta_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<TaskPreview>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskPreview {
+    pub index: usize,
+    pub timestamp_seconds: f64,
+    pub content_type: String,
+    pub data_base64: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,6 +176,12 @@ pub struct TaskView {
     pub updated_at: u64,
     pub metadata: Value,
     pub outputs: Vec<StoredArtifact>,
+    pub previews: Vec<TaskPreview>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskQueueInfo {
+    pub estimated_wait_seconds: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -179,6 +231,8 @@ struct RegisteredNode {
     last_dispatched: u64,
     /// 已下发、尚未被 node 最新负载快照覆盖的准入压力。
     pending_pressure: usize,
+    /// 注册时的物理并发容量；热调只能降低/恢复到该上限。
+    physical_max_concurrency: usize,
     commands: NodeCommands,
     /// 持有 iroh 连接防 drop 关闭；standalone 同进程节点没有 transport。
     _transport: Option<iroh::endpoint::Connection>,
@@ -301,10 +355,15 @@ struct InflightRequest {
     cancelled: bool,
     /// 是否占用节点并发槽位(primary=true;重试合并条目没有真实 NewPrefill,不占)。
     counted: bool,
+    /// 瘦身下发时保存的完整请求:节点终态 CacheMiss 后去掉 cache_id 重发,
+    /// 走全量 prefill 而不是把 miss 暴露给客户端。非瘦身请求为 None。
+    full_request: Option<Value>,
 }
 
 struct InflightTask {
     node_id: String,
+    cancel_pending: bool,
+    started_at: Option<u64>,
     view: TaskView,
     /// 原始任务请求。节点断连后孤儿任务改派到新节点时需要重发 NewTask。
     request: Value,
@@ -322,6 +381,16 @@ pub struct LocalNodeChannels {
 /// 被新注册节点接管的孤儿任务;调用方在锁外重发 NewTask。
 struct AdoptedTask {
     task_id: String,
+    model: String,
+    task_kind: String,
+    request: Value,
+}
+
+struct QueuedDispatch {
+    node_id: String,
+    commands: NodeCommands,
+    task_id: String,
+    model: String,
     task_kind: String,
     request: Value,
 }
@@ -442,6 +511,7 @@ impl Scheduler {
                     connection,
                     last_dispatched: 0,
                     pending_pressure: 0,
+                    physical_max_concurrency: max_concurrency,
                     commands,
                     _transport: transport,
                 },
@@ -455,6 +525,9 @@ impl Scheduler {
         let mut state = self.state.lock().await;
         if let Some(node) = state.nodes.get_mut(node_id).filter(|node| node.connection == connection) {
             node.view.caches = caches;
+            if let Some(limit) = runtime.runtime_max_concurrency {
+                node.view.max_concurrency = limit.min(node.physical_max_concurrency);
+            }
             node.view.runtime = runtime;
             node.pending_pressure = 0;
             node.view.last_seen = unix_seconds();
@@ -464,6 +537,9 @@ impl Scheduler {
     async fn update_runtime(&self, node_id: &str, connection: u64, runtime: NodeRuntime) {
         let mut state = self.state.lock().await;
         if let Some(node) = state.nodes.get_mut(node_id).filter(|node| node.connection == connection) {
+            if let Some(limit) = runtime.runtime_max_concurrency {
+                node.view.max_concurrency = limit.min(node.physical_max_concurrency);
+            }
             node.view.runtime = runtime;
             node.pending_pressure = 0;
             node.view.last_seen = unix_seconds();
@@ -521,11 +597,18 @@ impl Scheduler {
             .collect()
     }
 
-    pub async fn models(&self) -> Vec<String> {
-        self.state.lock().await.nodes.values().map(|node| node.view.model.clone()).collect::<BTreeSet<_>>().into_iter().collect()
+    /// 热调只负责可靠下发；节点校验后的 revision、实际值或错误由
+    /// RuntimeChanged 回报，调用方随后从 `/v1/nodes` 读取权威状态。
+    pub async fn update_runtime_config(&self, node_id: &str, patch: Value) -> Result<(), DispatchError> {
+        let commands = self.state.lock().await.nodes.get(node_id).map(|node| node.commands.clone()).ok_or(DispatchError::NodeDisconnected)?;
+        commands.send(SchedulerMessage::UpdateRuntimeConfig { patch }).await.then_some(()).ok_or(DispatchError::NodeDisconnected)
     }
 
-    pub async fn dispatch(&self, request_id: String, model: String, cache_id: Option<&str>, request: Value) -> Result<mpsc::Receiver<InferenceEvent>, DispatchError> {
+    pub async fn models(&self) -> Vec<String> {
+        self.state.lock().await.nodes.values().flat_map(|node| std::iter::once(node.view.model.clone()).chain(node.view.capabilities.task_models.keys().cloned())).collect::<BTreeSet<_>>().into_iter().collect()
+    }
+
+    async fn dispatch_inner(&self, request_id: String, model: String, cache_id: Option<&str>, request: Value, slim_candidate: Option<(Value, Value)>) -> Result<mpsc::Receiver<InferenceEvent>, DispatchError> {
         let events = {
             let mut state = self.state.lock().await;
             // 同 cache_id 已有 writer = 同一请求的重复提交:正常对话的 cache_id
@@ -537,7 +620,7 @@ impl Scheduler {
                 let hub = existing.hub.clone();
                 let node_id = existing.node_id.clone();
                 let receiver = hub.subscribe(request_id.clone());
-                state.requests.insert(request_id.clone(), InflightRequest { node_id, hub, cache_id: Some(cache_id.to_owned()), cancelled: false, counted: false });
+                state.requests.insert(request_id.clone(), InflightRequest { node_id, hub, cache_id: Some(cache_id.to_owned()), cancelled: false, counted: false, full_request: None });
                 return Ok(receiver);
             }
             let cached_nodes = cache_id
@@ -547,10 +630,11 @@ impl Scheduler {
             let admission_pressure = if cached_nodes.is_empty() { 4 } else { 1 };
             // cache 已存在时只在持有者中选择：内存优先于本机 SSD；全部满载则排队，
             // 不 fallback 到无 cache 节点重算并制造第二个 writer。
-            let selected = if let Some(cache_id) = cache_id.filter(|_| !cached_nodes.is_empty()) {
+            let from_holder = cache_id.is_some_and(|_| !cached_nodes.is_empty());
+            let selected = if from_holder {
                 cached_nodes.into_iter().filter(|node_id| state.nodes.get(node_id).is_some_and(|node| node_has_capacity(node, admission_pressure))).min_by_key(|node_id| {
                     let node = &state.nodes[node_id];
-                    (cache_location_rank(&node.view.runtime, cache_id), node.view.runtime.scheduling_pressure(), node.last_dispatched, node.view.registration_seq)
+                    (cache_location_rank(&node.view.runtime, cache_id.unwrap_or_default()), node.view.runtime.scheduling_pressure(), node.last_dispatched, node.view.registration_seq)
                 })
             } else {
                 state
@@ -569,10 +653,21 @@ impl Scheduler {
             node.last_dispatched = dispatch;
             node.pending_pressure = node.pending_pressure.saturating_add(admission_pressure);
             let commands = node.commands.clone();
+            // 瘦身:命中路由到持有者且节点声明支持增量 resume 时,下发锁外
+            // 预构造的增量请求([边界 assistant, ...增量])——节点直接用 cache
+            // 开工,wire 不再传全文;完整请求留在 inflight 供终态 CacheMiss 后重发。
+            let (dispatched, full_request) = if from_holder
+                && state.nodes.get(&node_id).is_some_and(|node| node.view.capabilities.terminal_resume_delta)
+                && let Some((slim, full)) = slim_candidate
+            {
+                (slim, Some(full))
+            } else {
+                (request, None)
+            };
             let (entry_tx, entry_rx) = mpsc::channel(64);
             let hub = EventHub::new(entry_tx.clone(), request_id.clone());
             let receiver = hub.subscribe(request_id.clone());
-            state.requests.insert(request_id.clone(), InflightRequest { node_id: node_id.clone(), hub: hub.clone(), cache_id: cache_id.map(str::to_owned), cancelled: false, counted: true });
+            state.requests.insert(request_id.clone(), InflightRequest { node_id: node_id.clone(), hub: hub.clone(), cache_id: cache_id.map(str::to_owned), cancelled: false, counted: true, full_request });
             if let Some(node) = state.nodes.get_mut(&node_id) {
                 node.view.active_requests += 1;
             }
@@ -581,11 +676,11 @@ impl Scheduler {
             // 本地节点的 NewPrefill 直接携带事件入口,token 数据面不再经过 scheduler。
             let retry_model = model.clone();
             let sent = match &commands {
-                NodeCommands::Wire(tx) => tx.try_send(SchedulerMessage::NewPrefill { request_id: request_id.clone(), model, request }).map_err(|error| match error {
+                NodeCommands::Wire(tx) => tx.try_send(SchedulerMessage::NewPrefill { request_id: request_id.clone(), model, request: dispatched }).map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => DispatchError::NoAvailableNode(retry_model.clone()),
                     mpsc::error::TrySendError::Closed(_) => DispatchError::NodeDisconnected,
                 }),
-                NodeCommands::Local(tx) => tx.try_send(LocalNodeCommand::NewPrefill { request_id: request_id.clone(), model, request, events: entry_tx }).map_err(|error| match error {
+                NodeCommands::Local(tx) => tx.try_send(LocalNodeCommand::NewPrefill { request_id: request_id.clone(), model, request: dispatched, events: entry_tx }).map_err(|error| match error {
                     mpsc::error::TrySendError::Full(_) => DispatchError::NoAvailableNode(retry_model.clone()),
                     mpsc::error::TrySendError::Closed(_) => DispatchError::NodeDisconnected,
                 }),
@@ -633,15 +728,22 @@ impl Scheduler {
         self.state.lock().await.nodes.iter().filter(|(_, node)| node.view.caches.iter().any(|cache| cache.cache_id == cache_id)).map(|(node_id, node)| (node_id.clone(), node.commands.clone())).collect()
     }
 
+    pub async fn dispatch(&self, request_id: String, model: String, cache_id: Option<&str>, request: Value) -> Result<mpsc::Receiver<InferenceEvent>, DispatchError> {
+        let slim_candidate = slim_resume_candidate(cache_id, &request);
+        self.dispatch_inner(request_id, model, cache_id, request, slim_candidate).await
+    }
+
     /// 节点真实并发槽位暂满时等待流式 runtime 释放容量；模型未注册则立即返回。
     /// 同 cache_id 的重试请求在 dispatch 内即时合并,不进入这条等待路径。
     /// append 排队期间对 cache 持有者下发 pin:排队等的是"槽位",不能再让
-    /// LRU 换出把等待目标挪到 SSD,排到队时退化为 swap-in 慢路径。
+    /// LRU 换出把等待目标挪到 SSD,排到队时退化为 swap-in 慢路径。瘦身候选
+    /// 在循环外计算一次,排队轮询不重复折叠全量 messages。
     pub async fn dispatch_wait(&self, request_id: String, model: String, cache_id: Option<&str>, request: Value) -> Result<mpsc::Receiver<InferenceEvent>, DispatchError> {
+        let slim_candidate = slim_resume_candidate(cache_id, &request);
         let deadline = tokio::time::Instant::now() + self.dispatch_wait;
         let mut pinned: Vec<(String, NodeCommands)> = Vec::new();
         let result = loop {
-            match self.dispatch(request_id.clone(), model.clone(), cache_id, request.clone()).await {
+            match self.dispatch_inner(request_id.clone(), model.clone(), cache_id, request.clone(), slim_candidate.clone()).await {
                 Err(DispatchError::NoAvailableNode(_)) => {
                     let (model_registered, cache_hit) = {
                         let state = self.state.lock().await;
@@ -712,9 +814,18 @@ impl Scheduler {
         let terminal = event.terminal();
         let entry = {
             let mut state = self.state.lock().await;
-            let Some(request) = state.requests.get(request_id).filter(|request| request.node_id == node_id) else {
+            let Some(request) = state.requests.get(request_id) else {
+                if terminal {
+                    eprintln!("[scheduler] 忽略未知请求终态 node_id={node_id} request_id={request_id} event={event:?}");
+                }
                 return;
             };
+            if request.node_id != node_id {
+                if terminal {
+                    eprintln!("[scheduler] 忽略旧节点终态 node_id={node_id} expected_node_id={} request_id={request_id} event={event:?}", request.node_id);
+                }
+                return;
+            }
             let entry = request.hub.entry.clone();
             if terminal {
                 let request = state.requests.remove(request_id).expect("刚确认请求存在");
@@ -725,6 +836,88 @@ impl Scheduler {
             entry
         };
         let _ = entry.send(event).await;
+    }
+
+    /// 节点对瘦身 resume 请求终态 miss(cache 已不可恢复):用 inflight 保存的
+    /// 完整请求去掉 cache_id 重发,复用原 hub 与 request_id,HTTP 订阅者对
+    /// miss 无感。重发无 cache_id,自然走新 prompt 的全量 prefill,不会再次
+    /// 进入瘦身路径;选不到节点或发送失败则向订阅者补终态错误。非瘦身请求
+    /// 的 miss 不在协议内(节点本就收到完整请求,miss 走全量 prefill),按
+    /// 异常上报处理:摘条目并终止。
+    async fn handle_cache_miss(&self, node_id: &str, request_id: &str) {
+        let Some((hub, redispatch)) = self.plan_cache_miss(node_id, request_id).await else { return };
+        let Some((node_id, commands, model, full, events)) = redispatch else {
+            eprintln!("[scheduler] resume cache miss 终止 request_id={request_id}: 请求已取消或无可用节点");
+            let _ = hub.entry.send(InferenceEvent::Error { message: "resume cache 重建不可用".to_owned() }).await;
+            return;
+        };
+        let failed = match &commands {
+            NodeCommands::Wire(tx) => tx.try_send(SchedulerMessage::NewPrefill { request_id: request_id.to_owned(), model, request: full }).is_err(),
+            NodeCommands::Local(tx) => tx.try_send(LocalNodeCommand::NewPrefill { request_id: request_id.to_owned(), model, request: full, events }).is_err(),
+        };
+        if failed {
+            eprintln!("[scheduler] resume cache miss 重发失败 request_id={request_id}: 节点命令通道已满或已关闭");
+            let mut state = self.state.lock().await;
+            state.requests.remove(request_id);
+            if let Some(node) = state.nodes.get_mut(&node_id) {
+                node.view.active_requests = node.view.active_requests.saturating_sub(1);
+                node.pending_pressure = node.pending_pressure.saturating_sub(4);
+            }
+            drop(state);
+            let _ = hub.entry.send(InferenceEvent::Error { message: "resume cache 重建重发失败".to_owned() }).await;
+        }
+    }
+
+    /// CacheMiss 的锁内决策:摘除瘦身条目、归还槽位;可重发时按新 prompt 预算
+    /// 重选节点并登记新条目。返回 (hub, None) 表示应终止,Some(...) 为待发送
+    /// 的重发载荷(Local 重发携带原 hub 的事件入口,节点事件直达既有 dispatcher,
+    /// 订阅者无感;Wire 节点的事件本就经 publish 进同一 hub)。
+    async fn plan_cache_miss(&self, node_id: &str, request_id: &str) -> Option<(Arc<EventHub>, Option<(String, NodeCommands, String, Value, mpsc::Sender<InferenceEvent>)>)> {
+        let mut state = self.state.lock().await;
+        let request = state.requests.get(request_id).filter(|request| request.node_id == node_id)?;
+        let hub = request.hub.clone();
+        let Some(mut full) = request.full_request.clone() else {
+            state.requests.remove(request_id);
+            if let Some(node) = state.nodes.get_mut(node_id) {
+                node.view.active_requests = node.view.active_requests.saturating_sub(1);
+            }
+            return Some((hub, None));
+        };
+        if request.cancelled {
+            state.requests.remove(request_id);
+            if let Some(node) = state.nodes.get_mut(node_id) {
+                node.view.active_requests = node.view.active_requests.saturating_sub(1);
+            }
+            return Some((hub, None));
+        }
+        // 去掉 cache_id 与瘦身标记,重发走新 prompt 的四份预算,不会再次命中瘦身路径。
+        state.requests.remove(request_id);
+        if let Some(node) = state.nodes.get_mut(node_id) {
+            node.view.active_requests = node.view.active_requests.saturating_sub(1);
+            node.pending_pressure = node.pending_pressure.saturating_sub(1);
+        }
+        if let Some(object) = full.as_object_mut() {
+            object.remove("cache_id");
+            object.remove("_zllm_resume");
+            object.remove("_zllm_resume_hash");
+        }
+        let Some(model) = full.get("model").and_then(Value::as_str).map(str::to_owned) else { return Some((hub, None)) };
+        state.next_dispatch = state.next_dispatch.wrapping_add(1).max(1);
+        let dispatch = state.next_dispatch;
+        let target = state.nodes.iter().filter(|(_, node)| node.view.model == model && node_has_capacity(node, 4)).min_by_key(|(_, node)| dispatch_order(&node.view, node.last_dispatched, None)).map(|(node_id, _)| node_id.clone());
+        // 已摘除 primary，仍要把 hub 交给终态分发器，避免订阅者与合并条目悬挂。
+        let Some(target) = target else { return Some((hub, None)) };
+        if let Some(node) = state.nodes.get_mut(&target) {
+            node.last_dispatched = dispatch;
+            node.pending_pressure = node.pending_pressure.saturating_add(4);
+        }
+        let commands = state.nodes.get(&target).expect("刚选择的节点必须存在").commands.clone();
+        state.requests.insert(request_id.to_owned(), InflightRequest { node_id: target.clone(), hub: hub.clone(), cache_id: None, cancelled: false, counted: true, full_request: None });
+        if let Some(node) = state.nodes.get_mut(&target) {
+            node.view.active_requests += 1;
+        }
+        let events = hub.entry.clone();
+        Some((hub, Some((target, commands, model, full, events))))
     }
 
     pub async fn cancel(&self, request_id: &str) {
@@ -774,7 +967,7 @@ impl Scheduler {
                             break;
                         }
                         for task in adopted {
-                            if command_tx.send(LocalNodeCommand::Wire(SchedulerMessage::NewTask { task_id: task.task_id, model: model.clone(), task_kind: task.task_kind, request: task.request })).await.is_err() {
+                            if command_tx.send(LocalNodeCommand::Wire(SchedulerMessage::NewTask { task_id: task.task_id, model: task.model, task_kind: task.task_kind, request: task.request })).await.is_err() {
                                 break;
                             }
                         }
@@ -797,6 +990,9 @@ impl Scheduler {
                             // 数据面应已直达请求通道；非终态事件出现在控制面说明节点实现漂移。
                             eprintln!("[scheduler] 本地节点经控制面发送非终态事件 request={request_id}，已丢弃");
                         }
+                    }
+                    NodeMessage::CacheMiss { request_id, .. } => {
+                        scheduler.handle_cache_miss(&node_id, &request_id).await;
                     }
                     NodeMessage::TaskStatus { task_id, status, error, outputs } => {
                         scheduler.update_task_status(&node_id, &task_id, &status, error, outputs).await;
@@ -829,7 +1025,7 @@ impl Scheduler {
     pub(super) async fn track_test_request(&self, request_id: &str) {
         let (entry, _entry_rx) = mpsc::channel(1);
         let hub = EventHub::new(entry, request_id.to_owned());
-        self.state.lock().await.requests.insert(request_id.to_owned(), InflightRequest { node_id: String::new(), hub, cache_id: None, cancelled: false, counted: false });
+        self.state.lock().await.requests.insert(request_id.to_owned(), InflightRequest { node_id: String::new(), hub, cache_id: None, cancelled: false, counted: false, full_request: None });
     }
 
     #[cfg(test)]
@@ -844,37 +1040,50 @@ impl Scheduler {
 
     pub async fn dispatch_task(&self, task_id: String, model: String, task_kind: String, request: Value, metadata: Value) -> Result<TaskView, DispatchError> {
         let now = unix_seconds();
-        let view = TaskView { id: task_id.clone(), model: model.clone(), task_kind: task_kind.clone(), status: "queued".to_owned(), progress: None, error: None, created_at: now, updated_at: now, metadata, outputs: Vec::new() };
-        let commands = {
-            let mut state = self.state.lock().await;
-            // 跟文本路径同元组（无 cache_id → cache_miss=false）：先按 current_batch_tokens，再 active_requests，
-            // 最后 last_dispatched 单调计数器做 tiebreak，取代 last_seen（与 active_requests 共变动会反复重排）。
-            let selected = state
-                .nodes
-                .iter()
-                .filter(|(_, node)| node.view.model == model && node.view.active_requests < node.view.max_concurrency && node.view.capabilities.task_kinds.iter().any(|kind| kind == &task_kind))
-                .min_by_key(|(_, node)| dispatch_order(&node.view, node.last_dispatched, None))
-                .map(|(node_id, _)| node_id.clone());
-            let Some(node_id) = selected else {
-                return Err(DispatchError::NoAvailableNode(model));
-            };
-            state.next_dispatch = state.next_dispatch.wrapping_add(1).max(1);
-            let dispatch = state.next_dispatch;
-            if let Some(node) = state.nodes.get_mut(&node_id) {
-                node.last_dispatched = dispatch;
-            }
-            let commands = state.nodes.get(&node_id).expect("刚选择的节点必须存在").commands.clone();
-            state.tasks.insert(task_id.clone(), InflightTask { node_id: node_id.clone(), view: view.clone(), request: request.clone(), expected_outputs: BTreeMap::new(), expected_output_count: 0 });
-            if let Some(node) = state.nodes.get_mut(&node_id) {
-                node.view.active_requests += 1;
-            }
-            commands
+        let view = TaskView {
+            id: task_id.clone(),
+            model: model.clone(),
+            task_kind: task_kind.clone(),
+            status: "queued".to_owned(),
+            progress: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
+            metadata,
+            outputs: Vec::new(),
+            previews: Vec::new(),
         };
-        if !commands.send(SchedulerMessage::NewTask { task_id: task_id.clone(), model, task_kind, request }).await {
-            self.update_task_status("", &task_id, "failed", Some("选中的节点已经断开".to_owned()), Vec::new()).await;
-            return Err(DispatchError::NodeDisconnected);
+        {
+            let mut state = self.state.lock().await;
+            let registered = state.nodes.iter().any(|(_, node)| node.view.capabilities.supports_task(&node.view.model, &model, &task_kind));
+            if !registered {
+                return Err(DispatchError::NoAvailableNode(model));
+            }
+            state.tasks.insert(task_id.clone(), InflightTask { node_id: String::new(), cancel_pending: false, started_at: None, view, request, expected_outputs: BTreeMap::new(), expected_output_count: 0 });
         }
-        Ok(view)
+        self.dispatch_queued_tasks().await;
+        self.task(&task_id).await.ok_or(DispatchError::NodeDisconnected)
+    }
+
+    async fn dispatch_queued_tasks(&self) {
+        let dispatches = {
+            let mut state = self.state.lock().await;
+            assign_queued_tasks(&mut state)
+        };
+        for dispatch in dispatches {
+            let message = SchedulerMessage::NewTask { task_id: dispatch.task_id.clone(), model: dispatch.model, task_kind: dispatch.task_kind, request: dispatch.request };
+            if !dispatch.commands.send(message).await {
+                let mut state = self.state.lock().await;
+                if let Some(task) = state.tasks.get_mut(&dispatch.task_id).filter(|task| task.node_id == dispatch.node_id && task.view.status == "queued") {
+                    task.node_id.clear();
+                    task.view.error = Some("执行节点连接已断开，等待其他节点".to_owned());
+                    task.view.updated_at = unix_seconds();
+                    if let Some(node) = state.nodes.get_mut(&dispatch.node_id) {
+                        node.view.active_requests = node.view.active_requests.saturating_sub(1);
+                    }
+                }
+            }
+        }
     }
 
     async fn update_task_status(&self, node_id: &str, task_id: &str, status: &str, error: Option<String>, outputs: Vec<ArtifactDescriptor>) {
@@ -890,6 +1099,16 @@ impl Scheduler {
         }
         let was_terminal = matches!(task.view.status.as_str(), "succeeded" | "failed" | "cancelled");
         if was_terminal {
+            // HTTP 取消只发出停止请求，节点确认计算已退出才释放物理执行名额。
+            if task.cancel_pending && matches!(status, "cancelled" | "failed" | "uploading") {
+                task.cancel_pending = false;
+                let owner = task.node_id.clone();
+                if let Some(node) = state.nodes.get_mut(&owner) {
+                    node.view.active_requests = node.view.active_requests.saturating_sub(1);
+                }
+                drop(state);
+                self.dispatch_queued_tasks().await;
+            }
             return;
         }
         let (status, error, expected_outputs) = if status == "succeeded" {
@@ -917,6 +1136,10 @@ impl Scheduler {
         if terminal && let Some(node) = state.nodes.get_mut(&owner) {
             node.view.active_requests = node.view.active_requests.saturating_sub(1);
         }
+        drop(state);
+        if terminal {
+            self.dispatch_queued_tasks().await;
+        }
     }
 
     async fn update_task_progress(&self, node_id: &str, task_id: &str, progress: TaskProgress) {
@@ -927,12 +1150,75 @@ impl Scheduler {
         if task.node_id != node_id || matches!(task.view.status.as_str(), "succeeded" | "failed" | "cancelled") {
             return;
         }
+        if let Some(preview) = progress.preview.as_ref() {
+            task.view.previews.retain(|existing| existing.index != preview.index);
+            task.view.previews.push(preview.clone());
+            task.view.previews.sort_by_key(|preview| preview.index);
+        }
+        if progress.phase == "preview" {
+            task.view.updated_at = unix_seconds();
+            return;
+        }
         task.view.progress = Some(progress);
         task.view.updated_at = unix_seconds();
     }
 
     pub async fn task(&self, task_id: &str) -> Option<TaskView> {
         self.state.lock().await.tasks.get(task_id).map(|task| task.view.clone())
+    }
+
+    pub async fn task_queue_info(&self, task_id: &str) -> Option<TaskQueueInfo> {
+        let state = self.state.lock().await;
+        let task = state.tasks.get(task_id)?;
+        if task.view.status != "queued" {
+            return None;
+        }
+        if !task.node_id.is_empty() {
+            return Some(TaskQueueInfo { estimated_wait_seconds: 0 });
+        }
+        let now = unix_seconds();
+        let estimate = |task: &InflightTask| {
+            let mut measured = state
+                .tasks
+                .values()
+                .filter(|old| old.view.status == "succeeded" && old.view.model == task.view.model && old.view.task_kind == task.view.task_kind && task_work_units(&old.view) == task_work_units(&task.view))
+                .filter_map(|old| old.started_at.map(|start| old.view.updated_at.saturating_sub(start)))
+                .filter(|seconds| *seconds > 0)
+                .collect::<Vec<_>>();
+            measured.sort_unstable();
+            measured.get(measured.len() / 2).copied().unwrap_or_else(|| estimated_task_seconds(&task.view))
+        };
+        // 模拟所有共享名额上的 FIFO，而不是分别数两种模型的排队人数。
+        let mut slots = state
+            .nodes
+            .iter()
+            .flat_map(|(id, node)| {
+                let mut free = vec![0_u64; node.view.max_concurrency];
+                let mut active = state.tasks.values().filter(|active| &active.node_id == id && (active.cancel_pending || !matches!(active.view.status.as_str(), "succeeded" | "failed" | "cancelled")));
+                for ready in &mut free {
+                    if let Some(active) = active.next() {
+                        *ready = estimate(active).saturating_sub(now.saturating_sub(active.started_at.unwrap_or(now))).max(10);
+                    }
+                }
+                free.into_iter().map(move |ready| (id, node, ready))
+            })
+            .collect::<Vec<_>>();
+        let mut queued = state.tasks.iter().filter(|(_, queued)| queued.view.status == "queued" && queued.node_id.is_empty()).collect::<Vec<_>>();
+        queued.sort_by_key(|(id, queued)| (queued.view.created_at, *id));
+        for (id, queued) in queued {
+            let slot = slots.iter_mut().filter(|(_, node, _)| node.view.capabilities.supports_task(&node.view.model, &queued.view.model, &queued.view.task_kind)).min_by_key(|(id, _, ready)| (*ready, *id));
+            let Some((_, _, ready)) = slot else {
+                if id == task_id {
+                    return None;
+                }
+                continue;
+            };
+            if id == task_id {
+                return Some(TaskQueueInfo { estimated_wait_seconds: *ready });
+            }
+            *ready = ready.saturating_add(estimate(queued));
+        }
+        None
     }
 
     pub async fn tasks(&self, task_kind: Option<&str>) -> Vec<TaskView> {
@@ -946,19 +1232,22 @@ impl Scheduler {
             if matches!(task.view.status.as_str(), "succeeded" | "failed" | "cancelled") {
                 return Some(task.view.clone());
             }
+            let computation_finished = task.view.status == "uploading";
             task.view.status = "cancelled".to_owned();
             task.view.updated_at = unix_seconds();
             let node_id = task.node_id.clone();
+            task.cancel_pending = !node_id.is_empty() && !computation_finished;
             let view = task.view.clone();
-            let commands = state.nodes.get_mut(&node_id).map(|node| {
+            if computation_finished && let Some(node) = state.nodes.get_mut(&node_id) {
                 node.view.active_requests = node.view.active_requests.saturating_sub(1);
-                node.commands.clone()
-            });
+            }
+            let commands = state.nodes.get(&node_id).map(|node| node.commands.clone());
             (commands, view)
         };
         if let Some(commands) = commands {
             let _ = commands.send(SchedulerMessage::Cancel { request_id: task_id.to_owned() }).await;
         }
+        self.dispatch_queued_tasks().await;
         Some(view)
     }
 
@@ -966,7 +1255,7 @@ impl Scheduler {
         let task = {
             let mut state = self.state.lock().await;
             let task = state.tasks.get(task_id)?;
-            if !matches!(task.view.status.as_str(), "succeeded" | "failed" | "cancelled") {
+            if task.cancel_pending || !matches!(task.view.status.as_str(), "succeeded" | "failed" | "cancelled") {
                 return None;
             }
             state.tasks.remove(task_id).map(|task| task.view)
@@ -992,6 +1281,35 @@ impl Scheduler {
         let mut encoded = vec![0u8; header_bytes];
         recv.read_exact(&mut encoded).await?;
         let header: ArtifactHeader = serde_json::from_slice(&encoded)?;
+        self.receive_artifact_data(node_id, connection, header, recv).await
+    }
+
+    /// 本地产物复用同一提交协议；先登记完整清单，避免状态通道与文件通道竞速。
+    pub(super) async fn receive_local_artifacts(&self, node_id: &str, task_id: &str, outputs: Vec<(ArtifactDescriptor, PathBuf)>) -> Result<(), DynError> {
+        let connection = {
+            let state = self.state.lock().await;
+            let node = state.nodes.get(node_id).filter(|node| matches!(node.commands, NodeCommands::Local(_))).ok_or("本地产物提交需要已注册的 local 节点")?;
+            if !state.tasks.get(task_id).is_some_and(|task| task.node_id == node_id) {
+                return Err(format!("artifact task {task_id} 不属于节点 {node_id}").into());
+            }
+            node.connection
+        };
+        let descriptors = outputs.iter().map(|(descriptor, _)| descriptor.clone()).collect::<Vec<_>>();
+        validate_artifact_descriptors(descriptors.clone())?;
+        self.update_task_status(node_id, task_id, "uploading", None, descriptors).await;
+        let output_count = outputs.len();
+        for (artifact, path) in outputs {
+            let file = tokio::fs::File::open(&path).await?;
+            let metadata = file.metadata().await?;
+            if !metadata.is_file() || metadata.len() != artifact.bytes {
+                return Err(format!("本地产物 {} 大小变化: actual={} expected={}", path.display(), metadata.len(), artifact.bytes).into());
+            }
+            self.receive_artifact_data(node_id, connection, ArtifactHeader { task_id: task_id.to_owned(), artifact, output_count }, file).await?;
+        }
+        Ok(())
+    }
+
+    async fn receive_artifact_data<R: tokio::io::AsyncRead + Unpin>(&self, node_id: &str, connection: u64, header: ArtifactHeader, recv: R) -> Result<(), DynError> {
         if header.artifact.bytes == 0 || header.artifact.bytes > MAX_ARTIFACT_BYTES || header.output_count == 0 {
             return Err(format!("artifact {} bytes={} output_count={} 非法", header.artifact.id, header.artifact.bytes, header.output_count).into());
         }
@@ -1028,6 +1346,7 @@ impl Scheduler {
         tokio::fs::rename(&temporary, &final_path).await?;
         tokio::fs::File::open(directory).await?.sync_all().await?;
 
+        let mut completed = false;
         {
             let mut state = self.state.lock().await;
             let task = state.tasks.get_mut(&header.task_id).ok_or_else(|| format!("artifact task {} 已不存在", header.task_id))?;
@@ -1050,12 +1369,45 @@ impl Scheduler {
                 if !was_terminal && let Some(node) = state.nodes.get_mut(&owner) {
                     node.view.active_requests = node.view.active_requests.saturating_sub(1);
                 }
+                completed = !was_terminal;
             }
         }
         if !commands.send(SchedulerMessage::ArtifactCommitted { task_id: header.task_id, artifact_id: header.artifact.id }).await {
             return Err("artifact committed ACK 发送失败".into());
         }
+        if completed {
+            self.dispatch_queued_tasks().await;
+        }
         Ok(())
+    }
+}
+
+/// 瘦身候选(增量请求, 完整请求底稿)的锁外预计算:边界验证与截断是对全量
+/// messages 的序列化折叠,长 prompt 时毫秒级,不能放进 registry 锁内阻塞心跳
+/// 与并发 dispatch。仅当选中持有者且节点声明能力时才被消费。
+fn slim_resume_candidate(cache_id: Option<&str>, request: &Value) -> Option<(Value, Value)> {
+    let cache_id = cache_id?;
+    match request_terminal_resume(request) {
+        Ok(TerminalResume::Match { cache_id: matched, assistant }) if matched == cache_id => slim_resume_request(request, cache_id, assistant).ok().map(|slim| (slim, request.clone())),
+        _ => None,
+    }
+}
+
+/// 已完成任务的同规格实测优先；冷启动阶段仅提供明确的时长/像素估算。
+fn task_work_units(task: &TaskView) -> (u64, u64) {
+    let duration = task.metadata.get("duration").and_then(Value::as_u64).unwrap_or_else(|| task.metadata.get("frames").and_then(Value::as_u64).unwrap_or(360).div_ceil(24));
+    let pixels = task.metadata.get("width").and_then(Value::as_u64).unwrap_or(1344).saturating_mul(task.metadata.get("height").and_then(Value::as_u64).unwrap_or(768));
+    (duration.max(1), pixels.max(1))
+}
+
+fn estimated_task_seconds(task: &TaskView) -> u64 {
+    let (duration, pixels) = task_work_units(task);
+    match task.task_kind.as_str() {
+        "video_generation" => 180 * duration / 15,
+        // 使用已验收2K批次的估算基准，不能把1K整片成绩线性放大为2K耗时。
+        "video_super_resolution" => (super::studio::HD_ESTIMATED_SECONDS_PER_VIDEO_SECOND as u64).saturating_mul(duration).saturating_mul(pixels).div_ceil(2688 * 1536),
+        "image_generation" => 90,
+        _ => 120,
     }
 }
 
@@ -1069,13 +1421,52 @@ fn registered_max_concurrency(requested: usize, capabilities: &NodeCapabilities)
     requested.min(min_tokens / page_tokens)
 }
 
-fn node_has_capacity(node: &RegisteredNode, additional: usize) -> bool {
+fn node_has_capacity(node: &RegisteredNode, admission_pressure: usize) -> bool {
+    if node.view.runtime.kv_cache_available_tokens.is_some() {
+        // 引擎拿到实际 token 数及两端 GPU cache 形态后做最终内存准入。
+        // scheduler 只限制业务入口槽位，待放行的请求在引擎中排队。
+        return node.view.active_requests < node.view.max_concurrency;
+    }
     node.view.active_requests < node.view.max_concurrency
-        && if additional == 1 {
+        && if admission_pressure == 1 {
             node.view.runtime.decode.saturating_add(node.pending_pressure) <= NodeRuntime::APPEND_DECODE_LIMIT
         } else {
-            node.view.runtime.scheduling_pressure().saturating_add(node.pending_pressure).saturating_add(additional) <= NodeRuntime::MAX_SCHEDULING_PRESSURE
+            node.view.runtime.scheduling_pressure().saturating_add(node.pending_pressure).saturating_add(admission_pressure) <= NodeRuntime::MAX_SCHEDULING_PRESSURE
         }
+}
+
+/// 把等待队列按创建时间分配到当前空闲节点。任务只有在这里拿到 node_id 后才
+/// 占节点槽位；节点满载时仍保留在 scheduler，不把排队压力推给 HTTP 客户端。
+fn assign_queued_tasks(state: &mut RegistryState) -> Vec<QueuedDispatch> {
+    let mut task_ids =
+        state.tasks.iter().filter(|(_, task)| task.view.status == "queued" && (task.node_id.is_empty() || !state.nodes.contains_key(&task.node_id))).map(|(task_id, task)| (task.view.created_at, task_id.clone())).collect::<Vec<_>>();
+    task_ids.sort_unstable();
+    let mut dispatches = Vec::new();
+    for (_, task_id) in task_ids {
+        let Some((model, task_kind, request)) = state.tasks.get(&task_id).map(|task| (task.view.model.clone(), task.view.task_kind.clone(), task.request.clone())) else {
+            continue;
+        };
+        let selected = state
+            .nodes
+            .iter()
+            .filter(|(_, node)| node.view.capabilities.supports_task(&node.view.model, &model, &task_kind) && node.view.active_requests < node.view.max_concurrency)
+            .min_by_key(|(_, node)| dispatch_order(&node.view, node.last_dispatched, None))
+            .map(|(node_id, _)| node_id.clone());
+        let Some(node_id) = selected else { continue };
+        state.next_dispatch = state.next_dispatch.wrapping_add(1).max(1);
+        let dispatch = state.next_dispatch;
+        let node = state.nodes.get_mut(&node_id).expect("刚选择的节点必须存在");
+        node.last_dispatched = dispatch;
+        node.view.active_requests += 1;
+        let commands = node.commands.clone();
+        let task = state.tasks.get_mut(&task_id).expect("排队任务必须存在");
+        task.node_id = node_id.clone();
+        task.started_at = Some(unix_seconds());
+        task.view.error = None;
+        task.view.updated_at = unix_seconds();
+        dispatches.push(QueuedDispatch { node_id, commands, task_id, model, task_kind, request });
+    }
+    dispatches
 }
 
 /// 节点断连时 video_generation 等持久化任务会置回 queued 等待原节点恢复；若原
@@ -1087,26 +1478,27 @@ fn adopt_orphaned_tasks(state: &mut RegistryState, node_id: &str) -> Vec<Adopted
     let Some(node) = state.nodes.get(node_id) else {
         return Vec::new();
     };
-    let (model, task_kinds, mut slots) = (node.view.model.clone(), node.view.capabilities.task_kinds.clone(), node.view.max_concurrency.saturating_sub(node.view.active_requests));
+    let (model, capabilities, mut slots) = (node.view.model.clone(), node.view.capabilities.clone(), node.view.max_concurrency.saturating_sub(node.view.active_requests));
     let mut adopted = Vec::new();
-    if slots == 0 || task_kinds.is_empty() {
+    if slots == 0 {
         return adopted;
     }
     for (task_id, task) in state.tasks.iter_mut() {
         if slots == 0 {
             break;
         }
-        if task.view.status != "queued" || state.nodes.contains_key(&task.node_id) || task.view.model != model || !task_kinds.contains(&task.view.task_kind) {
+        if task.view.status != "queued" || state.nodes.contains_key(&task.node_id) || !capabilities.supports_task(&model, &task.view.model, &task.view.task_kind) {
             continue;
         }
         task.node_id = node_id.to_owned();
+        task.started_at = Some(unix_seconds());
         task.view.error = None;
         task.view.updated_at = unix_seconds();
         slots -= 1;
         if let Some(node) = state.nodes.get_mut(node_id) {
             node.view.active_requests += 1;
         }
-        adopted.push(AdoptedTask { task_id: task_id.clone(), task_kind: task.view.task_kind.clone(), request: task.request.clone() });
+        adopted.push(AdoptedTask { task_id: task_id.clone(), model: task.view.model.clone(), task_kind: task.view.task_kind.clone(), request: task.request.clone() });
     }
     adopted
 }
@@ -1215,7 +1607,7 @@ async fn handle_connection(connection: iroh::endpoint::Connection, scheduler: Sc
     command_tx.send(SchedulerMessage::Registered { node_id: peer_id.clone(), heartbeat_seconds: 5, task_ids }).await.map_err(|_| "节点注册确认发送失败")?;
     for task in adopted {
         // 改派失败仅意味着新节点已断开;任务的 node_id 已指向它,随其 unregister 重新排队。
-        if command_tx.send(SchedulerMessage::NewTask { task_id: task.task_id, model: model.clone(), task_kind: task.task_kind, request: task.request }).await.is_err() {
+        if command_tx.send(SchedulerMessage::NewTask { task_id: task.task_id, model: task.model, task_kind: task.task_kind, request: task.request }).await.is_err() {
             break;
         }
     }
@@ -1245,6 +1637,9 @@ async fn handle_connection(connection: iroh::endpoint::Connection, scheduler: Sc
                 NodeMessage::RuntimeChanged { runtime } => scheduler.update_runtime(&peer_id, connection_id, runtime).await,
                 NodeMessage::Event { request_id, event } => {
                     scheduler.publish(&peer_id, &request_id, event).await;
+                }
+                NodeMessage::CacheMiss { request_id, .. } => {
+                    scheduler.handle_cache_miss(&peer_id, &request_id).await;
                 }
                 NodeMessage::TaskStatus { task_id, status, error, outputs } => {
                     scheduler.update_task_status(&peer_id, &task_id, &status, error, outputs).await;
@@ -1555,6 +1950,152 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn 瘦身命中下发增量且cache_miss重发完整请求() {
+        let service = SchedulerService::bind(None, SchedulerConfig::default()).await.unwrap();
+        let scheduler = service.scheduler();
+        let ticket = EndpointTicket::from_str(service.ticket()).unwrap();
+        let client = Endpoint::builder(presets::N0).clear_relay_transports().bind().await.unwrap();
+        let connection = client.connect(ticket.endpoint_addr().clone(), SCHEDULER_ALPN).await.unwrap();
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        let first = json!({"model": "m", "messages": [{"role": "user", "content": "问"}]});
+        let cache_id = terminal_cache_id(&first, "答", &[]).unwrap();
+        write_json_line(
+            &mut send,
+            &NodeMessage::Register {
+                protocol_version: SCHEDULER_PROTOCOL_VERSION,
+                api_key: None,
+                model: "m".to_owned(),
+                max_concurrency: 2,
+                capabilities: NodeCapabilities { terminal_resume_delta: true, ..NodeCapabilities::default() },
+                runtime: NodeRuntime::default(),
+                caches: vec![CacheInfo { cache_id: cache_id.clone(), model_key: "m".to_owned(), cache_format: "mla".to_owned(), last_layer: 7, prompt_tokens: 32, bytes: 4096, modified_unix: 1 }],
+            },
+        )
+        .await
+        .unwrap();
+        let mut reader = BufReader::new(recv);
+        assert!(matches!(read_json_line::<_, SchedulerMessage>(&mut reader).await.unwrap(), SchedulerMessage::Registered { .. }));
+
+        let append = json!({"model": "m", "cache_id": cache_id, "messages": [
+            {"role": "user", "content": "问"},
+            {"role": "assistant", "content": "答"},
+            {"role": "user", "content": "续"},
+        ]});
+        let mut events = scheduler.dispatch("req_slim".to_owned(), "m".to_owned(), Some(&cache_id), append).await.unwrap();
+        let SchedulerMessage::NewPrefill { request, .. } = read_json_line::<_, SchedulerMessage>(&mut reader).await.unwrap() else {
+            panic!("应收到 NewPrefill");
+        };
+        // 瘦身:只发 [边界 assistant, ...增量],注入 resume 标记与折叠锚。
+        assert_eq!(request.get("_zllm_resume").and_then(Value::as_str), Some(cache_id.as_str()));
+        assert!(request.get("_zllm_resume_hash").and_then(Value::as_str).is_some());
+        let messages = request.get("messages").and_then(Value::as_array).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].get("role"), Some(&json!("assistant")));
+        assert_eq!(messages[1].get("content"), Some(&json!("续")));
+
+        // 节点终态 miss:scheduler 去 cache_id 重发完整请求,事件流不中断。
+        write_json_line(&mut send, &NodeMessage::CacheMiss { request_id: "req_slim".to_owned(), cache_id: cache_id.clone() }).await.unwrap();
+        let SchedulerMessage::NewPrefill { request, .. } = read_json_line::<_, SchedulerMessage>(&mut reader).await.unwrap() else {
+            panic!("miss 后应重发 NewPrefill");
+        };
+        assert!(request.get("cache_id").is_none() && request.get("_zllm_resume").is_none() && request.get("_zllm_resume_hash").is_none());
+        assert_eq!(request.get("messages").and_then(Value::as_array).map(Vec::len), Some(3), "重发必须携带完整 messages");
+
+        write_json_line(&mut send, &NodeMessage::Event { request_id: "req_slim".to_owned(), event: InferenceEvent::Started }).await.unwrap();
+        write_json_line(&mut send, &NodeMessage::Event { request_id: "req_slim".to_owned(), event: InferenceEvent::Completed { finish_reason: "stop".to_owned(), prompt_tokens: 4, completion_tokens: 1 } }).await.unwrap();
+        assert!(matches!(events.recv().await, Some(InferenceEvent::Started)), "miss 不应向订阅者暴露错误");
+        assert!(matches!(events.recv().await, Some(InferenceEvent::Completed { completion_tokens: 1, .. })));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while scheduler.nodes().await[0].active_requests != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        connection.close(0u32.into(), b"test complete");
+        client.close().await;
+        service.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn 瘦身miss无重建容量时结束全部订阅并释放条目() {
+        let scheduler = Scheduler::default();
+        let first = json!({"model": "m", "messages": [{"role": "user", "content": "问"}]});
+        let cache_id = terminal_cache_id(&first, "答", &[]).unwrap();
+        let cache = CacheInfo { cache_id: cache_id.clone(), model_key: "m".to_owned(), cache_format: "mla".to_owned(), last_layer: 7, prompt_tokens: 32, bytes: 4096, modified_unix: 1 };
+        let mut node = register_local_node(&scheduler, "node", "m", 12, vec![cache]).await;
+        scheduler.state.lock().await.nodes.get_mut("node").unwrap().view.capabilities.terminal_resume_delta = true;
+        let append = json!({"model": "m", "cache_id": cache_id, "messages": [
+            {"role": "user", "content": "问"}, {"role": "assistant", "content": "答"}, {"role": "user", "content": "续"},
+        ]});
+        let mut events = scheduler.dispatch("primary".to_owned(), "m".to_owned(), Some(&cache_id), append.clone()).await.unwrap();
+        let mut retry = scheduler.dispatch("retry".to_owned(), "m".to_owned(), Some(&cache_id), append).await.unwrap();
+        assert!(matches!(node.commands.recv().await, Some(LocalNodeCommand::NewPrefill { request, .. }) if request.get("_zllm_resume").is_some()));
+        // 已接入的 append 只占一点压力；重建要四点，其他 decode 使它无法重发。
+        scheduler.state.lock().await.nodes.get_mut("node").unwrap().view.runtime.decode = NodeRuntime::MAX_SCHEDULING_PRESSURE;
+        scheduler.handle_cache_miss("node", "primary").await;
+        for receiver in [&mut events, &mut retry] {
+            assert!(matches!(tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await, Ok(Some(InferenceEvent::Error { .. }))), "没有重建容量也必须发送终态错误");
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !scheduler.state.lock().await.requests.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let state = scheduler.state.lock().await;
+        assert_eq!(state.nodes["node"].view.active_requests, 0);
+        assert_eq!(state.nodes["node"].pending_pressure, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn 未声明瘦身能力的节点仍收到完整请求() {
+        let service = SchedulerService::bind(None, SchedulerConfig::default()).await.unwrap();
+        let scheduler = service.scheduler();
+        let ticket = EndpointTicket::from_str(service.ticket()).unwrap();
+        let client = Endpoint::builder(presets::N0).clear_relay_transports().bind().await.unwrap();
+        let connection = client.connect(ticket.endpoint_addr().clone(), SCHEDULER_ALPN).await.unwrap();
+        let (mut send, recv) = connection.open_bi().await.unwrap();
+        let first = json!({"model": "m", "messages": [{"role": "user", "content": "问"}]});
+        let cache_id = terminal_cache_id(&first, "答", &[]).unwrap();
+        write_json_line(
+            &mut send,
+            &NodeMessage::Register {
+                protocol_version: SCHEDULER_PROTOCOL_VERSION,
+                api_key: None,
+                model: "m".to_owned(),
+                max_concurrency: 2,
+                capabilities: NodeCapabilities::default(),
+                runtime: NodeRuntime::default(),
+                caches: vec![CacheInfo { cache_id: cache_id.clone(), model_key: "m".to_owned(), cache_format: "mla".to_owned(), last_layer: 7, prompt_tokens: 32, bytes: 4096, modified_unix: 1 }],
+            },
+        )
+        .await
+        .unwrap();
+        let mut reader = BufReader::new(recv);
+        assert!(matches!(read_json_line::<_, SchedulerMessage>(&mut reader).await.unwrap(), SchedulerMessage::Registered { .. }));
+
+        let append = json!({"model": "m", "cache_id": cache_id, "messages": [
+            {"role": "user", "content": "问"},
+            {"role": "assistant", "content": "答"},
+            {"role": "user", "content": "续"},
+        ]});
+        let events = scheduler.dispatch("req_full".to_owned(), "m".to_owned(), Some(&cache_id), append).await.unwrap();
+        drop(events);
+        let SchedulerMessage::NewPrefill { request, .. } = read_json_line::<_, SchedulerMessage>(&mut reader).await.unwrap() else {
+            panic!("应收到 NewPrefill");
+        };
+        assert!(request.get("_zllm_resume").is_none(), "未声明能力的节点不瘦身");
+        assert_eq!(request.get("messages").and_then(Value::as_array).map(Vec::len), Some(3));
+
+        connection.close(0u32.into(), b"test complete");
+        client.close().await;
+        service.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn 断连后的video孤儿任务由新节点接管() {
         let service = SchedulerService::bind(None, SchedulerConfig::default()).await.unwrap();
         let scheduler = service.scheduler();
@@ -1676,6 +2217,20 @@ mod tests {
         assert_eq!(registered_max_concurrency(128, &NodeCapabilities::default()), 14);
     }
 
+    #[tokio::test]
+    async fn 实时显存节点只在物理槽位用尽时停止入口() {
+        let scheduler = Scheduler::default();
+        let _node = register_local_node(&scheduler, "node", "glm-5.2", 14, Vec::new()).await;
+        let mut state = scheduler.state.lock().await;
+        let node = state.nodes.get_mut("node").unwrap();
+        node.view.runtime.kv_cache_available_tokens = Some(1024);
+        node.view.runtime.decode = 13;
+        node.view.active_requests = 13;
+        assert!(node_has_capacity(node, 4), "第十四路由引擎按逐卡显存做最终准入，scheduler 不得用 prefill 权重提前拒绝");
+        node.view.active_requests = 14;
+        assert!(!node_has_capacity(node, 1), "物理 session 槽位耗尽后必须停止入口");
+    }
+
     #[test]
     fn runtime_pressure_uses_prefill_four_to_one_ratio() {
         let runtime = NodeRuntime { new_prefill: 2, append_prefill: 3, decode: 5, ..NodeRuntime::default() };
@@ -1697,6 +2252,99 @@ mod tests {
         assert!(validate_artifact_descriptors(vec![descriptor.clone(), descriptor]).unwrap_err().contains("重复"));
         let outside = ArtifactDescriptor { id: "audio".to_owned(), file_name: "../audio.wav".to_owned(), content_type: "audio/wav".to_owned(), bytes: 1024 };
         assert!(validate_artifact_descriptors(vec![outside]).unwrap_err().contains("单一文件名"));
+    }
+
+    #[tokio::test]
+    async fn local_artifacts_commit_and_release_video_slot() {
+        let directory = std::env::temp_dir().join(format!("zllm-local-artifacts-{}-{}", std::process::id(), ARTIFACT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)));
+        tokio::fs::create_dir_all(&directory).await.unwrap();
+        let scheduler = Scheduler::new(&SchedulerConfig { artifact_dir: directory.join("committed"), ..SchedulerConfig::default() });
+        let (commands, mut receiver) = mpsc::channel(8);
+        scheduler
+            .register("local".to_owned(), "h3".to_owned(), 1, Vec::new(), NodeCapabilities { task_kinds: vec!["video_generation".to_owned()], ..NodeCapabilities::default() }, NodeRuntime::default(), NodeCommands::Local(commands), None)
+            .await;
+        scheduler.dispatch_task("first".to_owned(), "h3".to_owned(), "video_generation".to_owned(), json!({}), json!({})).await.unwrap();
+        let _ = receiver.recv().await.unwrap();
+        let mut outputs = Vec::new();
+        for (id, data) in [("video", b"video bytes".as_slice()), ("audio", b"audio bytes".as_slice())] {
+            let path = directory.join(id);
+            tokio::fs::write(&path, data).await.unwrap();
+            outputs.push((ArtifactDescriptor { id: id.to_owned(), file_name: format!("{id}.bin"), content_type: "application/octet-stream".to_owned(), bytes: data.len() as u64 }, path));
+        }
+        assert!(scheduler.receive_local_artifacts("unknown", "first", outputs.clone()).await.is_err());
+        scheduler.receive_local_artifacts("local", "first", outputs.clone()).await.unwrap();
+        assert_eq!(scheduler.task("first").await.unwrap().status, "succeeded");
+        assert_eq!(scheduler.task("first").await.unwrap().outputs.len(), 2);
+        assert_eq!(scheduler.nodes().await[0].active_requests, 0);
+        for (descriptor, path) in &outputs {
+            assert_eq!(tokio::fs::read(scheduler.artifact_path("first", &descriptor.id).unwrap()).await.unwrap(), tokio::fs::read(path).await.unwrap());
+            assert!(matches!(receiver.recv().await.unwrap(), LocalNodeCommand::Wire(SchedulerMessage::ArtifactCommitted { .. })));
+        }
+        // 重复的 uploading 状态和文件提交不能重复释放槽位或改变已提交结果。
+        scheduler.receive_local_artifacts("local", "first", outputs).await.unwrap();
+        assert_eq!(scheduler.nodes().await[0].active_requests, 0);
+        scheduler.dispatch_task("second".to_owned(), "h3".to_owned(), "video_generation".to_owned(), json!({}), json!({})).await.unwrap();
+        assert_eq!(scheduler.nodes().await[0].active_requests, 1);
+        scheduler.cancel_task("second").await.unwrap();
+        let path = directory.join("video");
+        let output = ArtifactDescriptor { id: "video".to_owned(), file_name: "video.bin".to_owned(), content_type: "application/octet-stream".to_owned(), bytes: 11 };
+        assert!(scheduler.receive_local_artifacts("local", "second", vec![(output, path)]).await.is_err());
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn 生成节点满载时进入队列并在取消后自动下发() {
+        let scheduler = Scheduler::default();
+        let mut node = scheduler.attach_local_node("h3-node".to_owned());
+        node.messages
+            .send(NodeMessage::Register {
+                protocol_version: SCHEDULER_PROTOCOL_VERSION,
+                api_key: None,
+                model: "MiniMax-H3".to_owned(),
+                max_concurrency: 1,
+                caches: Vec::new(),
+                capabilities: NodeCapabilities { task_kinds: vec!["video_generation".to_owned()], ..NodeCapabilities::default() },
+                runtime: NodeRuntime::default(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(node.commands.recv().await, Some(LocalNodeCommand::Wire(SchedulerMessage::Registered { .. }))));
+
+        scheduler.dispatch_task("first".to_owned(), "MiniMax-H3".to_owned(), "video_generation".to_owned(), json!({}), json!({})).await.unwrap();
+        assert!(matches!(node.commands.recv().await, Some(LocalNodeCommand::Wire(SchedulerMessage::NewTask { task_id, .. })) if task_id == "first"));
+        scheduler.dispatch_task("second".to_owned(), "MiniMax-H3".to_owned(), "video_generation".to_owned(), json!({}), json!({})).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20), node.commands.recv()).await.is_err());
+        assert!((179..=180).contains(&scheduler.task_queue_info("second").await.unwrap().estimated_wait_seconds));
+
+        scheduler.cancel_task("first").await.unwrap();
+        assert!(matches!(node.commands.recv().await, Some(LocalNodeCommand::Wire(SchedulerMessage::Cancel { request_id })) if request_id == "first"));
+        assert!(tokio::time::timeout(Duration::from_millis(20), node.commands.recv()).await.is_err());
+        assert_eq!(scheduler.nodes().await[0].active_requests, 1);
+        node.messages.send(NodeMessage::TaskStatus { task_id: "first".to_owned(), status: "cancelled".to_owned(), error: None, outputs: Vec::new() }).await.unwrap();
+        assert!(matches!(node.commands.recv().await, Some(LocalNodeCommand::Wire(SchedulerMessage::NewTask { task_id, .. })) if task_id == "second"));
+        assert_eq!(scheduler.task_queue_info("second").await.unwrap().estimated_wait_seconds, 0);
+    }
+
+    #[tokio::test]
+    async fn 双模型两节点共用名额并估算混合队列() {
+        let scheduler = Scheduler::default();
+        let capabilities = NodeCapabilities { task_kinds: vec!["video_generation".to_owned()], task_models: BTreeMap::from([("SeedVR2-7B".to_owned(), vec!["video_super_resolution".to_owned()])]), ..NodeCapabilities::default() };
+        let mut channels = Vec::new();
+        for id in ["a", "b"] {
+            let (sender, receiver) = mpsc::channel(8);
+            scheduler.register(id.to_owned(), "MiniMax-H3".to_owned(), 1, Vec::new(), capabilities.clone(), NodeRuntime::default(), NodeCommands::Local(sender), None).await;
+            channels.push(receiver);
+        }
+        assert!(scheduler.models().await.contains(&"SeedVR2-7B".to_owned()));
+        scheduler.dispatch_task("a-video".to_owned(), "MiniMax-H3".to_owned(), "video_generation".to_owned(), json!({}), json!({"duration": 15})).await.unwrap();
+        scheduler.dispatch_task("b-hd".to_owned(), "SeedVR2-7B".to_owned(), "video_super_resolution".to_owned(), json!({}), json!({"frames": 360, "width": 2688, "height": 1536})).await.unwrap();
+        scheduler.dispatch_task("c-hd".to_owned(), "SeedVR2-7B".to_owned(), "video_super_resolution".to_owned(), json!({}), json!({"frames": 360, "width": 2688, "height": 1536})).await.unwrap();
+        assert!(scheduler.nodes().await.iter().all(|node| node.active_requests == 1));
+        assert!((179..=180).contains(&scheduler.task_queue_info("c-hd").await.unwrap().estimated_wait_seconds));
+        let owner = scheduler.state.lock().await.tasks["a-video"].node_id.clone();
+        scheduler.update_task_status(&owner, "a-video", "failed", None, Vec::new()).await;
+        assert_eq!(scheduler.state.lock().await.tasks["c-hd"].node_id, owner);
+        assert!(scheduler.nodes().await.iter().all(|node| node.active_requests == 1));
     }
 
     /// 本地节点注册辅助:用 `attach_local_node` 的内存通道避开 iroh。
@@ -1908,5 +2556,20 @@ mod tests {
         drop(pending_after);
         scheduler.publish("idle", "req_after", InferenceEvent::Completed { finish_reason: "stop".to_owned(), prompt_tokens: 1, completion_tokens: 0 }).await;
         scheduler.publish("owner", "req_fill", InferenceEvent::Completed { finish_reason: "stop".to_owned(), prompt_tokens: 1, completion_tokens: 0 }).await;
+    }
+
+    #[tokio::test]
+    async fn runtime_config_is_delivered_without_reconnecting_node() {
+        let scheduler = Scheduler::default();
+        let mut node = register_local_node(&scheduler, "hot-node", "glm-5.2", 12, Vec::new()).await;
+        let patch = json!({"max_concurrency": 6, "mtp_draft_tokens": 3});
+        scheduler.update_runtime_config("hot-node", patch.clone()).await.unwrap();
+        assert!(matches!(node.commands.recv().await, Some(LocalNodeCommand::Wire(SchedulerMessage::UpdateRuntimeConfig { patch: actual })) if actual == patch));
+
+        let connection = scheduler.state.lock().await.nodes["hot-node"].connection;
+        scheduler.update_runtime("hot-node", connection, NodeRuntime { runtime_config_revision: 2, runtime_max_concurrency: Some(6), runtime_config: Some(patch), ..NodeRuntime::default() }).await;
+        let view = scheduler.nodes().await.into_iter().find(|node| node.node_id == "hot-node").unwrap();
+        assert_eq!(view.max_concurrency, 6);
+        assert_eq!(view.runtime.runtime_config_revision, 2);
     }
 }

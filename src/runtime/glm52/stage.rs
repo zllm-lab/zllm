@@ -296,15 +296,14 @@ pub struct Glm52SchedulerPolicy {
     pub execution_slots: usize,
     pub decode_execution_slots: usize,
     pub pipeline_work_window: usize,
-    pub prefill_admission_burst: usize,
+    /// 多 placement 尚不支持跨 placement 多行 wave；普通路径取物理 session 上限。
     pub decode_batch_limit: usize,
-    pub prefill_batch_limit: usize,
     pub profile_completion: bool,
 }
 
 impl Default for Glm52SchedulerPolicy {
     fn default() -> Self {
-        Self { execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 8, prefill_admission_burst: 1, decode_batch_limit: 4, prefill_batch_limit: 4, profile_completion: false }
+        Self { execution_slots: 1, decode_execution_slots: 1, pipeline_work_window: 8, decode_batch_limit: usize::MAX, profile_completion: false }
     }
 }
 
@@ -784,9 +783,8 @@ where
         execution_slots: policy.execution_slots.max(1).min(session_capacity),
         decode_execution_slots: policy.decode_execution_slots.max(1).min(session_capacity),
         pipeline_work_window: policy.pipeline_work_window,
-        prefill_admission_burst: policy.prefill_admission_burst,
+        prefill_admission_burst: 1,
         decode_batch_limit: policy.decode_batch_limit.max(1).min(session_capacity),
-        prefill_batch_limit: policy.prefill_batch_limit.max(1).min(session_capacity),
         profile_completion: policy.profile_completion,
     })
 }

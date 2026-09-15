@@ -6,7 +6,17 @@ pub(super) fn ct_quantized_code() -> Result<&'static [u8], String> {
     static CODE: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
     CODE.get_or_init(|| {
         compile_hip_source(
-            &[super::super::hiprtc::DEVICE_CONVERSIONS_PREAMBLE, super::gguf::QUANT_SOURCE, super::gguf::K_DECODE_SOURCE, super::ct_common::SOURCE, super::ct_dense::SOURCE, super::ct_grouped::SOURCE, super::convrot::SOURCE, super::gguf::SOURCE].concat(),
+            &[
+                super::super::hiprtc::DEVICE_CONVERSIONS_PREAMBLE,
+                super::gguf::QUANT_SOURCE,
+                super::gguf::K_DECODE_SOURCE,
+                super::ct_common::SOURCE,
+                super::ct_dense::SOURCE,
+                super::ct_grouped::SOURCE,
+                super::convrot::SOURCE,
+                super::gguf::SOURCE,
+            ]
+            .concat(),
             "zllm_rocm_ct_quantized.hip",
         )
     })
@@ -19,17 +29,14 @@ fn gguf_k_decode_wave64_code() -> Result<&'static [u8], String> {
     static CODE: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
     CODE.get_or_init(|| {
         super::super::hiprtc::compile_hip_source_with_options(
-            &[
-                super::super::hiprtc::DEVICE_CONVERSIONS_PREAMBLE,
-                super::gguf::QUANT_SOURCE,
-                "\n#if defined(__gfx1100__)\n",
-                super::gguf::K_DECODE_SOURCE,
-                "\n#endif\n",
-            ].concat(),
+            &[super::super::hiprtc::DEVICE_CONVERSIONS_PREAMBLE, super::gguf::QUANT_SOURCE, "\n#if defined(__gfx1100__)\n", super::gguf::K_DECODE_SOURCE, "\n#endif\n"].concat(),
             "zllm_rocm_gguf_k_decode_wave64.hip",
             &["-mwavefrontsize64"],
         )
-    }).as_ref().map(Vec::as_slice).map_err(Clone::clone)
+    })
+    .as_ref()
+    .map(Vec::as_slice)
+    .map_err(Clone::clone)
 }
 
 #[derive(Clone, Copy)]

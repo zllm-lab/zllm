@@ -1080,8 +1080,8 @@ pub fn glm52_moe_prefill_layer_segmented<B: ExpertPrefillBackend + DsaPrefillBac
     )?;
     backend.profile_device_operator("glm_ffn")?;
     let (spec, shared) = glm52_moe_spec(cfg, &weights.shared_gate, &weights.shared_up, &weights.shared_down);
-    let ffn_weights = MoeFfnRef { router_weight: &weights.router_weight, router_bias: &weights.router_bias, shared_experts: &shared, selected_experts: None };
-    let routed_weights = RoutedMoeWeightsRef { router: &weights.router_weight, bias: &weights.router_bias, selected_experts: None };
+    let ffn_weights = MoeFfnRef { router_weight: &weights.router_weight, router_bias: &weights.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
+    let routed_weights = RoutedMoeWeightsRef { router: &weights.router_weight, bias: &weights.router_bias, selected_experts: None, bias_vl: None, image_rows: None };
     if let Some(result) = backend.parallel_moe_rmsnorm_add(&spec, routed_weights, &shared, layer, experts, &out, &weights.post_attn_norm, cfg.rms_eps)? {
         Ok(result)
     } else if let Some((route_input, expert_input)) = backend.rmsnorm_quantized_pair(&out, &weights.post_attn_norm, cfg.rms_eps)? {
@@ -1196,8 +1196,8 @@ pub fn glm52_moe_prefill_layer<B: ExpertPrefillBackend + DsaPrefillBackend>(
 
     backend.profile_device_operator("glm_ffn")?;
     let (spec, shared) = glm52_moe_spec(cfg, &weights.shared_gate, &weights.shared_up, &weights.shared_down);
-    let ffn_weights = MoeFfnRef { router_weight: &weights.router_weight, router_bias: &weights.router_bias, shared_experts: &shared, selected_experts: None };
-    let routed_weights = RoutedMoeWeightsRef { router: &weights.router_weight, bias: &weights.router_bias, selected_experts: None };
+    let ffn_weights = MoeFfnRef { router_weight: &weights.router_weight, router_bias: &weights.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
+    let routed_weights = RoutedMoeWeightsRef { router: &weights.router_weight, bias: &weights.router_bias, selected_experts: None, bias_vl: None, image_rows: None };
     let parallel_result = if route_trace.is_none() { backend.parallel_moe_rmsnorm_add(&spec, routed_weights, &shared, layer, experts, &out, &weights.post_attn_norm, cfg.rms_eps)? } else { None };
     let result = if let Some(result) = parallel_result {
         Ok(result)
@@ -1333,7 +1333,7 @@ pub fn glm52_decode_layer<B: ExpertDecodeBackend + DecodeBackend, S: ExpertSourc
         cfg.rms_eps,
     )?;
     let (spec, shared) = glm52_moe_spec(cfg, &weights.shared_gate, &weights.shared_up, &weights.shared_down);
-    let ffn_weights = MoeFfnRef { router_weight: &weights.router_weight, router_bias: &weights.router_bias, shared_experts: &shared, selected_experts: None };
+    let ffn_weights = MoeFfnRef { router_weight: &weights.router_weight, router_bias: &weights.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
     let source = expert_sources.source(layer).map_err(BackendError::ExpertLoad)?;
     let next_source = if layer + 1 < cfg.layer_count {
         let next_layer = layer + 1;
@@ -1528,6 +1528,11 @@ where
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 for (segment, segment_key) in segments.iter_mut().zip(segment_keys.iter()) {
+                    // catch-up 与后续 draft 必须从首行起使用同一份双卡 DSA
+                    // history；先写单卡再切分会使辅助层在首次 draft 时失败。
+                    if backend.cooperative_dsa_append_keys_layernorm_rope(cfg.layer_count, experts, &mut *segment.dsa, segment.position, segment_key, &indexer.k_norm_weight, &indexer.k_norm_bias, 1.0e-6, &rope.cos, &rope.sin, &dsa)? {
+                        continue;
+                    }
                     if !backend.append_dsa_keys_layernorm_rope(&mut *segment.dsa, cfg.layer_count, segment.position, segment_key, &indexer.k_norm_weight, &indexer.k_norm_bias, 1.0e-6, &rope.cos, &rope.sin, &dsa)? {
                         return Err(BackendError::Compute { msg: "GLM-5.2 segmented MTP DSA 融合预检后拒绝执行".to_owned() });
                     }

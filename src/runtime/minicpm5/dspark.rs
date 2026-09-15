@@ -93,10 +93,8 @@ fn check_matrix(shape: &[usize], rows: usize, columns: usize, name: &str) -> Res
 
 impl Minicpm5DsparkRuntime {
     pub fn load(ctx: &MetalContext, directory: &Path, max_seq_len: usize) -> Result<Self, BackendError> {
-        let config: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(directory.join("config.json")).map_err(|error| compute(format!("DSpark config.json: {error}")))?,
-        )
-        .map_err(|error| compute(format!("DSpark config.json 解析: {error}")))?;
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(directory.join("config.json")).map_err(|error| compute(format!("DSpark config.json: {error}")))?).map_err(|error| compute(format!("DSpark config.json 解析: {error}")))?;
         let num = |key: &str| config.get(key).and_then(|value| value.as_u64()).map(|value| value as usize);
         let spec = Minicpm5DsparkSpec {
             hidden_size: num("hidden_size").ok_or_else(|| compute("DSpark config 缺 hidden_size"))?,
@@ -110,7 +108,11 @@ impl Minicpm5DsparkRuntime {
             mask_token_id: num("mask_token_id").ok_or_else(|| compute("DSpark config 缺 mask_token_id"))? as u32,
             markov_rank: num("markov_rank").ok_or_else(|| compute("DSpark config 缺 markov_rank"))?,
             vocab_size: num("draft_vocab_size").or_else(|| num("vocab_size")).ok_or_else(|| compute("DSpark config 缺 vocab_size"))?,
-            target_layers: config.get("target_layer_ids").and_then(|value| value.as_array()).map(|items| items.iter().filter_map(|item| item.as_u64().map(|id| id as usize)).collect()).ok_or_else(|| compute("DSpark config 缺 target_layer_ids"))?,
+            target_layers: config
+                .get("target_layer_ids")
+                .and_then(|value| value.as_array())
+                .map(|items| items.iter().filter_map(|item| item.as_u64().map(|id| id as usize)).collect())
+                .ok_or_else(|| compute("DSpark config 缺 target_layer_ids"))?,
         };
         let bytes = std::fs::read(directory.join("model.safetensors")).map_err(|error| compute(format!("DSpark safetensors: {error}")))?;
         let file = safetensors::SafeTensors::deserialize(&bytes).map_err(|error| compute(format!("DSpark safetensors 解析: {error}")))?;
@@ -149,14 +151,7 @@ impl Minicpm5DsparkRuntime {
         let markov_w2 = prepare_matrix_f32(ctx, &tensor_f32(&file, "markov_head.markov_w2.weight")?, spec.vocab_size, spec.markov_rank)?;
         check_matrix(&shape(&file, "markov_head.markov_w1.weight")?, spec.vocab_size, spec.markov_rank, "markov_w1")?;
         let markov_w1 = tensor_f32(&file, "markov_head.markov_w1.weight")?;
-        let backbone = DsparkBackbone {
-            output_norm: prepare_norm_f16(ctx, &tensor_f32(&file, "norm.weight")?)?,
-            layers,
-            head_count: spec.head_count,
-            kv_head_count: spec.kv_head_count,
-            head_dim: spec.head_dim,
-            rms_eps: spec.rms_eps,
-        };
+        let backbone = DsparkBackbone { output_norm: prepare_norm_f16(ctx, &tensor_f32(&file, "norm.weight")?)?, layers, head_count: spec.head_count, kv_head_count: spec.kv_head_count, head_dim: spec.head_dim, rms_eps: spec.rms_eps };
         let draft_tokens = spec.block_size;
         Ok(Self {
             rope: RopeTable::precompute(max_seq_len + spec.block_size, spec.head_dim, spec.rope_theta),

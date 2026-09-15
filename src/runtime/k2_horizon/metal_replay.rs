@@ -154,7 +154,7 @@ fn record_round(
                 experts.decode_inputs(
                     ctx,
                     &config.moe_spec(),
-                    &MoeFfnRef { router_weight: router, router_bias: bias, shared_experts: &shared, selected_experts: None },
+                    &MoeFfnRef { router_weight: router, router_bias: bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None },
                     ExpertDecodeRequest { layer, source: expert_source, position, next },
                     RoutedMoeInputs { route: &input, expert: &input },
                 )?

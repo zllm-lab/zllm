@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::attention::compressed_sparse::{
-    CompressedBatch, CompressedGatedSegment, CompressedSelection, CompressedSparseAttentionSpec, CompressedSparseKernel, CompressedSparsePrefillSegment, CompressionState, CompressionStream, KvCompressionSpec,
-    compress_gated_segmented_fallback,
+    CompressedBatch, CompressedGatedSegment, CompressedKvFormat, CompressedSelection, CompressedSparseAttentionSpec, CompressedSparseKernel, CompressedSparsePrefillSegment, CompressionState, CompressionStream, KvCompressionSpec, SharedCompressedBatch,
+    SharedCsaOutput, V41Compressed, compress_gated_segmented_fallback,
 };
 use crate::backend::{SegmentedTensorBackend, compute_error as compute};
 
@@ -76,6 +76,7 @@ pub struct RocmCompressedKvSerde {
     pub window_size: usize,
     pub kv_width: usize,
     pub q8_group_size: usize,
+    pub format: CompressedKvFormat,
     pub recent_capacity: usize,
     pub recent_start: usize,
     pub recent_len: usize,
@@ -94,6 +95,7 @@ pub struct RocmCompressedKvSerde {
     pub compressed_value_scales: Vec<u8>,
     pub compressed_index_width: usize,
     pub compressed_index_key: Option<Vec<u8>>,
+    pub compressed_index_key_scales: Option<Vec<u8>>,
     pub compressor: RocmGatedPoolSerde,
     pub indexer: RocmGatedPoolSerde,
 }
@@ -106,6 +108,18 @@ struct RocmCompressionReplay {
     compression: KvCompressionSpec,
     width: usize,
     rotary_dim: usize,
+    eps: f32,
+}
+
+struct RocmV41CompressionReplay {
+    key: RocmTensor,
+    gate: Option<RocmTensor>,
+    norm: RocmWeight,
+    index_key_projection: Option<(RocmWeight, RocmWeight)>,
+    compression: KvCompressionSpec,
+    width: usize,
+    rotary_dim: usize,
+    index_rope_dim: usize,
     eps: f32,
 }
 
@@ -131,6 +145,7 @@ struct RocmCompressedTransaction {
     indexer: RocmGatedPoolSnapshot,
     attention_replays: Vec<RocmAttentionReplay>,
     compressor_replays: Vec<RocmCompressionReplay>,
+    v41_compressor_replays: Vec<RocmV41CompressionReplay>,
     indexer_replays: Vec<RocmCompressionReplay>,
 }
 
@@ -228,6 +243,57 @@ impl RocmGatedPoolState {
         Ok(plan.visible_positions())
     }
 
+    fn replay_v41_prefix(&mut self, context: &RocmContext, replay: RocmV41CompressionReplay, rows: usize) -> Result<Vec<usize>, BackendError> {
+        if rows == 0 {
+            return Ok(Vec::new());
+        }
+        let key = f32_tensor(context, &replay.key)?;
+        let gate = replay.gate.as_ref().map(|gate| f32_tensor(context, gate)).transpose()?;
+        if rows > key.rows || gate.as_ref().is_some_and(|gate| rows > gate.rows) {
+            return Err(compute(format!("V4.1 ROCm compressor replay rows={rows} 超过 key/gate {}/{}", key.rows, gate.as_ref().map_or(0, |gate| gate.rows))));
+        }
+        let key_device = key.device.as_deref().ok_or_else(|| compute("V4.1 ROCm compressor replay key 缺少 device buffer"))?;
+        let gate_device = gate.as_ref().and_then(|gate| gate.device.as_deref());
+        let norm = constant(&replay.norm, replay.width, "V4.1 compressor replay norm")?;
+        let (wk, k_norm, index_dim) = match &replay.index_key_projection {
+            Some((wk, k_norm)) => {
+                let index_dim = k_norm.data().len();
+                let elements = index_dim.checked_mul(replay.width).ok_or_else(|| compute("V4.1 compressor replay wk 元素溢出"))?;
+                (Some(constant(wk, elements, "V4.1 compressor replay wk")?), Some(constant(k_norm, index_dim, "V4.1 compressor replay k_norm")?), index_dim)
+            }
+            None => (None, None, 0),
+        };
+        let pending_key = self.pending_key.as_deref().ok_or_else(|| compute("V4.1 compressor replay pending key 未初始化"))?;
+        let pending_gate = self.pending_gate.as_deref().ok_or_else(|| compute("V4.1 compressor replay pending gate 未初始化"))?;
+        let rope = self.rope.as_deref().ok_or_else(|| compute("V4.1 compressor replay RoPE 未初始化"))?;
+        let plan = self.state.plan_rows(rows, replay.compression.ratio).map_err(compute)?;
+        let (_, _, remaining) = ops::hip::try_csa_compress_v41_f32(
+            context.device_id,
+            pending_key,
+            pending_gate,
+            plan.pending_rows(),
+            key_device,
+            gate_device,
+            rows,
+            norm,
+            wk,
+            k_norm,
+            replay.compression.ratio,
+            replay.width,
+            plan.entry_start(),
+            replay.rotary_dim,
+            index_dim,
+            if index_dim == 0 { replay.rotary_dim } else { replay.index_rope_dim },
+            &rope.cos,
+            &rope.sin,
+            rope.elements,
+            replay.eps,
+        )
+        .map_err(compute)?;
+        self.state.commit(plan, remaining).map_err(compute)?;
+        Ok(plan.visible_positions())
+    }
+
     fn ensure_buffers(&mut self, context: &RocmContext, ratio: usize, width: usize, overlap: bool) -> Result<(), BackendError> {
         let channels = if overlap { width.checked_mul(2).ok_or_else(|| compute("V4 ROCm compressor channels 溢出"))? } else { width };
         if self.pending_key.is_none() {
@@ -286,6 +352,7 @@ pub struct RocmCompressedKvStorage {
     window_size: usize,
     kv_width: usize,
     q8_group_size: usize,
+    format: CompressedKvFormat,
     recent_key: Arc<ops::hip::DeviceBuffer>,
     recent_key_scales: Arc<ops::hip::DeviceBuffer>,
     recent_value: Arc<ops::hip::DeviceBuffer>,
@@ -300,8 +367,12 @@ pub struct RocmCompressedKvStorage {
     compressed_value: Arc<ops::hip::DeviceBuffer>,
     compressed_value_scales: Arc<ops::hip::DeviceBuffer>,
     compressed_index_key: Option<Arc<ops::hip::DeviceBuffer>>,
+    compressed_index_key_scales: Option<Arc<ops::hip::DeviceBuffer>>,
     compressed_index_width: usize,
     compressed_positions: Vec<usize>,
+    /// 单行 pipeline source 视图固定的压缩历史长度。视图只服务同一位置的
+    /// 下游层，所有压缩项都已可见，因此无需逐 token 复制完整位置表。
+    fixed_compressed_len: Option<usize>,
     compressed_capacity: usize,
     visible_scalar_value: Option<u32>,
     visible_scalar: Option<Arc<ops::hip::DeviceBuffer>>,
@@ -318,6 +389,143 @@ pub struct RocmCompressedKvStorage {
 }
 
 impl RocmCompressedKvStorage {
+    /// 捕获 source 层在当前 work 末尾的只读视图。底层 cache allocation 通过
+    /// Arc 共享；环形位置和可见长度按 work 固定，避免上游 stage 提前推进后让
+    /// 下游层读到未来 token。压缩器、batch scratch 与事务只属于写侧，不进入视图。
+    pub(crate) fn source_view(&self, decode: bool) -> Self {
+        let fixed_compressed_len = decode.then_some(self.compressed_positions.len());
+        Self {
+            window_size: self.window_size,
+            kv_width: self.kv_width,
+            q8_group_size: self.q8_group_size,
+            format: self.format,
+            recent_key: self.recent_key.clone(),
+            recent_key_scales: self.recent_key_scales.clone(),
+            recent_value: self.recent_value.clone(),
+            recent_value_scales: self.recent_value_scales.clone(),
+            recent_capacity: self.recent_capacity,
+            recent_start: self.recent_start,
+            recent_len: self.recent_len,
+            recent_first_position: self.recent_first_position,
+            next_recent_position: self.next_recent_position,
+            compressed_key: self.compressed_key.clone(),
+            compressed_key_scales: self.compressed_key_scales.clone(),
+            compressed_value: self.compressed_value.clone(),
+            compressed_value_scales: self.compressed_value_scales.clone(),
+            compressed_index_key: self.compressed_index_key.clone(),
+            compressed_index_key_scales: self.compressed_index_key_scales.clone(),
+            compressed_index_width: self.compressed_index_width,
+            compressed_positions: if decode { Vec::new() } else { self.compressed_positions.clone() },
+            fixed_compressed_len,
+            compressed_capacity: self.compressed_capacity,
+            visible_scalar_value: None,
+            visible_scalar: None,
+            batch_key: None,
+            batch_key_scales: None,
+            batch_value: None,
+            batch_value_scales: None,
+            batch_capacity: 0,
+            block_table: RocmBlockTable::new(),
+            compressor: RocmGatedPoolState::default(),
+            indexer: RocmGatedPoolState::default(),
+            transaction: None,
+            transaction_pool: None,
+        }
+    }
+
+    /// 跨 device 共享的压缩历史只追加。消费层把新增 prefix 镜像到本卡，避免
+    /// 每个 query/head 在 attention 内反复经 PCIe 读取源卡 Q8 cache。
+    fn mirror_compressed_from(&mut self, context: &RocmContext, source: &Self) -> Result<(), BackendError> {
+        if (self.window_size, self.kv_width, self.q8_group_size, self.format) != (source.window_size, source.kv_width, source.q8_group_size, source.format) {
+            return Err(compute("V4 ROCm compressed mirror 规格不一致"));
+        }
+        let required = source.compressed_positions.len();
+        if required == 0 {
+            self.compressed_positions.clear();
+            return Ok(());
+        }
+        let source_shared = Arc::ptr_eq(&source.compressed_key, &source.compressed_value)
+            && Arc::ptr_eq(&source.compressed_key_scales, &source.compressed_value_scales);
+        let index_width = source.compressed_index_width;
+        if index_width != 0 && source.compressed_index_key.is_none() {
+            return Err(compute("V4 ROCm compressed mirror 缺少 index key"));
+        }
+        let index_has_scales = source.format == CompressedKvFormat::Fp8WindowFp4Compressed && index_width != 0;
+        if source.compressed_index_key_scales.is_some() != index_has_scales {
+            return Err(compute("V4 ROCm compressed mirror index scale 规格不一致"));
+        }
+        let local_shared = Arc::ptr_eq(&self.compressed_key, &self.compressed_value)
+            && Arc::ptr_eq(&self.compressed_key_scales, &self.compressed_value_scales);
+        let same_prefix = self.compressed_positions.len() <= required
+            && self.compressed_positions == source.compressed_positions[..self.compressed_positions.len()];
+        let layout_changed = self.compressed_key.device_id() != context.device_id
+            || local_shared != source_shared
+            || self.compressed_index_width != index_width
+            || self.compressed_index_key.is_some() != source.compressed_index_key.is_some()
+            || self.compressed_index_key_scales.is_some() != source.compressed_index_key_scales.is_some();
+        let growing = required > self.compressed_capacity;
+        let copy_from = if layout_changed || growing || !same_prefix { 0 } else { self.compressed_positions.len() };
+        if layout_changed || growing {
+            let capacity = required.next_power_of_two();
+            let (key, key_scales) = Self::allocate_quantized_pair(context.device_id, capacity, self.compressed_row_bytes(), self.compressed_scale_row_bytes(), "compressed mirror key")?;
+            self.compressed_key = key;
+            self.compressed_key_scales = key_scales;
+            if source_shared {
+                self.compressed_value = self.compressed_key.clone();
+                self.compressed_value_scales = self.compressed_key_scales.clone();
+            } else {
+                let (value, value_scales) = Self::allocate_quantized_pair(context.device_id, capacity, self.compressed_row_bytes(), self.compressed_scale_row_bytes(), "compressed mirror value")?;
+                self.compressed_value = value;
+                self.compressed_value_scales = value_scales;
+            }
+            self.compressed_index_key = if index_width == 0 {
+                None
+            } else {
+                Some(Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, capacity * self.index_row_bytes(index_width)).map_err(compute)?))
+            };
+            self.compressed_index_key_scales = if index_has_scales {
+                Some(Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, capacity * self.index_scale_row_bytes(index_width)).map_err(compute)?))
+            } else {
+                None
+            };
+            self.compressed_capacity = capacity;
+        }
+        if copy_from == required {
+            return Ok(());
+        }
+        let rows = required - copy_from;
+        let row_bytes = self.compressed_row_bytes();
+        let scale_row_bytes = self.compressed_scale_row_bytes();
+        let mut sources = vec![source.compressed_key.clone(), source.compressed_key_scales.clone()];
+        let mut source_offsets = vec![copy_from * row_bytes, copy_from * scale_row_bytes];
+        let mut destinations = vec![(&*self.compressed_key, copy_from * row_bytes), (&*self.compressed_key_scales, copy_from * scale_row_bytes)];
+        let mut bytes = vec![rows * row_bytes, rows * scale_row_bytes];
+        if !source_shared {
+            sources.extend([source.compressed_value.clone(), source.compressed_value_scales.clone()]);
+            source_offsets.extend([copy_from * row_bytes, copy_from * scale_row_bytes]);
+            destinations.extend([(&*self.compressed_value, copy_from * row_bytes), (&*self.compressed_value_scales, copy_from * scale_row_bytes)]);
+            bytes.extend([rows * row_bytes, rows * scale_row_bytes]);
+        }
+        if let Some(index) = &source.compressed_index_key {
+            sources.push(index.clone());
+            let index_row_bytes = self.index_row_bytes(index_width);
+            source_offsets.push(copy_from * index_row_bytes);
+            destinations.push((self.compressed_index_key.as_deref().expect("compressed mirror index 已分配"), copy_from * index_row_bytes));
+            bytes.push(rows * index_row_bytes);
+        }
+        if let Some(scales) = &source.compressed_index_key_scales {
+            sources.push(scales.clone());
+            let scale_row_bytes = self.index_scale_row_bytes(index_width);
+            source_offsets.push(copy_from * scale_row_bytes);
+            destinations.push((self.compressed_index_key_scales.as_deref().expect("compressed mirror index scales 已分配"), copy_from * scale_row_bytes));
+            bytes.push(rows * scale_row_bytes);
+        }
+        ops::hip::DeviceBuffer::copy_stable_ranges_into_device_ordered_async_retained_by(&sources, &source_offsets, &destinations, &bytes, context.device_id, context.device_id).map_err(compute)?;
+        self.compressed_index_width = index_width;
+        self.compressed_positions.clone_from(&source.compressed_positions);
+        Ok(())
+    }
+
     /// 从不可变终点 graph 构造可写 session。recent ring 与压缩器状态会被后续
     /// token 原地修改，因此立即私有化；只追加的 compressed prefix 继续共享，
     /// 并把逻辑 capacity 收紧到当前长度，确保首次追加必经 COW。
@@ -335,6 +543,7 @@ impl RocmCompressedKvStorage {
             window_size: self.window_size,
             kv_width: self.kv_width,
             q8_group_size: self.q8_group_size,
+            format: self.format,
             recent_key,
             recent_key_scales,
             recent_value,
@@ -349,8 +558,10 @@ impl RocmCompressedKvStorage {
             compressed_value: self.compressed_value.clone(),
             compressed_value_scales: self.compressed_value_scales.clone(),
             compressed_index_key: self.compressed_index_key.clone(),
+            compressed_index_key_scales: self.compressed_index_key_scales.clone(),
             compressed_index_width: self.compressed_index_width,
             compressed_positions: self.compressed_positions.clone(),
+            fixed_compressed_len: None,
             compressed_capacity: self.compressed_positions.len(),
             visible_scalar_value: self.visible_scalar_value,
             visible_scalar: self.visible_scalar.clone(),
@@ -376,10 +587,12 @@ impl RocmCompressedKvStorage {
         self.recent_first_position = 0;
         self.next_recent_position = None;
         self.compressed_positions.clear();
+        self.fixed_compressed_len = None;
         // reusable session 不能把上一条长会话的 high-water capacity 继承给新会话。
         // buffer 在首次写入时按新请求实际规模替换，旧 allocation 随后回到可驱逐池。
         self.compressed_capacity = 1;
         self.compressed_index_key = None;
+        self.compressed_index_key_scales = None;
         self.compressed_index_width = 0;
         self.batch_key = None;
         self.batch_key_scales = None;
@@ -405,6 +618,7 @@ impl RocmCompressedKvStorage {
             add(Some(buffer));
         }
         add(self.compressed_index_key.as_ref());
+        add(self.compressed_index_key_scales.as_ref());
         add(self.batch_key.as_ref());
         add(self.batch_key_scales.as_ref());
         add(self.batch_value.as_ref());
@@ -419,7 +633,7 @@ impl RocmCompressedKvStorage {
 
     /// DSpark target 历史与临时 noise block 使用两份 storage；每轮只复制 128 行 recent ring。
     pub fn copy_recent_from(&mut self, source: &Self) -> Result<(), BackendError> {
-        if self.window_size != source.window_size || self.kv_width != source.kv_width || self.q8_group_size != source.q8_group_size || !source.compressed_positions.is_empty() {
+        if self.window_size != source.window_size || self.kv_width != source.kv_width || self.q8_group_size != source.q8_group_size || self.format != source.format || !source.compressed_positions.is_empty() {
             return Err(compute("V4 ROCm DSpark recent cache 规格不一致或 source 含 compressed history"));
         }
         self.ensure_recent_capacity(source.recent_key.device_id(), source.recent_capacity)?;
@@ -435,7 +649,7 @@ impl RocmCompressedKvStorage {
             self.recent_value = self.recent_key.clone();
             self.recent_value_scales = self.recent_key_scales.clone();
         } else if !source_shared && destination_shared {
-            let (value, value_scales) = Self::allocate_q8_pair(self.recent_key.device_id(), self.recent_capacity, self.kv_width, self.scale_row_bytes(), "recent value split")?;
+            let (value, value_scales) = Self::allocate_quantized_pair(self.recent_key.device_id(), self.recent_capacity, self.recent_row_bytes(), self.recent_scale_row_bytes(), "recent value split")?;
             self.recent_value = value;
             self.recent_value_scales = value_scales;
         }
@@ -452,13 +666,48 @@ impl RocmCompressedKvStorage {
         Ok(())
     }
 
-    fn scale_row_bytes(&self) -> usize {
-        self.kv_width / self.q8_group_size * mem::size_of::<u16>()
+    fn recent_row_bytes(&self) -> usize {
+        self.kv_width
     }
 
-    fn allocate_q8_pair(device_id: i32, rows: usize, row_bytes: usize, scale_row_bytes: usize, name: &str) -> Result<(Arc<ops::hip::DeviceBuffer>, Arc<ops::hip::DeviceBuffer>), BackendError> {
-        let code_bytes = rows.checked_mul(row_bytes).ok_or_else(|| compute(format!("V4 ROCm {name} Q8 codes 溢出")))?;
-        let scale_bytes = rows.checked_mul(scale_row_bytes).ok_or_else(|| compute(format!("V4 ROCm {name} Q8 scales 溢出")))?;
+    fn recent_scale_row_bytes(&self) -> usize {
+        match self.format {
+            CompressedKvFormat::Q8 => self.kv_width / self.q8_group_size * mem::size_of::<u16>(),
+            CompressedKvFormat::Fp8WindowFp4Compressed => self.kv_width / 32,
+        }
+    }
+
+    fn compressed_row_bytes(&self) -> usize {
+        match self.format {
+            CompressedKvFormat::Q8 => self.kv_width,
+            CompressedKvFormat::Fp8WindowFp4Compressed => self.kv_width / 2,
+        }
+    }
+
+    fn compressed_scale_row_bytes(&self) -> usize {
+        match self.format {
+            CompressedKvFormat::Q8 => self.kv_width / self.q8_group_size * mem::size_of::<u16>(),
+            CompressedKvFormat::Fp8WindowFp4Compressed => self.kv_width / 16,
+        }
+    }
+
+    fn index_row_bytes(&self, width: usize) -> usize {
+        match self.format {
+            CompressedKvFormat::Q8 => width * mem::size_of::<f32>(),
+            CompressedKvFormat::Fp8WindowFp4Compressed => width / 2,
+        }
+    }
+
+    fn index_scale_row_bytes(&self, width: usize) -> usize {
+        match self.format {
+            CompressedKvFormat::Q8 => 0,
+            CompressedKvFormat::Fp8WindowFp4Compressed => width / 32,
+        }
+    }
+
+    fn allocate_quantized_pair(device_id: i32, rows: usize, row_bytes: usize, scale_row_bytes: usize, name: &str) -> Result<(Arc<ops::hip::DeviceBuffer>, Arc<ops::hip::DeviceBuffer>), BackendError> {
+        let code_bytes = rows.checked_mul(row_bytes).ok_or_else(|| compute(format!("V4 ROCm {name} codes 溢出")))?;
+        let scale_bytes = rows.checked_mul(scale_row_bytes).ok_or_else(|| compute(format!("V4 ROCm {name} scales 溢出")))?;
         Ok((Arc::new(ops::hip::DeviceBuffer::allocate_cache(device_id, code_bytes).map_err(compute)?), Arc::new(ops::hip::DeviceBuffer::allocate_cache(device_id, scale_bytes).map_err(compute)?)))
     }
 
@@ -468,8 +717,8 @@ impl RocmCompressedKvStorage {
         if next == self.recent_capacity {
             return Ok(());
         }
-        let row_bytes = self.kv_width;
-        let scale_row_bytes = self.scale_row_bytes();
+        let row_bytes = self.recent_row_bytes();
+        let scale_row_bytes = self.recent_scale_row_bytes();
         let shared = Arc::ptr_eq(&self.recent_key, &self.recent_value) && Arc::ptr_eq(&self.recent_key_scales, &self.recent_value_scales);
         let key = grow_cache_buffer(device_id, &self.recent_key, self.recent_len * row_bytes, next * row_bytes)?;
         let key_scales = grow_cache_buffer(device_id, &self.recent_key_scales, self.recent_len * scale_row_bytes, next * scale_row_bytes)?;
@@ -507,14 +756,14 @@ impl RocmCompressedKvStorage {
         };
         if required_capacity > self.batch_capacity || shared_input != shared_cache || shrink_decode_workspace {
             let capacity = if shrink_decode_workspace { required_capacity } else { required_capacity.max(self.batch_capacity) };
-            let (key, key_scales) = Self::allocate_q8_pair(context.device_id, capacity, self.kv_width, self.scale_row_bytes(), "batch key")?;
+            let (key, key_scales) = Self::allocate_quantized_pair(context.device_id, capacity, self.recent_row_bytes(), self.recent_scale_row_bytes(), "batch key")?;
             self.batch_key = Some(key);
             self.batch_key_scales = Some(key_scales);
             if shared_input {
                 self.batch_value = self.batch_key.clone();
                 self.batch_value_scales = self.batch_key_scales.clone();
             } else {
-                let (value, value_scales) = Self::allocate_q8_pair(context.device_id, capacity, self.kv_width, self.scale_row_bytes(), "batch value")?;
+                let (value, value_scales) = Self::allocate_quantized_pair(context.device_id, capacity, self.recent_row_bytes(), self.recent_scale_row_bytes(), "batch value")?;
                 self.batch_value = Some(value);
                 self.batch_value_scales = Some(value_scales);
             }
@@ -526,9 +775,17 @@ impl RocmCompressedKvStorage {
         let value_cache = self.batch_value.as_deref().ok_or_else(|| compute("V4 ROCm batch Q8 value 未初始化"))?;
         let key_scales = self.batch_key_scales.as_deref().ok_or_else(|| compute("V4 ROCm batch Q8 key scales 未初始化"))?;
         let value_scales = self.batch_value_scales.as_deref().ok_or_else(|| compute("V4 ROCm batch Q8 value scales 未初始化"))?;
-        let table = self.block_table.get("CSA batch", self.batch_capacity, context.device_id, key.rows)?;
-        ops::hip::try_paged_cache_append_f32_q8(context.device_id, key_input, key_cache, key_scales, &table, 0, key.rows, self.kv_width, self.q8_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute)?;
-        if shared_input { Ok(()) } else { ops::hip::try_paged_cache_append_f32_q8(context.device_id, value_input, value_cache, value_scales, &table, 0, value.rows, self.kv_width, self.q8_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute) }
+        match self.format {
+            CompressedKvFormat::Q8 => {
+                let table = self.block_table.get("CSA batch", self.batch_capacity, context.device_id, key.rows)?;
+                ops::hip::try_paged_cache_append_f32_q8(context.device_id, key_input, key_cache, key_scales, &table, 0, key.rows, self.kv_width, self.q8_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute)?;
+                if shared_input { Ok(()) } else { ops::hip::try_paged_cache_append_f32_q8(context.device_id, value_input, value_cache, value_scales, &table, 0, value.rows, self.kv_width, self.q8_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute) }
+            }
+            CompressedKvFormat::Fp8WindowFp4Compressed => {
+                ops::hip::try_csa_quantize_official_f32(context.device_id, key_input, key_cache, key_scales, 0, key.rows, self.kv_width, 0).map_err(compute)?;
+                if shared_input { Ok(()) } else { ops::hip::try_csa_quantize_official_f32(context.device_id, value_input, value_cache, value_scales, 0, value.rows, self.kv_width, 0).map_err(compute) }
+            }
+        }
     }
 
     fn append_compressed(&mut self, context: &RocmContext, positions: &[usize], key: &RocmTensor, value: &RocmTensor, index_key: Option<&RocmTensor>) -> Result<(), BackendError> {
@@ -566,20 +823,23 @@ impl RocmCompressedKvStorage {
             if self.compressed_index_key.is_none() && !self.compressed_positions.is_empty() {
                 return Err(compute("V4 ROCm compressed 历史缺少 index key"));
             }
+            if self.format == CompressedKvFormat::Fp8WindowFp4Compressed && !index.cols.is_multiple_of(32) {
+                return Err(compute(format!("V4.1 ROCm compressed index width={} 不能按 group32 量化", index.cols)));
+            }
         } else if self.compressed_index_key.is_some() {
             return Err(compute("V4 ROCm compressed append 缺少 index key"));
         }
 
         let old_rows = self.compressed_positions.len();
         let required = old_rows.checked_add(positions.len()).ok_or_else(|| compute("V4 ROCm compressed rows 溢出"))?;
-        let compacting_empty = old_rows == 0 && (self.compressed_key.bytes() > self.compressed_capacity * self.kv_width || self.compressed_key_scales.bytes() > self.compressed_capacity * self.scale_row_bytes());
+        let compacting_empty = old_rows == 0 && (self.compressed_key.bytes() > self.compressed_capacity * self.compressed_row_bytes() || self.compressed_key_scales.bytes() > self.compressed_capacity * self.compressed_scale_row_bytes());
         let growing = required > self.compressed_capacity || compacting_empty;
         let shared_cache = Arc::ptr_eq(&self.compressed_key, &self.compressed_value) && Arc::ptr_eq(&self.compressed_key_scales, &self.compressed_value_scales);
         let share_cache = shared_input && (old_rows == 0 || shared_cache);
         let split_cache = shared_cache && !share_cache;
         let new_capacity = if growing { required.next_power_of_two() } else { self.compressed_capacity };
-        let row_bytes = self.kv_width;
-        let scale_row_bytes = self.scale_row_bytes();
+        let row_bytes = self.compressed_row_bytes();
+        let scale_row_bytes = self.compressed_scale_row_bytes();
         let new_key = if growing { Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, new_capacity * row_bytes).map_err(compute)?) } else { self.compressed_key.clone() };
         let new_key_scales = if growing { Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, new_capacity * scale_row_bytes).map_err(compute)?) } else { self.compressed_key_scales.clone() };
         let new_value = if share_cache {
@@ -597,13 +857,21 @@ impl RocmCompressedKvStorage {
             self.compressed_value_scales.clone()
         };
         let index_width = index_key.as_ref().map_or(self.compressed_index_width, |tensor| tensor.cols);
-        let index_row_bytes = index_width.checked_mul(mem::size_of::<f32>()).ok_or_else(|| compute("V4 ROCm index row bytes 溢出"))?;
+        let index_row_bytes = self.index_row_bytes(index_width);
+        let index_scale_row_bytes = self.index_scale_row_bytes(index_width);
         let new_index = if index_width == 0 {
             None
         } else if growing || self.compressed_index_key.is_none() {
             Some(Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, new_capacity * index_row_bytes).map_err(compute)?))
         } else {
             self.compressed_index_key.clone()
+        };
+        let new_index_scales = if index_scale_row_bytes == 0 {
+            None
+        } else if growing || self.compressed_index_key_scales.is_none() {
+            Some(Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, new_capacity * index_scale_row_bytes).map_err(compute)?))
+        } else {
+            self.compressed_index_key_scales.clone()
         };
 
         if growing && old_rows != 0 {
@@ -618,23 +886,50 @@ impl RocmCompressedKvStorage {
             if let (Some(old), Some(new)) = (&self.compressed_index_key, &new_index) {
                 new.copy_from_device(0, old, 0, old_rows * index_row_bytes).map_err(compute)?;
             }
+            if let (Some(old), Some(new)) = (&self.compressed_index_key_scales, &new_index_scales) {
+                new.copy_from_device(0, old, 0, old_rows * index_scale_row_bytes).map_err(compute)?;
+            }
         }
         let key_device = key.device.as_deref().ok_or_else(|| compute("V4 ROCm compressed key 缺少 device buffer"))?;
         let value_device = value.device.as_deref().ok_or_else(|| compute("V4 ROCm compressed value 缺少 device buffer"))?;
-        let table = self.block_table.get("CSA compressed", new_capacity, context.device_id, required)?;
-        ops::hip::try_paged_cache_append_f32_q8(context.device_id, key_device, &new_key, &new_key_scales, &table, old_rows, positions.len(), self.kv_width, self.q8_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute)?;
-        if !share_cache {
-            ops::hip::try_paged_cache_append_f32_q8(context.device_id, value_device, &new_value, &new_value_scales, &table, old_rows, positions.len(), self.kv_width, self.q8_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute)?;
+        match self.format {
+            CompressedKvFormat::Q8 => {
+                let table = self.block_table.get("CSA compressed", new_capacity, context.device_id, required)?;
+                ops::hip::try_paged_cache_append_f32_q8(context.device_id, key_device, &new_key, &new_key_scales, &table, old_rows, positions.len(), self.kv_width, self.q8_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute)?;
+                if !share_cache {
+                    ops::hip::try_paged_cache_append_f32_q8(context.device_id, value_device, &new_value, &new_value_scales, &table, old_rows, positions.len(), self.kv_width, self.q8_group_size, ROCM_KV_BLOCK_SIZE).map_err(compute)?;
+                }
+            }
+            CompressedKvFormat::Fp8WindowFp4Compressed => {
+                ops::hip::try_csa_quantize_official_f32(context.device_id, key_device, &new_key, &new_key_scales, old_rows, positions.len(), self.kv_width, 1).map_err(compute)?;
+                if !share_cache {
+                    ops::hip::try_csa_quantize_official_f32(context.device_id, value_device, &new_value, &new_value_scales, old_rows, positions.len(), self.kv_width, 1).map_err(compute)?;
+                }
+            }
         }
         if let (Some(index), Some(destination)) = (&index_key, &new_index) {
             let source = index.device.as_deref().ok_or_else(|| compute("V4 ROCm compressed index key 缺少 device buffer"))?;
-            destination.copy_from_device(old_rows * index_row_bytes, source, 0, positions.len() * index_row_bytes).map_err(compute)?;
+            match self.format {
+                CompressedKvFormat::Q8 => destination.copy_from_device(old_rows * index_row_bytes, source, 0, positions.len() * index_row_bytes).map_err(compute)?,
+                CompressedKvFormat::Fp8WindowFp4Compressed => ops::hip::try_csa_quantize_official_f32(
+                    context.device_id,
+                    source,
+                    destination,
+                    new_index_scales.as_deref().expect("official index scales 已分配"),
+                    old_rows,
+                    positions.len(),
+                    index_width,
+                    2,
+                )
+                .map_err(compute)?,
+            }
         }
         self.compressed_key = new_key;
         self.compressed_key_scales = new_key_scales;
         self.compressed_value = new_value;
         self.compressed_value_scales = new_value_scales;
         self.compressed_index_key = new_index;
+        self.compressed_index_key_scales = new_index_scales;
         self.compressed_index_width = index_width;
         self.compressed_capacity = new_capacity;
         self.compressed_positions.extend_from_slice(positions);
@@ -656,15 +951,15 @@ impl RocmCompressedKvStorage {
         let value_device = self.batch_value.as_deref().ok_or_else(|| compute("V4 ROCm recent batch value 缺失"))?;
         let key_scales = self.batch_key_scales.as_deref().ok_or_else(|| compute("V4 ROCm recent batch key scales 缺失"))?;
         let value_scales = self.batch_value_scales.as_deref().ok_or_else(|| compute("V4 ROCm recent batch value scales 缺失"))?;
-        let row_bytes = self.kv_width;
-        let scale_row_bytes = self.scale_row_bytes();
+        let row_bytes = self.recent_row_bytes();
+        let scale_row_bytes = self.recent_scale_row_bytes();
         let shared_batch = std::ptr::eq(key_device, value_device) && std::ptr::eq(key_scales, value_scales);
         let shared_recent = Arc::ptr_eq(&self.recent_key, &self.recent_value) && Arc::ptr_eq(&self.recent_key_scales, &self.recent_value_scales);
         if shared_batch && self.recent_len == 0 && !shared_recent {
             self.recent_value = self.recent_key.clone();
             self.recent_value_scales = self.recent_key_scales.clone();
         } else if !shared_batch && shared_recent {
-            let (value, value_scales) = Self::allocate_q8_pair(key_device.device_id(), self.recent_capacity, row_bytes, scale_row_bytes, "recent value split")?;
+            let (value, value_scales) = Self::allocate_quantized_pair(key_device.device_id(), self.recent_capacity, row_bytes, scale_row_bytes, "recent value split")?;
             value.copy_from_device(0, &self.recent_value, 0, self.recent_capacity * row_bytes).map_err(compute)?;
             value_scales.copy_from_device(0, &self.recent_value_scales, 0, self.recent_capacity * scale_row_bytes).map_err(compute)?;
             self.recent_value = value;
@@ -676,7 +971,7 @@ impl RocmCompressedKvStorage {
         let fused_decode_copy = positions.len() == 1 && !shared_recent;
         if fused_decode_copy {
             let target_row = if positions.len() >= self.window_size { 0 } else { (self.recent_start + self.recent_len) % self.window_size };
-            ops::hip::try_q8_cache_copy_pair(
+            ops::hip::try_quantized_cache_copy_pair(
                 key_device.device_id(),
                 key_device,
                 key_scales,
@@ -689,8 +984,8 @@ impl RocmCompressedKvStorage {
                 0,
                 target_row,
                 1,
-                self.kv_width,
-                self.kv_width / self.q8_group_size,
+                row_bytes,
+                scale_row_bytes,
                 self.recent_capacity,
             )
             .map_err(compute)?;
@@ -746,6 +1041,10 @@ impl RocmCompressedKvStorage {
     }
 
     fn visible_counts(&self, positions: &[usize]) -> Result<Vec<u32>, BackendError> {
+        if let Some(count) = self.fixed_compressed_len {
+            let count = u32::try_from(count).map_err(|_| compute(format!("V4 compressed visible rows={count} 超过 u32")))?;
+            return Ok(vec![count; positions.len()]);
+        }
         positions
             .iter()
             .map(|position| {
@@ -790,27 +1089,59 @@ fn upload_f32(device_id: i32, values: &[f32]) -> Result<Arc<ops::hip::DeviceBuff
     ops::hip::DeviceBuffer::upload(device_id, f32_bytes(values)).map(Arc::new).map_err(compute)
 }
 
+/// V4.1 index selection 保持在发布它的 GPU；跨 stage 时只做一次有序 P2P。
+#[derive(Clone)]
+pub struct RocmCsaSelection {
+    buffer: Arc<ops::hip::DeviceBuffer>,
+    rows: usize,
+    top_k: usize,
+}
+
 impl CompressedSparseKernel for RocmContext {
+    type SharedSelection = RocmCsaSelection;
     type CompressedKvStorage = RocmCompressedKvStorage;
+
+    fn stabilize_shared_selection(&self, selection: Self::SharedSelection) -> Result<Self::SharedSelection, BackendError> {
+        if !selection.buffer.is_async_allocated() {
+            return Ok(selection);
+        }
+        let buffer = selection.buffer.copy_to_stable_deferred().map(Arc::new).map_err(compute)?;
+        Ok(RocmCsaSelection { buffer, rows: selection.rows, top_k: selection.top_k })
+    }
 
     fn allocate_compressed_kv(&self, spec: &CompressedSparseAttentionSpec) -> Result<Self::CompressedKvStorage, BackendError> {
         spec.validate().map_err(compute)?;
+        if spec.kv_format == CompressedKvFormat::Fp8WindowFp4Compressed && !spec.head_dim.is_multiple_of(32) {
+            return Err(compute(format!("官方 FP8/FP4 CSA head_dim={} 不能按 32 分组", spec.head_dim)));
+        }
         let kv_width = spec.num_kv_heads.checked_mul(spec.head_dim).ok_or_else(|| compute("V4 ROCm KV width 溢出"))?;
         let q8_group_size = [crate::kv_cache::DEFAULT_GROUP_SIZE, 32, 16, 8, 4, 2, 1].into_iter().find(|group| spec.head_dim.is_multiple_of(*group)).ok_or_else(|| compute(format!("V4 ROCm head_dim={} 不支持 Q8 group", spec.head_dim)))?;
-        let row_bytes = kv_width;
-        let scale_row_bytes = kv_width / q8_group_size * mem::size_of::<u16>();
         let recent_capacity = spec.window_size.min(ROCM_KV_BLOCK_SIZE);
         let compressed_capacity = recent_capacity;
-        let (recent_key, recent_key_scales) = RocmCompressedKvStorage::allocate_q8_pair(self.device_id, recent_capacity, row_bytes, scale_row_bytes, "recent key")?;
+        let recent_row_bytes = kv_width;
+        let recent_scale_row_bytes = match spec.kv_format {
+            CompressedKvFormat::Q8 => kv_width / q8_group_size * mem::size_of::<u16>(),
+            CompressedKvFormat::Fp8WindowFp4Compressed => kv_width / 32,
+        };
+        let compressed_row_bytes = match spec.kv_format {
+            CompressedKvFormat::Q8 => kv_width,
+            CompressedKvFormat::Fp8WindowFp4Compressed => kv_width / 2,
+        };
+        let compressed_scale_row_bytes = match spec.kv_format {
+            CompressedKvFormat::Q8 => kv_width / q8_group_size * mem::size_of::<u16>(),
+            CompressedKvFormat::Fp8WindowFp4Compressed => kv_width / 16,
+        };
+        let (recent_key, recent_key_scales) = RocmCompressedKvStorage::allocate_quantized_pair(self.device_id, recent_capacity, recent_row_bytes, recent_scale_row_bytes, "recent key")?;
         let recent_value = recent_key.clone();
         let recent_value_scales = recent_key_scales.clone();
-        let (compressed_key, compressed_key_scales) = RocmCompressedKvStorage::allocate_q8_pair(self.device_id, compressed_capacity, row_bytes, scale_row_bytes, "compressed key")?;
+        let (compressed_key, compressed_key_scales) = RocmCompressedKvStorage::allocate_quantized_pair(self.device_id, compressed_capacity, compressed_row_bytes, compressed_scale_row_bytes, "compressed key")?;
         let compressed_value = compressed_key.clone();
         let compressed_value_scales = compressed_key_scales.clone();
         Ok(RocmCompressedKvStorage {
             window_size: spec.window_size,
             kv_width,
             q8_group_size,
+            format: spec.kv_format,
             recent_key,
             recent_key_scales,
             recent_value,
@@ -825,8 +1156,10 @@ impl CompressedSparseKernel for RocmContext {
             compressed_value,
             compressed_value_scales,
             compressed_index_key: None,
+            compressed_index_key_scales: None,
             compressed_index_width: 0,
             compressed_positions: Vec::new(),
+            fixed_compressed_len: None,
             compressed_capacity,
             visible_scalar_value: None,
             visible_scalar: None,
@@ -1080,10 +1413,260 @@ impl CompressedSparseKernel for RocmContext {
             spec.head_dim,
             spec.window_size,
             storage.q8_group_size,
+            u32::from(storage.format == CompressedKvFormat::Fp8WindowFp4Compressed),
         )
         .map_err(compute)?;
         storage.append_recent(positions)?;
         Ok(device_tensor_f32(output, query.rows, query.cols))
+    }
+
+    fn compress_v41(
+        &self,
+        storage: &mut Self::CompressedKvStorage,
+        positions: &[usize],
+        kv: &RocmTensor,
+        gate: Option<&RocmTensor>,
+        norm: &RocmWeight,
+        index_key_projection: Option<(&RocmWeight, &RocmWeight)>,
+        compression: KvCompressionSpec,
+        width: usize,
+        rotary_dim: usize,
+        index_rope_dim: usize,
+        cos: &[f32],
+        sin: &[f32],
+        eps: f32,
+    ) -> Result<V41Compressed<RocmTensor>, BackendError> {
+        if compression.overlap {
+            return Err(compute("V4.1 ROCm compressor 不支持 overlap"));
+        }
+        if positions.len() != kv.rows || positions.is_empty() || positions.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+            return Err(compute(format!("V4.1 ROCm compressor positions={positions:?} key rows={}", kv.rows)));
+        }
+        let has_index = index_key_projection.is_some();
+        let index_dim = index_key_projection.map_or(0, |(_, k_norm)| k_norm.data().len());
+        let kv = f32_tensor(self, kv)?;
+        let gate = gate.map(|gate| f32_tensor(self, gate)).transpose()?;
+        if let Some(gate) = &gate
+            && (gate.rows != kv.rows || gate.cols != kv.cols)
+        {
+            return Err(compute(format!("V4.1 ROCm compressor shape 非法: kv=[{},{}] gate=[{},{}]", kv.rows, kv.cols, gate.rows, gate.cols)));
+        }
+        if let Some(transaction) = storage.transaction.as_mut() {
+            transaction.v41_compressor_replays.push(RocmV41CompressionReplay {
+                key: kv.clone(),
+                gate: gate.clone(),
+                norm: norm.clone(),
+                index_key_projection: index_key_projection.map(|(wk, k_norm)| (wk.clone(), k_norm.clone())),
+                compression,
+                width,
+                rotary_dim,
+                index_rope_dim,
+                eps,
+            });
+        }
+        let kv_device = kv.device.as_deref().ok_or_else(|| compute("V4.1 ROCm compressor kv 缺少 device buffer"))?;
+        let gate_device: Option<&ops::hip::DeviceBuffer> = gate.as_ref().and_then(|gate| gate.device.as_deref());
+        let norm = constant(norm, width, "V4.1 compressor norm")?;
+        let (wk, k_norm) = match index_key_projection {
+            Some((wk, k_norm)) => {
+                let index_dim = k_norm.data().len();
+                let elements = index_dim.checked_mul(width).ok_or_else(|| compute("V4.1 wk 元素溢出"))?;
+                (Some(constant(wk, elements, "V4.1 compressor wk")?), Some(constant(k_norm, index_dim, "V4.1 compressor k_norm")?))
+            }
+            None => (None, None),
+        };
+        let state = &mut storage.compressor;
+        let plan = state.state.plan(positions, compression.ratio).map_err(compute)?;
+        let pending_rows = plan.pending_rows();
+        let entry_start = plan.entry_start();
+        let windows = plan.windows();
+        let required_table = (entry_start + windows).checked_mul(compression.ratio).and_then(|rows| rows.checked_mul(rotary_dim / 2)).ok_or_else(|| compute("V4.1 ROCm compressor RoPE table offset 溢出"))?;
+        if windows != 0 && required_table > cos.len() {
+            return Err(compute(format!("V4.1 ROCm compressor RoPE table={}，需要 {required_table}", cos.len())));
+        }
+        state.ensure_buffers(self, compression.ratio, width, false)?;
+        state.ensure_rope_tables(self, cos, sin, required_table)?;
+        let pending_key = state.pending_key.as_deref().ok_or_else(|| compute("V4.1 ROCm compressor pending key 未初始化"))?;
+        let pending_gate = state.pending_gate.as_deref().ok_or_else(|| compute("V4.1 ROCm compressor pending gate 未初始化"))?;
+        let rope = state.rope.as_deref().ok_or_else(|| compute("V4.1 ROCm compressor RoPE 未初始化"))?;
+        let (output, index_output, remaining) = ops::hip::try_csa_compress_v41_f32(
+            self.device_id,
+            pending_key,
+            pending_gate,
+            pending_rows,
+            kv_device,
+            gate_device,
+            kv.rows,
+            norm,
+            wk,
+            k_norm,
+            compression.ratio,
+            width,
+            entry_start,
+            rotary_dim,
+            index_dim,
+            if has_index { index_rope_dim } else { rotary_dim },
+            &rope.cos,
+            &rope.sin,
+            rope.elements,
+            eps,
+        )
+        .map_err(compute)?;
+        state.state.commit(plan, remaining).map_err(compute)?;
+        let visible_positions = plan.visible_positions();
+        let attention = CompressedBatch { visible_positions: visible_positions.clone(), values: device_tensor_f32(output, windows, width) };
+        let index_key = index_output.map(|buffer| CompressedBatch { visible_positions, values: device_tensor_f32(buffer, windows, index_dim) });
+        Ok(V41Compressed { attention, index_key })
+    }
+
+    fn compressed_sparse_prefill_shared(
+        &self,
+        recent: &mut Self::CompressedKvStorage,
+        shared: Option<&Self::CompressedKvStorage>,
+        positions: &[usize],
+        causal_batch: bool,
+        query: &RocmTensor,
+        key: &RocmTensor,
+        value: &RocmTensor,
+        batch: Option<SharedCompressedBatch<'_, RocmTensor>>,
+        index_query: Option<&RocmTensor>,
+        index_head_weights: Option<&RocmTensor>,
+        preset_selection: Option<&Self::SharedSelection>,
+        candidate: Option<crate::attention::compressed_sparse::CandidateSpec>,
+        sink: Option<&RocmWeight>,
+        spec: &CompressedSparseAttentionSpec,
+    ) -> Result<SharedCsaOutput<RocmTensor, Self::SharedSelection>, BackendError> {
+        if candidate.is_some() {
+            return Err(compute("V4.1 ROCm 候选块粗筛 kernel 尚未接入;配置 candidate_topk_blocks=0 走单级 topk(数学等价的稀疏选择)"));
+        }
+        if positions.len() != query.rows || positions.is_empty() || positions.windows(2).any(|pair| pair[1] != pair[0] + 1) {
+            return Err(compute(format!("V4.1 ROCm CSA prefill positions={positions:?} query rows={}", query.rows)));
+        }
+        let shared_kv = std::ptr::eq(key, value);
+        let query = f32_tensor(self, query)?;
+        let key = f32_tensor(self, key)?;
+        let value = if shared_kv { key.clone() } else { f32_tensor(self, value)? };
+        // 源层(shared=None)把本批压缩项写入自身 storage;组内其余层只读 shared。
+        if shared.is_none()
+            && let Some(batch) = &batch
+        {
+            let Some(index_key) = batch.index_key else {
+                return Err(compute("V4.1 ROCm 源层压缩批缺少 index key"));
+            };
+            recent.append_compressed(self, batch.visible_positions, batch.key, batch.value, Some(index_key))?;
+        }
+        recent.validate_recent_positions(positions)?;
+        let mirrored = match shared {
+            Some(source) if query.rows > 8 && source.compressed_key.device_id() != self.device_id => {
+                recent.mirror_compressed_from(self, source)?;
+                true
+            }
+            _ => false,
+        };
+        // 压缩历史的可见性以组源层为准;可见行数先算出,visible_buffer 缓存落本层。
+        let visible = {
+            let source = if mirrored { &*recent } else { shared.unwrap_or(recent) };
+            if causal_batch { source.visible_counts(positions)? } else { source.visible_counts(&vec![*positions.last().expect("positions 已非空"); positions.len()])? }
+        };
+        let visible_buffer = recent.visible_buffer(self.device_id, &visible)?;
+        // selection 与压缩历史 buffer 从组源层读取;Arc 克隆后结束共享借用,
+        // 本层滑窗的 &mut 写入不再交叉。
+        let (compressed_key, compressed_key_scales, compressed_value, compressed_value_scales, compressed_capacity, selection, published) = {
+            let source = if mirrored { &*recent } else { shared.unwrap_or(recent) };
+            let indexer_top_k = match spec.compression.map(|compression| compression.selection) {
+                Some(CompressedSelection::LearnedIndexer(indexer)) => Some(indexer.top_k),
+                _ => None,
+            };
+            let mut published = None;
+            let selection = match (indexer_top_k, preset_selection) {
+                (Some(top_k), Some(preset)) => {
+                    if preset.rows != query.rows || preset.top_k != top_k {
+                        return Err(compute(format!("V4.1 ROCm preset selection=[{},{}] query=[{},{}]", preset.rows, preset.top_k, query.rows, top_k)));
+                    }
+                    let buffer = if preset.buffer.device_id() == self.device_id {
+                        preset.buffer.clone()
+                    } else {
+                        Arc::new(preset.buffer.copy_stable_to_device_ordered_async_retained_by(self.device_id, self.device_id).map_err(compute)?)
+                    };
+                    published = Some(RocmCsaSelection { buffer: buffer.clone(), rows: query.rows, top_k });
+                    Some((buffer, top_k))
+                }
+                (Some(top_k), None) => {
+                    let selection = select_history(self, source, index_query, index_head_weights, spec, &visible, &visible_buffer)?;
+                    if let Some((buffer, _)) = &selection {
+                        published = Some(RocmCsaSelection { buffer: buffer.clone(), rows: query.rows, top_k });
+                    }
+                    selection
+                }
+                (None, _) => None,
+            };
+            (source.compressed_key.clone(), source.compressed_key_scales.clone(), source.compressed_value.clone(), source.compressed_value_scales.clone(), source.compressed_capacity, selection, published)
+        };
+        let sink = sink.map(|weight| constant(weight, spec.num_heads, "attention sink")).transpose()?;
+        let query_device = query.device.as_deref().ok_or_else(|| compute("V4.1 ROCm CSA query 缺少 device buffer"))?;
+        recent.quantize_batch(self, &key, &value)?;
+        recent.record_transaction_attention(positions, &key, &value)?;
+        let batch_key = recent.batch_key.as_deref().ok_or_else(|| compute("V4.1 ROCm CSA batch Q8 key 缺失"))?;
+        let batch_key_scales = recent.batch_key_scales.as_deref().ok_or_else(|| compute("V4.1 ROCm CSA batch Q8 key scales 缺失"))?;
+        let batch_value = recent.batch_value.as_deref().ok_or_else(|| compute("V4.1 ROCm CSA batch Q8 value 缺失"))?;
+        let batch_value_scales = recent.batch_value_scales.as_deref().ok_or_else(|| compute("V4.1 ROCm CSA batch Q8 value scales 缺失"))?;
+        let output = ops::hip::try_csa_attention_q8(
+            self.device_id,
+            query_device,
+            &compressed_key,
+            &compressed_key_scales,
+            &compressed_value,
+            &compressed_value_scales,
+            &visible_buffer,
+            selection.as_ref().map(|(buffer, top_k)| (buffer.as_ref(), *top_k)),
+            &recent.recent_key,
+            &recent.recent_key_scales,
+            &recent.recent_value,
+            &recent.recent_value_scales,
+            recent.recent_start,
+            recent.recent_len,
+            recent.recent_first_position,
+            batch_key,
+            batch_key_scales,
+            batch_value,
+            batch_value_scales,
+            positions[0],
+            causal_batch,
+            sink,
+            query.rows,
+            compressed_capacity,
+            spec.num_heads,
+            spec.num_kv_heads,
+            spec.head_dim,
+            spec.window_size,
+            recent.q8_group_size,
+            u32::from(recent.format == CompressedKvFormat::Fp8WindowFp4Compressed),
+        )
+        .map_err(compute)?;
+        recent.append_recent(positions)?;
+        Ok(SharedCsaOutput { attended: device_tensor_f32(output, query.rows, query.cols), selection: published })
+    }
+
+    fn compressed_sparse_decode_shared(
+        &self,
+        recent: &mut Self::CompressedKvStorage,
+        shared: Option<&Self::CompressedKvStorage>,
+        position: usize,
+        query: &RocmTensor,
+        key: &RocmTensor,
+        value: &RocmTensor,
+        batch: Option<SharedCompressedBatch<'_, RocmTensor>>,
+        index_query: Option<&RocmTensor>,
+        index_head_weights: Option<&RocmTensor>,
+        preset_selection: Option<&Self::SharedSelection>,
+        candidate: Option<crate::attention::compressed_sparse::CandidateSpec>,
+        sink: Option<&RocmWeight>,
+        spec: &CompressedSparseAttentionSpec,
+    ) -> Result<SharedCsaOutput<RocmTensor, Self::SharedSelection>, BackendError> {
+        if query.rows != 1 || key.rows != 1 || value.rows != 1 {
+            return Err(compute("V4.1 ROCm CSA decode 的 Q/K/V 必须是单行 tensor"));
+        }
+        self.compressed_sparse_prefill_shared(recent, shared, &[position], true, query, key, value, batch, index_query, index_head_weights, preset_selection, candidate, sink, spec)
     }
 
     fn compressed_sparse_prefill_segmented(
@@ -1216,7 +1799,20 @@ impl CompressedSparseKernel for RocmContext {
         if prepared.iter().any(|segment| segment.q8_group_size != q8_group_size) {
             return Err(compute("V4 ROCm segmented CSA Q8 group 不一致"));
         }
-        let output = ops::hip::try_csa_attention_q8_segmented(self.device_id, query_device, &descriptors, sink, total_rows, spec.num_heads, spec.num_kv_heads, spec.head_dim, spec.window_size, q8_group_size).map_err(compute)?;
+        let output = ops::hip::try_csa_attention_q8_segmented(
+            self.device_id,
+            query_device,
+            &descriptors,
+            sink,
+            total_rows,
+            spec.num_heads,
+            spec.num_kv_heads,
+            spec.head_dim,
+            spec.window_size,
+            q8_group_size,
+            u32::from(spec.kv_format == CompressedKvFormat::Fp8WindowFp4Compressed),
+        )
+        .map_err(compute)?;
         for segment in segments {
             segment.storage.append_recent(segment.positions)?;
         }
@@ -1258,11 +1854,13 @@ fn select_history(
 ) -> Result<Option<(Arc<ops::hip::DeviceBuffer>, usize)>, BackendError> {
     match spec.compression.map(|compression| compression.selection) {
         Some(CompressedSelection::LearnedIndexer(indexer)) => {
-            let query = index_query.ok_or_else(|| compute("V4 ROCm CSA 缺少 index query"))?;
-            let head_weights = index_head_weights.ok_or_else(|| compute("V4 ROCm CSA 缺少 index head weights"))?;
+            // 可见历史不超过 top_k 时全选,无需 index query;非 index 层(复用 preset)在
+            // 历史未满的窗口期也不应因缺 query 报错。
             if visible.iter().copied().max().unwrap_or(0) as usize <= indexer.top_k {
                 return Ok(None);
             }
+            let query = index_query.ok_or_else(|| compute("V4 ROCm CSA 缺少 index query"))?;
+            let head_weights = index_head_weights.ok_or_else(|| compute("V4 ROCm CSA 缺少 index head weights"))?;
             let keys = storage.compressed_index_key.as_deref().ok_or_else(|| compute("V4 ROCm compressed 历史缺少 index key"))?;
             let query = f32_tensor(context, query)?;
             let head_weights = f32_tensor(context, head_weights)?;
@@ -1271,7 +1869,19 @@ fn select_history(
             }
             let query_device = query.device.as_deref().ok_or_else(|| compute("V4 ROCm index query 缺少 device buffer"))?;
             let weights_device = head_weights.device.as_deref().ok_or_else(|| compute("V4 ROCm index head weights 缺少 device buffer"))?;
-            let selection = ops::hip::try_csa_index_select_f32(context.device_id, query_device, keys, weights_device, visible_buffer, query.rows, storage.compressed_positions.len(), indexer.num_heads, indexer.head_dim, indexer.top_k)
+            let selection = ops::hip::try_csa_index_select_f32(
+                context.device_id,
+                query_device,
+                keys,
+                storage.compressed_index_key_scales.as_deref(),
+                weights_device,
+                visible_buffer,
+                query.rows,
+                storage.fixed_compressed_len.unwrap_or(storage.compressed_positions.len()),
+                indexer.num_heads,
+                indexer.head_dim,
+                indexer.top_k,
+            )
                 .map(Arc::new)
                 .map_err(compute)?;
             Ok(Some((selection, indexer.top_k)))
@@ -1321,6 +1931,7 @@ mod tests {
             rope: RopeSpec::Default { rotary_dim: 2, theta: 10_000.0 },
             compression,
             attention_sink: true,
+            kv_format: crate::attention::compressed_sparse::CompressedKvFormat::Q8,
         }
     }
 
@@ -1457,6 +2068,7 @@ mod tests {
             rope: RopeSpec::Default { rotary_dim: 64, theta: 10_000.0 },
             compression: None,
             attention_sink: true,
+            kv_format: crate::attention::compressed_sparse::CompressedKvFormat::Q8,
         };
         let history_positions = (0..HISTORY).collect::<Vec<_>>();
         let history_key = (0..HISTORY * DIM).map(|index| ((index % 37) as f32 * 0.017 - 0.3).sin()).collect::<Vec<_>>();
@@ -1499,6 +2111,7 @@ mod tests {
             rope: RopeSpec::Default { rotary_dim: 64, theta: 10_000.0 },
             compression: None,
             attention_sink: true,
+            kv_format: crate::attention::compressed_sparse::CompressedKvFormat::Q8,
         };
         let history_positions = (0..HISTORY).collect::<Vec<_>>();
         let history_key = (0..HISTORY * DIM).map(|index| ((index % 37) as f32 * 0.017 - 0.3).sin()).collect::<Vec<_>>();
@@ -1611,6 +2224,7 @@ mod tests {
             rope: RopeSpec::Default { rotary_dim: 32, theta: 10_000.0 },
             compression: Some(compression),
             attention_sink: true,
+            kv_format: crate::attention::compressed_sparse::CompressedKvFormat::Q8,
         };
         let sink_values = (0..HEADS).map(|head| -1.0e9 - head as f32).collect::<Vec<_>>();
         let sink = weight(&context, &sink_values);
@@ -1694,6 +2308,7 @@ mod tests {
             rope: RopeSpec::Default { rotary_dim: 64, theta: 10_000.0 },
             compression: Some(compression),
             attention_sink: true,
+            kv_format: crate::attention::compressed_sparse::CompressedKvFormat::Q8,
         };
         let rows = 5usize;
         let positions: Vec<usize> = (COMPRESSED_ROWS * 4..COMPRESSED_ROWS * 4 + rows).collect();

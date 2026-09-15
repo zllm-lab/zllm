@@ -12,6 +12,7 @@ use std::{
 };
 
 use crate::{
+    attention::compressed_sparse::CompressedSparseKernel,
     backend::{
         BackendError, SegmentedTensorBackend, TokenFence,
         rocm::{RocmContext, RocmPrefillExperts, RocmTensor, RocmWeight},
@@ -20,8 +21,9 @@ use crate::{
         DeepSeekV4, DeepSeekV4Config, DeepSeekV4LayerCache, DeepSeekV4OutputHead, DeepSeekV4RopeTables, deepseek_v4_token_output, deepseek_v4_token_outputs,
         dspark_rocm::{RocmDeepSeekV4Dspark, RocmDeepSeekV4DsparkCache, RocmDeepSeekV4DsparkSession},
         prepare_deepseek_v4_gguf_layer, prepare_deepseek_v4_layer,
-        rocm_stage::{DeepSeekV4ReadyForward, DeepSeekV4StageCache, DeepSeekV4StageEvent, DeepSeekV4StagePipeline, DeepSeekV4StageState, DeepSeekV4StageTemplate, allocate_stage_caches, drive_deepseek_v4_stage_pipeline},
+        rocm_stage::{DeepSeekV4ReadyForward, DeepSeekV4StageCache, DeepSeekV4StageEvent, DeepSeekV4StagePipeline, DeepSeekV4StageState, DeepSeekV4StageTemplate, allocate_stage_caches, drive_deepseek_v4_stage_pipeline, open_stage_session},
         rocm_swap::{DeepSeekV4CacheSnapshot, DeepSeekV4SwapStore},
+        vision::{DeepseekV41SpanOverlays, DeepseekV41VisionInput, deepseek_v41_vision_encode, span_rows_f32},
     },
     runtime::rocm_chain,
     runtime::session::KvCacheDeviceCapacity,
@@ -33,6 +35,7 @@ use crate::{
         tool::{DsmlToolFence, DsmlToolSpec},
     },
     tokenizer::{Detokenizer, Tokenizer},
+    vision::ImageTokenRange,
     weight::{
         expert_source::GgufExpertSource,
         model::deepseek_v4::{DeepSeekV4Gguf, DeepSeekV4Weights},
@@ -49,6 +52,14 @@ impl Source {
     fn open(root: &Path, config: DeepSeekV4Config) -> Result<Self, String> {
         let official = std::fs::read_dir(root).map(|entries| entries.filter_map(Result::ok).any(|entry| entry.path().extension().is_some_and(|extension| extension == "safetensors"))).unwrap_or(false);
         if official { Ok(Self::Official(DeepSeekV4Weights::open(root, config)?)) } else { Ok(Self::Gguf(DeepSeekV4Gguf::open(root, config)?)) }
+    }
+
+    /// safetensors 权重的引用(engram 装配需要);GGUF 源为 None。
+    fn official_weights(&self) -> Option<&DeepSeekV4Weights> {
+        match self {
+            Self::Official(weights) => Some(weights),
+            Self::Gguf(_) => None,
+        }
     }
 
     fn tokenizer(&self, root: &Path) -> Result<(Tokenizer, Detokenizer), String> {
@@ -90,6 +101,27 @@ impl Source {
     }
 }
 
+/// 按权重目录内容探测 V4/V4.1:safetensors 看 config.json 的 model_type,GGUF 看 architecture。
+fn detect_flash_model(root: &Path) -> Result<DeepSeekV4, String> {
+    let config_json = root.join("config.json");
+    if config_json.exists() {
+        let text = std::fs::read_to_string(&config_json).map_err(|error| format!("读取 {config_json:?}: {error}"))?;
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|error| format!("解析 {config_json:?}: {error}"))?;
+        let is_v41 = value.get("model_type").and_then(serde_json::Value::as_str) == Some("deepseek_v41");
+        eprintln!("[load] DeepSeek-V4 权重探测: model_type={} → {}", value.get("model_type").and_then(serde_json::Value::as_str).unwrap_or("?"), if is_v41 { "V4.1-Flash" } else { "V4-Flash" });
+        return Ok(if is_v41 { DeepSeekV4::flash_v41() } else { DeepSeekV4::flash() });
+    }
+    if let Ok(path) = crate::weight::container::gguf::GgufReader::locate(root) {
+        let reader = crate::weight::container::gguf::GgufReader::open(&path)?;
+        if let Some(arch) = reader.metadata("general.architecture").and_then(crate::weight::container::gguf::GgufValue::as_str) {
+            let is_v41 = arch == "deepseek41";
+            eprintln!("[load] DeepSeek-V4 权重探测: architecture={arch} → {}", if is_v41 { "V4.1-Flash" } else { "V4-Flash" });
+            return Ok(if is_v41 { DeepSeekV4::flash_v41() } else { DeepSeekV4::flash() });
+        }
+    }
+    Ok(DeepSeekV4::flash())
+}
+
 #[derive(Clone)]
 pub struct RocmDeepSeekV4Options {
     pub weights_directory: PathBuf,
@@ -102,6 +134,7 @@ pub struct RocmDeepSeekV4Options {
     pub decode_priority_prefill_chunk_size: usize,
     pub decode_priority_prefill_chunk_ceiling: usize,
     pub device_pool_gib: usize,
+    pub device_arena_gib: usize,
     pub kv_reservation_page_tokens: usize,
     pub memory_reserve_bytes: usize,
     pub long_prefill_threshold_tokens: Option<usize>,
@@ -116,6 +149,8 @@ pub struct RocmDeepSeekV4Options {
     pub persist_kv_cache: bool,
     pub score_expert_top_k: Option<usize>,
     pub profile: bool,
+    /// V4.1 engram CPU 注入开关;false 时跳过(二分定位/对照用)。
+    pub engram_enabled: bool,
 }
 
 pub struct RocmGeneration {
@@ -133,9 +168,15 @@ pub struct RocmBatchRequest {
     pub cancellation: Arc<AtomicBool>,
     pub cache_id: Option<String>,
     pub resume_suffix: Option<String>,
+    /// 瘦身 resume 请求(messages 只有 [边界 assistant, ...增量]):命中仅走
+    /// cache_id 精确恢复,残缺 prompt 不参与前缀复用,miss 哨兵上报。
+    pub slim_resume: bool,
     pub cache_namespace: Option<String>,
     pub tool_fence: Option<DsmlToolSpec>,
     pub repeat_loop_breaker: bool,
+    /// V4.1 多模态:prompt 内已含 image 占位符的解码图像;engine 侧展开
+    /// span、跑视觉塔并拼接 embedding。None 走纯文本。
+    pub vision_images: Option<Vec<crate::vision::RgbImage>>,
 }
 
 pub struct RocmBatchResult {
@@ -156,11 +197,13 @@ struct BatchTask {
     stats: crate::runtime::speculative::SpeculativeStats,
     cache_id: Option<String>,
     resume_suffix_tokens: Option<Vec<u32>>,
+    slim_resume: bool,
     cache_namespace: Option<String>,
     cached_tokens: Vec<u32>,
     resumed_cache_id: Option<String>,
     resumed_cache_round: Option<usize>,
     token_fence: GenerationGuard<Option<DsmlToolFence>>,
+    vision: Option<Arc<DeepseekV41SpanOverlays>>,
 }
 
 struct RocmSessionState {
@@ -170,10 +213,27 @@ struct RocmSessionState {
 
 impl RocmSessionState {
     fn fork_session(&self) -> Result<Self, String> {
-        Ok(Self {
-            stages: self.stages.iter().map(DeepSeekV4StageState::fork_session).collect::<Result<_, _>>().map_err(backend_error)?,
-            dspark: self.dspark.as_ref().map(RocmDeepSeekV4DsparkSession::fork_session).transpose().map_err(backend_error)?,
-        })
+        // engram 统一 fork 一次,全部 stage 共享(此前各 stage fork_session 只是 clone 占位)
+        let engram = self
+            .stages
+            .first()
+            .and_then(|stage| stage.engram.clone())
+            .map(|engram| {
+                let forked = engram.lock().map_err(|_| "engram 锁中毒".to_owned())?.fork();
+                Ok::<_, String>(Arc::new(Mutex::new(forked)))
+            })
+            .transpose()?;
+        let v41_caches = self.stages.first().map(DeepSeekV4StageState::fork_v41_caches).transpose().map_err(backend_error)?.flatten();
+        let stages = self
+            .stages
+            .iter()
+            .map(|stage| {
+                let mut stage = stage.fork_session_with_v41(v41_caches.clone()).map_err(backend_error)?;
+                stage.engram = engram.clone();
+                Ok::<_, String>(stage)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { stages, dspark: self.dspark.as_ref().map(RocmDeepSeekV4DsparkSession::fork_session).transpose().map_err(backend_error)? })
     }
 
     fn reset_session(&mut self) {
@@ -257,12 +317,12 @@ impl RocmDeepSeekV4Engine {
         if options.devices.is_empty() || options.max_sequence_length == 0 || options.prefill_chunk_size == 0 {
             return Err("DeepSeek-V4 ROCm node 配置为空".to_owned());
         }
-        let mut model = DeepSeekV4::flash();
+        let root = options.weights_directory.as_path();
+        let mut model = detect_flash_model(root)?;
         if let Some(top_k) = options.score_expert_top_k {
             model = model.with_score_expert_top_k(top_k).map_err(|error| format!("DeepSeek-V4 score expert top-k: {error}"))?;
         }
         let model = Arc::new(model);
-        let root = options.weights_directory.as_path();
         let source = Arc::new(Source::open(root, model.config().clone())?);
         let (tokenizer, detokenizer) = source.tokenizer(root)?;
         let tokenizer = Arc::new(tokenizer);
@@ -272,9 +332,10 @@ impl RocmDeepSeekV4Engine {
             return Err(format!("layer_ends={:?} 与 devices={:?} 不匹配", options.layer_ends, options.devices));
         }
         let dspark_config = options.dspark.then(|| crate::weight::model::deepseek_v4_dspark::DeepSeekV4DsparkConfig::read(root, model.config())).transpose()?;
-        let capture_plan = dspark_config.as_ref().map(|config| config.capture_plan(layer_count)).transpose()?.map(Arc::new);
+        let capture_plan = dspark_config.as_ref().map(|config| config.capture_plan(model.config())).transpose()?.map(Arc::new);
         let gib = 1024usize * 1024 * 1024;
         crate::kernel::rocm::hip::set_device_buffer_pool_limit(options.device_pool_gib.checked_mul(gib).ok_or("device_pool_gib 溢出")?)?;
+        crate::kernel::rocm::hip::set_arena_segment_bytes(options.device_arena_gib.checked_mul(gib).ok_or("device_arena_gib 溢出")?);
         crate::kernel::rocm::hip::enable_device_buffer_reuse();
         for target in &options.devices {
             let context = RocmContext::new(*target).map_err(|error| format!("初始化 ROCm 设备 {target}: {error}"))?;
@@ -301,8 +362,9 @@ impl RocmDeepSeekV4Engine {
                     layer_bytes[layer] = source.layer_storage_bytes(layer)?;
                 }
                 let mut layer_cache = DeepSeekV4LayerCache::with_layer_bytes(layer_bytes, core_cache_gib.saturating_mul(gib));
-                let caches = allocate_stage_caches(&context, &model, layer_start, layer_end).map_err(backend_error)?;
-                let experts = build_experts(&source, &context, layer_start, layer_end, model.config().expert_count)?;
+                // V4.1 的 CSA cache 在会话级全局表(见下方 v41_table),stage 不再重复分配
+                let caches = if model.is_v41() { Vec::new() } else { allocate_stage_caches(&context, &model, layer_start, layer_end).map_err(backend_error)? };
+                let experts = build_experts(&source, &context, layer_start, layer_end, model.config())?;
                 for layer in layer_start..layer_end {
                     prepare_layer(&source, &context, layer, &mut layer_cache).map_err(backend_error)?;
                 }
@@ -338,13 +400,57 @@ impl RocmDeepSeekV4Engine {
         };
         let dspark_window = dspark.as_ref().map(|runtime| runtime.lock().map_err(|_| "DSpark runtime mutex poisoned".to_owned())?.target_window_size().map_err(backend_error)).transpose()?;
         let entry_context = tiers[0].context;
+        // V4.1 engram CPU 母版:wkv BF16 驻内存(算法与数据都不进显存,用户决策);
+        // 会话 fork 时 Arc 共享权重、hash 状态重置。
+        let engram = if model.is_v41() && options.engram_enabled {
+            let weights = source.official_weights().ok_or("V4.1 engram 需要 safetensors 权重源(GGUF 不支持)")?;
+            let token_map = root.join("engram_token_map.bin");
+            let cpu = crate::runtime::deepseek_v4::engram_cpu::DeepSeekV4EngramCpu::load(&token_map, weights.clone(), model.config().hyper_connection_copies, model.config().hidden_size, model.config().rms_eps)?;
+            eprintln!("[load] engram CPU 算子就绪(2 层 wkv BF16 驻内存,token_map={token_map:?})");
+            Some(Arc::new(Mutex::new(cpu)))
+        } else {
+            None
+        };
+        // V4.1 会话级全层 CSA cache 母版表:40 层各归属其 stage 的 device,
+        // 会话 fork 时逐层 fork_session(compressed 前缀 Arc 共享、recent 私有化)。
+        let v41_table = if model.is_v41() {
+            let mut table = Vec::with_capacity(layer_count);
+            let mut start = 0;
+            for (tier_index, &end) in options.layer_ends.iter().enumerate() {
+                for layer in start..end {
+                    let spec = model.layer_spec(layer).map_err(|error| format!("V4.1 layer {layer} spec: {error}"))?;
+                    table.push(Mutex::new(tiers[tier_index].context.allocate_compressed_kv(&spec.attention).map_err(backend_error)?));
+                }
+                start = end;
+            }
+            if table.len() != layer_count {
+                return Err(format!("V4.1 cache 表 {} 层与 layer_count={layer_count} 不符", table.len()));
+            }
+            eprintln!("[load] V4.1 会话级 CSA cache 表 {} 层建立(P2P 共享)", table.len());
+            Some(Arc::new(table))
+        } else {
+            None
+        };
         let mut layer_start = 0usize;
         let mut stage_contexts = Vec::with_capacity(tiers.len());
         let resident_states: Vec<DeepSeekV4StageState> = tiers
             .into_iter()
             .map(|tier| {
                 stage_contexts.push(tier.context);
-                let state = DeepSeekV4StageState::new(tier.context, model.clone(), rope.clone(), layer_start, tier.layer_cache, tier.experts, tier.caches, capture_plan.clone(), options.profile);
+                let state = DeepSeekV4StageState::new(
+                    tier.context,
+                    model.clone(),
+                    rope.clone(),
+                    layer_start,
+                    options.layer_ends[stage_contexts.len() - 1] - layer_start,
+                    tier.layer_cache,
+                    tier.experts,
+                    tier.caches,
+                    v41_table.clone(),
+                    engram.clone(),
+                    capture_plan.clone(),
+                    options.profile,
+                );
                 layer_start += state.layer_count();
                 state
             })
@@ -366,7 +472,12 @@ impl RocmDeepSeekV4Engine {
                 DeepSeekV4SwapStore::open(options.cache_directory.join("deepseek-v4-terminal"), &metadata)
             })
             .transpose()?;
-        // 权重、输出头、DSpark 与首个 session 全部驻留后再查空闲显存，逐卡按
+        // arena 是固定预留段；在 KV 容量快照前建立，避免先高估容量、首轮
+        // prefill 再突然吃掉 arena 段。
+        for &device in &options.devices {
+            crate::kernel::rocm::hip::reserve_device_arena(device).map_err(|error| format!("DeepSeek-V4 device {device} arena: {error}"))?;
+        }
+        // 权重、输出头、DSpark、首个 session 与 arena 全部驻留后再查空闲显存，逐卡按
         // CSA 线性 bytes/token 折算 KV token 容量；调度器据此对准入按 token
         // 记账，而不是只数请求数。卡内各层压缩比不同，先对层求和再调用
         // （layers=1），保持与 rocm_chain 统一的安全水位与 total/2 封顶口径。
@@ -398,6 +509,15 @@ impl RocmDeepSeekV4Engine {
             dspark,
             dspark_window,
         })
+    }
+
+    /// terminal cache 的模型隔离键:V4.1 权重与 V4 不同,cache 不可混用。
+    pub fn cache_model_key(&self) -> &'static str {
+        if self.model.is_v41() { "deepseek-v41-flash" } else { "deepseek-v4-flash" }
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.model.layer_count()
     }
 
     pub fn max_sequence_length(&self) -> usize {
@@ -542,7 +662,10 @@ impl RocmDeepSeekV4Engine {
                 eprintln!("[deepseek-v4-cache] 精确 cache_id 前缀分叉 cache_id={cache_id} 公共前缀={common} 快照长度={} prompt 长度={}", cached.len(), task.prompt_tokens.len());
             }
         }
+        // 瘦身请求的 prompt_tokens 只有增量,内容前缀复用会错误匹配其他
+        // cache 的短前缀;命中只允许走上面的 cache_id 精确恢复路径。
         if resident.is_none()
+            && !task.slim_resume
             && let Some(materialized) = self.terminal_sessions.materialize_longest_prefix(&task.prompt_tokens, |state| state.cache_namespace == task.cache_namespace)
         {
             let (cache_id, cached, round, state) = materialized?;
@@ -564,6 +687,7 @@ impl RocmDeepSeekV4Engine {
             }
             snapshot = snapshot.filter(|snapshot| snapshot.tokens.len() < task.prompt_tokens.len() && task.prompt_tokens.starts_with(&snapshot.tokens));
             if snapshot.is_none()
+                && !task.slim_resume
                 && let Some(cache_id) = swap.longest_prefix_cache_id(&task.prompt_tokens)?
             {
                 snapshot = swap.get(&cache_id)?.filter(|snapshot| snapshot.tokens.len() < task.prompt_tokens.len());
@@ -578,12 +702,7 @@ impl RocmDeepSeekV4Engine {
                 }
                 // SSD prefix 每次恢复都重新分配 session，会让已经换出的旧 session
                 // 永久堆在 reusable pool。优先覆盖其中一份，使设备 buffer 真正复用。
-                let mut session = self
-                    .reusable_sessions
-                    .pop()
-                    .map(Ok)
-                    .unwrap_or_else(|| self.stage_templates.iter().map(DeepSeekV4StageTemplate::open_session).collect::<Result<Vec<_>, _>>().map(|stages| RocmSessionState { stages, dspark: None }))
-                    .map_err(backend_error)?;
+                let mut session = self.reusable_sessions.pop().map(Ok).unwrap_or_else(|| open_stage_session(&self.stage_templates).map(|stages| RocmSessionState { stages, dspark: None })).map_err(backend_error)?;
                 for (stage, cached_stage) in session.stages.iter_mut().zip(snapshot.stages) {
                     stage.upload_cache(cached_stage).map_err(backend_error)?;
                 }
@@ -604,12 +723,12 @@ impl RocmDeepSeekV4Engine {
             task.resumed_cache_round = Some(round);
             return Ok(state.session);
         }
-        let mut session = self
-            .reusable_sessions
-            .pop()
-            .map(Ok)
-            .unwrap_or_else(|| self.stage_templates.iter().map(DeepSeekV4StageTemplate::open_session).collect::<Result<Vec<_>, _>>().map(|stages| RocmSessionState { stages, dspark: None }))
-            .map_err(backend_error)?;
+        // 瘦身请求没有完整 messages,miss 不能退回残缺 prompt 的全量 prefill。
+        if task.slim_resume {
+            let cache_id = task.cache_id.as_deref().unwrap_or_default();
+            return Err(format!("{} {cache_id}", crate::runtime::session::TERMINAL_RESUME_MISS));
+        }
+        let mut session = self.reusable_sessions.pop().map(Ok).unwrap_or_else(|| open_stage_session(&self.stage_templates).map(|stages| RocmSessionState { stages, dspark: None })).map_err(backend_error)?;
         session.reset_session();
         Ok(session)
     }
@@ -621,7 +740,7 @@ impl RocmDeepSeekV4Engine {
         if request.cancellation.load(Ordering::Acquire) {
             return Err("请求已取消".to_owned());
         }
-        let target_chunks = self.options.devices.len().saturating_mul(3).max(1);
+        let target_chunks = self.options.devices.len().saturating_mul(7).max(1);
         let aligned = prompt_tokens.len().div_ceil(target_chunks).div_ceil(256).saturating_mul(256).max(256);
         let prefill_chunk = self.options.prefill_chunk_size.min(aligned);
         let long_prefill = match (self.options.long_prefill_threshold_tokens, self.options.long_prefill_chunk_size) {
@@ -642,6 +761,18 @@ impl RocmDeepSeekV4Engine {
         let tool_fence = request.tool_fence.map(|spec| DsmlToolFence::new(&self.tokenizer, self.json_tokens.clone(), self.model.config().vocab_size, &self.model.config().eos_token_ids, spec)).transpose()?;
         let token_fence = GenerationGuard::new(tool_fence, request.repeat_loop_breaker, self.model.config().eos_token_ids.iter().copied());
         let resume_suffix_tokens = request.resume_suffix.as_deref().map(|suffix| self.tokenizer.tokenize(suffix.as_bytes()));
+        // 多模态:占位符 token 展开为完整 span,并在入口设备上完成视觉编码。
+        let (prompt_tokens, vision) = match request.vision_images.as_ref() {
+            Some(images) if !images.is_empty() => {
+                let input = self.expand_vision_input(images, &prompt_tokens)?;
+                let overlays = self.build_vision_overlays(&input)?;
+                if input.tokens.len() >= self.options.max_sequence_length {
+                    return Err(format!("DeepSeek-V4.1 图文展开后 prompt_tokens={} 超出 max_sequence_length={}", input.tokens.len(), self.options.max_sequence_length));
+                }
+                (input.tokens, Some(Arc::new(overlays)))
+            }
+            _ => (prompt_tokens, None),
+        };
         Ok(BatchTask {
             request_id: request.request_id,
             cancellation: request.cancellation,
@@ -655,12 +786,58 @@ impl RocmDeepSeekV4Engine {
             stats: crate::runtime::speculative::SpeculativeStats::default(),
             cache_id: request.cache_id,
             resume_suffix_tokens,
+            slim_resume: request.slim_resume,
             cache_namespace: request.cache_namespace,
             cached_tokens: Vec::new(),
             resumed_cache_id: None,
             resumed_cache_round: None,
             token_fence,
+            vision,
         })
+    }
+
+    /// 把 prompt 中的 image 占位符展开为完整 span(预处理图像 → patch 张量)。
+    fn expand_vision_input(&self, images: &[crate::vision::RgbImage], prompt_tokens: &[u32]) -> Result<DeepseekV41VisionInput, String> {
+        let image_token_id = self.model.config().image_token_id.ok_or("当前 DeepSeek-V4 配置无 image token,不支持图像输入")?;
+        let vision_config = crate::model_spec::deepseek_v4::DeepseekV41VisionConfig::standard();
+        let processor = super::vision::DeepseekV41ImageProcessor::new(vision_config.clone())?;
+        let tensors = images.iter().map(|image| crate::vision::ImageProcessor::preprocess(&processor, image)).collect::<Result<Vec<_>, _>>()?;
+        let (tokens, spans) = super::vision::expand_image_spans(prompt_tokens, image_token_id, &tensors, vision_config.downsample_ratio)?;
+        Ok(DeepseekV41VisionInput { tokens, images: tensors, spans })
+    }
+
+    /// 多模态请求的视觉编码:入口设备上跑视觉塔,把 aligner 行与首尾/换行
+    /// 学习向量组装成 span 覆盖(chunked prefill 的 embedding 上传拼接用)。
+    fn build_vision_overlays(&self, input: &DeepseekV41VisionInput) -> Result<DeepseekV41SpanOverlays, String> {
+        let weights = self.source.official_weights().ok_or("DeepSeek-V4.1 多模态需要官方 safetensors checkpoint")?;
+        if !weights.has_vision_tower() {
+            return Err("DeepSeek-V4.1 checkpoint 缺少视觉塔,不能处理图像输入".to_owned());
+        }
+        let config = crate::model_spec::deepseek_v4::DeepseekV41VisionConfig::standard();
+        let span_embeddings = weights.load_image_span_embeddings()?;
+        let hidden = self.model.config().hidden_size;
+        let context = self.entry_context;
+        context.activate().map_err(|error| format!("入口设备: {error}"))?;
+        let mut ranges = Vec::with_capacity(input.spans.len());
+        let mut rows = Vec::with_capacity(input.spans.len());
+        for (index, span) in input.spans.iter().enumerate() {
+            let image = input.images.get(index).ok_or_else(|| format!("缺少图像 {index} 的 patch 张量"))?;
+            let encoded = deepseek_v41_vision_encode(&context, &config, weights, image).map_err(|error| format!("图像 {index} 视觉编码: {error:?}"))?;
+            let aligner_rows = context.tensor_to_f32(&encoded).map_err(|error| format!("图像 {index} 视觉输出下载: {error}"))?;
+            rows.push(span_rows_f32(span, &aligner_rows, hidden, &span_embeddings)?);
+            ranges.push(ImageTokenRange { image_index: index, tokens: span.start..span.start + span.token_count() });
+        }
+        Ok(DeepseekV41SpanOverlays { ranges, rows })
+    }
+
+    /// checkpoint 是否携带视觉塔(node 能力上报与图像请求接受判定)。
+    pub fn vision_available(&self) -> bool {
+        self.source.official_weights().is_some_and(|weights| weights.has_vision_tower())
+    }
+
+    /// V4.1 image span 共用 token id(node 输出侧拦截生成)。
+    pub fn image_token_id(&self) -> Option<u32> {
+        self.model.config().image_token_id
     }
 
     pub fn generate(&mut self, prompt: &str, requested_tokens: usize, cancellation: &AtomicBool, on_token: &mut dyn FnMut(u32, String) -> bool) -> Result<RocmGeneration, String> {
@@ -671,9 +848,11 @@ impl RocmDeepSeekV4Engine {
             cancellation: Arc::new(AtomicBool::new(cancellation.load(Ordering::Acquire))),
             cache_id: None,
             resume_suffix: None,
+            slim_resume: false,
             cache_namespace: None,
             tool_fence: None,
             repeat_loop_breaker: true,
+            vision_images: None,
         };
         let mut completed = Vec::new();
         let mut results = self.generate_batch(vec![request], &mut |_| Vec::new(), &mut |_, token, text| on_token(token, text), &mut |_, result| completed.push(result));
@@ -743,18 +922,27 @@ impl RocmDeepSeekV4Engine {
         let sessions = active_sessions.into_iter().map(|state| state.stages).collect::<Vec<_>>();
         let capture_count = self.dspark.as_ref().map_or(0, |_| 3);
         let config = self.model.config().clone();
-        let driven = drive_deepseek_v4_stage_pipeline(sessions, DEEPSEEK_V4_MAX_CONCURRENCY, &config, self.options.devices.len().saturating_mul(3), self.options.decode_batch_limit, self.options.profile, |scheduler| {
+        // V4.1 的大批量 mHC/CSA scratch 在一个 8-stage 波次内已经覆盖全部设备；
+        // 继续预灌三波只会延长临时 buffer 生命周期并把显存峰值推到 OOM。
+        let pipeline_work_window = if self.model.is_v41() { self.options.devices.len() } else { self.options.devices.len().saturating_mul(3) };
+        let driven = drive_deepseek_v4_stage_pipeline(sessions, DEEPSEEK_V4_MAX_CONCURRENCY, &config, pipeline_work_window, self.options.decode_batch_limit, self.options.profile, |scheduler| {
             let pipeline = DeepSeekV4StagePipeline::new(scheduler, capture_count);
             let entry_context = self.entry_context;
             let source = self.source.clone();
             let hidden_size = self.model.config().hidden_size;
-            let pack_input = move |tokens: &[u32]| -> Result<RocmTensor, String> {
+            let pack_input = move |tokens: &[u32], start: usize, vision: Option<&Arc<DeepseekV41SpanOverlays>>| -> Result<RocmTensor, String> {
                 entry_context.activate().map_err(|error| format!("入口设备: {error}"))?;
-                entry_context.tensor_from_f32(source.embedding_rows(tokens)?, tokens.len(), hidden_size).map_err(|error| format!("输入上传: {error:?}"))
+                let mut rows = source.embedding_rows(tokens)?;
+                if let Some(overlay) = vision {
+                    crate::vision::splice_image_embeddings_f32(&mut rows, hidden_size, start, &overlay.ranges, &overlay.rows).map_err(|error| format!("视觉 embedding 拼接: {error}"))?;
+                }
+                // 调度线程没有 stage compute stream；独立上传在专用 H2D stream
+                // 完成后返回，并把输入 buffer 纳入显式 device pool。
+                entry_context.tensor_from_f32_independent(rows, tokens.len(), hidden_size).map_err(|error| format!("输入上传: {error:?}"))
             };
             let run = (|| -> Result<(), String> {
                 let prefill_started = Instant::now();
-                let work_window = self.options.devices.len().saturating_mul(3).max(1);
+                let work_window = pipeline_work_window.max(1);
                 let mut in_flight = 0usize;
                 let mut cursor = 0usize;
                 let mut work_id = 0usize;
@@ -790,7 +978,7 @@ impl RocmDeepSeekV4Engine {
                         let start = task.next_prefill;
                         let end = start.saturating_add(task.chunk_policy.chunk_size(0, start)).min(task.prompt_tokens.len());
                         let tokens = task.prompt_tokens[start..end].to_vec();
-                        let input = pack_input(&tokens)?;
+                        let input = pack_input(&tokens, start, task.vision.as_ref())?;
                         let dspark_prefill_from = self.dspark_window.and_then(|window| {
                             let tail_start = task.prompt_tokens.len().saturating_sub(window);
                             (end > tail_start).then_some(tail_start.saturating_sub(start))
@@ -841,7 +1029,7 @@ impl RocmDeepSeekV4Engine {
                     }
                 }
 
-                // 单路 target decode 在目标 ROCm 机器上比 DSpark 更快；按本次 engine batch
+                // 单路 target decode 在已验证的 8 卡主机上比 DSpark 更快；按本次 engine batch
                 // 的初始会话数固定模式，避免同一会话因后续请求到达而中途切换语义。
                 if let Some(dspark) = self.dspark.clone().filter(|_| tasks.len() >= self.options.dspark_min_sessions) {
                     struct DraftWork {
@@ -970,13 +1158,14 @@ impl RocmDeepSeekV4Engine {
                         let mut ready_forwards = Vec::new();
                         for (work, commit_speculative) in forward_wave {
                             let session = work.session;
-                            // 完整 verify block 只有一份 work 时不足以填满八级流水线；按
-                            // token 因果顺序切成两个 wave，事务 begin/commit 只随首段。
-                            let segment_count = if work.transactional && work.inputs.len() >= 4 { 2 } else { 1 };
+                            // 官方 K=5 的完整 verify block 只有一份 work，不足以填满八级流水线；
+                            // 按 token 切成独立 work，让 target verify 覆盖更多 pipeline stage。
+                            let segment_count = if work.transactional { work.inputs.len() } else { 1 };
                             let segments = prefill_token_segments(0, work.inputs.len(), segment_count);
                             for (index, segment) in segments.iter().enumerate() {
                                 let tokens = work.inputs[segment.clone()].to_vec();
-                                let hidden = pack_input(&tokens)?;
+                                // DSpark verify 段是生成 token,image overlay 区间不可能命中。
+                                let hidden = pack_input(&tokens, work.position + segment.start, tasks[session].vision.as_ref())?;
                                 ready_forwards.push(DeepSeekV4ReadyForward {
                                     session,
                                     chunk_index: work_id,
@@ -1031,7 +1220,7 @@ impl RocmDeepSeekV4Engine {
                             let segments = prefill_token_segments(start, end - start, segment_budget);
                             for segment in &segments {
                                 let tokens = task.prompt_tokens[segment.clone()].to_vec();
-                                let input = pack_input(&tokens)?;
+                                let input = pack_input(&tokens, segment.start, task.vision.as_ref())?;
                                 let dspark_prefill_from = self.dspark_window.and_then(|window| {
                                     let tail_start = task.prompt_tokens.len().saturating_sub(window);
                                     (segment.end > tail_start).then_some(tail_start.saturating_sub(segment.start))
@@ -1386,7 +1575,7 @@ impl RocmDeepSeekV4Engine {
                         for &session in &active {
                             let token = *tasks[session].generated.last().expect("generated 非空");
                             let position = tasks[session].prompt_tokens.len() + tasks[session].generated.len() - 1;
-                            let input = pack_input(&[token])?;
+                            let input = pack_input(&[token], position, None)?;
                             pipeline.push(session, work_id, position, vec![token], input, None)?;
                             work_id += 1;
                         }
@@ -1602,7 +1791,7 @@ fn backend_error(error: BackendError) -> String {
     format!("{error:?}")
 }
 
-fn build_experts(source: &Source, context: &RocmContext, layer_start: usize, layer_end: usize, expert_count: usize) -> Result<RocmPrefillExperts, String> {
+fn build_experts(source: &Source, context: &RocmContext, layer_start: usize, layer_end: usize, config: &crate::model_spec::deepseek_v4::DeepSeekV4Config) -> Result<RocmPrefillExperts, String> {
     let mut experts = match source {
         Source::Gguf(gguf) => {
             let expert_source: Arc<dyn GgufExpertSource> = Arc::new(gguf.clone());
@@ -1613,21 +1802,21 @@ fn build_experts(source: &Source, context: &RocmContext, layer_start: usize, lay
     match source {
         Source::Gguf(_) => {
             for layer in layer_start..layer_end {
-                experts.preload_layer(context, layer, expert_count).map_err(|error| format!("预载 L{layer} 专家: {error:?}"))?;
+                experts.preload_layer(context, layer, config.expert_count).map_err(|error| format!("预载 L{layer} 专家: {error:?}"))?;
             }
         }
         Source::Official(_) => {
             // MXFP4 的 grouped/preshuffle 布局同时覆盖 decode 与 prefill；不要再预载一套逐专家 resident 权重。
             let spec = crate::moe::topk_moe::TopkMoeSpec {
-                num_experts: expert_count,
-                top_k: 6,
-                num_shared_experts: 1,
+                num_experts: config.expert_count,
+                top_k: config.expert_top_k,
+                num_shared_experts: config.shared_expert_count,
                 scoring_func: crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias,
                 normalize_selected: true,
-                routed_scaling_factor: 1.5,
-                intermediate_size: 2048,
-                shared_intermediate_size: 2048,
-                activation: crate::moe::Activation::SiluClamped { limit: 10.0 },
+                routed_scaling_factor: config.routed_scaling_factor,
+                intermediate_size: config.expert_intermediate_size,
+                shared_intermediate_size: config.expert_intermediate_size,
+                activation: crate::moe::Activation::SiluClamped { limit: config.swiglu_limit },
             };
             for layer in layer_start..layer_end {
                 experts.mxfp4_grouped(context, layer, &spec).map_err(|error| format!("装配 L{layer} grouped: {error:?}"))?;

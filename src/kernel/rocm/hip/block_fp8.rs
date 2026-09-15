@@ -9,8 +9,7 @@
 //! - `block_fp8_small_n_f32` (`input_rows <= 8`):每个 WG 读取一次 weight，
 //!   在寄存器中同时累计多行，供推测验证等小批量路径复用权重带宽。
 //!
-//! 第一版仅支持 `block_rows == block_cols == 128`(DeepSeek-V4 spec);其他 block
-//! 形态返回 `Err`,由 caller 走老 `decode → BF16 WMMA` 路径。
+//! 支持 DeepSeek-V4 的 128×128 与 V4.1 的 32×32 二维 scale block。
 
 use std::{
     collections::HashMap,
@@ -22,6 +21,10 @@ use std::{
 use libloading::Symbol;
 
 use crate::moe::Activation;
+
+fn supported_block_shape(block_rows: usize, block_cols: usize) -> bool {
+    block_rows == block_cols && matches!(block_rows, 32 | 128)
+}
 
 use super::{DeviceBuffer, HIP_SUCCESS, HipModuleGetFunction, HipModuleLoadData, RocmRuntime, compile_hip_source, options, set_device, synchronize_device};
 
@@ -102,8 +105,8 @@ fn block_fp8_functions(device_id: i32) -> Result<BlockFp8Functions, String> {
 /// gfx11 没有 FP8 计算单元,prefill 大 GEMM 走"解码 → BF16 WMMA"路径;解码一次
 /// 的结果由调用方按权重缓存。kernel 异步提交,消费方在同流上接续 GEMM。
 pub fn try_block_fp8_decode_bf16(device_id: i32, codes: &DeviceBuffer, scales: &DeviceBuffer, weight_rows: usize, columns: usize, block_rows: usize, block_cols: usize) -> Result<DeviceBuffer, String> {
-    if block_rows != 128 || block_cols != 128 {
-        return Err(format!("ROCm block-fp8 decode 只支持 128×128 block，实际 [{block_rows},{block_cols}]"));
+    if !supported_block_shape(block_rows, block_cols) {
+        return Err(format!("ROCm block-fp8 decode 只支持 32×32 或 128×128 block，实际 [{block_rows},{block_cols}]"));
     }
     let elements = weight_rows.checked_mul(columns).ok_or("ROCm block-fp8 decode 元素数溢出")?;
     let scale_bytes = weight_rows.div_ceil(block_rows).checked_mul(columns.div_ceil(block_cols)).ok_or("ROCm block-fp8 decode scales 溢出")?;
@@ -150,7 +153,6 @@ pub fn try_block_fp8_decode_bf16(device_id: i32, codes: &DeviceBuffer, scales: &
 /// 在 RD device 上跑 `output[N,M] = input[N,K] @ weight_fp8[M,K]^T`。
 ///
 /// `codes` 是 `[M, K]` E4M3 行优先,`scales` 是 `[M/BR, K/BC]` E8M0。
-/// 仅支持 `BR == BC == 128`(V4 spec);其他 block 形态返回 `Err`。
 pub fn try_block_fp8_matmul_resident_f32(
     device_id: i32,
     input: &DeviceBuffer,
@@ -162,8 +164,8 @@ pub fn try_block_fp8_matmul_resident_f32(
     block_rows: usize,
     block_cols: usize,
 ) -> Result<DeviceBuffer, String> {
-    if block_rows != 128 || block_cols != 128 {
-        return Err(format!("ROCm block-fp8 只支持 128×128 block，实际 [{block_rows},{block_cols}]"));
+    if !supported_block_shape(block_rows, block_cols) {
+        return Err(format!("ROCm block-fp8 只支持 32×32 或 128×128 block，实际 [{block_rows},{block_cols}]"));
     }
     if input_rows == 0 || input_columns == 0 || weight_rows == 0 {
         return Err(format!("ROCm block-fp8 shape rows={input_rows} cols={input_columns} weight_rows={weight_rows} 不能为 0"));
@@ -288,7 +290,7 @@ pub fn try_block_fp8_three_segment_bf16_resident_f32(
     block_rows: usize,
     block_cols: usize,
 ) -> Result<DeviceBuffer, String> {
-    if input_rows == 0 || input_rows > 8 || segment_columns == 0 || weight_rows == 0 || block_rows != 128 || block_cols != 128 || !segment_columns.is_multiple_of(16) {
+    if input_rows == 0 || input_rows > 8 || segment_columns == 0 || weight_rows == 0 || !supported_block_shape(block_rows, block_cols) || !segment_columns.is_multiple_of(16) {
         return Err(format!("ROCm three-segment BlockFP8 shape rows={input_rows} cols={segment_columns} weight_rows={weight_rows} block=[{block_rows},{block_cols}] 非法"));
     }
     let input_columns = segment_columns.checked_mul(3).ok_or("ROCm three-segment BlockFP8 columns 溢出")?;
@@ -370,7 +372,7 @@ pub fn try_block_fp8_dual_gemv_resident_f32(
     block_rows: usize,
     block_cols: usize,
 ) -> Result<(DeviceBuffer, DeviceBuffer), String> {
-    if input_rows == 0 || input_rows > 8 || block_rows != 128 || block_cols != 128 || input_columns == 0 || first_rows == 0 || second_rows == 0 || !input_columns.is_multiple_of(16) {
+    if input_rows == 0 || input_rows > 8 || !supported_block_shape(block_rows, block_cols) || input_columns == 0 || first_rows == 0 || second_rows == 0 || !input_columns.is_multiple_of(16) {
         return Err(format!("ROCm dual block-fp8 shape input_rows={input_rows} cols={input_columns} rows={first_rows}/{second_rows} block=[{block_rows},{block_cols}] 非法"));
     }
     let input_bytes = input_rows.checked_mul(input_columns).and_then(|n| n.checked_mul(4)).ok_or("ROCm dual block-fp8 input 溢出")?;
@@ -480,7 +482,7 @@ pub fn try_block_fp8_gated_gemv_resident_f32(
     block_cols: usize,
     activation: &Activation,
 ) -> Result<DeviceBuffer, String> {
-    if input_rows == 0 || input_rows > 8 || block_rows != 128 || block_cols != 128 || input_columns == 0 || rows == 0 || !input_columns.is_multiple_of(16) {
+    if input_rows == 0 || input_rows > 8 || !supported_block_shape(block_rows, block_cols) || input_columns == 0 || rows == 0 || !input_columns.is_multiple_of(16) {
         return Err(format!("ROCm gated block-fp8 shape input_rows={input_rows} cols={input_columns} rows={rows} block=[{block_rows},{block_cols}] 非法"));
     }
     let input_bytes = input_rows.checked_mul(input_columns).and_then(|n| n.checked_mul(4)).ok_or("ROCm gated block-fp8 input 溢出")?;
@@ -581,7 +583,7 @@ pub fn try_block_fp8_grouped_columns_gemv_resident_f32(
     block_cols: usize,
 ) -> Result<DeviceBuffer, String> {
     let group_count = weights.len();
-    if group_count == 0 || input_rows == 0 || input_rows > 8 || rows_per_group == 0 || group_columns == 0 || !group_columns.is_multiple_of(16) || block_rows != 128 || block_cols != 128 || !rows_per_group.is_multiple_of(block_rows) {
+    if group_count == 0 || input_rows == 0 || input_rows > 8 || rows_per_group == 0 || group_columns == 0 || !group_columns.is_multiple_of(16) || !supported_block_shape(block_rows, block_cols) || !rows_per_group.is_multiple_of(block_rows) {
         return Err(format!("ROCm grouped-columns BlockFP8 shape input_rows={input_rows} groups={group_count} rows={rows_per_group} cols={group_columns} block=[{block_rows},{block_cols}] 非法"));
     }
     let input_bytes = input_rows.checked_mul(group_count).and_then(|n| n.checked_mul(group_columns)).and_then(|n| n.checked_mul(4)).ok_or("ROCm grouped-columns BlockFP8 input 溢出")?;
@@ -674,6 +676,12 @@ mod tests {
         (codes, scales)
     }
 
+    fn build_block_fp8_32(rows: usize, cols: usize, seed: u32) -> (Vec<u8>, Vec<u8>) {
+        let (codes, _) = build_block_fp8(rows, cols, seed);
+        let scales = (0..rows.div_ceil(32) * cols.div_ceil(32)).map(|index| 125 + (index % 6) as u8).collect();
+        (codes, scales)
+    }
+
     fn upload_codes_scales_input(device_id: i32, codes: &[u8], scales: &[u8], input: &[f32]) -> Result<(DeviceBuffer, DeviceBuffer, DeviceBuffer), String> {
         let codes_buf = DeviceBuffer::upload(device_id, codes)?;
         let scales_buf = DeviceBuffer::upload(device_id, scales)?;
@@ -706,6 +714,33 @@ mod tests {
         for (index, (actual, expected)) in decoded_f32.iter().zip(expected.iter()).enumerate() {
             // 合成数据含 E4M3 NaN 编码(S.1111.111),两侧一致地解码为 NaN 即通过。
             assert!(actual.is_nan() && expected.is_nan() || (actual - expected).abs() <= expected.abs() * 1.0e-2 + 1.0e-6, "index={index} actual={actual} expected={expected}");
+        }
+    }
+
+    #[test]
+    fn block32_fp8_decode_and_gemv_match_cpu_oracle() {
+        let Some(device_id) = skip_if_no_rocm("block32-fp8") else { return };
+        let (rows, cols) = (64, 256);
+        let (codes, scales) = build_block_fp8_32(rows, cols, 31);
+        let codes_buf = DeviceBuffer::upload(device_id, &codes).expect("upload codes");
+        let scales_buf = DeviceBuffer::upload(device_id, &scales).expect("upload scales");
+        let decoded = try_block_fp8_decode_bf16(device_id, &codes_buf, &scales_buf, rows, cols, 32, 32).expect("decode");
+        let mut bf16_bytes = vec![0u8; rows * cols * 2];
+        decoded.copy_to_host(&mut bf16_bytes).expect("readback");
+        let expected_matrix = crate::weight::format::block_fp8::BlockFp8Matrix::new(codes.clone(), scales.clone(), rows, cols, 32, 32).expect("matrix");
+        for (index, (actual, expected)) in bf16_bytes.chunks_exact(2).map(|bytes| half::bf16::from_le_bytes([bytes[0], bytes[1]]).to_f32()).zip(expected_matrix.decode()).enumerate() {
+            assert!(actual.is_nan() && expected.is_nan() || (actual - expected).abs() <= expected.abs() * 1.0e-2 + 1.0e-6, "decode index={index} actual={actual} expected={expected}");
+        }
+
+        let input = (0..cols).map(|column| column as f32 * 0.007 - 0.5).collect::<Vec<_>>();
+        let input_bytes = unsafe { std::slice::from_raw_parts(input.as_ptr().cast::<u8>(), input.len() * 4) };
+        let input_buf = DeviceBuffer::upload(device_id, input_bytes).expect("upload input");
+        let output = try_block_fp8_matmul_resident_f32(device_id, &input_buf, &codes_buf, &scales_buf, 1, cols, rows, 32, 32).expect("gemv");
+        let actual = readback_f32(&output, rows).expect("readback gemv");
+        let mut expected = vec![0.0; rows];
+        crate::kernel::cpu::block_fp8::matvec_block_fp8_matrix(&codes, &scales, 32, 32, rows, cols, &input, &mut expected).expect("cpu oracle");
+        for (row, (actual, expected)) in actual.into_iter().zip(expected).enumerate() {
+            assert!(actual.is_nan() && expected.is_nan() || (actual - expected).abs() < 5.0e-2, "gemv row={row} actual={actual} expected={expected}");
         }
     }
 

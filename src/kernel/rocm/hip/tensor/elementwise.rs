@@ -195,6 +195,38 @@ pub fn try_concat_columns_resident_f32(device_id: i32, left: &DeviceBuffer, righ
     Ok(output)
 }
 
+pub(crate) fn try_copy_columns_into_pointer_ordered_f32(device_id: i32, input: *mut c_void, output: *mut c_void, rows: usize, input_columns: usize, output_columns: usize, output_column_start: usize) -> Result<(), String> {
+    if input.is_null() || output.is_null() || rows == 0 || input_columns == 0 || output_column_start.checked_add(input_columns).is_none_or(|end| end > output_columns) {
+        return Err(format!("copy columns rows={rows} input_cols={input_columns} output_cols={output_columns} start={output_column_start} 非法"));
+    }
+    set_device(device_id)?;
+    let functions = tensor_functions(device_id)?;
+    let vectorized = (input as usize).is_multiple_of(16) && (output as usize).is_multiple_of(16) && input_columns.is_multiple_of(4) && output_columns.is_multiple_of(4) && output_column_start.is_multiple_of(4);
+    let (input_width, output_width, output_start) = if vectorized {
+        (u32::try_from(input_columns / 4), u32::try_from(output_columns / 4), u32::try_from(output_column_start / 4))
+    } else {
+        (u32::try_from(input_columns), u32::try_from(output_columns), u32::try_from(output_column_start))
+    };
+    let mut input_width = input_width.map_err(|_| "copy columns input width 超过 u32")?;
+    let mut output_width = output_width.map_err(|_| "copy columns output width 超过 u32")?;
+    let mut output_start = output_start.map_err(|_| "copy columns output start 超过 u32")?;
+    let mut d_input = input;
+    let mut d_output = output;
+    let elements = rows.checked_mul(input_width as usize).ok_or("copy columns elements 溢出")?;
+    let mut row_count = u32::try_from(rows).map_err(|_| "copy columns rows 超过 u32")?;
+    let mut arguments = [
+        (&mut d_input as *mut *mut c_void).cast(),
+        (&mut d_output as *mut *mut c_void).cast(),
+        (&mut row_count as *mut u32).cast(),
+        (&mut input_width as *mut u32).cast(),
+        (&mut output_width as *mut u32).cast(),
+        (&mut output_start as *mut u32).cast(),
+    ];
+    let grid = u32::try_from(elements.div_ceil(256)).map_err(|_| "copy columns grid 超过 u32")?.clamp(1, 2048);
+    let function = if vectorized { functions.copy_columns_into_f32x4 } else { functions.copy_columns_into };
+    launch_tensor_kernel(function, grid, 256, &mut arguments, "HIP resident copy columns into")
+}
+
 /// 把原始 Q/K/V 的连续 head 范围压紧，减少跨卡传输。
 pub fn try_compact_qkv_head_range_resident_f32(device_id: i32, input: &DeviceBuffer, rows: usize, total_head_count: usize, head_start: usize, head_count: usize, head_dim: usize) -> Result<DeviceBuffer, String> {
     if rows == 0 || total_head_count == 0 || head_count == 0 || head_start.checked_add(head_count).is_none_or(|end| end > total_head_count) || head_dim == 0 {
@@ -606,6 +638,55 @@ pub fn try_group_norm_time_isolated_resident_f32(device_id: i32, input: &DeviceB
     let mut spatial = u32::try_from(spatial).map_err(|_| "HIP time-isolated GroupNorm spatial 超过 u32".to_owned())?;
     let mut groups = u32::try_from(groups).map_err(|_| "HIP time-isolated GroupNorm groups 超过 u32".to_owned())?;
     let mut eps = eps;
+    // 小组继续单块归约；大空间拆成固定块，两次中心化避免 E[x²]-E[x]² 消减。
+    let mut count = (channels / groups).checked_mul(spatial).ok_or("HIP GroupNorm group count 溢出")?;
+    let tasks = time.checked_mul(groups).ok_or("HIP GroupNorm tasks 溢出")?;
+    if count >= 65536 {
+        let mut chunk_size = 16384u32;
+        let mut chunks = count.div_ceil(chunk_size);
+        let blocks = tasks.checked_mul(chunks).ok_or("HIP GroupNorm partial grid 溢出")?;
+        let partial = DeviceBuffer::allocate_reusable(device_id, blocks as usize * 4)?;
+        let mean = DeviceBuffer::allocate_reusable(device_id, tasks as usize * 4)?;
+        let inv = DeviceBuffer::allocate_reusable(device_id, tasks as usize * 4)?;
+        let mut d_partial = partial.pointer;
+        let mut d_mean = mean.pointer;
+        let mut d_inv = inv.pointer;
+        for mut variance in [0u32, 1] {
+            let mut partial_args = [
+                (&mut d_input as *mut *mut c_void).cast(),
+                (&mut d_mean as *mut *mut c_void).cast(),
+                (&mut d_partial as *mut *mut c_void).cast(),
+                (&mut channels as *mut u32).cast(),
+                (&mut time as *mut u32).cast(),
+                (&mut spatial as *mut u32).cast(),
+                (&mut groups as *mut u32).cast(),
+                (&mut chunks as *mut u32).cast(),
+                (&mut chunk_size as *mut u32).cast(),
+                (&mut variance as *mut u32).cast(),
+            ];
+            launch_tensor_kernel(functions.group_norm_partial, blocks, 256, &mut partial_args, "HIP GroupNorm partial")?;
+            let mut d_stat = if variance == 0 { d_mean } else { d_inv };
+            let mut finish_args =
+                [(&mut d_partial as *mut *mut c_void).cast(), (&mut d_stat as *mut *mut c_void).cast(), (&mut chunks as *mut u32).cast(), (&mut count as *mut u32).cast(), (&mut eps as *mut f32).cast(), (&mut variance as *mut u32).cast()];
+            launch_tensor_kernel(functions.group_norm_finish, tasks, 256, &mut finish_args, "HIP GroupNorm finish")?;
+        }
+        let mut elements = elements as u64;
+        let mut apply_args = [
+            (&mut d_input as *mut *mut c_void).cast(),
+            (&mut d_scale as *mut *mut c_void).cast(),
+            (&mut d_bias as *mut *mut c_void).cast(),
+            (&mut d_mean as *mut *mut c_void).cast(),
+            (&mut d_inv as *mut *mut c_void).cast(),
+            (&mut d_output as *mut *mut c_void).cast(),
+            (&mut channels as *mut u32).cast(),
+            (&mut time as *mut u32).cast(),
+            (&mut spatial as *mut u32).cast(),
+            (&mut groups as *mut u32).cast(),
+            (&mut elements as *mut u64).cast(),
+        ];
+        launch_tensor_kernel(functions.group_norm_apply, u32::try_from(elements.div_ceil(256)).map_err(|_| "HIP GroupNorm apply grid 溢出")?, 256, &mut apply_args, "HIP GroupNorm apply")?;
+        return Ok(output);
+    }
     let mut arguments = [
         (&mut d_input as *mut *mut c_void).cast(),
         (&mut d_scale as *mut *mut c_void).cast(),
@@ -1420,6 +1501,26 @@ pub fn try_split_gated_activation_owned_bf16(device_id: i32, input: DeviceBuffer
     let elements = rows.checked_mul(columns).ok_or("resident packed gated elements 溢出")?;
     launch_tensor_kernel(functions.split_gated_activation, elements.div_ceil(256), 256, &mut arguments, "HIP resident packed gated")?;
     drop(input);
+    Ok(output)
+}
+
+pub fn try_slice_columns_resident_f32(device_id: i32, input: &DeviceBuffer, rows: usize, cols: usize, range: std::ops::Range<usize>) -> Result<DeviceBuffer, String> {
+    if rows == 0 || range.start >= range.end || range.end > cols {
+        return Err(format!("resident column slice rows={rows} cols={cols} range={range:?} 非法"));
+    }
+    let input_bytes = rows.checked_mul(cols).and_then(|n| n.checked_mul(4)).ok_or("resident column slice input 字节溢出")?;
+    let count = range.end - range.start;
+    let elements = rows.checked_mul(count).ok_or("resident column slice elements 溢出")?;
+    validate_resident(input, device_id, input_bytes, "column slice input")?;
+    set_device(device_id)?;
+    let output = DeviceBuffer::allocate(device_id, elements.checked_mul(4).ok_or("resident column slice output 字节溢出")?)?;
+    let functions = tensor_functions(device_id)?;
+    let mut d_input = input.pointer;
+    let mut d_output = output.pointer;
+    let mut dims = [cols as u64, range.start as u64, count as u64, elements as u64];
+    let mut args: Vec<*mut c_void> = vec![(&mut d_input as *mut *mut c_void).cast(), (&mut d_output as *mut *mut c_void).cast()];
+    args.extend(dims.iter_mut().map(|v| (v as *mut u64).cast()));
+    launch_tensor_kernel(functions.slice_columns, u32::try_from(elements.div_ceil(256)).map_err(|_| "resident column slice grid 超过 u32")?, 256, &mut args, "HIP resident column slice")?;
     Ok(output)
 }
 

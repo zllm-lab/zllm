@@ -127,8 +127,8 @@ pub fn sensevoice_encode<B: Backend + DiffusionBackend>(backend: &B, config: &Se
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::cpu::CpuContext;
     use crate::backend::VaeBackend;
+    use crate::backend::cpu::CpuContext;
     use crate::model_spec::sensevoice::SenseVoiceConfig;
 
     /// 与朴素标量 reference 对拍单层 SAN-M forward，验证算子组合与顺序。

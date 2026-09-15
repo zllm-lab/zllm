@@ -458,7 +458,7 @@ pub fn run(gguf_path: &Path, prompt: &str, max_seq_len: usize, decode_steps: usi
     let mut prefill_moe = |layer: usize, input: &CpuTensor| -> Result<CpuTensor, BackendError> {
         let weights = &layers[layer];
         let shared = [SharedExpertRef { gate: &weights.moe.shared_gate, up: &weights.moe.shared_up, down: &weights.moe.shared_down, output_gate: Some(&weights.moe.shared_output_gate) }];
-        let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
+        let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
         prefill_experts_observed(&backend, &moe_spec, &reference, layer, &mut prefill_experts, input, None, |_| {}).map(|moe| moe.tensor)
     };
 
@@ -509,7 +509,7 @@ pub fn run(gguf_path: &Path, prompt: &str, max_seq_len: usize, decode_steps: usi
         let mut decode_moe = |layer: usize, moe_input: &CpuTensor| -> Result<CpuTensor, BackendError> {
             let weights = &layers[layer];
             let shared = [SharedExpertRef { gate: &weights.moe.shared_gate, up: &weights.moe.shared_up, down: &weights.moe.shared_down, output_gate: Some(&weights.moe.shared_output_gate) }];
-            let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None };
+            let reference = MoeFfnRef { router_weight: &weights.moe.router, router_bias: &weights.moe.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
             let source = gguf.source(layer).map_err(BackendError::ExpertLoad)?;
             let next = (layer + 1 < cfg.num_layers).then(|| gguf.source(layer + 1).map(|source| (layer + 1, source))).transpose().map_err(BackendError::ExpertLoad)?;
             expert_state.decode(&backend, &moe_spec, &reference, ExpertDecodeRequest { layer, source, position, next }, moe_input)

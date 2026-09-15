@@ -125,6 +125,10 @@ impl VisionBackend for CpuContext {
         Ok(CpuTensor { data: input.data.clone(), rows: input.rows / merge, cols })
     }
 
+    fn vision_download(&self, input: &CpuTensor) -> Result<Vec<f32>, BackendError> {
+        Ok(input.data.clone())
+    }
+
     fn scatter_rows(&self, destination: &mut CpuTensor, start_row: usize, source: &CpuTensor) -> Result<(), BackendError> {
         if destination.cols != source.cols || start_row.checked_add(source.rows).is_none_or(|end| end > destination.rows) {
             return Err(compute(format!("CPU 视觉 scatter destination=[{},{}] start={start_row} source=[{},{}]", destination.rows, destination.cols, source.rows, source.cols)));

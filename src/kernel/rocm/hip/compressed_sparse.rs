@@ -11,10 +11,13 @@ const COMPRESSED_SPARSE_SOURCE: &str = include_str!("compressed_sparse/source.hi
 
 #[derive(Clone, Copy)]
 struct CompressedSparseFunctions {
+    quantize_official: usize,
     gated_compress: usize,
+    compress_v41: usize,
     store_overlap: usize,
     store_pending: usize,
     index_scores: usize,
+    index_scores_official: usize,
     index_scores_wmma: usize,
     store_segment_table: usize,
     attention: usize,
@@ -63,10 +66,13 @@ fn compressed_sparse_functions(device_id: i32) -> Result<CompressedSparseFunctio
         Ok((
             module as usize,
             CompressedSparseFunctions {
+                quantize_official: function("csa_quantize_official_f32")?,
                 gated_compress: function("csa_gated_compress_f32")?,
+                compress_v41: function("csa_compress_v41_f32")?,
                 store_overlap: function("csa_store_overlap_f32")?,
                 store_pending: function("csa_store_pending_f32")?,
                 index_scores: function("csa_index_scores_f32")?,
+                index_scores_official: function("csa_index_scores_official_f32")?,
                 index_scores_wmma: function("csa_index_scores_wmma_f32")?,
                 store_segment_table: function("csa_store_segment_table")?,
                 attention: function("csa_attention_wave_q8")?,
@@ -81,6 +87,47 @@ fn compressed_sparse_functions(device_id: i32) -> Result<CompressedSparseFunctio
     })();
     cache.insert(device_id, result.clone());
     result.map(|(_, functions)| functions)
+}
+
+pub fn try_csa_quantize_official_f32(
+    device_id: i32,
+    input: &DeviceBuffer,
+    codes: &DeviceBuffer,
+    scales: &DeviceBuffer,
+    row_offset: usize,
+    rows: usize,
+    width: usize,
+    format: u32,
+) -> Result<(), String> {
+    let group_size = if format == 1 { 16 } else { 32 };
+    if rows == 0 || width == 0 || !width.is_multiple_of(group_size) || format > 2 {
+        return Err(format!("ROCm CSA official quant shape 非法: rows={rows} width={width} format={format}"));
+    }
+    let row_bytes = if format == 0 { width } else { width / 2 };
+    let scale_row_bytes = width / group_size;
+    validate_resident(input, device_id, rows.checked_mul(width).and_then(|n| n.checked_mul(4)).ok_or("ROCm CSA official input 溢出")?, "CSA official input")?;
+    validate_resident(codes, device_id, row_offset.checked_add(rows).and_then(|n| n.checked_mul(row_bytes)).ok_or("ROCm CSA official codes 溢出")?, "CSA official codes")?;
+    validate_resident(scales, device_id, row_offset.checked_add(rows).and_then(|n| n.checked_mul(scale_row_bytes)).ok_or("ROCm CSA official scales 溢出")?, "CSA official scales")?;
+    let grid = u32_value("CSA official grid", rows.checked_mul(width / group_size).ok_or("ROCm CSA official grid 溢出")?)?;
+    set_device(device_id)?;
+    let functions = compressed_sparse_functions(device_id)?;
+    let mut d_input = input.pointer;
+    let mut d_codes = codes.pointer;
+    let mut d_scales = scales.pointer;
+    let mut row_offset = u32_value("CSA official row offset", row_offset)?;
+    let mut rows = u32_value("CSA official rows", rows)?;
+    let mut width = u32_value("CSA official width", width)?;
+    let mut format = format;
+    let mut arguments = [
+        (&mut d_input as *mut *mut c_void).cast(),
+        (&mut d_codes as *mut *mut c_void).cast(),
+        (&mut d_scales as *mut *mut c_void).cast(),
+        (&mut row_offset as *mut u32).cast(),
+        (&mut rows as *mut u32).cast(),
+        (&mut width as *mut u32).cast(),
+        (&mut format as *mut u32).cast(),
+    ];
+    launch(functions.quantize_official, grid, 1, 32, &mut arguments, "HIP CSA official quantize")
 }
 
 fn launch(function: usize, grid_x: u32, grid_y: u32, block: u32, arguments: &mut [*mut c_void], action: &str) -> Result<(), String> {
@@ -236,11 +283,146 @@ pub fn try_csa_gated_compress_f32(
     Ok((output, remaining))
 }
 
+/// V4.1 压缩管线:无 ape/overlap 的池化 + norm/RoPE 输出 attention 流,
+/// 并(owns_k 源层)从 pre-norm 池化 latent 经 wk/k_norm/压缩行 RoPE 输出 index key。
+/// pending 拼接与 RoPE 表复用现有 store_pending / rope buffer 契约。
+#[allow(clippy::too_many_arguments)]
+pub fn try_csa_compress_v41_f32(
+    device_id: i32,
+    pending_key: &DeviceBuffer,
+    pending_gate: &DeviceBuffer,
+    pending_rows: usize,
+    key: &DeviceBuffer,
+    gate: Option<&DeviceBuffer>,
+    input_rows: usize,
+    norm: &DeviceBuffer,
+    wk: Option<&DeviceBuffer>,
+    k_norm: Option<&DeviceBuffer>,
+    ratio: usize,
+    width: usize,
+    entry_start: usize,
+    rotary_dim: usize,
+    index_dim: usize,
+    index_rotary_dim: usize,
+    cos: &DeviceBuffer,
+    sin: &DeviceBuffer,
+    table_elements: usize,
+    eps: f32,
+) -> Result<(DeviceBuffer, Option<DeviceBuffer>, usize), String> {
+    let channels = width;
+    if ratio == 0 || width == 0 || width > 1024 || pending_rows >= ratio && ratio > 1 || input_rows == 0 || rotary_dim == 0 || rotary_dim > width || !rotary_dim.is_multiple_of(2) {
+        return Err(format!("ROCm V4.1 compressor shape 非法: pending={pending_rows} rows={input_rows} ratio={ratio} width={width} rotary={rotary_dim}"));
+    }
+    let has_index = wk.is_some() && k_norm.is_some();
+    if wk.is_some() != k_norm.is_some() {
+        return Err("ROCm V4.1 compressor 的 wk/k_norm 必须成对出现".to_owned());
+    }
+    // index RoPE 与 attention RoPE 共用一张表,rotary 维度必须一致(官方均为 qk_rope_head_dim)。
+    if has_index && index_rotary_dim != rotary_dim {
+        return Err(format!("ROCm V4.1 compressor index rotary={index_rotary_dim} 与 attention rotary={rotary_dim} 不一致"));
+    }
+    let use_gate = gate.is_some();
+    let gate = gate.unwrap_or(key);
+    let input_elements = input_rows.checked_mul(channels).ok_or("ROCm V4.1 compressor input 溢出")?;
+    let state_elements = ratio.checked_mul(channels).ok_or("ROCm V4.1 compressor state 溢出")?;
+    validate_resident(key, device_id, input_elements * 4, "V4.1 compressor key")?;
+    if use_gate {
+        validate_resident(gate, device_id, input_elements * 4, "V4.1 compressor gate")?;
+    }
+    validate_resident(pending_key, device_id, state_elements * 4, "V4.1 compressor pending key")?;
+    validate_resident(pending_gate, device_id, state_elements * 4, "V4.1 compressor pending gate")?;
+    validate_resident(norm, device_id, width * 4, "V4.1 compressor norm")?;
+    if let Some(wk) = wk {
+        validate_resident(wk, device_id, index_dim.checked_mul(width).ok_or("ROCm V4.1 wk 元素溢出")? * 4, "V4.1 compressor wk")?;
+    }
+    if let Some(k_norm) = k_norm {
+        validate_resident(k_norm, device_id, index_dim * 4, "V4.1 compressor k_norm")?;
+    }
+    validate_resident(cos, device_id, table_elements * 4, "V4.1 compressor cos")?;
+    validate_resident(sin, device_id, table_elements * 4, "V4.1 compressor sin")?;
+    set_device(device_id)?;
+    let total_rows = pending_rows.checked_add(input_rows).ok_or("ROCm V4.1 compressor rows 溢出")?;
+    let windows = total_rows / ratio;
+    let remaining = total_rows % ratio;
+    let output_bytes = windows.checked_mul(width).and_then(|n| n.checked_mul(4)).ok_or("ROCm V4.1 compressor output 大小溢出")?;
+    let output = DeviceBuffer::allocate(device_id, output_bytes.max(4))?;
+    let index_output = has_index.then(|| DeviceBuffer::allocate(device_id, windows.checked_mul(index_dim).and_then(|n| n.checked_mul(4)).ok_or("ROCm V4.1 index 输出大小溢出")?.max(4))).transpose()?;
+    let functions = compressed_sparse_functions(device_id)?;
+    let mut d_pending_key = pending_key.pointer;
+    let mut d_pending_gate = pending_gate.pointer;
+    let mut d_key = key.pointer;
+    let mut d_gate = gate.pointer;
+    let mut d_norm = norm.pointer;
+    let mut d_wk = wk.map_or(ptr::null_mut(), |buffer| buffer.pointer);
+    let mut d_k_norm = k_norm.map_or(ptr::null_mut(), |buffer| buffer.pointer);
+    let mut d_cos = cos.pointer;
+    let mut d_sin = sin.pointer;
+    let mut d_output = output.pointer;
+    let mut d_index_output = index_output.as_ref().map_or(ptr::null_mut(), |buffer| buffer.pointer);
+    let mut pending_rows_u32 = u32_value("V4.1 compressor pending rows", pending_rows)?;
+    let mut input_rows_u32 = u32_value("V4.1 compressor input rows", input_rows)?;
+    let mut windows_u32 = u32_value("V4.1 compressor windows", windows)?;
+    let mut ratio_u32 = u32_value("V4.1 compressor ratio", ratio)?;
+    let mut width_u32 = u32_value("V4.1 compressor width", width)?;
+    let mut channels_u32 = u32_value("V4.1 compressor channels", channels)?;
+    let mut entry_start_u32 = u32_value("V4.1 compressor entry", entry_start)?;
+    let mut rotary_dim_u32 = u32_value("V4.1 compressor rotary dim", rotary_dim)?;
+    let mut index_dim_u32 = u32_value("V4.1 compressor index dim", index_dim)?;
+    let mut index_rotary_u32 = u32_value("V4.1 compressor index rotary", index_rotary_dim)?;
+    let mut use_gate_u32 = u32::from(use_gate);
+    let mut eps_f32 = eps;
+    if windows != 0 {
+        let mut arguments = [
+            (&mut d_pending_key as *mut *mut c_void).cast(),
+            (&mut d_pending_gate as *mut *mut c_void).cast(),
+            (&mut d_key as *mut *mut c_void).cast(),
+            (&mut d_gate as *mut *mut c_void).cast(),
+            (&mut d_norm as *mut *mut c_void).cast(),
+            (&mut d_wk as *mut *mut c_void).cast(),
+            (&mut d_k_norm as *mut *mut c_void).cast(),
+            (&mut d_cos as *mut *mut c_void).cast(),
+            (&mut d_sin as *mut *mut c_void).cast(),
+            (&mut d_output as *mut *mut c_void).cast(),
+            (&mut d_index_output as *mut *mut c_void).cast(),
+            (&mut pending_rows_u32 as *mut u32).cast(),
+            (&mut windows_u32 as *mut u32).cast(),
+            (&mut ratio_u32 as *mut u32).cast(),
+            (&mut width_u32 as *mut u32).cast(),
+            (&mut channels_u32 as *mut u32).cast(),
+            (&mut entry_start_u32 as *mut u32).cast(),
+            (&mut rotary_dim_u32 as *mut u32).cast(),
+            (&mut index_dim_u32 as *mut u32).cast(),
+            (&mut index_rotary_u32 as *mut u32).cast(),
+            (&mut use_gate_u32 as *mut u32).cast(),
+            (&mut eps_f32 as *mut f32).cast(),
+        ];
+        launch(functions.compress_v41, windows_u32, 1, u32_value("V4.1 compressor block", width.next_power_of_two())?, &mut arguments, "HIP V4.1 compressed pooling")?;
+    }
+    if remaining != 0 {
+        let mut arguments = [
+            (&mut d_pending_key as *mut *mut c_void).cast(),
+            (&mut d_pending_gate as *mut *mut c_void).cast(),
+            (&mut d_key as *mut *mut c_void).cast(),
+            (&mut d_gate as *mut *mut c_void).cast(),
+            (&mut d_pending_key as *mut *mut c_void).cast(),
+            (&mut d_pending_gate as *mut *mut c_void).cast(),
+            (&mut pending_rows_u32 as *mut u32).cast(),
+            (&mut input_rows_u32 as *mut u32).cast(),
+            (&mut ratio_u32 as *mut u32).cast(),
+            (&mut channels_u32 as *mut u32).cast(),
+        ];
+        let elements = u32_value("V4.1 compressor pending elements", remaining * channels)?;
+        launch(functions.store_pending, elements.div_ceil(256), 1, 256, &mut arguments, "HIP V4.1 compressed pending state")?;
+    }
+    Ok((output, index_output, remaining))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn try_csa_index_select_f32(
     device_id: i32,
     query: &DeviceBuffer,
     keys: &DeviceBuffer,
+    key_scales: Option<&DeviceBuffer>,
     head_weights: &DeviceBuffer,
     visible_counts: &DeviceBuffer,
     query_rows: usize,
@@ -253,13 +435,28 @@ pub fn try_csa_index_select_f32(
         return Err("ROCm indexer shape 不能包含 0".to_owned());
     }
     validate_resident(query, device_id, query_rows * head_count * head_dim * 4, "index query")?;
-    validate_resident(keys, device_id, compressed_rows * head_dim * 4, "index keys")?;
+    // V4.1 的 index key 归组源层，index 层跨 stage 时直接 P2P 读取。
+    let official = key_scales.is_some();
+    let key_row_bytes = if official { head_dim / 2 } else { head_dim * 4 };
+    super::tensor::validate_peer_resident(keys, compressed_rows * key_row_bytes, "index keys")?;
+    if let Some(scales) = key_scales {
+        super::tensor::validate_peer_resident(scales, compressed_rows * head_dim / 32, "index key scales")?;
+    }
     validate_resident(head_weights, device_id, query_rows * head_count * 4, "index head weights")?;
     validate_resident(visible_counts, device_id, query_rows * 4, "index visible counts")?;
     set_device(device_id)?;
-    let use_wmma = head_count <= 64 && head_dim <= 128 && head_count.is_multiple_of(16) && head_dim.is_multiple_of(16);
+    let use_wmma = !official && head_count <= 64 && head_dim <= 128 && head_count.is_multiple_of(16) && head_dim.is_multiple_of(16);
     let query_elements = query_rows.checked_mul(head_count).and_then(|n| n.checked_mul(head_dim)).ok_or("ROCm index query 溢出")?;
     let query_bf16 = use_wmma.then(|| super::try_cast_f32_to_bf16_resident(device_id, query, query_elements)).transpose()?;
+    let query_width = head_count.checked_mul(head_dim).ok_or("ROCm index query width 溢出")?;
+    let query_official = if official {
+        let codes = DeviceBuffer::allocate(device_id, query_elements / 2)?;
+        let scales = DeviceBuffer::allocate(device_id, query_elements / 32)?;
+        try_csa_quantize_official_f32(device_id, query, &codes, &scales, 0, query_rows, query_width, 2)?;
+        Some((codes, scales))
+    } else {
+        None
+    };
     let selection = DeviceBuffer::allocate(device_id, query_rows.checked_mul(top_k).and_then(|n| n.checked_mul(4)).ok_or("ROCm index selection 溢出")?)?;
     let score_row_bytes = compressed_rows.checked_mul(4).ok_or("ROCm index score row 溢出")?;
     let chunk_rows = (INDEX_SCRATCH_BYTES / score_row_bytes.max(1)).max(1).min(query_rows);
@@ -279,21 +476,41 @@ pub fn try_csa_index_select_f32(
             let mut d_visible = unsafe { visible_counts.pointer.cast::<u32>().add(query_start).cast() };
             let mut d_scores = scores.pointer;
             let mut rows_u32 = u32_value("index query rows", rows)?;
-            let mut score_arguments = [
-                (&mut d_query as *mut *mut c_void).cast(),
-                (&mut d_keys as *mut *mut c_void).cast(),
-                (&mut d_weights as *mut *mut c_void).cast(),
-                (&mut d_visible as *mut *mut c_void).cast(),
-                (&mut d_scores as *mut *mut c_void).cast(),
-                (&mut rows_u32 as *mut u32).cast(),
-                (&mut compressed_rows_u32 as *mut u32).cast(),
-                (&mut head_count_u32 as *mut u32).cast(),
-                (&mut head_dim_u32 as *mut u32).cast(),
-            ];
-            if use_wmma {
-                launch(functions.index_scores_wmma, compressed_rows_u32.div_ceil(32), rows_u32.div_ceil(4), 512, &mut score_arguments, "HIP index scores WMMA")?;
+            if let Some((query_codes, query_scales)) = &query_official {
+                d_query = unsafe { query_codes.pointer.cast::<u8>().add(query_start * query_width / 2).cast() };
+                let mut d_query_scales = unsafe { query_scales.pointer.cast::<u8>().add(query_start * query_width / 32).cast() };
+                let mut d_key_scales = key_scales.expect("official index scales 已验证").pointer;
+                let mut score_arguments = [
+                    (&mut d_query as *mut *mut c_void).cast(),
+                    (&mut d_query_scales as *mut *mut c_void).cast(),
+                    (&mut d_keys as *mut *mut c_void).cast(),
+                    (&mut d_key_scales as *mut *mut c_void).cast(),
+                    (&mut d_weights as *mut *mut c_void).cast(),
+                    (&mut d_visible as *mut *mut c_void).cast(),
+                    (&mut d_scores as *mut *mut c_void).cast(),
+                    (&mut rows_u32 as *mut u32).cast(),
+                    (&mut compressed_rows_u32 as *mut u32).cast(),
+                    (&mut head_count_u32 as *mut u32).cast(),
+                    (&mut head_dim_u32 as *mut u32).cast(),
+                ];
+                launch(functions.index_scores_official, compressed_rows_u32, rows_u32, 256, &mut score_arguments, "HIP official index scores")?;
             } else {
-                launch(functions.index_scores, compressed_rows_u32, rows_u32, 256, &mut score_arguments, "HIP index scores")?;
+                let mut score_arguments = [
+                    (&mut d_query as *mut *mut c_void).cast(),
+                    (&mut d_keys as *mut *mut c_void).cast(),
+                    (&mut d_weights as *mut *mut c_void).cast(),
+                    (&mut d_visible as *mut *mut c_void).cast(),
+                    (&mut d_scores as *mut *mut c_void).cast(),
+                    (&mut rows_u32 as *mut u32).cast(),
+                    (&mut compressed_rows_u32 as *mut u32).cast(),
+                    (&mut head_count_u32 as *mut u32).cast(),
+                    (&mut head_dim_u32 as *mut u32).cast(),
+                ];
+                if use_wmma {
+                    launch(functions.index_scores_wmma, compressed_rows_u32.div_ceil(32), rows_u32.div_ceil(4), 512, &mut score_arguments, "HIP index scores WMMA")?;
+                } else {
+                    launch(functions.index_scores, compressed_rows_u32, rows_u32, 256, &mut score_arguments, "HIP index scores")?;
+                }
             }
             try_stable_radix_topk_u32_into(device_id, scores, Some((visible_counts, query_start)), &selection, rows, compressed_rows, 0, top_k, query_start)?;
         }
@@ -374,6 +591,7 @@ pub fn try_csa_attention_q8_segmented(
     head_dim: usize,
     window_size: usize,
     q8_group_size: usize,
+    cache_format: u32,
 ) -> Result<DeviceBuffer, String> {
     if segments.is_empty()
         || segments.len() > CSA_SEGMENT_CAPACITY
@@ -387,12 +605,12 @@ pub fn try_csa_attention_q8_segmented(
         || q8_group_size > 256
         || !q8_group_size.is_power_of_two()
         || !head_dim.is_multiple_of(q8_group_size)
+        || cache_format > 1
     {
         return Err(format!("ROCm segmented CSA shape 非法: segments={} rows={total_query_rows} heads={num_heads}/{num_kv_heads} dim={head_dim} window={window_size} q8={q8_group_size}", segments.len()));
     }
     let query_elements = total_query_rows.checked_mul(num_heads).and_then(|n| n.checked_mul(head_dim)).ok_or("ROCm segmented CSA query 溢出")?;
     let kv_width = num_kv_heads.checked_mul(head_dim).ok_or("ROCm segmented CSA KV width 溢出")?;
-    let scale_width = kv_width / q8_group_size;
     validate_resident(query, device_id, query_elements * 4, "segmented CSA query")?;
     if let Some(sink) = sink {
         validate_resident(sink, device_id, num_heads * 4, "segmented CSA sink")?;
@@ -403,16 +621,18 @@ pub fn try_csa_attention_q8_segmented(
         if segment.query_rows == 0 || segment.row_start != expected_row {
             return Err(format!("ROCm segmented CSA row range 非连续: segment={index} start={} expected={expected_row} rows={}", segment.row_start, segment.query_rows));
         }
-        for (codes, scales, rows, name) in [
-            (segment.batch_key, segment.batch_key_scales, segment.query_rows, "batch key"),
-            (segment.batch_value, segment.batch_value_scales, segment.query_rows, "batch value"),
-            (segment.compressed_key, segment.compressed_key_scales, segment.compressed_capacity, "compressed key"),
-            (segment.compressed_value, segment.compressed_value_scales, segment.compressed_capacity, "compressed value"),
-            (segment.recent_key, segment.recent_key_scales, segment.recent_len.max(1), "recent key"),
-            (segment.recent_value, segment.recent_value_scales, segment.recent_len.max(1), "recent value"),
+        for (codes, scales, rows, name, compressed) in [
+            (segment.batch_key, segment.batch_key_scales, segment.query_rows, "batch key", false),
+            (segment.batch_value, segment.batch_value_scales, segment.query_rows, "batch value", false),
+            (segment.compressed_key, segment.compressed_key_scales, segment.compressed_capacity, "compressed key", true),
+            (segment.compressed_value, segment.compressed_value_scales, segment.compressed_capacity, "compressed value", true),
+            (segment.recent_key, segment.recent_key_scales, segment.recent_len.max(1), "recent key", false),
+            (segment.recent_value, segment.recent_value_scales, segment.recent_len.max(1), "recent value", false),
         ] {
-            validate_resident(codes, device_id, rows.checked_mul(kv_width).ok_or("ROCm segmented CSA Q8 codes 溢出")?, name)?;
-            validate_resident(scales, device_id, rows.checked_mul(scale_width).and_then(|n| n.checked_mul(2)).ok_or("ROCm segmented CSA Q8 scales 溢出")?, name)?;
+            let row_bytes = if cache_format == 1 && compressed { kv_width / 2 } else { kv_width };
+            let scale_row_bytes = if cache_format == 1 { kv_width / if compressed { 16 } else { 32 } } else { kv_width / q8_group_size * 2 };
+            validate_resident(codes, device_id, rows.checked_mul(row_bytes).ok_or("ROCm segmented CSA codes 溢出")?, name)?;
+            validate_resident(scales, device_id, rows.checked_mul(scale_row_bytes).ok_or("ROCm segmented CSA scales 溢出")?, name)?;
         }
         validate_resident(segment.visible_compressed, device_id, segment.query_rows * 4, "segmented CSA visible")?;
         if let Some((selection, top_k)) = segment.selection {
@@ -462,6 +682,7 @@ pub fn try_csa_attention_q8_segmented(
     let mut dim = u32_value("segmented CSA head dim", head_dim)?;
     let mut window = u32_value("segmented CSA window", window_size)?;
     let mut q8_group = u32_value("segmented CSA Q8 group", q8_group_size)?;
+    let mut cache_format = cache_format;
     let mut has_sink = u32::from(sink.is_some());
     let heads_per_kv = num_heads / num_kv_heads;
     let (heads_per_block, block) = if heads_per_kv.is_multiple_of(16) {
@@ -496,6 +717,7 @@ pub fn try_csa_attention_q8_segmented(
                 (&mut dim as *mut u32).cast(),
                 (&mut window as *mut u32).cast(),
                 (&mut q8_group as *mut u32).cast(),
+                (&mut cache_format as *mut u32).cast(),
                 (&mut has_sink as *mut u32).cast(),
                 (&mut split as *mut u32).cast(),
             ];
@@ -523,6 +745,7 @@ pub fn try_csa_attention_q8_segmented(
                 (&mut dim as *mut u32).cast(),
                 (&mut window as *mut u32).cast(),
                 (&mut q8_group as *mut u32).cast(),
+                (&mut cache_format as *mut u32).cast(),
                 (&mut has_sink as *mut u32).cast(),
             ];
             launch(
@@ -570,6 +793,7 @@ pub fn try_csa_attention_q8(
     head_dim: usize,
     window_size: usize,
     q8_group_size: usize,
+    cache_format: u32,
 ) -> Result<DeviceBuffer, String> {
     if query_rows == 0
         || num_heads == 0
@@ -582,27 +806,35 @@ pub fn try_csa_attention_q8(
         || !q8_group_size.is_power_of_two()
         || !head_dim.is_multiple_of(q8_group_size)
         || !num_heads.is_multiple_of(num_kv_heads)
+        || cache_format > 1
     {
         return Err("ROCm CSA attention shape 非法".to_owned());
     }
     let query_elements = query_rows.checked_mul(num_heads).and_then(|n| n.checked_mul(head_dim)).ok_or("ROCm CSA query 溢出")?;
     let kv_width = num_kv_heads.checked_mul(head_dim).ok_or("ROCm CSA KV width 溢出")?;
-    let scale_width = kv_width / q8_group_size;
     validate_resident(query, device_id, query_elements * 4, "CSA query")?;
-    for (codes, scales, rows, name) in [
-        (batch_key, batch_key_scales, query_rows, "batch key"),
-        (batch_value, batch_value_scales, query_rows, "batch value"),
-        (compressed_key, compressed_key_scales, compressed_capacity, "compressed key"),
-        (compressed_value, compressed_value_scales, compressed_capacity, "compressed value"),
+    for (codes, scales, rows, name, peer, compressed) in [
+        (batch_key, batch_key_scales, query_rows, "batch key", false, false),
+        (batch_value, batch_value_scales, query_rows, "batch value", false, false),
+        // V4.1 压缩历史归属组源层 device,消费层经 peer access 直读,放开 device 校验
+        (compressed_key, compressed_key_scales, compressed_capacity, "compressed key", true, true),
+        (compressed_value, compressed_value_scales, compressed_capacity, "compressed value", true, true),
         // recent_start 只会在 ring 填满后推进，此时 committed capacity 已等于 window；
         // 填满前 kernel 只访问 0..recent_len，不能强迫 lazy cache 提前提交完整窗口。
-        (recent_key, recent_key_scales, recent_len.max(1), "recent key"),
-        (recent_value, recent_value_scales, recent_len.max(1), "recent value"),
+        (recent_key, recent_key_scales, recent_len.max(1), "recent key", false, false),
+        (recent_value, recent_value_scales, recent_len.max(1), "recent value", false, false),
     ] {
-        let code_bytes = rows.checked_mul(kv_width).ok_or_else(|| format!("ROCm CSA {name} Q8 溢出"))?;
-        let scale_bytes = rows.checked_mul(scale_width).and_then(|n| n.checked_mul(2)).ok_or_else(|| format!("ROCm CSA {name} Q8 scales 溢出"))?;
-        validate_resident(codes, device_id, code_bytes, &format!("CSA {name} Q8"))?;
-        validate_resident(scales, device_id, scale_bytes, &format!("CSA {name} Q8 scales"))?;
+        let row_bytes = if cache_format == 1 && compressed { kv_width / 2 } else { kv_width };
+        let scale_row_bytes = if cache_format == 1 { kv_width / if compressed { 16 } else { 32 } } else { kv_width / q8_group_size * 2 };
+        let code_bytes = rows.checked_mul(row_bytes).ok_or_else(|| format!("ROCm CSA {name} codes 溢出"))?;
+        let scale_bytes = rows.checked_mul(scale_row_bytes).ok_or_else(|| format!("ROCm CSA {name} scales 溢出"))?;
+        if peer {
+            super::tensor::validate_peer_resident(codes, code_bytes, &format!("CSA {name} Q8"))?;
+            super::tensor::validate_peer_resident(scales, scale_bytes, &format!("CSA {name} Q8 scales"))?;
+        } else {
+            validate_resident(codes, device_id, code_bytes, &format!("CSA {name} Q8"))?;
+            validate_resident(scales, device_id, scale_bytes, &format!("CSA {name} Q8 scales"))?;
+        }
     }
     validate_resident(visible_compressed, device_id, query_rows * 4, "CSA visible counts")?;
     if let Some((selection, top_k)) = selection {
@@ -645,6 +877,7 @@ pub fn try_csa_attention_q8(
     let mut head_dim = u32_value("CSA head dim", head_dim)?;
     let mut window_size = u32_value("CSA window", window_size)?;
     let mut q8_group_size = u32_value("CSA Q8 group", q8_group_size)?;
+    let mut cache_format = cache_format;
     let mut has_sink = u32::from(sink.is_some());
     let mut arguments = [
         (&mut d_query as *mut *mut c_void).cast(),
@@ -677,6 +910,7 @@ pub fn try_csa_attention_q8(
         (&mut head_dim as *mut u32).cast(),
         (&mut window_size as *mut u32).cast(),
         (&mut q8_group_size as *mut u32).cast(),
+        (&mut cache_format as *mut u32).cast(),
         (&mut has_sink as *mut u32).cast(),
     ];
     let heads_per_kv = num_heads / num_kv_heads;
@@ -734,6 +968,75 @@ pub fn try_csa_attention_q8(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn official_cache_quantization_uses_expected_codes_and_scales() {
+        if !super::super::is_hip_available() {
+            eprintln!("[csa-official-quant] 跳过：本机未检测到 ROCm 运行时");
+            return;
+        }
+        let device_id = 0;
+        let input = DeviceBuffer::upload_f32(device_id, &[1.0; 32]).unwrap();
+
+        let fp8_codes = DeviceBuffer::allocate(device_id, 32).unwrap();
+        let fp8_scales = DeviceBuffer::allocate(device_id, 1).unwrap();
+        try_csa_quantize_official_f32(device_id, &input, &fp8_codes, &fp8_scales, 0, 1, 32, 0).unwrap();
+        let mut codes = [0u8; 32];
+        let mut scales = [0u8; 1];
+        fp8_codes.copy_to_host(&mut codes).unwrap();
+        fp8_scales.copy_to_host(&mut scales).unwrap();
+        assert_eq!(codes, [120; 32]);
+        assert_eq!(scales, [119]);
+
+        let fp4_codes = DeviceBuffer::allocate(device_id, 16).unwrap();
+        let fp4_scales = DeviceBuffer::allocate(device_id, 2).unwrap();
+        try_csa_quantize_official_f32(device_id, &input, &fp4_codes, &fp4_scales, 0, 1, 32, 1).unwrap();
+        let mut codes = [0u8; 16];
+        let mut scales = [0u8; 2];
+        fp4_codes.copy_to_host(&mut codes).unwrap();
+        fp4_scales.copy_to_host(&mut scales).unwrap();
+        assert_eq!(codes, [0x77; 16]);
+        assert_eq!(scales, [35; 2]);
+
+        try_csa_quantize_official_f32(device_id, &input, &fp4_codes, &fp4_scales, 0, 1, 32, 2).unwrap();
+        fp4_codes.copy_to_host(&mut codes).unwrap();
+        fp4_scales.copy_to_host(&mut scales[..1]).unwrap();
+        assert_eq!(codes, [0x66; 16]);
+        assert_eq!(scales[0], 125);
+
+        let ties = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0]
+            .into_iter()
+            .chain(std::iter::repeat_n(0.0, 24))
+            .collect::<Vec<_>>();
+        let input = DeviceBuffer::upload_f32(device_id, &ties).unwrap();
+        try_csa_quantize_official_f32(device_id, &input, &fp4_codes, &fp4_scales, 0, 1, 32, 2).unwrap();
+        fp4_codes.copy_to_host(&mut codes).unwrap();
+        fp4_scales.copy_to_host(&mut scales[..1]).unwrap();
+        assert_eq!(&codes[..4], &[0x20, 0x42, 0x64, 0x76]);
+        assert_eq!(scales[0], 127);
+    }
+
+    #[test]
+    fn official_index_select_uses_packed_query_and_keys() {
+        if !super::super::is_hip_available() {
+            eprintln!("[csa-official-index] 跳过：本机未检测到 ROCm 运行时");
+            return;
+        }
+        let device_id = 0;
+        let query = DeviceBuffer::upload_f32(device_id, &[1.0; 32]).unwrap();
+        let key_values = [0.0f32, 1.0, 2.0, -1.0].into_iter().flat_map(|value| [value; 32]).collect::<Vec<_>>();
+        let keys_f32 = DeviceBuffer::upload_f32(device_id, &key_values).unwrap();
+        let keys = DeviceBuffer::allocate(device_id, 4 * 16).unwrap();
+        let key_scales = DeviceBuffer::allocate(device_id, 4).unwrap();
+        try_csa_quantize_official_f32(device_id, &keys_f32, &keys, &key_scales, 0, 4, 32, 2).unwrap();
+        let weights = DeviceBuffer::upload_f32(device_id, &[1.0]).unwrap();
+        let visible = DeviceBuffer::upload(device_id, &4u32.to_ne_bytes()).unwrap();
+        let selection = try_csa_index_select_f32(device_id, &query, &keys, Some(&key_scales), &weights, &visible, 1, 4, 1, 32, 2).unwrap();
+        let mut selected = [0u32; 2];
+        selection.copy_to_host(unsafe { std::slice::from_raw_parts_mut(selected.as_mut_ptr().cast(), std::mem::size_of_val(&selected)) }).unwrap();
+        selected.sort_unstable();
+        assert_eq!(selected, [1, 2]);
+    }
 
     #[test]
     fn hip_source_keeps_all_deepseek_kernels_parameterized() {
@@ -803,6 +1106,7 @@ mod tests {
             head_dim,
             window,
             group,
+            0,
         )
         .expect("CSA tiled dot2");
         let actual = output.download_f32(rows * heads * head_dim).unwrap();

@@ -125,10 +125,18 @@ impl MiniCpm5MetalSession {
     }
 
     /// DSpark 推测解码评测的直达件（engine::dspark_eval 使用）。
-    pub(crate) fn config(&self) -> &minicpm5::MiniCpm5Config { &self.config }
-    pub(crate) fn layers(&self) -> &[minicpm5::MiniCpm5TextLayer<MetalWeight>] { &self.layers }
-    pub(crate) fn weights(&self) -> &crate::weight::model::minicpm5::MiniCpm5Weights { &self.weights }
-    pub(crate) fn output_head(&self) -> &MiniCpm5OutputHead<MetalWeight> { &self.output_head }
+    pub(crate) fn config(&self) -> &minicpm5::MiniCpm5Config {
+        &self.config
+    }
+    pub(crate) fn layers(&self) -> &[minicpm5::MiniCpm5TextLayer<MetalWeight>] {
+        &self.layers
+    }
+    pub(crate) fn weights(&self) -> &crate::weight::model::minicpm5::MiniCpm5Weights {
+        &self.weights
+    }
+    pub(crate) fn output_head(&self) -> &MiniCpm5OutputHead<MetalWeight> {
+        &self.output_head
+    }
     pub(crate) fn allocate_cache(&self) -> Result<MetalKvCache, String> {
         if self.kv_f16 {
             MetalKvCache::new_f16(&self.context, self.cache_spec.clone(), self.config.layer_count, self.max_seq_len)

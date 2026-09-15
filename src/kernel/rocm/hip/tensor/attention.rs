@@ -61,6 +61,256 @@ fn with_attention_rope_tables<R>(device_id: i32, cosine: &[f32], sine: &[f32], r
 }
 
 #[allow(clippy::too_many_arguments)]
+fn launch_prepare_attention_qkv_bf16(
+    device_id: i32,
+    qkv: &DeviceBuffer,
+    query_weight: &DeviceBuffer,
+    key_weight: &DeviceBuffer,
+    rows: usize,
+    packed_rows: usize,
+    table_row_start: usize,
+    output_row_stride: usize,
+    total_head_count: usize,
+    head_start: usize,
+    head_count: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    eps: f32,
+    cosine: &[f32],
+    sine: &[f32],
+    query: *mut c_void,
+    key: *mut c_void,
+    value: *mut c_void,
+) -> Result<(), String> {
+    let functions = tensor_functions(device_id)?;
+    with_attention_rope_tables(device_id, cosine, sine, |cosine_device, sine_device| {
+        let mut d_qkv = qkv.pointer;
+        let mut d_query_weight = query_weight.pointer;
+        let mut d_key_weight = key_weight.pointer;
+        let mut d_cosine = cosine_device.pointer;
+        let mut d_sine = sine_device.pointer;
+        let mut d_query = query;
+        let mut d_key = key;
+        let mut d_value = value;
+        let mut rows = u32::try_from(rows).map_err(|_| "resident fused QKV attention rows 超过 u32")?;
+        let mut packed_rows = u32::try_from(packed_rows).map_err(|_| "resident fused QKV attention packed rows 超过 u32")?;
+        let mut table_row_start = u32::try_from(table_row_start).map_err(|_| "resident fused QKV attention table row start 超过 u32")?;
+        let mut output_row_stride = u32::try_from(output_row_stride).map_err(|_| "resident fused QKV attention output row stride 超过 u32")?;
+        let mut total_head_count = u32::try_from(total_head_count).map_err(|_| "resident fused QKV attention total heads 超过 u32")?;
+        let mut head_start = u32::try_from(head_start).map_err(|_| "resident fused QKV attention head start 超过 u32")?;
+        let mut head_count = u32::try_from(head_count).map_err(|_| "resident fused QKV attention heads 超过 u32")?;
+        let mut head_dim = u32::try_from(head_dim).map_err(|_| "resident fused QKV attention head_dim 超过 u32")?;
+        let mut rotary_dim = u32::try_from(rotary_dim).map_err(|_| "resident fused QKV attention rotary_dim 超过 u32")?;
+        let mut eps = eps;
+        let mut arguments = [
+            (&mut d_qkv as *mut *mut c_void).cast(),
+            (&mut d_query_weight as *mut *mut c_void).cast(),
+            (&mut d_key_weight as *mut *mut c_void).cast(),
+            (&mut d_cosine as *mut *mut c_void).cast(),
+            (&mut d_sine as *mut *mut c_void).cast(),
+            (&mut d_query as *mut *mut c_void).cast(),
+            (&mut d_key as *mut *mut c_void).cast(),
+            (&mut d_value as *mut *mut c_void).cast(),
+            (&mut rows as *mut u32).cast(),
+            (&mut packed_rows as *mut u32).cast(),
+            (&mut table_row_start as *mut u32).cast(),
+            (&mut output_row_stride as *mut u32).cast(),
+            (&mut total_head_count as *mut u32).cast(),
+            (&mut head_start as *mut u32).cast(),
+            (&mut head_count as *mut u32).cast(),
+            (&mut head_dim as *mut u32).cast(),
+            (&mut rotary_dim as *mut u32).cast(),
+            (&mut eps as *mut f32).cast(),
+        ];
+        let grid = packed_rows.checked_mul(head_count).ok_or("resident fused QKV attention prepare grid 溢出")?;
+        launch_tensor_kernel(functions.prepare_attention_qkv_bf16, grid, 128, &mut arguments, "HIP prepare attention QKV BF16")
+    })
+}
+
+/// 在 sequence source 上完成与 attention 前完全相同的 norm、RoPE 和 BF16 round，
+/// 输出逐行 `[Q|K|V]`，使跨卡只传 2 B/element。
+#[allow(clippy::too_many_arguments)]
+pub fn try_prepare_compact_attention_qkv_range_resident_bf16(
+    device_id: i32,
+    qkv: &DeviceBuffer,
+    query_weight: &DeviceBuffer,
+    key_weight: &DeviceBuffer,
+    rows: usize,
+    table_row_start: usize,
+    total_head_count: usize,
+    head_start: usize,
+    head_count: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    eps: f32,
+    cosine: &[f32],
+    sine: &[f32],
+) -> Result<DeviceBuffer, String> {
+    if rows == 0
+        || total_head_count == 0
+        || head_count == 0
+        || head_start.checked_add(head_count).is_none_or(|end| end > total_head_count)
+        || head_dim == 0
+        || head_dim > 128
+        || rotary_dim == 0
+        || rotary_dim > head_dim
+        || !rotary_dim.is_multiple_of(2)
+        || !eps.is_finite()
+        || eps < 0.0
+    {
+        return Err(format!(
+            "prepare compact QKV rows={rows} table_row_start={table_row_start} total_heads={total_head_count} head_range={head_start}..{} head_dim={head_dim} rotary_dim={rotary_dim} eps={eps} 非法",
+            head_start.saturating_add(head_count)
+        ));
+    }
+    let total_columns = total_head_count.checked_mul(head_dim).ok_or("prepare compact QKV total columns 溢出")?;
+    let columns = head_count.checked_mul(head_dim).ok_or("prepare compact QKV columns 溢出")?;
+    let input_elements = rows.checked_mul(total_columns).and_then(|value| value.checked_mul(3)).ok_or("prepare compact QKV input elements 溢出")?;
+    validate_resident(qkv, device_id, input_elements.checked_mul(4).ok_or("prepare compact QKV input bytes 溢出")?, "prepare compact QKV input")?;
+    let weight_bytes = head_dim.checked_mul(4).ok_or("prepare compact QKV weight bytes 溢出")?;
+    validate_resident(query_weight, device_id, weight_bytes, "prepare compact QKV query norm weight")?;
+    validate_resident(key_weight, device_id, weight_bytes, "prepare compact QKV key norm weight")?;
+    let half = rotary_dim / 2;
+    if cosine.len() != sine.len() || !cosine.len().is_multiple_of(half) || table_row_start.checked_add(rows).is_none_or(|end| end > cosine.len() / half) {
+        return Err(format!("prepare compact QKV table cos={} sin={} row_range={table_row_start}..{} half={half} 非法", cosine.len(), sine.len(), table_row_start.saturating_add(rows)));
+    }
+    let output_elements = rows.checked_mul(columns).and_then(|value| value.checked_mul(3)).ok_or("prepare compact QKV output elements 溢出")?;
+    let output = DeviceBuffer::allocate_peer(device_id, output_elements.checked_mul(2).ok_or("prepare compact QKV output bytes 溢出")?)?;
+    let section_bytes = columns.checked_mul(2).ok_or("prepare compact QKV section bytes 溢出")?;
+    let value_offset = section_bytes.checked_mul(2).ok_or("prepare compact QKV value offset 溢出")?;
+    let output_row_stride = columns.checked_mul(3).ok_or("prepare compact QKV row stride 溢出")?;
+    let query = output.pointer;
+    let key = unsafe { output.pointer.cast::<u8>().add(section_bytes).cast() };
+    let value = unsafe { output.pointer.cast::<u8>().add(value_offset).cast() };
+    launch_prepare_attention_qkv_bf16(
+        device_id,
+        qkv,
+        query_weight,
+        key_weight,
+        rows,
+        rows,
+        table_row_start,
+        output_row_stride,
+        total_head_count,
+        head_start,
+        head_count,
+        head_dim,
+        rotary_dim,
+        eps,
+        cosine,
+        sine,
+        query,
+        key,
+        value,
+    )?;
+    Ok(output)
+}
+
+pub fn try_compact_prepared_attention_qkv_range_resident_bf16(
+    device_id: i32,
+    input: &DeviceBuffer,
+    rows: usize,
+    total_head_count: usize,
+    head_start: usize,
+    head_count: usize,
+    head_dim: usize,
+) -> Result<DeviceBuffer, String> {
+    if rows == 0 || total_head_count == 0 || head_count == 0 || head_start.checked_add(head_count).is_none_or(|end| end > total_head_count) || head_dim == 0 {
+        return Err(format!("compact prepared QKV rows={rows} total_heads={total_head_count} range={head_start}..{} dim={head_dim} 非法", head_start.saturating_add(head_count)));
+    }
+    let total_columns = total_head_count.checked_mul(head_dim).ok_or("compact prepared QKV total columns 溢出")?;
+    let local_columns = head_count.checked_mul(head_dim).ok_or("compact prepared QKV local columns 溢出")?;
+    let input_elements = rows.checked_mul(total_columns).and_then(|value| value.checked_mul(3)).ok_or("compact prepared QKV input elements 溢出")?;
+    let output_elements = rows.checked_mul(local_columns).and_then(|value| value.checked_mul(3)).ok_or("compact prepared QKV output elements 溢出")?;
+    validate_resident(input, device_id, input_elements.checked_mul(2).ok_or("compact prepared QKV input bytes 溢出")?, "compact prepared QKV input")?;
+    set_device(device_id)?;
+    let output = DeviceBuffer::allocate_peer(device_id, output_elements.checked_mul(2).ok_or("compact prepared QKV output bytes 溢出")?)?;
+    let functions = tensor_functions(device_id)?;
+    let mut d_input = input.pointer;
+    let mut d_output = output.pointer;
+    let mut rows = u32::try_from(rows).map_err(|_| "compact prepared QKV rows 超过 u32")?;
+    let mut total_head_count = u32::try_from(total_head_count).map_err(|_| "compact prepared QKV total heads 超过 u32")?;
+    let mut head_start = u32::try_from(head_start).map_err(|_| "compact prepared QKV head start 超过 u32")?;
+    let mut head_count = u32::try_from(head_count).map_err(|_| "compact prepared QKV heads 超过 u32")?;
+    let mut head_dim = u32::try_from(head_dim).map_err(|_| "compact prepared QKV head dim 超过 u32")?;
+    let mut arguments = [
+        (&mut d_input as *mut *mut c_void).cast(),
+        (&mut d_output as *mut *mut c_void).cast(),
+        (&mut rows as *mut u32).cast(),
+        (&mut total_head_count as *mut u32).cast(),
+        (&mut head_start as *mut u32).cast(),
+        (&mut head_count as *mut u32).cast(),
+        (&mut head_dim as *mut u32).cast(),
+    ];
+    let grid = u32::try_from(output_elements.div_ceil(256)).map_err(|_| "compact prepared QKV grid 超过 u32")?;
+    launch_tensor_kernel(functions.compact_prepared_attention_qkv_bf16, grid, 256, &mut arguments, "HIP compact prepared attention QKV BF16")?;
+    Ok(output)
+}
+
+fn try_full_attention_packed_bf16(
+    device_id: i32,
+    packed_query: DeviceBuffer,
+    packed_key: DeviceBuffer,
+    packed_value: DeviceBuffer,
+    rows: usize,
+    packed_rows: usize,
+    head_count: usize,
+    head_dim: usize,
+    score_scale: f32,
+    profile_started: Option<std::time::Instant>,
+    profile_name: &str,
+) -> Result<DeviceBuffer, String> {
+    let columns = head_count.checked_mul(head_dim).ok_or("packed QKV attention columns 溢出")?;
+    let output_elements = rows.checked_mul(columns).ok_or("packed QKV attention output elements 溢出")?;
+    let output_bytes = output_elements.checked_mul(4).ok_or("packed QKV attention output bytes 溢出")?;
+    let generic_attention = options().generic_full_attention;
+    let native_kv = head_dim == 128 && !generic_attention && options().native_full_attention_kv;
+    let functions = tensor_functions(device_id)?;
+    if native_kv {
+        let mut d_key = packed_key.pointer;
+        let mut d_value = packed_value.pointer;
+        let mut packed_rows = u32::try_from(packed_rows).map_err(|_| "packed QKV attention rows 超过 u32")?;
+        let mut head_count = u32::try_from(head_count).map_err(|_| "packed QKV attention heads 超过 u32")?;
+        let mut arguments = [(&mut d_key as *mut *mut c_void).cast(), (&mut d_value as *mut *mut c_void).cast(), (&mut packed_rows as *mut u32).cast(), (&mut head_count as *mut u32).cast()];
+        let grid = packed_rows.checked_div(16).and_then(|tiles| tiles.checked_mul(head_count)).ok_or("packed QKV native K/V grid 溢出")?;
+        launch_tensor_kernel(functions.pack_attention_kv_native_bf16, grid, 256, &mut arguments, "HIP pack native attention K/V")?;
+    }
+
+    let output = DeviceBuffer::allocate(device_id, output_bytes)?;
+    let grid = rows.div_ceil(128).checked_mul(head_count).ok_or("packed QKV attention grid 溢出")?;
+    let mut d_query = packed_query.pointer;
+    let mut d_key = packed_key.pointer;
+    let mut d_value = packed_value.pointer;
+    let mut d_output = output.pointer;
+    let mut rows_u32 = u32::try_from(rows).map_err(|_| "packed QKV attention rows 超过 u32")?;
+    let mut head_count_u32 = u32::try_from(head_count).map_err(|_| "packed QKV attention heads 超过 u32")?;
+    let mut head_dim_u32 = u32::try_from(head_dim).map_err(|_| "packed QKV attention head_dim 超过 u32")?;
+    let mut score_scale = score_scale;
+    let mut arguments = [
+        (&mut d_query as *mut *mut c_void).cast(),
+        (&mut d_key as *mut *mut c_void).cast(),
+        (&mut d_value as *mut *mut c_void).cast(),
+        (&mut d_output as *mut *mut c_void).cast(),
+        (&mut rows_u32 as *mut u32).cast(),
+        (&mut head_count_u32 as *mut u32).cast(),
+        (&mut head_dim_u32 as *mut u32).cast(),
+        (&mut score_scale as *mut f32).cast(),
+    ];
+    let attention_kernel = if head_dim == 128 && !generic_attention { if native_kv { functions.full_attention_128_native_kv } else { functions.full_attention_128 } } else { functions.full_attention };
+    launch_tensor_kernel(attention_kernel, u32::try_from(grid).map_err(|_| "packed QKV attention grid 超过 u32")?, 256, &mut arguments, "HIP fused QKV full attention")?;
+    if profile_started.is_some() || options().kernel_sync {
+        synchronize_device(device_id, profile_name)?;
+    }
+    drop(packed_query);
+    drop(packed_key);
+    drop(packed_value);
+    if let Some(started) = profile_started {
+        eprintln!("[rocm-kernel] {profile_name} device={device_id} rows={rows} heads={head_count} dim={head_dim} wall={:.6}s", started.elapsed().as_secs_f64());
+    }
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn try_full_attention_qkv_range_resident_f32(
     device_id: i32,
     qkv: DeviceBuffer,
@@ -133,103 +383,86 @@ pub fn try_full_attention_qkv_range_resident_weights_f32(
     let packed_rows = rows.div_ceil(128).checked_mul(128).ok_or("resident fused QKV attention padded rows 溢出")?;
     let packed_elements = packed_rows.checked_mul(columns).ok_or("resident fused QKV attention packed elements 溢出")?;
     let packed_bytes = packed_elements.checked_mul(2).ok_or("resident fused QKV attention packed bytes 溢出")?;
-    let output_elements = rows.checked_mul(columns).ok_or("resident fused QKV attention output elements 溢出")?;
-    let output_bytes = output_elements.checked_mul(4).ok_or("resident fused QKV attention output bytes 溢出")?;
+    set_device(device_id)?;
+    let packed_query = DeviceBuffer::allocate(device_id, packed_bytes)?;
+    let packed_key = DeviceBuffer::allocate(device_id, packed_bytes)?;
+    let packed_value = DeviceBuffer::allocate(device_id, packed_bytes)?;
+    let profile_started = options().kernel_profile.then(std::time::Instant::now);
+    let weight_bytes = head_dim.checked_mul(4).ok_or("resident fused QKV attention weight bytes 溢出")?;
+    validate_resident(query_weight, device_id, weight_bytes, "fused QKV query norm weight")?;
+    validate_resident(key_weight, device_id, weight_bytes, "fused QKV key norm weight")?;
+    launch_prepare_attention_qkv_bf16(
+        device_id,
+        &qkv,
+        query_weight,
+        key_weight,
+        rows,
+        packed_rows,
+        0,
+        columns,
+        total_head_count,
+        head_start,
+        head_count,
+        head_dim,
+        rotary_dim,
+        eps,
+        cosine,
+        sine,
+        packed_query.pointer,
+        packed_key.pointer,
+        packed_value.pointer,
+    )?;
+
+    // QKV 最后一次读取已在 prepare 中提交。超大缓冲会走同步 hipFree，
+    // 必须在长 attention 启动前释放，避免逐卡提交时等待上一张卡算完。
+    drop(qkv);
+    try_full_attention_packed_bf16(device_id, packed_query, packed_key, packed_value, rows, packed_rows, head_count, head_dim, score_scale, profile_started, "fused-qkv-attention")
+}
+
+pub fn try_full_attention_prepared_qkv_resident_bf16(
+    device_id: i32,
+    qkv: DeviceBuffer,
+    rows: usize,
+    head_count: usize,
+    head_dim: usize,
+    score_scale: f32,
+) -> Result<DeviceBuffer, String> {
+    if rows == 0 || head_count == 0 || head_dim == 0 || head_dim > 128 || !score_scale.is_finite() || score_scale <= 0.0 {
+        return Err(format!("prepared QKV attention rows={rows} heads={head_count} head_dim={head_dim} scale={score_scale} 非法"));
+    }
+    let columns = head_count.checked_mul(head_dim).ok_or("prepared QKV attention columns 溢出")?;
+    let input_elements = rows.checked_mul(columns).and_then(|value| value.checked_mul(3)).ok_or("prepared QKV attention input elements 溢出")?;
+    validate_resident(&qkv, device_id, input_elements.checked_mul(2).ok_or("prepared QKV attention input bytes 溢出")?, "prepared QKV attention input")?;
+    let packed_rows = rows.div_ceil(128).checked_mul(128).ok_or("prepared QKV attention padded rows 溢出")?;
+    let packed_elements = packed_rows.checked_mul(columns).ok_or("prepared QKV attention packed elements 溢出")?;
+    let packed_bytes = packed_elements.checked_mul(2).ok_or("prepared QKV attention packed bytes 溢出")?;
     set_device(device_id)?;
     let packed_query = DeviceBuffer::allocate(device_id, packed_bytes)?;
     let packed_key = DeviceBuffer::allocate(device_id, packed_bytes)?;
     let packed_value = DeviceBuffer::allocate(device_id, packed_bytes)?;
     let functions = tensor_functions(device_id)?;
     let profile_started = options().kernel_profile.then(std::time::Instant::now);
-    let weight_bytes = head_dim.checked_mul(4).ok_or("resident fused QKV attention weight bytes 溢出")?;
-    validate_resident(query_weight, device_id, weight_bytes, "fused QKV query norm weight")?;
-    validate_resident(key_weight, device_id, weight_bytes, "fused QKV key norm weight")?;
-    with_attention_rope_tables(device_id, cosine, sine, |cosine_device, sine_device| {
-        let mut d_qkv = qkv.pointer;
-        let mut d_query_weight = query_weight.pointer;
-        let mut d_key_weight = key_weight.pointer;
-        let mut d_cosine = cosine_device.pointer;
-        let mut d_sine = sine_device.pointer;
-        let mut d_query = packed_query.pointer;
-        let mut d_key = packed_key.pointer;
-        let mut d_value = packed_value.pointer;
-        let mut rows = u32::try_from(rows).map_err(|_| "resident fused QKV attention rows 超过 u32")?;
-        let mut packed_rows = u32::try_from(packed_rows).map_err(|_| "resident fused QKV attention packed rows 超过 u32")?;
-        let mut total_head_count = u32::try_from(total_head_count).map_err(|_| "resident fused QKV attention total heads 超过 u32")?;
-        let mut head_start = u32::try_from(head_start).map_err(|_| "resident fused QKV attention head start 超过 u32")?;
-        let mut head_count = u32::try_from(head_count).map_err(|_| "resident fused QKV attention heads 超过 u32")?;
-        let mut head_dim = u32::try_from(head_dim).map_err(|_| "resident fused QKV attention head_dim 超过 u32")?;
-        let mut rotary_dim = u32::try_from(rotary_dim).map_err(|_| "resident fused QKV attention rotary_dim 超过 u32")?;
-        let mut eps = eps;
-        let mut arguments = [
-            (&mut d_qkv as *mut *mut c_void).cast(),
-            (&mut d_query_weight as *mut *mut c_void).cast(),
-            (&mut d_key_weight as *mut *mut c_void).cast(),
-            (&mut d_cosine as *mut *mut c_void).cast(),
-            (&mut d_sine as *mut *mut c_void).cast(),
-            (&mut d_query as *mut *mut c_void).cast(),
-            (&mut d_key as *mut *mut c_void).cast(),
-            (&mut d_value as *mut *mut c_void).cast(),
-            (&mut rows as *mut u32).cast(),
-            (&mut packed_rows as *mut u32).cast(),
-            (&mut total_head_count as *mut u32).cast(),
-            (&mut head_start as *mut u32).cast(),
-            (&mut head_count as *mut u32).cast(),
-            (&mut head_dim as *mut u32).cast(),
-            (&mut rotary_dim as *mut u32).cast(),
-            (&mut eps as *mut f32).cast(),
-        ];
-        let grid = packed_rows.checked_mul(head_count).ok_or("resident fused QKV attention prepare grid 溢出")?;
-        launch_tensor_kernel(functions.prepare_attention_qkv_bf16, grid, 128, &mut arguments, "HIP prepare attention QKV BF16")?;
-        Ok(())
-    })?;
-
-    let generic_attention = options().generic_full_attention;
-    let native_kv = head_dim == 128 && !generic_attention && options().native_full_attention_kv;
-    if native_kv {
-        let mut d_key = packed_key.pointer;
-        let mut d_value = packed_value.pointer;
-        let mut packed_rows = u32::try_from(packed_rows).map_err(|_| "resident fused QKV attention packed rows 超过 u32")?;
-        let mut head_count = u32::try_from(head_count).map_err(|_| "resident fused QKV attention heads 超过 u32")?;
-        let mut arguments = [(&mut d_key as *mut *mut c_void).cast(), (&mut d_value as *mut *mut c_void).cast(), (&mut packed_rows as *mut u32).cast(), (&mut head_count as *mut u32).cast()];
-        let grid = packed_rows.checked_div(16).and_then(|tiles| tiles.checked_mul(head_count)).ok_or("resident fused QKV native K/V grid 溢出")?;
-        launch_tensor_kernel(functions.pack_attention_kv_native_bf16, grid, 256, &mut arguments, "HIP pack native attention K/V")?;
-    }
-
-    let output = DeviceBuffer::allocate(device_id, output_bytes)?;
-    let blocks_per_head = rows.div_ceil(128);
-    let grid = blocks_per_head.checked_mul(head_count).ok_or("resident fused QKV attention grid 溢出")?;
+    let mut d_qkv = qkv.pointer;
     let mut d_query = packed_query.pointer;
     let mut d_key = packed_key.pointer;
     let mut d_value = packed_value.pointer;
-    let mut d_output = output.pointer;
-    let mut rows = u32::try_from(rows).map_err(|_| "resident fused QKV attention rows 超过 u32")?;
-    let mut head_count = u32::try_from(head_count).map_err(|_| "resident fused QKV attention heads 超过 u32")?;
-    let mut head_dim = u32::try_from(head_dim).map_err(|_| "resident fused QKV attention head_dim 超过 u32")?;
-    let mut score_scale = score_scale;
+    let mut rows_u32 = u32::try_from(rows).map_err(|_| "prepared QKV attention rows 超过 u32")?;
+    let mut packed_rows_u32 = u32::try_from(packed_rows).map_err(|_| "prepared QKV attention packed rows 超过 u32")?;
+    let mut columns_u32 = u32::try_from(columns).map_err(|_| "prepared QKV attention columns 超过 u32")?;
     let mut arguments = [
+        (&mut d_qkv as *mut *mut c_void).cast(),
         (&mut d_query as *mut *mut c_void).cast(),
         (&mut d_key as *mut *mut c_void).cast(),
         (&mut d_value as *mut *mut c_void).cast(),
-        (&mut d_output as *mut *mut c_void).cast(),
-        (&mut rows as *mut u32).cast(),
-        (&mut head_count as *mut u32).cast(),
-        (&mut head_dim as *mut u32).cast(),
-        (&mut score_scale as *mut f32).cast(),
+        (&mut rows_u32 as *mut u32).cast(),
+        (&mut packed_rows_u32 as *mut u32).cast(),
+        (&mut columns_u32 as *mut u32).cast(),
     ];
-    let attention_kernel = if head_dim == 128 && !generic_attention { if native_kv { functions.full_attention_128_native_kv } else { functions.full_attention_128 } } else { functions.full_attention };
-    launch_tensor_kernel(attention_kernel, u32::try_from(grid).map_err(|_| "resident fused QKV attention grid 超过 u32")?, 256, &mut arguments, "HIP fused QKV full attention")?;
-    if profile_started.is_some() || options().kernel_sync {
-        synchronize_device(device_id, "fused QKV full attention")?;
-    }
+    let grid = u32::try_from(packed_elements.div_ceil(256)).map_err(|_| "prepared QKV attention unpack grid 超过 u32")?;
+    launch_tensor_kernel(functions.unpack_prepared_attention_qkv_bf16, grid, 256, &mut arguments, "HIP unpack prepared attention QKV BF16")?;
+    // 输入最后一次读取已排入同一 stream，尽早释放大块 A2A 拼接缓冲。
     drop(qkv);
-    drop(packed_query);
-    drop(packed_key);
-    drop(packed_value);
-    if let Some(started) = profile_started {
-        eprintln!("[rocm-kernel] fused-qkv-attention device={device_id} rows={rows} heads={head_count} dim={head_dim} wall={:.6}s", started.elapsed().as_secs_f64());
-    }
-    Ok(output)
+    try_full_attention_packed_bf16(device_id, packed_query, packed_key, packed_value, rows, packed_rows, head_count, head_dim, score_scale, profile_started, "prepared-qkv-attention")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -409,7 +642,86 @@ pub fn try_gqa_prefill_wmma_resident_f32(
 
 #[allow(clippy::too_many_arguments)]
 pub fn try_full_attention_resident_f32(device_id: i32, query: DeviceBuffer, key: DeviceBuffer, value: DeviceBuffer, rows: usize, head_count: usize, head_dim: usize, score_scale: f32) -> Result<DeviceBuffer, String> {
-    try_full_attention_resident_f32_inner(device_id, query, key, value, 1, rows, head_count, head_dim, score_scale)
+    try_full_attention_resident_f32_inner(device_id, query, key, value, 1, rows, head_count, head_dim, score_scale, false)
+}
+
+/// 宽 head 保持 F32 输入和累加；每个 wave 独立归约完整 head，不产生逐 KV 的 block barrier。
+#[allow(clippy::too_many_arguments)]
+pub fn try_full_attention_wide_resident_f32(device_id: i32, query: &DeviceBuffer, key: &DeviceBuffer, value: &DeviceBuffer, rows: usize, head_count: usize, head_dim: usize, score_scale: f32) -> Result<DeviceBuffer, String> {
+    if rows == 0 || head_count == 0 || !(129..=512).contains(&head_dim) || !score_scale.is_finite() || score_scale <= 0.0 {
+        return Err(format!("resident wide full attention rows={rows} heads={head_count} dim={head_dim} scale={score_scale} 非法"));
+    }
+    let bytes = rows.checked_mul(head_count).and_then(|n| n.checked_mul(head_dim)).and_then(|n| n.checked_mul(4)).ok_or("wide full attention 字节溢出")?;
+    validate_resident(query, device_id, bytes, "wide full attention query")?;
+    validate_resident(key, device_id, bytes, "wide full attention key")?;
+    validate_resident(value, device_id, bytes, "wide full attention value")?;
+    let grid = rows.div_ceil(8).checked_mul(head_count).ok_or("wide full attention grid 溢出")?;
+    let grid = u32::try_from(grid).map_err(|_| "wide full attention grid 超过 u32")?;
+    let mut rows = u32::try_from(rows).map_err(|_| "wide full attention rows 超过 u32")?;
+    let mut head_count = u32::try_from(head_count).map_err(|_| "wide full attention heads 超过 u32")?;
+    let mut head_dim = u32::try_from(head_dim).map_err(|_| "wide full attention dim 超过 u32")?;
+    let mut score_scale = score_scale;
+    set_device(device_id)?;
+    let functions = tensor_functions(device_id)?;
+    let output = DeviceBuffer::allocate_reusable(device_id, bytes)?;
+    let mut d_query = query.pointer;
+    let mut d_key = key.pointer;
+    let mut d_value = value.pointer;
+    let mut d_output = output.pointer;
+    // 长序列用完整 head 的 WMMA online softmax；范围检查只回读四字节标志。
+    // packed buffers 与本次调用同生命周期，异常值仍使用原 F32 路径。
+    let packed = if head_dim == 512 && rows >= 4096 {
+        if let (Some(pack), Some(wmma)) = (functions.pack_attention_f16_checked, functions.full_attention_wmma_wide) {
+            let q = DeviceBuffer::allocate_reusable(device_id, bytes / 2)?;
+            let k = DeviceBuffer::allocate_reusable(device_id, bytes / 2)?;
+            let v = DeviceBuffer::allocate_reusable(device_id, bytes / 2)?;
+            let flag = DeviceBuffer::upload(device_id, &[0; 4])?;
+            let mut qp = q.pointer;
+            let mut kp = k.pointer;
+            let mut vp = v.pointer;
+            let mut fp = flag.pointer;
+            let mut elements = (bytes / 4) as u64;
+            let mut args = [
+                (&mut d_query as *mut *mut c_void).cast(),
+                (&mut d_key as *mut *mut c_void).cast(),
+                (&mut d_value as *mut *mut c_void).cast(),
+                (&mut qp as *mut *mut c_void).cast(),
+                (&mut kp as *mut *mut c_void).cast(),
+                (&mut vp as *mut *mut c_void).cast(),
+                (&mut fp as *mut *mut c_void).cast(),
+                (&mut elements as *mut u64).cast(),
+            ];
+            let pack_grid = u32::try_from(elements.div_ceil(256)).map_err(|_| "wide attention pack grid 超过 u32")?;
+            launch_tensor_kernel(pack, pack_grid, 256, &mut args, "HIP checked attention F16 pack")?;
+            let mut invalid = [0u8; 4];
+            flag.copy_to_host(&mut invalid)?;
+            if invalid == [0; 4] { Some((q, k, v, wmma)) } else { None }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let (function, grid) = if let Some((q, k, v, function)) = packed.as_ref() {
+        d_query = q.pointer;
+        d_key = k.pointer;
+        d_value = v.pointer;
+        (*function, rows.div_ceil(16).checked_mul(head_count).and_then(|n| n.checked_mul(4)).ok_or("wide WMMA grid 溢出")?)
+    } else {
+        (functions.full_attention_wide, grid)
+    };
+    let mut arguments = [
+        (&mut d_query as *mut *mut c_void).cast(),
+        (&mut d_key as *mut *mut c_void).cast(),
+        (&mut d_value as *mut *mut c_void).cast(),
+        (&mut d_output as *mut *mut c_void).cast(),
+        (&mut rows as *mut u32).cast(),
+        (&mut head_count as *mut u32).cast(),
+        (&mut head_dim as *mut u32).cast(),
+        (&mut score_scale as *mut f32).cast(),
+    ];
+    launch_tensor_kernel(function, grid, 256, &mut arguments, "HIP resident wide full attention")?;
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -431,7 +743,7 @@ pub fn try_block_attention_resident_f32(
         || head_count == 0
         || kv_head_count == 0
         || head_dim == 0
-        || head_dim > 256
+        || head_dim > 512
         || !head_count.is_multiple_of(kv_head_count)
         || visible_ranges.len() != query_rows * 2
         || !score_scale.is_finite()
@@ -574,11 +886,27 @@ pub fn try_block_attention_prefix_suffix_resident_f32(
 
 #[allow(clippy::too_many_arguments)]
 pub fn try_full_attention_batched_resident_f32(device_id: i32, query: DeviceBuffer, key: DeviceBuffer, value: DeviceBuffer, batch: usize, rows: usize, head_count: usize, head_dim: usize, score_scale: f32) -> Result<DeviceBuffer, String> {
-    try_full_attention_resident_f32_inner(device_id, query, key, value, batch, rows, head_count, head_dim, score_scale)
+    try_full_attention_resident_f32_inner(device_id, query, key, value, batch, rows, head_count, head_dim, score_scale, false)
+}
+
+/// head128 窗口使用真实 softmax max，保留 BF16 WMMA 的乘法与 F32 累加。
+pub fn try_full_attention_batched_zero_margin_resident_f32(device_id: i32, query: DeviceBuffer, key: DeviceBuffer, value: DeviceBuffer, batch: usize, rows: usize, head_count: usize, score_scale: f32) -> Result<DeviceBuffer, String> {
+    try_full_attention_resident_f32_inner(device_id, query, key, value, batch, rows, head_count, 128, score_scale, true)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn try_full_attention_resident_f32_inner(device_id: i32, query: DeviceBuffer, key: DeviceBuffer, value: DeviceBuffer, batch: usize, rows: usize, head_count: usize, head_dim: usize, score_scale: f32) -> Result<DeviceBuffer, String> {
+fn try_full_attention_resident_f32_inner(
+    device_id: i32,
+    query: DeviceBuffer,
+    key: DeviceBuffer,
+    value: DeviceBuffer,
+    batch: usize,
+    rows: usize,
+    head_count: usize,
+    head_dim: usize,
+    score_scale: f32,
+    zero_margin: bool,
+) -> Result<DeviceBuffer, String> {
     if batch == 0 || rows == 0 || head_count == 0 || head_dim == 0 || head_dim > 128 || !head_dim.is_multiple_of(16) || !score_scale.is_finite() || score_scale <= 0.0 {
         return Err(format!("resident full attention rows={rows} heads={head_count} head_dim={head_dim} scale={score_scale} 非法"));
     }
@@ -619,7 +947,10 @@ fn try_full_attention_resident_f32_inner(device_id: i32, query: DeviceBuffer, ke
             (&mut packed_elements as *mut u32).cast(),
         ];
         launch_tensor_kernel(functions.pack_qkv_bf16, packed_elements.div_ceil(256), 256, &mut pack_arguments, "HIP pack QKV BF16")?;
-        synchronize_device(device_id, "full attention pack QKV before releasing F32")?;
+        // 异步分配在同一流按 pack→free 排序；其它分配保留等待，避免显式池跨层积压。
+        if !(dim64_batched && query.is_async_allocated() && key.is_async_allocated() && value.is_async_allocated()) {
+            synchronize_device(device_id, "full attention pack QKV before releasing F32")?;
+        }
         drop(query);
         drop(key);
         drop(value);
@@ -640,7 +971,9 @@ fn try_full_attention_resident_f32_inner(device_id: i32, query: DeviceBuffer, ke
             (&mut head_dim as *mut u32).cast(),
             (&mut score_scale as *mut f32).cast(),
         ];
-        let function = if batch != 1 && head_dim == 64 {
+        let function = if zero_margin {
+            functions.full_attention_batched_128_zero_margin
+        } else if batch != 1 && head_dim == 64 {
             functions.full_attention_batched_64
         } else {
             match (batch == 1, head_dim == 128) {

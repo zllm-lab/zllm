@@ -237,3 +237,56 @@ extern "C" __global__ void causal_attention_f32(
         output[out_index] = accumulated / control[1];
     }
 }
+
+// 两次中心化归约保持方差定义；分块增加空间并行度。
+extern "C" __global__ void group_norm_partial_f32(
+    const float* x, const float* stats, float* partial,
+    unsigned channels, unsigned time, unsigned spatial, unsigned groups,
+    unsigned chunks, unsigned chunk_size, unsigned variance)
+{
+    const unsigned chunk = blockIdx.x % chunks, task = blockIdx.x / chunks;
+    const unsigned g = task % groups, t = task / groups, count = channels / groups * spatial;
+    const float mean = variance ? stats[task] : 0;
+    float sum = 0;
+    for (unsigned long long i = (unsigned long long)chunk * chunk_size + threadIdx.x;
+         i < min((unsigned long long)count, (unsigned long long)(chunk + 1) * chunk_size); i += blockDim.x) {
+        const unsigned c = g * (channels / groups) + i / spatial;
+        const float v = x[(unsigned long long)c * time * spatial + (unsigned long long)t * spatial + i % spatial] - mean;
+        sum += variance ? v * v : v;
+    }
+    __shared__ float reduction[256];
+    reduction[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned n = 128; n; n /= 2) {
+        if (threadIdx.x < n) reduction[threadIdx.x] += reduction[threadIdx.x + n];
+        __syncthreads();
+    }
+    if (!threadIdx.x) partial[task * chunks + chunk] = reduction[0];
+}
+
+extern "C" __global__ void group_norm_finish_f32(
+    const float* partial, float* stats, unsigned chunks, unsigned count, float eps, unsigned variance)
+{
+    const unsigned task = blockIdx.x;
+    float sum = 0;
+    for (unsigned i = threadIdx.x; i < chunks; i += 256) sum += partial[task * chunks + i];
+    __shared__ float reduction[256];
+    reduction[threadIdx.x] = sum;
+    __syncthreads();
+    for (unsigned n = 128; n; n /= 2) {
+        if (threadIdx.x < n) reduction[threadIdx.x] += reduction[threadIdx.x + n];
+        __syncthreads();
+    }
+    if (!threadIdx.x) stats[task] = variance ? rsqrtf(reduction[0] / count + eps) : reduction[0] / count;
+}
+
+extern "C" __global__ void group_norm_apply_f32(
+    const float* x, const float* w, const float* b, const float* mean, const float* inv, float* y,
+    unsigned channels, unsigned time, unsigned spatial, unsigned groups, unsigned long long elements)
+{
+    const unsigned long long i = (unsigned long long)blockIdx.x * 256 + threadIdx.x;
+    if (i >= elements) return;
+    const unsigned c = i / ((unsigned long long)time * spatial), t = i / spatial % time;
+    const unsigned task = t * groups + c / (channels / groups);
+    y[i] = (x[i] - mean[task]) * inv[task] * w[c] + b[c];
+}

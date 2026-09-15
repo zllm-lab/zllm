@@ -563,6 +563,15 @@ extern "C" __global__ void split_columns_f32(
     }
 }
 
+// 只复制选中列，不分配被丢弃的左右部分，输出拥有独立紧凑存储。
+extern "C" __global__ void slice_columns_f32(
+    const float* input, float* output, unsigned long long columns,
+    unsigned long long start, unsigned long long count, unsigned long long elements)
+{
+    const unsigned long long index = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < elements) output[index] = input[(index / count) * columns + start + index % count];
+}
+
 extern "C" __global__ void concat_columns_f32(
     const float* left,
     const float* right,
@@ -580,6 +589,42 @@ extern "C" __global__ void concat_columns_f32(
     output[index] = column < left_columns
         ? left[(unsigned long long)row * left_columns + column]
         : right[(unsigned long long)row * right_columns + column - left_columns];
+}
+
+extern "C" __global__ void copy_columns_into_f32(
+    const float* input,
+    float* output,
+    unsigned int rows,
+    unsigned int input_columns,
+    unsigned int output_columns,
+    unsigned int output_column_start)
+{
+    const unsigned int total = gridDim.x * blockDim.x;
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int elements = rows * input_columns;
+    for (; index < elements; index += total) {
+        const unsigned int row = index / input_columns;
+        const unsigned int column = index - row * input_columns;
+        output[(unsigned long long)row * output_columns + output_column_start + column] = input[index];
+    }
+}
+
+extern "C" __global__ void copy_columns_into_f32x4(
+    const float4* input,
+    float4* output,
+    unsigned int rows,
+    unsigned int input_vectors,
+    unsigned int output_vectors,
+    unsigned int output_vector_start)
+{
+    const unsigned int total = gridDim.x * blockDim.x;
+    unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int elements = rows * input_vectors;
+    for (; index < elements; index += total) {
+        const unsigned int row = index / input_vectors;
+        const unsigned int column = index - row * input_vectors;
+        output[(unsigned long long)row * output_vectors + output_vector_start + column] = input[index];
+    }
 }
 
 extern "C" __global__ void compact_qkv_head_range_f32(

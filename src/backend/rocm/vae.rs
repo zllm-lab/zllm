@@ -6,7 +6,105 @@ use crate::{
     vae::{Conv1dSpec, Conv3dSpec, PixelShuffleSpec},
 };
 
-use super::{RocmContext, compute_error, device_tensor_bf16, device_tensor_f32, f32_tensor, resident_weight};
+use super::{RocmContext, RocmTensor, RocmWeight, compute_error, device_tensor_bf16, device_tensor_f32, f32_tensor, resident_weight};
+
+thread_local! {
+    // 权重在prepare后不可变；弱引用只保存分类身份，不延长设备allocation生命周期。
+    static HISTORY_WEIGHT_F16: std::cell::RefCell<std::collections::HashMap<usize, (std::sync::Weak<hip::DeviceBuffer>, bool)>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn finite_exact_f16(data: &[f32]) -> bool {
+    !data.is_empty() && data.iter().all(|&value| value.is_finite() && half::f16::from_f32(value).to_f32() == value)
+}
+
+fn history_weight_exact_f16(weight: &RocmWeight) -> bool {
+    let Some(resident) = weight.resident() else { return false };
+    let Some(elements) = weight.rows.checked_mul(weight.cols) else { return false };
+    if weight.resident_bf16() || elements == 0 || weight.data().len() != elements || elements.checked_mul(4) != Some(resident.bytes()) {
+        return false;
+    }
+    HISTORY_WEIGHT_F16.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let key = std::sync::Arc::as_ptr(resident) as usize;
+        if let Some((identity, exact)) = cache.get(&key)
+            && identity.upgrade().is_some_and(|buffer| std::sync::Arc::ptr_eq(&buffer, resident))
+        {
+            return *exact;
+        }
+        cache.retain(|_, (identity, _)| identity.strong_count() != 0);
+        let exact = finite_exact_f16(weight.data());
+        cache.insert(key, (std::sync::Arc::downgrade(resident), exact));
+        exact
+    })
+}
+
+fn history_f16_wmma_shape(spec: &Conv3dSpec, spatial_pad_after: [usize; 2]) -> bool {
+    if spec.kernel == [1; 3] && spec.padding == [0; 3] {
+        return matches!(spec.input_channels, 256 | 512)
+            && spec.output_channels == spec.input_channels * 4
+            && matches!(spec.input_shape[0], 1 | 2)
+            && spec.input_shape[1].checked_mul(spec.input_shape[2]).is_some_and(|n| n >= 16128)
+            && spec.stride == [1; 3]
+            && !spec.causal
+            && spatial_pad_after == [0; 2];
+    }
+    // 只保留已测受益的通道与空间组合；其他形状使用F32 tiled。
+    let minimum_plane = match (spec.input_channels, spec.output_channels) {
+        (128, 128) | (256, 128) => 768 * 1344,
+        (128, 256) | (256, 256) | (512, 256) => 384 * 672,
+        (256, 512) => 192 * 336,
+        (512, 512) => 96 * 168,
+        _ => return false,
+    };
+    matches!(spec.input_shape[0], 1 | 2)
+        && spec.input_shape[1].checked_mul(spec.input_shape[2]).is_some_and(|plane| plane >= minimum_plane)
+        && spec.kernel == [3, 3, 3]
+        && spec.stride == [1, 1, 1]
+        && spec.padding == [0, 1, 1]
+        && !spec.causal
+        && spatial_pad_after == [0, 0]
+}
+
+#[cfg(test)]
+mod history_dispatch_tests {
+    use super::*;
+
+    #[test]
+    fn f16_weight_classification_rejects_loss_overflow_and_missing_shadow() {
+        assert!(finite_exact_f16(&[-0.0, 0.0, 1.0, -2.0, 65504.0, 2.0f32.powi(-24)]));
+        for value in [0.1, 65505.0, 1e-30, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(!finite_exact_f16(&[1.0, value]));
+        }
+        assert!(!finite_exact_f16(&[]));
+    }
+
+    #[test]
+    fn history_wmma_dispatch_keeps_unvalidated_geometry_on_f32() {
+        let spec = Conv3dSpec { input_channels: 256, output_channels: 128, input_shape: [1, 1536, 2688], kernel: [3, 3, 3], stride: [1, 1, 1], padding: [0, 1, 1], causal: false };
+        for (co, shape) in [(128, [1, 1536, 2688]), (256, [1, 768, 1344])] {
+            assert!(history_f16_wmma_shape(&Conv3dSpec { output_channels: co, input_shape: shape, ..spec }, [0, 0]));
+        }
+        for other in [
+            Conv3dSpec { input_channels: 512, output_channels: 512, input_shape: [3, 96, 168], ..spec },
+            Conv3dSpec { input_channels: 64, ..spec },
+            Conv3dSpec { output_channels: 64, ..spec },
+            Conv3dSpec { input_shape: [2, 32, 33], ..spec },
+            Conv3dSpec { input_shape: [1, 8, 17], ..spec },
+            Conv3dSpec { input_shape: [1, 32, 33], ..spec },
+            Conv3dSpec { output_channels: 256, input_shape: [1, 16, 33], ..spec },
+            Conv3dSpec { kernel: [1, 3, 3], ..spec },
+            Conv3dSpec { stride: [2, 1, 1], ..spec },
+            Conv3dSpec { padding: [0, 0, 0], ..spec },
+            Conv3dSpec { causal: true, ..spec },
+        ] {
+            assert!(!history_f16_wmma_shape(&other, [0, 0]), "{other:?}");
+        }
+        for time in [1, 2] {
+            assert!(history_f16_wmma_shape(&Conv3dSpec { input_channels: 512, output_channels: 512, input_shape: [time, 96, 168], ..spec }, [0, 0]));
+        }
+        assert!(!history_f16_wmma_shape(&spec, [1, 1]));
+    }
+}
 
 #[cfg(test)]
 mod resident_tests {
@@ -18,6 +116,175 @@ mod resident_tests {
         for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
             assert!((actual - expected).abs() < 1e-4, "index={index} actual={actual} expected={expected}");
         }
+    }
+
+    #[test]
+    fn parallel_group_norm_matches_centered_cpu_with_time_and_tails() {
+        use crate::backend::{Backend, cpu::CpuContext};
+        let Ok(context) = RocmContext::new(0) else { return };
+        let cpu = CpuContext;
+        for (channels, time, spatial, groups) in [(8, 2, 16391, 2), (32, 1, 65537, 32), (4, 3, 32769, 2)] {
+            for offset in [0.0f32, 1024.0] {
+                let values = (0..channels * time * spatial).map(|i| offset + ((i * 131 % 1009) as f32 - 504.0) * 0.001).collect::<Vec<_>>();
+                let scale = (0..channels).map(|c| 0.5 + c as f32 * 0.01).collect::<Vec<_>>();
+                let bias = (0..channels).map(|c| c as f32 * -0.02).collect::<Vec<_>>();
+                let x = context.tensor_from_f32(values.clone(), channels, time * spatial).unwrap();
+                let cx = cpu.vae_tensor_from_f32(values, channels, time * spatial).unwrap();
+                let w = context.prepare_f32(&scale, channels, 1).unwrap();
+                let b = context.prepare_f32(&bias, channels, 1).unwrap();
+                let cw = cpu.prepare_f32(&scale, channels, 1).unwrap();
+                let cb = cpu.prepare_f32(&bias, channels, 1).unwrap();
+                let actual = context.group_norm_time_isolated(&x, &w, &b, time, groups, 1e-6).unwrap();
+                let actual = context.tensor_to_f32(&actual).unwrap();
+                let expected = cpu.group_norm_time_isolated(&cx, &cw, &cb, time, groups, 1e-6).unwrap();
+                for (i, (&a, &e)) in actual.iter().zip(&expected.data).enumerate() {
+                    assert!(a.is_finite() && (a - e).abs() <= 0.01 + 0.01 * e.abs(), "shape={channels}/{time}/{spatial} offset={offset} index={i} actual={a} expected={e}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "需要gfx1100 GPU，覆盖FP16片段动态范围回退"]
+    fn history_wmma_out_of_range_keeps_f32_semantics() {
+        for (input_channels, kernel, depth) in [(3, 3, 1), (512, 3, 1), (256, 1, 1), (512, 1, 2)] {
+            let spec = Conv3dSpec { input_channels, output_channels: 129, input_shape: [depth, 3, 5], kernel: [kernel; 3], stride: [1, 1, 1], padding: [0, kernel / 2, kernel / 2], causal: false };
+            let mut weights = vec![0.0; spec.output_channels * spec.input_channels * kernel.pow(3)];
+            for channel in 0..spec.output_channels {
+                weights[channel * spec.input_channels * kernel.pow(3) + kernel.pow(3) / 2] = 1.0;
+            }
+            let weight = hip::DeviceBuffer::upload_f32(0, &weights).unwrap();
+            for value in [0.125, 65504.0, 65536.0, -65536.0, f32::MAX, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                for with_history in [false, true] {
+                    if kernel == 1 && with_history {
+                        continue;
+                    }
+                    let input = hip::DeviceBuffer::upload_f32(0, &vec![value; input_channels * depth * 15]).unwrap();
+                    let history = with_history.then(|| std::sync::Arc::new(hip::DeviceBuffer::upload_f32(0, &vec![value; input_channels * 30]).unwrap()));
+                    let frames = with_history.then_some(2);
+                    let (old, _) = hip::try_conv3d_with_history_resident_f32(0, &input, history.clone(), &weight, None, &spec, frames, [0, 0], false).unwrap();
+                    let (new, _) = hip::try_conv3d_with_history_resident_f32(0, &input, history, &weight, None, &spec, frames, [0, 0], true).unwrap();
+                    let expected = old.download_f32(129 * depth * 15).unwrap();
+                    let actual = new.download_f32(129 * depth * 15).unwrap();
+                    for (index, (&old, &new)) in expected.iter().zip(&actual).enumerate() {
+                        assert!((old.is_nan() && new.is_nan()) || old.to_bits() == new.to_bits(), "value={value} history={with_history} index={index} old={old} new={new}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compact_columns_and_conv3d_history_match_cpu() {
+        use crate::backend::{Backend, cpu::CpuContext};
+        let Ok(context) = RocmContext::new(0) else { return };
+        let cpu = CpuContext;
+        for (ci, co, shape, stride, after) in [(3, 2, [1, 3, 5], [1; 3], [0; 2]), (17, 19, [1, 4, 5], [1; 3], [0; 2]), (17, 19, [4, 3, 5], [2; 3], [1; 2])] {
+            let spec = Conv3dSpec { input_channels: ci, output_channels: co, input_shape: shape, kernel: [3; 3], stride, padding: [0, 1, 1], causal: false };
+            let cols = shape.into_iter().product::<usize>();
+            let weights = (0..co * ci * 27).map(|i| (i as f32 * 0.019).sin() * 0.03).collect::<Vec<_>>();
+            let bias = (0..co).map(|i| (i as f32 - 9.0) * 0.013).collect::<Vec<_>>();
+            let gpu_w = context.prepare_f32(&weights, co, ci * 27).unwrap();
+            let cpu_w = cpu.prepare_f32(&weights, co, ci * 27).unwrap();
+            let gpu_b = context.prepare_f32(&bias, co, 1).unwrap();
+            let cpu_b = cpu.prepare_f32(&bias, co, 1).unwrap();
+            for biased in [false, true] {
+                let (mut gpu_history, mut cpu_history): (Option<RocmTensor>, Option<<CpuContext as BackendResources>::Tensor>) = (None, None);
+                for chunk in 0..4 {
+                    let values = (0..ci * cols).map(|i| ((i + chunk * 137) as f32 * 0.031).cos() * 0.25).collect::<Vec<_>>();
+                    let gpu_x = context.tensor_from_f32(values.clone(), ci, cols).unwrap();
+                    let cpu_x = cpu.vae_tensor_from_f32(values, ci, cols).unwrap();
+                    let parent_history = if chunk == 3 {
+                        let h = gpu_history.as_ref().unwrap();
+                        let parent = context.concat_rows(h, h).unwrap();
+                        gpu_history = Some(crate::backend::SegmentedTensorBackend::slice_token_rows(&context, &parent, 0, ci).unwrap());
+                        Some(parent)
+                    } else {
+                        None
+                    };
+                    let shared = if chunk == 2 { gpu_history.clone() } else { None };
+                    let previous_pointer = gpu_history.as_ref().map(|h: &RocmTensor| h.device.as_ref().unwrap().device_pointer());
+                    let (out, tail) = context.conv3d_with_history(&gpu_x, gpu_history.take(), &gpu_w, biased.then_some(&gpu_b), &spec, after).unwrap();
+                    if let Some(previous_pointer) = previous_pointer {
+                        let next_pointer = tail.as_ref().unwrap().device.as_ref().unwrap().device_pointer();
+                        if chunk == 1 {
+                            assert_eq!(previous_pointer, next_pointer, "唯一紧凑history必须复用allocation");
+                        } else {
+                            assert_ne!(previous_pointer, next_pointer, "共享history不能覆盖");
+                        }
+                    }
+                    if let Some(shared) = shared {
+                        assert_eq!(context.tensor_to_f32(&shared).unwrap(), cpu_history.as_ref().unwrap().data);
+                    }
+                    if let Some(parent) = parent_history {
+                        let old = &cpu_history.as_ref().unwrap().data;
+                        assert_eq!(context.tensor_to_f32(&parent).unwrap(), [old.as_slice(), old.as_slice()].concat(), "history view不能写入owner");
+                    }
+                    let (expected, expected_tail) = cpu.conv3d_with_history(&cpu_x, cpu_history.take(), &cpu_w, biased.then_some(&cpu_b), &spec, after).unwrap();
+                    close(&context.tensor_to_f32(&out).unwrap(), &expected.data);
+                    assert_eq!(context.tensor_to_f32(tail.as_ref().unwrap()).unwrap(), expected_tail.as_ref().unwrap().data);
+                    gpu_history = tail;
+                    cpu_history = expected_tail;
+                    for range in [0..1, 1..cols, 0..cols] {
+                        let got = context.slice_columns_range(&gpu_x, range.clone()).unwrap();
+                        let want = cpu.slice_columns_range(&cpu_x, range).unwrap();
+                        assert_eq!(context.tensor_to_f32(&got).unwrap(), want.data);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conv3d_tiled_channel_k_position_tails_match_cpu() {
+        let Ok(context) = RocmContext::new(0) else { return };
+        let ci = 17;
+        let co = 19;
+        let weight_values = (0..co * ci * 27).map(|i| (i as f32 * 0.019).sin() * 0.03).collect::<Vec<_>>();
+        let bias_values = (0..co).map(|i| (i as f32 - 9.0) * 0.013).collect::<Vec<_>>();
+        let weight = context.prepare_f32(&weight_values, co, ci * 27).unwrap();
+        let bias = context.prepare_f32(&bias_values, co, 1).unwrap();
+        // 非整除的M/N/K尾块，以及时间stride/causal首部padding。
+        for (shape, stride, padding, causal) in [([3, 4, 5], [1; 3], [1; 3], false), ([5, 7, 7], [2; 3], [2, 1, 1], true)] {
+            let elements = ci * shape.into_iter().product::<usize>();
+            let values = (0..elements).map(|i| (i as f32 * 0.031).cos() * 0.25).collect::<Vec<_>>();
+            let input = context.tensor_from_f32(values.clone(), ci, elements / ci).unwrap();
+            for has_bias in [false, true] {
+                let spec = Conv3dSpec { input_channels: ci, output_channels: co, input_shape: shape, kernel: [3; 3], stride, padding, causal };
+                let output = context.conv3d(&input, &weight, has_bias.then_some(&bias), &spec).unwrap();
+                let expected = crate::kernel::cpu::vae::conv3d(
+                    &values,
+                    ci,
+                    shape[0],
+                    shape[1],
+                    shape[2],
+                    &weight_values,
+                    co,
+                    (3, 3, 3),
+                    (stride[0], stride[1], stride[2]),
+                    (padding[0], padding[1], padding[2]),
+                    has_bias.then_some(bias_values.as_slice()),
+                    causal,
+                );
+                close(&context.tensor_to_f32(&output).unwrap(), &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn conv3d_extra_zero_padding_accepts_small_spatial_input() {
+        let Ok(context) = RocmContext::new(0) else { return };
+        let spec = Conv3dSpec { input_channels: 17, output_channels: 19, input_shape: [4, 2, 17], kernel: [3; 3], stride: [1; 3], padding: [0; 3], causal: false };
+        let values = (0..17 * 4 * 2 * 17).map(|i| (i as f32 * 0.023).sin() * 0.1).collect::<Vec<_>>();
+        let weights = (0..19 * 17 * 27).map(|i| (i as f32 * 0.041).cos() * 0.03).collect::<Vec<_>>();
+        let input = context.tensor_from_f32(values.clone(), 17, 4 * 2 * 17).unwrap();
+        let weight = context.prepare_f32(&weights, 19, 17 * 27).unwrap();
+        let result = context.encoder_conv3d_zero_pad(&input, &weight, None, &spec, [1, 1]).unwrap();
+        let cpu = crate::backend::cpu::CpuContext;
+        let input = cpu.vae_tensor_from_f32(values, 17, 4 * 2 * 17).unwrap();
+        let weight = cpu.prepare_f32(&weights, 19, 17 * 27).unwrap();
+        let expected = cpu.encoder_conv3d_zero_pad(&input, &weight, None, &spec, [1, 1]).unwrap();
+        close(&context.tensor_to_f32(&result).unwrap(), &expected.data);
     }
 
     #[test]
@@ -134,6 +401,38 @@ mod resident_tests {
             assert!(max_error < 2.0e-3, "sample={sample} max_error={max_error}");
         }
     }
+}
+
+fn encoder_conv3d_impl(context: &RocmContext, input: &RocmTensor, weight: &RocmWeight, bias: Option<&RocmWeight>, spec: &Conv3dSpec, spatial_pad_after: [usize; 2], reflect_spatial: bool) -> Result<RocmTensor, BackendError> {
+    let input_spatial = spec.input_shape.into_iter().product::<usize>();
+    if input.rows != spec.input_channels || input.cols != input_spatial {
+        return Err(compute_error(format!("ROCm encoder Conv3D input=[{},{}]，期望 [{},{}]", input.rows, input.cols, spec.input_channels, input_spatial)));
+    }
+    // 附加右/下padding也参与shape合法性；H=2/K=3/pad_after=1仍有一个输出。
+    let mut padded_spec = *spec;
+    for axis in 1..3 {
+        padded_spec.input_shape[axis] = spec.input_shape[axis].checked_add(spatial_pad_after[axis - 1]).ok_or_else(|| compute_error("ROCm encoder Conv3D padded shape 溢出"))?;
+    }
+    let output_shape = padded_spec.output_shape().map_err(compute_error)?;
+    let input = f32_tensor(context, input)?;
+    let output = hip::try_encoder_conv3d_resident_f32(
+        context.device_id,
+        input.device.as_deref().ok_or_else(|| compute_error("ROCm encoder Conv3D input 缺少 device buffer"))?,
+        resident_weight(weight, "encoder Conv3D weight")?,
+        bias.map(|weight| resident_weight(weight, "encoder Conv3D bias")).transpose()?,
+        spec.input_channels,
+        spec.output_channels,
+        spec.input_shape,
+        spec.kernel,
+        spec.stride,
+        spec.padding,
+        spatial_pad_after,
+        spec.causal,
+        reflect_spatial,
+        output_shape,
+    )
+    .map_err(compute_error)?;
+    Ok(device_tensor_f32(output, spec.output_channels, output_shape.into_iter().product()))
 }
 
 impl VaeBackend for RocmContext {
@@ -414,37 +713,11 @@ impl VaeBackend for RocmContext {
     }
 
     fn encoder_conv3d(&self, input: &Self::Tensor, weight: &Self::Weight, bias: Option<&Self::Weight>, spec: &Conv3dSpec, spatial_pad_after: [usize; 2]) -> Result<Self::Tensor, BackendError> {
-        let input_spatial = spec.input_shape.into_iter().product::<usize>();
-        if input.rows != spec.input_channels || input.cols != input_spatial {
-            return Err(compute_error(format!("ROCm encoder Conv3D input=[{},{}]，期望 [{},{}]", input.rows, input.cols, spec.input_channels, input_spatial)));
-        }
-        let mut output_shape = spec.output_shape().map_err(compute_error)?;
-        for axis in 1..3 {
-            let padded = spec.input_shape[axis]
-                .checked_add(spec.padding[axis].checked_mul(2).ok_or_else(|| compute_error("ROCm encoder Conv3D padding 溢出"))?)
-                .and_then(|value| value.checked_add(spatial_pad_after[axis - 1]))
-                .ok_or_else(|| compute_error("ROCm encoder Conv3D padded shape 溢出"))?;
-            output_shape[axis] = padded.checked_sub(spec.kernel[axis]).ok_or_else(|| compute_error("ROCm encoder Conv3D kernel 超过输入"))? / spec.stride[axis] + 1;
-        }
-        let input = f32_tensor(self, input)?;
-        let output = hip::try_encoder_conv3d_resident_f32(
-            self.device_id,
-            input.device.as_deref().ok_or_else(|| compute_error("ROCm encoder Conv3D input 缺少 device buffer"))?,
-            resident_weight(weight, "encoder Conv3D weight")?,
-            bias.map(|weight| resident_weight(weight, "encoder Conv3D bias")).transpose()?,
-            spec.input_channels,
-            spec.output_channels,
-            spec.input_shape,
-            spec.kernel,
-            spec.stride,
-            spec.padding,
-            spatial_pad_after,
-            spec.causal,
-            true,
-            output_shape,
-        )
-        .map_err(compute_error)?;
-        Ok(device_tensor_f32(output, spec.output_channels, output_shape.into_iter().product()))
+        encoder_conv3d_impl(self, input, weight, bias, spec, spatial_pad_after, true)
+    }
+
+    fn encoder_conv3d_zero_pad(&self, input: &Self::Tensor, weight: &Self::Weight, bias: Option<&Self::Weight>, spec: &Conv3dSpec, spatial_pad_after: [usize; 2]) -> Result<Self::Tensor, BackendError> {
+        encoder_conv3d_impl(self, input, weight, bias, spec, spatial_pad_after, false)
     }
 
     fn group_norm_time_isolated(&self, input: &Self::Tensor, weight: &Self::Weight, bias: &Self::Weight, time: usize, num_groups: usize, eps: f32) -> Result<Self::Tensor, BackendError> {
@@ -598,6 +871,9 @@ impl VaeBackend for RocmContext {
         if bias.is_some_and(|bias| bias.data().len() != spec.output_channels) {
             return Err(compute_error("ROCm Conv3D bias 长度与输出通道不一致"));
         }
+        if spec.kernel == [1; 3] && history_f16_wmma_shape(spec, [0; 2]) && history_weight_exact_f16(weight) {
+            return self.conv3d_with_history(input, None, weight, bias, spec, [0; 2]).map(|(output, _)| output);
+        }
         let input = f32_tensor(self, input)?;
         let input = input.device.as_deref().ok_or_else(|| compute_error("ROCm Conv3D input 缺少 device buffer"))?;
         let weight = resident_weight(weight, "Conv3D weight")?;
@@ -605,6 +881,49 @@ impl VaeBackend for RocmContext {
         let output =
             hip::try_conv3d_resident_f32(self.device_id, input, weight, bias, spec.input_channels, spec.output_channels, spec.input_shape, spec.kernel, spec.stride, spec.padding, spec.causal, output_shape).map_err(compute_error)?;
         Ok(device_tensor_f32(output, spec.output_channels, output_spatial))
+    }
+
+    fn conv3d_with_history(
+        &self,
+        input: &Self::Tensor,
+        history: Option<Self::Tensor>,
+        weight: &Self::Weight,
+        bias: Option<&Self::Weight>,
+        spec: &Conv3dSpec,
+        spatial_pad_after: [usize; 2],
+    ) -> Result<(Self::Tensor, Option<Self::Tensor>), BackendError> {
+        let plane = spec.input_shape[1].checked_mul(spec.input_shape[2]).filter(|&n| n != 0).ok_or_else(|| compute_error("ROCm Conv3D history plane 非法"))?;
+        let input_spatial = spec.input_spatial().map_err(compute_error)?;
+        let kernel_columns = spec.kernel.into_iter().try_fold(spec.input_channels, |n, d| n.checked_mul(d).ok_or_else(|| compute_error("ROCm Conv3D history weight columns 溢出")))?;
+        if input.rows != spec.input_channels
+            || input.cols != input_spatial
+            || weight.rows != spec.output_channels
+            || weight.cols != kernel_columns
+            || bias.is_some_and(|b| b.data().len() != spec.output_channels)
+            || history.as_ref().is_some_and(|h| h.rows != spec.input_channels || !h.cols.is_multiple_of(plane))
+        {
+            return Err(compute_error(format!("ROCm Conv3D history shape不匹配: input=[{},{}] history={:?} weight=[{},{}] spec={spec:?}", input.rows, input.cols, history.as_ref().map(|h| (h.rows, h.cols)), weight.rows, weight.cols)));
+        }
+        let history_frames = history.as_ref().map(|h| h.cols / plane);
+        let (_, keep, output_shape) = crate::vae::conv3d_history_layout(spec, history_frames, spatial_pad_after).map_err(compute_error)?;
+        let input = f32_tensor(self, input)?;
+        let history = history.map(|h| self.tensor_as_f32(h)).transpose()?;
+        let input_device = input.device.as_deref().ok_or_else(|| compute_error("ROCm Conv3D history input 缺少 device buffer"))?;
+        let history_device = history.map(|h| h.device.ok_or_else(|| compute_error("ROCm Conv3D history tail 缺少 device buffer"))).transpose()?;
+        let (output, tail) = hip::try_conv3d_with_history_resident_f32(
+            self.device_id,
+            input_device,
+            history_device,
+            resident_weight(weight, "Conv3D history weight")?,
+            bias.map(|b| resident_weight(b, "Conv3D history bias")).transpose()?,
+            spec,
+            history_frames,
+            spatial_pad_after,
+            history_f16_wmma_shape(spec, spatial_pad_after) && history_weight_exact_f16(weight),
+        )
+        .map_err(compute_error)?;
+        let spatial = output_shape.into_iter().try_fold(1usize, |n, d| n.checked_mul(d).ok_or_else(|| compute_error("ROCm Conv3D history output spatial 溢出")))?;
+        Ok((device_tensor_f32(output, spec.output_channels, spatial), tail.map(|t| device_tensor_f32(t, spec.input_channels, keep * plane))))
     }
 
     fn group_norm(&self, input: &Self::Tensor, weight: &Self::Weight, bias: &Self::Weight, num_groups: usize, eps: f32) -> Result<Self::Tensor, BackendError> {

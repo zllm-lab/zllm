@@ -33,25 +33,40 @@ pub fn video_dimensions(path: &Path) -> Result<(usize, usize), String> {
 /// 用 ffmpeg 解码为 24 FPS 的 RGB24 原始帧序列。
 pub fn decode_video(path: &Path) -> Result<Vec<RgbImage>, String> {
     let (width, height) = video_dimensions(path)?;
+    decode_video_with_layout(path, width, height, None, MAX_DECODED_VIDEO_BYTES)
+}
+
+/// 按面积和帧数约束解码，避免高分辨率参考视频先全量展开后才缩放。
+/// `max_frames` 同时限制内存和 ffmpeg 输出，不改变保留帧的 24 FPS 时间轴。
+pub fn decode_video_bounded(path: &Path, max_pixels: usize, max_frames: usize) -> Result<Vec<RgbImage>, String> {
+    if max_pixels == 0 || max_frames == 0 {
+        return Err("视频解码面积和帧数上限必须大于 0".to_owned());
+    }
+    let (source_width, source_height) = video_dimensions(path)?;
+    let (width, height) = fit_dimensions(source_width, source_height, max_pixels)?;
+    let frame_bytes = width.checked_mul(height).and_then(|value| value.checked_mul(3)).ok_or("视频 frame bytes 溢出")?;
+    let max_bytes = frame_bytes.checked_mul(max_frames).ok_or("视频解码大小上限溢出")?;
+    decode_video_with_layout(path, width, height, Some(max_frames), max_bytes)
+}
+
+fn decode_video_with_layout(path: &Path, width: usize, height: usize, max_frames: Option<usize>, max_bytes: usize) -> Result<Vec<RgbImage>, String> {
     let frame_bytes = width.checked_mul(height).and_then(|value| value.checked_mul(3)).ok_or("视频 frame bytes 溢出")?;
     if frame_bytes == 0 {
         return Err("视频尺寸为 0".to_owned());
     }
 
-    let mut child = Command::new("ffmpeg")
-        .args(["-v", "error", "-i"])
-        .arg(path)
-        .args(["-an", "-vf", "fps=24", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("启动 ffmpeg 视频解码失败: {error}"))?;
+    let mut command = Command::new("ffmpeg");
+    command.args(["-v", "error", "-i"]).arg(path).args(["-an", "-vf", &format!("scale={width}:{height}:flags=lanczos,fps=24")]);
+    if let Some(max_frames) = max_frames {
+        command.args(["-frames:v", &max_frames.to_string()]);
+    }
+    let mut child = command.args(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|error| format!("启动 ffmpeg 视频解码失败: {error}"))?;
     let mut stdout = child.stdout.take().ok_or("ffmpeg stdout pipe 缺失")?;
     let stderr = child.stderr.take().ok_or("ffmpeg stderr pipe 缺失")?;
     // stderr 必须并行排空，否则 ffmpeg 错误输出填满 pipe 后会与 stdout 读取互相等待。
     let stderr_reader = std::thread::spawn(move || read_bounded(stderr, MAX_FFMPEG_ERROR_BYTES));
 
-    let frames = read_rgb_frames(&mut stdout, width, height, MAX_DECODED_VIDEO_BYTES);
+    let frames = read_rgb_frames(&mut stdout, width, height, max_bytes);
     drop(stdout);
     if frames.is_err() {
         let _ = child.kill();
@@ -66,6 +81,20 @@ pub fn decode_video(path: &Path) -> Result<Vec<RgbImage>, String> {
         return Err(format!("ffmpeg 视频解码 {} 没有输出帧", path.display()));
     }
     Ok(frames)
+}
+
+fn fit_dimensions(width: usize, height: usize, max_pixels: usize) -> Result<(usize, usize), String> {
+    let pixels = width.checked_mul(height).ok_or("视频像素数溢出")?;
+    if pixels <= max_pixels {
+        return Ok((width, height));
+    }
+    let scale = (max_pixels as f64 / pixels as f64).sqrt();
+    let scaled = |value: usize| ((value as f64 * scale).floor() as usize).max(2) / 2 * 2;
+    let fitted = (scaled(width), scaled(height));
+    if fitted.0.checked_mul(fitted.1).is_none_or(|pixels| pixels > max_pixels) {
+        return Err(format!("视频缩放结果 {}x{} 超过面积上限 {max_pixels}", fitted.0, fitted.1));
+    }
+    Ok(fitted)
 }
 
 fn read_rgb_frames(reader: &mut impl Read, width: usize, height: usize, max_bytes: usize) -> Result<Vec<RgbImage>, String> {
@@ -146,5 +175,14 @@ mod tests {
     #[test]
     fn bounded_reader_drains_but_only_keeps_limit() {
         assert_eq!(read_bounded(Cursor::new(vec![7; 32]), 5).unwrap(), vec![7; 5]);
+    }
+
+    #[test]
+    fn bounded_dimensions_preserve_aspect_ratio_and_pixel_budget() {
+        assert_eq!(fit_dimensions(640, 360, 1_032_192).unwrap(), (640, 360));
+        let (width, height) = fit_dimensions(1080, 1920, 1_032_192).unwrap();
+        assert!(width * height <= 1_032_192);
+        assert_eq!((width % 2, height % 2), (0, 0));
+        assert!((width as f64 / height as f64 - 1080.0 / 1920.0).abs() < 0.002);
     }
 }

@@ -184,7 +184,10 @@ impl OrnithRocmEngine {
         let output_head = ornith::prepare_ornith_output_head_quantized(tail, weights.as_ref(), lm_head_quantization).map_err(|error| -> DynError { format!("准备 Ornith ROCm 输出头: {error:?}").into() })?;
         // RocmKvCache 的 GQA K/V 当前是 F32 device buffer；在 backend 真正实现
         // F16/Q8 存储前不得按请求配置伪报 cache format。
-        let capabilities = node_capabilities(&chain.contexts, max_seq_len, "f32", "ornith-gguf-rocm".to_owned(), weights.reader().file_len());
+        let mut capabilities = node_capabilities(&chain.contexts, max_seq_len, "f32", "ornith-gguf-rocm".to_owned(), weights.reader().file_len());
+        // 引擎支持瘦身 resume(只渲染增量,token 长度由 cache 估算);miss 哨兵
+        // 上报。声明能力后 scheduler 命中时只发 [边界 assistant, ...增量]。
+        capabilities.terminal_resume_delta = true;
         Ok(Self {
             cfg,
             chain,
@@ -301,15 +304,29 @@ impl NodeEngine for OrnithRocmEngine {
 impl OrnithRocmEngine {
     /// 与 Metal 引擎同构的请求循环；区别只在序列操作走多卡设备链。
     fn generate(&mut self, request_id: &str, request: &serde_json::Value, cancellation: &AtomicBool, on_token: &mut dyn FnMut(u32, String) -> bool) -> Result<GenerationSummary, String> {
-        let prompt = chat_prompt(request)?;
-        let tokens = self.tokenizer.tokenize(prompt.as_bytes());
-        let prompt_tokens = tokens.len();
+        // 瘦身 resume:server 已验证边界并截为 [边界 assistant, ...增量],只渲染
+        // 增量,长度用节点 cache 的 token 数估算;内存 cache 没有该 id 则哨兵
+        // 上报,让 server 重发完整请求——残缺 messages 不能退回全量渲染。
+        let slim_cache_id = request.get("_zllm_resume").and_then(serde_json::Value::as_str).map(str::to_owned);
+        let (tokens, mut prompt_tokens) = if let Some(cache_id) = slim_cache_id.as_deref() {
+            let Some(cached) = self.terminal_states.cached_tokens(cache_id) else {
+                return Err(format!("{} {cache_id}", crate::runtime::session::TERMINAL_RESUME_MISS));
+            };
+            let suffix_tokens = self.tokenizer.tokenize(chat_prompt_suffix(request, 0)?.as_bytes());
+            let total = cached.len().saturating_add(1).saturating_add(suffix_tokens.len());
+            (suffix_tokens, total)
+        } else {
+            let prompt = chat_prompt(request)?;
+            let tokens = self.tokenizer.tokenize(prompt.as_bytes());
+            let total = tokens.len();
+            (tokens, total)
+        };
         let requested_tokens = crate::runtime::session::requested_completion_tokens(request);
         if requested_tokens == 0 {
             return Err("max_tokens 必须是大于 0 的整数".to_owned());
         }
-        if tokens.is_empty() || tokens.len() >= self.max_seq_len {
-            return Err(format!("Ornith prompt {} tokens 超出 max_seq_len {}", tokens.len(), self.max_seq_len));
+        if prompt_tokens == 0 || prompt_tokens >= self.max_seq_len {
+            return Err(format!("Ornith prompt {prompt_tokens} tokens 超出 max_seq_len {}", self.max_seq_len));
         }
         let stops = parse_stops(request.get("stop"))?;
         let resumed = match request_terminal_resume(request)? {
@@ -320,17 +337,24 @@ impl OrnithRocmEngine {
             }
             TerminalResume::None => None,
         };
-        let batch_tokens = resumed.as_ref().map_or(tokens.len(), |(_, (cached, _))| tokens.len().saturating_sub(cached.len()));
-        let _batch_guard = BatchTokenGuard::new(&self.runtime, batch_tokens);
+        // cached_tokens 检查与 take 之间被并发驱逐:瘦身后没有重建材料。
+        if slim_cache_id.is_some() && resumed.is_none() {
+            let cache_id = slim_cache_id.as_deref().unwrap_or_default();
+            return Err(format!("{} {cache_id}", crate::runtime::session::TERMINAL_RESUME_MISS));
+        }
+        // resume 命中时只对增量计费,避免 dispatch 把整段历史算到当前 batch。
+        let mut batch_tokens = tokens.len();
         let mut sequence = if let Some((assistant, (cached_tokens, state))) = resumed {
             let OrnithTerminalState { mut sequence, pending_tokens, .. } = state;
             let mut suffix = pending_tokens;
             suffix.extend(self.tokenizer.tokenize(chat_prompt_suffix(request, assistant)?.as_bytes()));
+            batch_tokens = suffix.len();
             let stages = std::mem::take(&mut sequence.stages);
             let (hidden, stages) = self.forward_tokens(stages, &suffix, sequence.tokens.len())?;
             sequence.stages = stages;
             sequence.hidden = hidden;
             sequence.tokens.extend_from_slice(&suffix);
+            prompt_tokens = sequence.token_count();
             eprintln!("[zllm-node] terminal cache 命中 cached_tokens={} new_tokens={}", cached_tokens.len(), suffix.len());
             sequence
         } else {
@@ -338,6 +362,7 @@ impl OrnithRocmEngine {
             let (hidden, stages) = self.forward_tokens(stages, &tokens, 0)?;
             OrnithRocmSequence { stages, hidden, tokens }
         };
+        let _batch_guard = BatchTokenGuard::new(&self.runtime, batch_tokens);
         if sequence.token_count() >= self.max_seq_len {
             return Err(format!("Ornith 会话状态 {} tokens 超过 max_seq_len {}", sequence.token_count(), self.max_seq_len));
         }

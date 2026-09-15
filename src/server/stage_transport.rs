@@ -23,7 +23,7 @@ use crate::runtime::output::SamplingConfig;
 
 const STAGE_ALPN: &[u8] = b"zllm/stage/1";
 const MAGIC: u32 = 0x5a_53_54_47;
-const VERSION: u16 = 11;
+const VERSION: u16 = 13;
 const STREAM_OPEN: u8 = 0x5a;
 const HEADER_BYTES: usize = 48;
 const STAGE_KEEP_ALIVE: Duration = Duration::from_secs(5);
@@ -52,6 +52,18 @@ const SPECULATIVE: u16 = 14;
 const SAMPLE: u16 = 15;
 const SAMPLED: u16 = 16;
 const SHUTDOWN: u16 = 17;
+const MEMORY_QUERY: u16 = 18;
+const MEMORY_REQUIREMENT: u16 = 19;
+const RUNTIME_CONFIG: u16 = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageRuntimeConfig {
+    pub execution_slots: usize,
+    pub decode_execution_slots: usize,
+    pub pipeline_work_window: usize,
+    pub device_buffer_pool_bytes: usize,
+    pub profile_completion: bool,
+}
 
 /// 下游 stage 在常驻权重与输出头完成分配后上报的设备资源快照。
 /// `model_units` 由模型 runtime 填入该卡负责的连续计算单元数（Transformer
@@ -112,6 +124,16 @@ const CONTINUOUS_STREAM: u16 = 0x102;
 
 #[derive(Debug)]
 pub enum StageMessage {
+    /// 准入前查询实时设备余量；不修改 session 或缓存内容。
+    MemoryQuery {
+        cache_request_id: Option<RequestId>,
+        reserved_rows: usize,
+    },
+    MemoryRequirement {
+        devices: Vec<StageDeviceMemory>,
+        required_bytes: Vec<u64>,
+        indexer_layers: Vec<usize>,
+    },
     /// 后续按此顺序流入每个 request 的 hidden；接收端收到首帧即可启动 stage。
     Stream {
         requests: Vec<RequestId>,
@@ -220,6 +242,8 @@ pub enum StageMessage {
         /// 主机 MemAvailable 快照；旧端未上报时为空。
         host_available_bytes: Option<u64>,
     },
+    /// 只改变下游 stage 后续尚未提交的调度；权重、KV 布局和在途 batch 不变。
+    RuntimeConfig(StageRuntimeConfig),
 }
 
 #[derive(Debug)]
@@ -648,6 +672,25 @@ impl StageTransport {
         self.send_device_memory_with_host(devices, session_capacity, None)
     }
 
+    pub fn send_memory_query(&mut self, cache_request_id: Option<RequestId>, reserved_rows: usize) -> Result<(), String> {
+        let payload = cache_request_id.map_or_else(Vec::new, |id| id.0.to_vec());
+        self.send_frame(RequestId([0; 16]), MEMORY_QUERY, reserved_rows, 0, 0, 0, &payload)
+    }
+
+    pub fn send_memory_requirement(&mut self, devices: &[StageDeviceMemory], required_bytes: &[u64], indexer_layers: &[usize]) -> Result<(), String> {
+        if devices.len() != required_bytes.len() || devices.len() != indexer_layers.len() || devices.is_empty() {
+            return Err("stage memory requirement 设备与预算数不一致".to_owned());
+        }
+        let mut payload = encode_device_memory(devices)?;
+        for bytes in required_bytes {
+            payload.extend_from_slice(&bytes.to_le_bytes());
+        }
+        for &layers in indexer_layers {
+            payload.extend_from_slice(&(layers as u64).to_le_bytes());
+        }
+        self.send_frame(RequestId([0; 16]), MEMORY_REQUIREMENT, devices.len(), 0, 0, 0, &payload)
+    }
+
     pub fn send_device_memory_with_host(&mut self, devices: &[StageDeviceMemory], session_capacity: Option<usize>, host_available_bytes: Option<u64>) -> Result<(), String> {
         if host_available_bytes == Some(0) {
             return Err("stage host available bytes 必须大于 0".to_owned());
@@ -662,6 +705,19 @@ impl StageTransport {
         // DEVICE_MEMORY 的 cols/value 旧端忽略；沿用24字节设备记录，兼容旧收发端。
         let host = host_available_bytes.unwrap_or(0);
         self.send_frame(RequestId([0; 16]), DEVICE_MEMORY, devices.len(), session_capacity.unwrap_or(0), host as u32 as usize, (host >> 32) as u32, &payload)
+    }
+
+    pub fn send_runtime_config(&mut self, config: StageRuntimeConfig) -> Result<(), String> {
+        let values = [config.execution_slots, config.decode_execution_slots, config.pipeline_work_window, config.device_buffer_pool_bytes];
+        if values.contains(&0) {
+            return Err("stage runtime config 各项必须大于 0".to_owned());
+        }
+        let mut payload = Vec::with_capacity(values.len() * 8);
+        for value in values {
+            payload.extend_from_slice(&u64::try_from(value).map_err(|_| "stage runtime config 超过 u64")?.to_le_bytes());
+        }
+        payload.extend_from_slice(&u64::from(config.profile_completion).to_le_bytes());
+        self.send_frame(RequestId([0; 16]), RUNTIME_CONFIG, 0, 0, 0, 0, &payload)
     }
 
     pub fn recv(&mut self) -> Result<StageFrame, String> {
@@ -984,6 +1040,17 @@ async fn receive_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<StageFrame,
         READY if payload_len == 0 => Ok(StageFrame { request_id, message: StageMessage::Ready { cached_tokens: position } }),
         PERSIST if payload_len == 0 => Ok(StageFrame { request_id, message: StageMessage::Persist }),
         SHUTDOWN if payload_len == 0 && position <= 1 => Ok(StageFrame { request_id, message: StageMessage::Shutdown { persist: position != 0 } }),
+        MEMORY_QUERY if payload_len == 0 || payload_len == 16 => {
+            Ok(StageFrame { request_id, message: StageMessage::MemoryQuery { cache_request_id: if payload.is_empty() { None } else { Some(RequestId(payload[..16].try_into().unwrap())) }, reserved_rows: position } })
+        }
+        MEMORY_REQUIREMENT if position != 0 && payload_len == position.checked_mul(40).ok_or("stage memory requirement 数量溢出")? => Ok(StageFrame {
+            request_id,
+            message: StageMessage::MemoryRequirement {
+                devices: decode_device_memory(&payload[..position * 24])?,
+                required_bytes: payload[position * 24..position * 32].chunks_exact(8).map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap())).collect(),
+                indexer_layers: payload[position * 32..].chunks_exact(8).map(|bytes| usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap())).map_err(|_| "stage indexer layers 超过 usize")).collect::<Result<_, _>>()?,
+            },
+        }),
         DEVICE_MEMORY if payload_len == position.checked_mul(24).ok_or("stage device memory 数量溢出")? => Ok(StageFrame {
             request_id,
             message: StageMessage::DeviceMemory {
@@ -992,6 +1059,25 @@ async fn receive_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<StageFrame,
                 host_available_bytes: ((cols as u64 | ((value as u64) << 32)) != 0).then_some(cols as u64 | ((value as u64) << 32)),
             },
         }),
+        RUNTIME_CONFIG if payload_len == 40 => {
+            let mut values = [0_usize; 5];
+            for (index, bytes) in payload.chunks_exact(8).enumerate() {
+                values[index] = usize::try_from(u64::from_le_bytes(bytes.try_into().unwrap())).map_err(|_| "stage runtime config 超过 usize")?;
+            }
+            if values[..4].contains(&0) || values[4] > 1 {
+                return Err("stage runtime config 各项必须大于 0".to_owned());
+            }
+            Ok(StageFrame {
+                request_id,
+                message: StageMessage::RuntimeConfig(StageRuntimeConfig {
+                    execution_slots: values[0],
+                    decode_execution_slots: values[1],
+                    pipeline_work_window: values[2],
+                    device_buffer_pool_bytes: values[3],
+                    profile_completion: values[4] != 0,
+                }),
+            })
+        }
         _ => Err(format!("未知 stage frame kind={kind} payload={payload_len}")),
     }
 }
@@ -1129,6 +1215,18 @@ mod tests {
     }
 
     #[test]
+    fn runtime_config_roundtrips() {
+        let listener = StageTransport::bind(IrohConfig { secret_key: Some(iroh::SecretKey::from_bytes(&[10; 32])), bind_addr: None, expected_peer: None }).unwrap();
+        let ticket = listener.ticket();
+        let accepted = std::thread::spawn(move || listener.accept().unwrap());
+        let mut head = StageTransport::connect(&ticket, IrohConfig::default()).unwrap();
+        let mut tail = accepted.join().unwrap();
+        let expected = StageRuntimeConfig { execution_slots: 2, decode_execution_slots: 3, pipeline_work_window: 12, device_buffer_pool_bytes: 12 * 1024 * 1024 * 1024, profile_completion: true };
+        head.send_runtime_config(expected).unwrap();
+        assert!(matches!(tail.recv().unwrap().message, StageMessage::RuntimeConfig(actual) if actual == expected));
+    }
+
+    #[test]
     fn sampling_payload_roundtrips() {
         let sampling = SamplingConfig { temperature: 0.6, top_p: 0.95, seed: 42 };
         assert_eq!(decode_sampling(&encode_sampling(sampling).unwrap()).unwrap(), sampling);
@@ -1177,6 +1275,13 @@ mod tests {
         let request = RequestId::generate_for_test();
         sender.send_prefill(request, 17, 2, 2, &[1, 2, 3, 4], &[9]).unwrap();
         assert!(matches!(receiver.recv().unwrap().message, StageMessage::Prefill { position: 17, rows: 2, cols: 2, values, selection, .. } if values == [1, 2, 3, 4] && selection == [9]));
+        sender.send_memory_query(Some(request), 500_123).unwrap();
+        assert!(matches!(receiver.recv().unwrap().message, StageMessage::MemoryQuery { cache_request_id: Some(id), reserved_rows: 500_123 } if id == request));
+        let devices = vec![StageDeviceMemory { device: 6, model_units: 10, available_bytes: 4_000_000_000, total_bytes: 48 << 30 }];
+        receiver.send_memory_requirement(&devices, &[123_456_789], &[3]).unwrap();
+        assert!(matches!(sender.recv().unwrap().message, StageMessage::MemoryRequirement { devices: actual, required_bytes, indexer_layers } if actual == devices && required_bytes == [123_456_789] && indexer_layers == [3]));
+        sender.send_memory_query(None, 0).unwrap();
+        assert!(matches!(receiver.recv().unwrap().message, StageMessage::MemoryQuery { cache_request_id: None, reserved_rows: 0 }));
     }
 
     #[test]

@@ -588,7 +588,16 @@ impl<'a, B: Backend> LagunaRuntime<'a, B> {
             LagunaMlp::Sparse { router_weight, router_bias, shared_gate, shared_up, shared_down } => {
                 let shared_full = [SharedExpertRef { gate: shared_gate, up: shared_up, down: shared_down, output_gate: None }];
                 let shared: &[SharedExpertRef<B::Weight>] = if std::env::var_os("ZLLM_CUDA_NO_SHARED").is_some() { &[] } else { &shared_full };
-                let result = prefill_experts_observed(self.backend, &self.moe, &MoeFfnRef { router_weight, router_bias, shared_experts: &shared, selected_experts: None }, layer, experts, moe_input, self.options.expert_batch_size, |_| {});
+                let result = prefill_experts_observed(
+                    self.backend,
+                    &self.moe,
+                    &MoeFfnRef { router_weight, router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None },
+                    layer,
+                    experts,
+                    moe_input,
+                    self.options.expert_batch_size,
+                    |_| {},
+                );
                 if let (Ok(moe), true) = (&result, std::env::var("ZLLM_CUDA_AUDIT_LAYER").map(|value| value.parse::<usize>() == Ok(layer)).unwrap_or(false)) {
                     let pairs: Vec<String> = (0..moe.routing.top_k).map(|slot| format!("E{}:{:.3}", moe.routing.expert_ids[slot], moe.routing.weights[slot])).collect();
                     eprintln!("[laguna-route-audit] L{layer} row0 [{}]", pairs.join(" "));
@@ -631,7 +640,7 @@ impl<'a, B: Backend> LagunaRuntime<'a, B> {
                         expert_state.decode(
                             self.backend,
                             &self.moe,
-                            &MoeFfnRef { router_weight, router_bias, shared_experts: &shared, selected_experts: None },
+                            &MoeFfnRef { router_weight, router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None },
                             ExpertDecodeRequest { layer, source, position, next: next_source },
                             &moe_input,
                         )?

@@ -525,6 +525,14 @@ pub trait Backend: BackendResources {
     }
     fn layernorm_bias(&self, input: &Self::Tensor, weight: &Self::Weight, bias: &Self::Weight, eps: f32) -> Result<Self::Tensor, BackendError>;
     fn split_columns(&self, input: &Self::Tensor, left_columns: usize) -> Result<(Self::Tensor, Self::Tensor), BackendError>;
+    /// 紧凑复制所需列范围；设备实现不应物化被丢弃的左右两段。
+    fn slice_columns_range(&self, input: &Self::Tensor, range: std::ops::Range<usize>) -> Result<Self::Tensor, BackendError> {
+        if range.start >= range.end || range.end > self.token_cols(input) {
+            return Err(BackendError::Compute { msg: format!("column slice={range:?} 超过 columns={}", self.token_cols(input)) });
+        }
+        let (prefix, _) = self.split_columns(input, range.end)?;
+        if range.start == 0 { Ok(prefix) } else { self.split_columns(&prefix, range.start).map(|(_, out)| out) }
+    }
     /// 消费 packed gate/up，backend 可融合拆分、激活与乘法并及时释放输入。
     fn split_gated_activation(&self, input: Self::Tensor, left_columns: usize, activation: &Activation) -> Result<Self::Tensor, BackendError> {
         let (gate, up) = self.split_columns(&input, left_columns)?;
@@ -800,6 +808,10 @@ pub trait VisionBackend: Backend {
     }
     fn merge_spatial(&self, input: &Self::Tensor, merge_size: usize) -> Result<Self::Tensor, BackendError>;
     fn scatter_rows(&self, destination: &mut Self::Tensor, start_row: usize, source: &Self::Tensor) -> Result<(), BackendError>;
+    /// 视觉张量下载为 F32 行主序(DeepSeek-V4.1 aligner 需 host 侧网格拼装)。
+    fn vision_download(&self, _input: &Self::Tensor) -> Result<Vec<f32>, BackendError> {
+        Err(BackendError::Compute { msg: "当前 backend 不支持视觉张量下载".to_owned() })
+    }
 }
 
 /// VAE 编解码器需要的平台能力。Conv3D/GroupNorm/像素shuffle 等算子，
@@ -943,9 +955,57 @@ pub trait VaeBackend: DiffusionBackend {
     /// 时空 3D 卷积（视频 VAE 核心算子）。
     fn conv3d(&self, input: &Self::Tensor, weight: &Self::Weight, bias: Option<&Self::Weight>, spec: &Conv3dSpec) -> Result<Self::Tensor, BackendError>;
 
+    /// 当前 C×THW 与紧凑历史尾分别提供；首片无历史时复制首帧。spec 描述
+    /// 当前片，时间 padding=0/causal=false；返回卷积结果与下一片需要的 Kt-St 帧。
+    /// 消费旧history，设备可在唯一所有权时原址更新紧凑尾部；共享/view必须保留来源。
+    /// 默认组合保持设备操作，ROCm 覆盖为直接读取双输入，避免完整拼接。
+    #[allow(clippy::type_complexity)]
+    fn conv3d_with_history(
+        &self,
+        input: &Self::Tensor,
+        history: Option<Self::Tensor>,
+        weight: &Self::Weight,
+        bias: Option<&Self::Weight>,
+        spec: &Conv3dSpec,
+        spatial_pad_after: [usize; 2],
+    ) -> Result<(Self::Tensor, Option<Self::Tensor>), BackendError> {
+        let plane = spec.input_shape[1].checked_mul(spec.input_shape[2]).ok_or_else(|| BackendError::Compute { msg: "Conv3D history plane溢出".into() })?;
+        if plane == 0
+            || self.token_rows(input) != spec.input_channels
+            || self.token_cols(input) != spec.input_spatial().map_err(|msg| BackendError::Compute { msg })?
+            || history.as_ref().is_some_and(|h| self.token_rows(h) != spec.input_channels || !self.token_cols(h).is_multiple_of(plane))
+        {
+            return Err(BackendError::Compute { msg: "Conv3D history tensor shape不匹配".into() });
+        }
+        let (head, keep, _) = crate::vae::conv3d_history_layout(spec, history.as_ref().map(|h| self.token_cols(h) / plane), spatial_pad_after).map_err(|msg| BackendError::Compute { msg })?;
+        let padded = if head == 0 {
+            None
+        } else if let Some(history) = history.as_ref() {
+            Some(self.concat_columns(history, input)?)
+        } else {
+            let first = self.slice_columns_range(input, 0..plane)?;
+            let mut repeated = self.slice_columns_range(input, 0..plane)?;
+            for _ in 1..head {
+                repeated = self.concat_columns(&repeated, &first)?;
+            }
+            Some(self.concat_columns(&repeated, input)?)
+        };
+        let input = padded.as_ref().unwrap_or(input);
+        let depth = spec.input_shape[0] + head;
+        let tail = if keep == 0 { None } else { Some(self.slice_columns_range(input, (depth - keep) * plane..depth * plane)?) };
+        let logical = Conv3dSpec { input_shape: [depth, spec.input_shape[1], spec.input_shape[2]], ..*spec };
+        let output = if spatial_pad_after == [0, 0] { self.conv3d(input, weight, bias, &logical)? } else { self.encoder_conv3d_zero_pad(input, weight, bias, &logical, spatial_pad_after)? };
+        Ok((output, tail))
+    }
+
     /// Encoder Conv3D：空间 reflect padding，downsample 额外只补右/下边界。
     fn encoder_conv3d(&self, _input: &Self::Tensor, _weight: &Self::Weight, _bias: Option<&Self::Weight>, _spec: &Conv3dSpec, _spatial_pad_after: [usize; 2]) -> Result<Self::Tensor, BackendError> {
         Err(BackendError::Compute { msg: "当前 backend 不支持 encoder Conv3D".to_owned() })
+    }
+
+    /// Encoder 下采样：对称部分和右/下附加区域均使用零填充。
+    fn encoder_conv3d_zero_pad(&self, _input: &Self::Tensor, _weight: &Self::Weight, _bias: Option<&Self::Weight>, _spec: &Conv3dSpec, _spatial_pad_after: [usize; 2]) -> Result<Self::Tensor, BackendError> {
+        Err(BackendError::Compute { msg: "当前 backend 不支持 zero-pad encoder Conv3D".to_owned() })
     }
 
     /// GroupNorm（VAE 专用归一化）。
@@ -1031,6 +1091,12 @@ pub trait DiffusionBackend: Backend {
             return self.full_attention(query, key, value, head_count, head_dim, score_scale);
         }
         Err(BackendError::Compute { msg: format!("当前 backend 不支持 batch={batch} full self-attention rows={rows}") })
+    }
+
+    /// 前缀和描述互不相交的非因果序列；不使用 dropout，Q/K 可有不同长度。
+    #[allow(clippy::too_many_arguments)]
+    fn varlen_attention(&self, _query: Self::Tensor, _key: Self::Tensor, _value: Self::Tensor, _query_offsets: &[usize], _kv_offsets: &[usize], _head_count: usize, _head_dim: usize, _score_scale: f32) -> Result<Self::Tensor, BackendError> {
+        Err(BackendError::Compute { msg: "当前 backend 不支持 varlen attention".to_owned() })
     }
 
     /// 自适应 LayerNorm：`out = input * (1 + scale) + shift`。
@@ -1409,6 +1475,11 @@ pub trait GqaPrefillBackend: Backend {
         self.gemma_rmsnorm_heads(input, weight, head_count, head_dim, eps)
     }
     fn gqa_prefill_attention(&self, query: &Self::Tensor, key: &Self::Tensor, value: &Self::Tensor, spec: &GqaSpec) -> Result<Self::Tensor, BackendError>;
+
+    /// 非 cached prefill 的逐 query 可见终点，用于 right-padding 文本编码。
+    fn gqa_prefill_attention_visible(&self, _query: &Self::Tensor, _key: &Self::Tensor, _value: &Self::Tensor, _spec: &GqaSpec, _visible_ends: &[u32]) -> Result<Self::Tensor, BackendError> {
+        Err(BackendError::Compute { msg: "backend 未实现带可见终点的 GQA prefill".to_owned() })
+    }
     #[allow(clippy::too_many_arguments)]
     fn gqa_prefill_attention_cached(
         &self,
@@ -1557,6 +1628,24 @@ pub trait MoePrefillBackend: Backend {
     type MoeAccumulator;
 
     fn moe_route(&self, input: &Self::Tensor, router_weight: &Self::Weight, router_bias: &Self::Weight, spec: &TopkMoeSpec) -> Result<MoePrefillRouting, BackendError>;
+
+    /// VL 行级双偏置路由(DeepSeek-V4.1 noaux_tc_for_vl):`image_rows` 为 true 的
+    /// 行用 `router_bias_vl` 选专家,权重仍来自无偏分数。两者为 None 时与
+    /// `moe_route` 等价;不支持双偏置的后端对 Some 输入明确报错。
+    fn moe_route_rows(
+        &self,
+        input: &Self::Tensor,
+        router_weight: &Self::Weight,
+        router_bias: &Self::Weight,
+        router_bias_vl: Option<&Self::Weight>,
+        image_rows: Option<&[bool]>,
+        spec: &TopkMoeSpec,
+    ) -> Result<MoePrefillRouting, BackendError> {
+        if router_bias_vl.is_some() || image_rows.is_some() {
+            return Err(BackendError::Compute { msg: "backend 未实现 VL 双偏置路由".to_owned() });
+        }
+        self.moe_route(input, router_weight, router_bias, spec)
+    }
 
     /// 模型已经给出专家 ID 时，只计算这些专家对应的路由权重。
     fn moe_route_selected(&self, input: &Self::Tensor, router_weight: &Self::Weight, selected_experts: &[u32], spec: &TopkMoeSpec) -> Result<MoePrefillRouting, BackendError> {

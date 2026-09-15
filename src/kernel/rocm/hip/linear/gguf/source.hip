@@ -722,6 +722,89 @@ __device__ __forceinline__ zllm_ct_bf16x2 gguf_q3k_pair_bf16(
     };
 }
 
+__device__ __forceinline__ int gguf_q3k_group_scale(
+    const unsigned char* block,
+    const unsigned int group)
+{
+    const unsigned int low = group < 8u
+        ? block[96u + group] & 15u
+        : block[96u + group - 8u] >> 4u;
+    const unsigned int high = (block[104u + group % 4u]
+        >> (2u * (group / 4u))) & 3u;
+    return (int)(low | (high << 4u)) - 32;
+}
+
+__device__ __forceinline__ zllm_ct_bf16x2 gguf_q3k_pair_bf16(
+    const unsigned char* block,
+    const unsigned int group,
+    const unsigned int within,
+    const float d,
+    const int group_scale)
+{
+    const unsigned int half = group >> 3u;
+    const unsigned int pair = group & 7u;
+    const unsigned int source = half * 32u + (pair & 1u) * 16u;
+    const unsigned int shift = 2u * (pair >> 1u);
+    const unsigned int low_pair = *(const unsigned short*)(
+        block + 32u + source + within);
+    const unsigned int hmask_pair = *(const unsigned short*)(
+        block + (pair & 1u) * 16u + within);
+    const unsigned int mask = 1u << (group >> 1u);
+    const int first_quant = (int)((low_pair >> shift) & 3u)
+        - ((hmask_pair & mask) == 0u ? 4 : 0);
+    const int second_quant = (int)((low_pair >> (8u + shift)) & 3u)
+        - ((hmask_pair & (mask << 8u)) == 0u ? 4 : 0);
+    return {
+        zllm_f32_to_bf16(
+            d * (float)group_scale * (float)first_quant),
+        zllm_f32_to_bf16(
+            d * (float)group_scale * (float)second_quant)
+    };
+}
+
+__device__ __forceinline__ void gguf_k4_group_scale_min(
+    const unsigned char* block,
+    const unsigned int group,
+    unsigned int& group_scale,
+    unsigned int& minimum)
+{
+    const unsigned char* scales = block + 4u;
+    if (group < 4u) {
+        group_scale = scales[group] & 63u;
+        minimum = scales[group + 4u] & 63u;
+    } else {
+        group_scale = (scales[group + 4u] & 15u)
+            | ((scales[group - 4u] >> 6u) << 4u);
+        minimum = (scales[group + 4u] >> 4u)
+            | ((scales[group] >> 6u) << 4u);
+    }
+}
+
+__device__ __forceinline__ zllm_ct_bf16x2 gguf_q4k_pair_bf16(
+    const unsigned char* block,
+    const unsigned int group,
+    const unsigned int within,
+    const float d,
+    const float dmin,
+    const unsigned int group_scale,
+    const unsigned int minimum)
+{
+    const unsigned int shift = 4u * (group & 1u);
+    const unsigned int packed_pair = *(const unsigned short*)(
+        block + 16u + (group >> 1u) * 32u + within);
+    const unsigned int first_quant = (packed_pair >> shift) & 15u;
+    const unsigned int second_quant
+        = (packed_pair >> (8u + shift)) & 15u;
+    return {
+        zllm_f32_to_bf16(
+            d * (float)(group_scale * first_quant)
+                - dmin * (float)minimum),
+        zllm_f32_to_bf16(
+            d * (float)(group_scale * second_quant)
+                - dmin * (float)minimum)
+    };
+}
+
 // 段一：每个 16-lane 子组计算一个 intermediate 维，一个 block 覆盖
 // 16 维。旧路径让整个 block 同时持有 8 维 gate/up 累加并用 64 KiB
 // LDS 归约，导致寄存器与 occupancy 双重受限。
@@ -941,6 +1024,87 @@ extern "C" __global__ void gguf_fused_down_f32(
         sum += __shfl_down(sum, offset, 16);
     if (lane == 0)
         output[(unsigned long long)token * hidden + output_row] = sum;
+}
+
+// Q4_K down 同样以两个 accumulator 模拟原 16-lane 归约的 offset=8，
+// 同一组 d/scale/min 只解析一次，同时把每个 block 的输出行数翻倍。
+extern "C" __global__ void gguf_fused_down_q4_k_f32(
+    const unsigned short* activated,
+    const GgufKqMeta* metas,
+    const unsigned int* route_ids,
+    const unsigned int* route_slots,
+    const float* route_weights,
+    float* output,
+    const unsigned int tokens,
+    const unsigned int top_k,
+    const unsigned int hidden,
+    const unsigned int intermediate)
+{
+    (void)route_ids;
+    const unsigned int token = blockIdx.y;
+    if (token >= tokens) return;
+    const unsigned int lane = threadIdx.x & 7u;
+    const unsigned int subgroup = threadIdx.x >> 3u;
+    const unsigned int output_row = blockIdx.x * 32u + subgroup;
+    if (output_row >= hidden) return;
+    const unsigned int within = lane * 2u;
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (unsigned int k = 0u; k < top_k; ++k) {
+        const unsigned int assignment = token * top_k + k;
+        const GgufKqMeta meta = metas[route_slots[assignment]];
+        const unsigned char* down_row = gguf_kq_row(
+            meta.down, 12u, output_row, intermediate);
+        const unsigned short* input = activated
+            + (unsigned long long)assignment * intermediate;
+        const float route_weight = route_weights[assignment];
+        for (unsigned int block_index = 0u;
+             block_index < intermediate / 256u;
+             ++block_index) {
+            const unsigned char* block
+                = down_row + (unsigned long long)block_index * 144u;
+            float d = lane == 0u ? gguf_kq_f16(block) : 0.0f;
+            float dmin = lane == 0u ? gguf_kq_f16(block + 2u) : 0.0f;
+            d = __shfl(d, 0, 8);
+            dmin = __shfl(dmin, 0, 8);
+            const unsigned short* block_input
+                = input + block_index * 256u;
+            #pragma unroll
+            for (unsigned int group = 0u; group < 8u; ++group) {
+                unsigned int group_scale = 0u;
+                unsigned int minimum = 0u;
+                if (lane == 0u) {
+                    gguf_k4_group_scale_min(
+                        block, group, group_scale, minimum);
+                }
+                group_scale = __shfl(group_scale, 0, 8);
+                minimum = __shfl(minimum, 0, 8);
+                const unsigned int column0 = group * 32u + within;
+                const unsigned int column1 = column0 + 16u;
+                const zllm_ct_bf16x2 input0 = {
+                    block_input[column0], block_input[column0 + 1u]
+                };
+                const zllm_ct_bf16x2 input1 = {
+                    block_input[column1], block_input[column1 + 1u]
+                };
+                sum0 += __builtin_amdgcn_fdot2_f32_bf16(
+                    input0, gguf_q4k_pair_bf16(
+                        block, group, within, d, dmin,
+                        group_scale, minimum),
+                    0.0f, false) * route_weight;
+                sum1 += __builtin_amdgcn_fdot2_f32_bf16(
+                    input1, gguf_q4k_pair_bf16(
+                        block, group, within + 16u, d, dmin,
+                        group_scale, minimum),
+                    0.0f, false) * route_weight;
+            }
+        }
+    }
+    sum0 += sum1;
+    for (unsigned int offset = 4u; offset; offset >>= 1u)
+        sum0 += __shfl_down(sum0, offset, 8);
+    if (lane == 0u)
+        output[(unsigned long long)token * hidden + output_row] = sum0;
 }
 
 template <unsigned int TensorType>

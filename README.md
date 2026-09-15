@@ -49,8 +49,10 @@ MiniCPM5 无 CUDA 执行路径；CUDA 上的 Qwen3.6/3.8 暂不支持 MTP。需�
 | SenseVoice-Small（ASR） | ✅ oracle | — | — | — | 中/英/日/韩/粤；Android QNN HTP 已真机验证 |
 | GLM-5.2 / GLM-5.3 | — | — | — | ✅ | 分布式；GGUF prefill/decode/MTP 双机 16 卡路径已真机验证 |
 | GLM-5.3-Flash | — | — | — | ✅ | |
-| DeepSeek-V4 | — | — | — | ✅ | |
-| MiniMax-H3 | — | — | — | ✅ 1/2/4/8 卡 | |
+| DeepSeek-V4 / V4.1-Flash | — | — | — | ✅ | 文本、视觉多模态、官方 DSpark 与压缩 KV cache |
+| MiniMax-H3 | — | — | — | ✅ 1/2/4/8 卡 | Ref2VA 长视频生成；4-step 蒸馏权重 |
+| SeedVR2 7B | ✅ oracle | — | — | ✅ 8 卡 | 原生视频修复；已验证 1344×768/15s 与 2688×1536/5s |
+| FLUX.2 Klein 4B | — | — | — | ✅ 单卡 | 文生图与最多 4 张参考图编辑 |
 
 CPU 主要承担跨后端 oracle、单元测试与 Qwen 混合分层的前缀层执行；服务级 CPU 入口目前仅 MiniCPM5。
 
@@ -58,14 +60,18 @@ Qwen3.8-Flash-Next 使用独立的 `qwen4exp` 架构，支持 CUDA QSA 稀疏注
 
 MiniCPM5-1B 已在 Snapdragon HTP 上完成 QNN 端到端验证，混合 INT4/INT8 热态 decode 达到 10.335 tok/s；SenseVoice-Small 的 encoder 与 CTC head 也已通过 HTP 真机验证，设备转写与 CPU oracle 一致。当前 QNN calibration profile 面向已验证输入，尚不代表任意 prompt 的通用服务能力。
 
+最新模型进展包括 DeepSeek-V4.1-Flash 的 ROCm 文本、多模态、官方 DSpark 与官方压缩 KV cache 全链路；MiniMax-H3 的 4-step 蒸馏推理；以及 FLUX.2 Klein 4B 图像生成/多参考编辑和 SeedVR2 7B 原生视频修复路径。
+
 ### 实测性能
 
-以下结果来自无风扇 Apple M5 24GB 与 NVIDIA RTX 3060 12GB 真机。吞吐会随提示长度、温度、量化格式和 MTP 接受率变化；表中数据用于说明已验证路径，不代表所有工作负载的固定值。
+以下结果来自对应表格所列真实硬件。吞吐会随提示长度、温度、量化格式、并发度和 MTP/DSpark 接受率变化；不同测试行不可直接横向等同，数据用于说明已验证路径，不代表所有工作负载的固定值。
 
 | 模型与权重 | 硬件 / 后端 | Prefill | Decode | 测试说明 |
 | --- | --- | ---: | ---: | --- |
 | GLM-5.3 UD-IQ4_XS GGUF | 双机 16× AMD GPU / ROCm | **1600+ tok/s** | **26.912 tok/s** | 最新 50K prefill；decode 为独立的 1,024-token 动态 MTP5 测试（三轮中位数） |
-| GLM-5.3 UD-Q4_K_XL GGUF | 双机 16× AMD GPU / ROCm | — | **29.22 tok/s** | 50K 输入、1,024-token 动态 MTP5 输出；三轮中位数 |
+| GLM-5.3 UD-Q4_K_XL GGUF | 双机 16× AMD GPU / ROCm | — | **35.20 tok/s** 单路；**114.97 tok/s** 六路总吞吐 | 单路约 61K–67K 上下文；六路各 50K 输入、1,024-token 动态 MTP5 输出 |
+| DeepSeek-V4.1-Flash oQ4e MTP | 8× AMD GPU / ROCm | — | **14.33 tok/s** target-only；**34.67–35.13 tok/s** DSpark 热态 | 官方压缩 KV；DSpark 700-token 长输出为 27.62–27.74 tok/s，重复运行输出一致 |
+| MiniMax-H3 4-step distilled | 8× AMD GPU / ROCm | — | 28.391s denoise；约 83s 关键路径 | 相对 19-step：denoise **4.55×**、端到端关键路径 **2.25×**；6/6 提示词质量验收通过 |
 | Qwen 3.8 27B UD-Q3_K_XL | Apple M5 24GB / Metal | 42 tokens / 0.73s；4K 155 tok/s | 8.33 tok/s | Metal4 cooperative tensor prefill；普通 decode |
 | Qwen 3.8 27B Q4_K_M | 双路 E5-2696 v4 + RTX 3060 12GB / CPU+CUDA | — | **2.68 tok/s** | CPU 前缀层 + CUDA 后缀层；40 个 CPU decode 线程 |
 | Gemma 4 12B IQ4_NL GGUF | Apple M5 24GB / Metal | 337.4 tok/s | 14.5–15.2 tok/s | 约 5.6K token 长提示，64-token 回复 |
@@ -202,8 +208,10 @@ Models × backends (`zllm-server` / `zllm-rt-*` service entries, per the config 
 | SenseVoice-Small (ASR) | ✅ oracle | — | — | — | zh/en/ja/ko/yue; Android QNN HTP validated on device |
 | GLM-5.2 / GLM-5.3 | — | — | — | ✅ | Distributed; GGUF prefill/decode/MTP path validated on a two-node 16-GPU deployment |
 | GLM-5.3-Flash | — | — | — | ✅ | |
-| DeepSeek-V4 | — | — | — | ✅ | |
-| MiniMax-H3 | — | — | — | ✅ 1/2/4/8 GPUs | |
+| DeepSeek-V4 / V4.1-Flash | — | — | — | ✅ | Text, vision, official DSpark, and compressed KV cache |
+| MiniMax-H3 | — | — | — | ✅ 1/2/4/8 GPUs | Ref2VA long-video generation; 4-step distilled weights |
+| SeedVR2 7B | ✅ oracle | — | — | ✅ 8 GPUs | Native video restoration; validated at 1344×768/15s and 2688×1536/5s |
+| FLUX.2 Klein 4B | — | — | — | ✅ single GPU | Text-to-image and editing with up to four references |
 
 CPU mainly serves as the cross-backend oracle, unit-test baseline, and CPU prefix layers of the Qwen hybrid path; the service-level CPU entry currently supports MiniCPM5 only.
 
@@ -211,14 +219,18 @@ Qwen3.8-Flash-Next uses the separate `qwen4exp` architecture with CUDA QSA spars
 
 MiniCPM5-1B has completed end-to-end QNN validation on Snapdragon HTP, reaching 10.335 tok/s for warm mixed INT4/INT8 decoding. SenseVoice-Small's encoder and CTC head have also passed on-device HTP validation, matching the CPU oracle. The current QNN calibration profiles target validated inputs and are not yet general arbitrary-prompt services.
 
+Recent model progress includes complete ROCm text, multimodal, official-DSpark, and official compressed-KV paths for DeepSeek-V4.1-Flash; 4-step distilled inference for MiniMax-H3; FLUX.2 Klein 4B text-to-image and multi-reference editing; and native SeedVR2 7B video restoration.
+
 ### Measured performance
 
-The following results were measured on a fanless Apple M5 with 24 GB unified memory and an NVIDIA RTX 3060 with 12 GB VRAM. Throughput varies with prompt length, temperature, quantization, and MTP acceptance rate; these numbers describe validated paths rather than guaranteed performance.
+The following results were measured on the real hardware listed in each row. Throughput varies with prompt length, temperature, quantization, concurrency, and MTP/DSpark acceptance rate. Rows with different workloads are not directly equivalent; the numbers describe validated paths rather than guaranteed performance.
 
 | Model and weights | Hardware / backend | Prefill | Decode | Workload |
 | --- | --- | ---: | ---: | --- |
 | GLM-5.3 UD-IQ4_XS GGUF | Two nodes, 16× AMD GPUs / ROCm | **1600+ tok/s** | **26.912 tok/s** | Latest 50K prefill; decode is a separate 1,024-token dynamic-MTP5 run (three-run median) |
-| GLM-5.3 UD-Q4_K_XL GGUF | Two nodes, 16× AMD GPUs / ROCm | — | **29.22 tok/s** | 50K-token input and 1,024-token dynamic-MTP5 output; three-run median |
+| GLM-5.3 UD-Q4_K_XL GGUF | Two nodes, 16× AMD GPUs / ROCm | — | **35.20 tok/s** single stream; **114.97 tok/s** aggregate at six streams | Single stream at about 61K–67K context; six streams each use 50K input and 1,024-token dynamic-MTP5 output |
+| DeepSeek-V4.1-Flash oQ4e MTP | 8× AMD GPUs / ROCm | — | **14.33 tok/s** target-only; **34.67–35.13 tok/s** hot DSpark | Official compressed KV; long 700-token DSpark runs reach 27.62–27.74 tok/s with identical repeated output |
+| MiniMax-H3 4-step distilled | 8× AMD GPUs / ROCm | — | 28.391s denoise; about 83s critical path | Versus 19 steps: **4.55×** denoise and **2.25×** end-to-end critical-path speedup; 6/6 prompt quality checks passed |
 | Qwen 3.8 27B UD-Q3_K_XL | Apple M5 24GB / Metal | 42 tokens / 0.73s; 4K at 155 tok/s | 8.33 tok/s | Metal4 cooperative-tensor prefill; standard decode |
 | Qwen 3.8 27B Q4_K_M | Dual E5-2696 v4 + RTX 3060 12GB / CPU+CUDA | — | **2.68 tok/s** | CPU prefix layers + CUDA suffix layers; 40 CPU decode threads |
 | Gemma 4 12B IQ4_NL GGUF | Apple M5 24GB / Metal | 337.4 tok/s | 14.5–15.2 tok/s | About 5.6K prompt tokens, 64-token response |

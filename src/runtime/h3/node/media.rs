@@ -11,11 +11,11 @@ use crate::{
     backend::{DiffusionBackend, VaeBackend},
     runtime::h3::{
         H3AudioCondition, H3OrderedReferences, H3PackedReferenceCondition, H3QwenVisual, H3VisualVaeClip, H3VisualVaeInput, PreparedH3AudioEncoder, PreparedH3VideoEncoder, h3_encode_audio_condition, h3_encode_video_condition,
-        h3_join_video_conditions, h3_noise_audio_condition, h3_noise_video_condition, h3_preprocess_reference_image, h3_preprocess_reference_video,
+        h3_join_video_conditions, h3_noise_audio_condition, h3_noise_video_condition, h3_preprocess_keyframe, h3_preprocess_reference_image_with_max_pixels, h3_preprocess_reference_video,
     },
     vision::{
         RgbImage,
-        video::{decode_video, qwen_video_frames, video_dimensions},
+        video::{decode_video_bounded, qwen_video_frames, video_dimensions},
     },
 };
 
@@ -43,8 +43,10 @@ pub enum ConditioningMedia {
 }
 
 static NEXT_TEMP_REFERENCE: AtomicU64 = AtomicU64::new(0);
+const H3_REFERENCE_VIDEO_MAX_PIXELS: usize = 256 * 448;
+const H3_REFERENCE_VIDEO_MAX_FRAMES: usize = 15 * 24;
 
-pub fn decode_references(references: &[LocalReference<'_>]) -> Result<Vec<IndexedReference>, String> {
+pub fn decode_references(references: &[LocalReference<'_>], reference_max_pixels: Option<usize>) -> Result<Vec<IndexedReference>, String> {
     let mut ordered = references.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|reference| reference.source_index);
     let mut previous = None;
@@ -55,12 +57,12 @@ pub fn decode_references(references: &[LocalReference<'_>]) -> Result<Vec<Indexe
                 return Err(format!("H3 reference source_index={} 重复", reference.source_index));
             }
             previous = Some(reference.source_index);
-            Ok(IndexedReference { source_index: reference.source_index, decoded: decode_reference(reference.path, reference.media_type)? })
+            Ok(IndexedReference { source_index: reference.source_index, decoded: decode_reference(reference.path, reference.media_type, reference_max_pixels)? })
         })
         .collect()
 }
 
-pub fn decode_control_references<T: serde::Serialize>(control: &T) -> Result<Vec<IndexedReference>, String> {
+pub fn decode_control_references<T: serde::Serialize>(control: &T, reference_max_pixels: Option<usize>) -> Result<Vec<IndexedReference>, String> {
     let value = serde_json::to_value(control).map_err(|error| format!("序列化 H3 control message 失败: {error}"))?;
     let root = value.as_object().ok_or("H3 control message 不是 object")?;
     let materialized = ["references", "reference_media", "media"].into_iter().find_map(|field| root.get(field).and_then(serde_json::Value::as_array).filter(|items| !items.is_empty()));
@@ -101,7 +103,7 @@ pub fn decode_control_references<T: serde::Serialize>(control: &T) -> Result<Vec
         }
     }
     let borrowed = owned.iter().map(|(source_index, path, media_type)| LocalReference { source_index: *source_index, path: path.as_path(), media_type }).collect::<Vec<_>>();
-    let decoded = decode_references(&borrowed);
+    let decoded = decode_references(&borrowed, reference_max_pixels);
     for path in temporary {
         let _ = fs::remove_file(path);
     }
@@ -233,17 +235,33 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, String> {
     Ok(output)
 }
 
-pub fn prepare_conditioning_media(references: Vec<IndexedReference>) -> Result<Vec<ConditioningMedia>, String> {
+pub fn prepare_conditioning_media(references: Vec<IndexedReference>, reference_image_max_pixels: Option<usize>, keyframe_size: Option<(usize, usize)>) -> Result<Vec<ConditioningMedia>, String> {
     references
         .into_iter()
         .map(|reference| match reference.decoded {
             DecodedReference::Image(image) => {
-                let visual_vae = h3_preprocess_reference_image(&image).map_err(|error| format!("H3 image {} VisualVAE preprocess: {error:?}", reference.source_index))?;
+                let visual_vae = if let Some((width, height)) = keyframe_size { h3_preprocess_keyframe(&image, width, height) } else { h3_preprocess_reference_image_with_max_pixels(&image, reference_image_max_pixels) }
+                    .map_err(|error| format!("H3 image {} VisualVAE preprocess: {error:?}", reference.source_index))?;
+                eprintln!("[h3-node] reference image index={} source={}x{} vae={}x{} max_pixels={reference_image_max_pixels:?}", reference.source_index, image.width, image.height, visual_vae.shape[2], visual_vae.shape[1]);
                 Ok(ConditioningMedia::Image { source_index: reference.source_index, qwen_image: image, visual_vae })
             }
             DecodedReference::Video { frames, audio } => {
-                let visual_vae = h3_preprocess_reference_video(&frames).map_err(|error| format!("H3 video {} VisualVAE preprocess: {error:?}", reference.source_index))?;
+                let ref2va_frames = evenly_sample_frames(&frames, crate::runtime::h3::conditioning::H3_VIDEO_CLIP_FRAMES)?;
+                let visual_vae = h3_preprocess_reference_video(&ref2va_frames, reference_image_max_pixels).map_err(|error| format!("H3 video {} VisualVAE preprocess: {error:?}", reference.source_index))?;
                 let (qwen_frames, qwen_timestamps) = qwen_video_frames(&frames)?;
+                if let (Some(frame), Some(clip)) = (frames.first(), visual_vae.first()) {
+                    eprintln!(
+                        "[h3-node] reference video index={} frames={} source={}x{} ref2va_frames={} vae={}x{} qwen_frames={} max_pixels={reference_image_max_pixels:?}",
+                        reference.source_index,
+                        frames.len(),
+                        frame.width,
+                        frame.height,
+                        ref2va_frames.len(),
+                        clip.input.shape[2],
+                        clip.input.shape[1],
+                        qwen_frames.len()
+                    );
+                }
                 Ok(ConditioningMedia::Video { source_index: reference.source_index, qwen_frames, qwen_timestamps, visual_vae, audio })
             }
             DecodedReference::Audio(samples) => Ok(ConditioningMedia::Audio { source_index: reference.source_index, samples }),
@@ -286,9 +304,9 @@ where
                 let mut clips = Vec::with_capacity(visual_vae.len());
                 for clip in visual_vae {
                     let condition = h3_encode_video_condition(backend, video_encoder, clip.input.values, clip.input.shape).map_err(backend_error)?;
-                    clips.push((condition, clip.drop_latent_tokens));
+                    clips.push(condition);
                 }
-                let video_condition = h3_join_video_conditions(backend, clips).map_err(backend_error)?;
+                let video_condition = h3_join_video_conditions(backend, clips, crate::runtime::h3::conditioning::H3_VIDEO_CLIP_TOKEN_DROP).map_err(backend_error)?;
                 let video_condition = h3_noise_video_condition(backend, video_condition, seed, timestep).map_err(backend_error)?;
                 let audio_condition = if let Some(samples) = audio {
                     let audio_encoder = audio_encoder.ok_or("H3 视频参考音轨缺少 audio encoder")?;
@@ -321,12 +339,13 @@ fn backend_error(error: crate::backend::BackendError) -> String {
     format!("{error:?}")
 }
 
-pub fn decode_reference(path: &Path, media_type: &str) -> Result<DecodedReference, String> {
+pub fn decode_reference(path: &Path, media_type: &str, reference_max_pixels: Option<usize>) -> Result<DecodedReference, String> {
     if media_type.starts_with("image/") {
         return RgbImage::open(path).map(DecodedReference::Image);
     }
     if media_type.starts_with("video/") {
-        let frames = decode_video(path)?;
+        let max_pixels = reference_max_pixels.unwrap_or(H3_REFERENCE_VIDEO_MAX_PIXELS).min(H3_REFERENCE_VIDEO_MAX_PIXELS);
+        let frames = decode_video_bounded(path, max_pixels, H3_REFERENCE_VIDEO_MAX_FRAMES)?;
         let audio = decode_audio(path)?.filter(|samples| !samples.is_empty());
         return Ok(DecodedReference::Video { frames, audio });
     }
@@ -338,6 +357,19 @@ pub fn decode_reference(path: &Path, media_type: &str) -> Result<DecodedReferenc
         return Ok(DecodedReference::Audio(samples));
     }
     Err(format!("H3 不支持参考媒体类型 {media_type:?}"))
+}
+
+fn evenly_sample_frames(frames: &[RgbImage], count: usize) -> Result<Vec<RgbImage>, String> {
+    if frames.is_empty() || count == 0 {
+        return Err("参考视频抽帧的输入和数量必须非零".to_owned());
+    }
+    if count == 1 {
+        return Ok(vec![frames[0].clone()]);
+    }
+    if frames.len() <= count {
+        return Ok(frames.to_vec());
+    }
+    Ok((0..count).map(|index| frames[index * (frames.len() - 1) / (count - 1)].clone()).collect())
 }
 
 pub fn reference_dimensions(path: &Path, media_type: &str) -> Result<Option<(usize, usize)>, String> {
@@ -364,4 +396,20 @@ fn decode_audio(path: &Path) -> Result<Option<Vec<f32>>, String> {
     }
     let samples = decoded.stdout.chunks_exact(4).map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).collect();
     Ok(Some(samples))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::evenly_sample_frames;
+    use crate::vision::RgbImage;
+
+    #[test]
+    fn ref2va_sampling_preserves_first_last_and_full_timeline() {
+        let frames = (0..88).map(|value| RgbImage::new(1, 1, vec![value, 0, 0]).unwrap()).collect::<Vec<_>>();
+        let sampled = evenly_sample_frames(&frames, 17).unwrap();
+        assert_eq!(sampled.len(), 17);
+        assert_eq!(sampled.first().unwrap().pixels[0], 0);
+        assert_eq!(sampled.last().unwrap().pixels[0], 87);
+        assert!(sampled.windows(2).all(|pair| pair[0].pixels[0] < pair[1].pixels[0]));
+    }
 }

@@ -60,6 +60,7 @@ pub(super) struct MoePrefillFunctions {
     router_logits_precise_rows4: usize,
     router_logits: usize,
     router_topk_256: usize,
+    router_topk_vl_256: usize,
     zero: usize,
     gather: usize,
     gather_bf16: usize,
@@ -116,6 +117,7 @@ pub(super) fn moe_prefill_functions(device_id: i32) -> Result<MoePrefillFunction
                 router_logits_precise_rows4: function("moe_router_logits_precise_rows4_f32")?,
                 router_logits: function("moe_router_logits_f32")?,
                 router_topk_256: function("moe_router_topk_256_f32")?,
+                router_topk_vl_256: function("moe_router_topk_vl_256_f32")?,
                 zero: function("moe_zero_f32")?,
                 gather: function("moe_gather_f32")?,
                 gather_bf16: function("moe_gather_bf16")?,
@@ -220,7 +222,7 @@ impl MoeRouteGraphBuffers {
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch(&self, device_id: i32, input: &DeviceBuffer, weight: &DeviceBuffer, bias: &DeviceBuffer, rows: usize, columns: usize, experts: usize, top_k: usize, scoring: u32, scaling: f32) -> Result<(), String> {
-        let len = launch_moe_route_resident_device_f32(device_id, input, weight, bias, rows, columns, experts, top_k, scoring, scaling, &self.logits, &self.expert_ids, &self.weights)?;
+        let len = launch_moe_route_resident_device_f32(device_id, input, weight, bias, None, None, rows, columns, experts, top_k, scoring, scaling, &self.logits, &self.expert_ids, &self.weights)?;
         if len != self.len {
             return Err(format!("ROCm graph route 数变化: {len}/{}", self.len));
         }
@@ -234,6 +236,8 @@ fn launch_moe_route_resident_device_f32(
     input: &DeviceBuffer,
     weight: &DeviceBuffer,
     bias: &DeviceBuffer,
+    bias_vl: Option<&DeviceBuffer>,
+    image_mask: Option<&[bool]>,
     rows: usize,
     columns: usize,
     experts: usize,
@@ -315,7 +319,24 @@ fn launch_moe_route_resident_device_f32(
         (&mut scaling_f32 as *mut f32).cast(),
     ];
     let topk_started = options().kernel_profile.then(std::time::Instant::now);
-    launch_moe_kernel(functions.router_topk_256, rows_u32, 1, 256, 0, &mut topk_arguments, "HIP MoE router top-k")?;
+    match (bias_vl, image_mask) {
+        (Some(bias_vl), Some(mask)) => {
+            if mask.len() != rows {
+                return Err(format!("ROCm MoE VL 路由 mask={} 与 rows={rows} 不一致", mask.len()));
+            }
+            validate_resident(bias_vl, device_id, experts.checked_mul(4).ok_or("ROCm MoE bias_vl 字节溢出")?, "MoE bias_vl")?;
+            let mask_bytes = mask.iter().map(|&image| image as u8).collect::<Vec<_>>();
+            let mask_device = DeviceBuffer::allocate(device_id, rows)?;
+            mask_device.copy_from_host(&mask_bytes)?;
+            let mut d_bias_vl = bias_vl.pointer;
+            let mut d_mask = mask_device.pointer;
+            let mut vl_arguments = topk_arguments.to_vec();
+            vl_arguments.insert(2, (&mut d_bias_vl as *mut *mut c_void).cast());
+            vl_arguments.insert(3, (&mut d_mask as *mut *mut c_void).cast());
+            launch_moe_kernel(functions.router_topk_vl_256, rows_u32, 1, 256, 0, &mut vl_arguments, "HIP MoE router top-k VL")?;
+        }
+        _ => launch_moe_kernel(functions.router_topk_256, rows_u32, 1, 256, 0, &mut topk_arguments, "HIP MoE router top-k")?,
+    }
     if let Some(started) = topk_started {
         synchronize_device(device_id, "MoE router top-k profile")?;
         eprintln!("[rocm-kernel] moe-router-topk device={device_id} rows={rows} wall={:.6}s", started.elapsed().as_secs_f64());
@@ -1012,6 +1033,8 @@ pub(crate) fn try_moe_route_resident_device_f32(
     input: &DeviceBuffer,
     weight: &DeviceBuffer,
     bias: &DeviceBuffer,
+    bias_vl: Option<&DeviceBuffer>,
+    image_mask: Option<&[bool]>,
     rows: usize,
     columns: usize,
     experts: usize,
@@ -1026,7 +1049,7 @@ pub(crate) fn try_moe_route_resident_device_f32(
     // stream-ordered 临时块再 deferred D2D 时源生命周期与 peer event 交错。
     let ids = DeviceBuffer::allocate_peer(device_id, route_bytes)?;
     let weights = DeviceBuffer::allocate_peer(device_id, route_bytes)?;
-    let len = launch_moe_route_resident_device_f32(device_id, input, weight, bias, rows, columns, experts, top_k, scoring, scaling, &logits, &ids, &weights)?;
+    let len = launch_moe_route_resident_device_f32(device_id, input, weight, bias, bias_vl, image_mask, rows, columns, experts, top_k, scoring, scaling, &logits, &ids, &weights)?;
     Ok(RocmMoeRoute { expert_ids: ids, weights, len })
 }
 
@@ -1036,6 +1059,8 @@ pub(crate) fn with_moe_route_resident_device_f32<R>(
     input: &DeviceBuffer,
     weight: &DeviceBuffer,
     bias: &DeviceBuffer,
+    bias_vl: Option<&DeviceBuffer>,
+    image_mask: Option<&[bool]>,
     rows: usize,
     columns: usize,
     experts: usize,
@@ -1050,7 +1075,7 @@ pub(crate) fn with_moe_route_resident_device_f32<R>(
         let logits = workspace.buffer(0);
         let ids = workspace.buffer(1);
         let weights = workspace.buffer(2);
-        let len = launch_moe_route_resident_device_f32(device_id, input, weight, bias, rows, columns, experts, top_k, scoring, scaling, logits, ids, weights)?;
+        let len = launch_moe_route_resident_device_f32(device_id, input, weight, bias, bias_vl, image_mask, rows, columns, experts, top_k, scoring, scaling, logits, ids, weights)?;
         run(ids, weights, len)
     })
 }
@@ -1061,6 +1086,8 @@ pub fn try_moe_route_resident_f32(
     input: &DeviceBuffer,
     weight: &DeviceBuffer,
     bias: &DeviceBuffer,
+    bias_vl: Option<&DeviceBuffer>,
+    image_mask: Option<&[bool]>,
     rows: usize,
     columns: usize,
     experts: usize,
@@ -1068,7 +1095,7 @@ pub fn try_moe_route_resident_f32(
     scoring: u32,
     scaling: f32,
 ) -> Result<(Vec<u32>, Vec<f32>), String> {
-    let route = try_moe_route_resident_device_f32(device_id, input, weight, bias, rows, columns, experts, top_k, scoring, scaling)?;
+    let route = try_moe_route_resident_device_f32(device_id, input, weight, bias, bias_vl, image_mask, rows, columns, experts, top_k, scoring, scaling)?;
     let mut expert_ids = vec![0_u32; route.len];
     route.expert_ids.copy_to_host(unsafe { std::slice::from_raw_parts_mut(expert_ids.as_mut_ptr().cast(), route.len * 4) })?;
     let mut route_weights = vec![0.0_f32; route.len];
@@ -1575,10 +1602,43 @@ mod tests {
             let weight_buf = DeviceBuffer::upload_f32(device_id, &weight).unwrap();
             let bias_bytes = unsafe { std::slice::from_raw_parts(bias.as_ptr().cast::<u8>(), bias.len() * 4) };
             let bias_buf = DeviceBuffer::upload(device_id, bias_bytes).unwrap();
-            let (ids, weights) = try_moe_route_resident_f32(device_id, &input_buf, &weight_buf, &bias_buf, rows, columns, experts, top_k, 2, scaling).expect("router");
+            let (ids, weights) = try_moe_route_resident_f32(device_id, &input_buf, &weight_buf, &bias_buf, None, None, rows, columns, experts, top_k, 2, scaling).expect("router");
             assert_eq!(ids, expected.experts, "experts={experts} ids {ids:?} != {:?}", expected.experts);
             for (index, (actual, expected)) in weights.iter().zip(expected.weights.iter()).enumerate() {
                 assert!((actual - expected).abs() <= 1.0e-5 + expected.abs() * 1.0e-3, "experts={experts} index={index} actual={actual} expected={expected}");
+            }
+        }
+    }
+
+    /// DeepSeek-V4.1 VL 双偏置:image 行按 bias_vl 选专家,文本行按 bias;
+    /// 路由权重两行一致(均来自无偏分数)。
+    #[test]
+    fn router_topk_vl_dual_bias_matches_cpu_oracle() {
+        if !super::super::is_hip_available() {
+            eprintln!("[router-topk-vl] 跳过：本机未检测到 ROCm 运行时");
+            return;
+        }
+        let (device_id, rows, columns, top_k, scaling) = (0, 6usize, 128usize, 4usize, 1.5_f32);
+        let experts = 33usize;
+        let input: Vec<f32> = (0..rows * columns).map(|index: usize| (index as f32 * 0.031).sin()).collect();
+        let weight: Vec<f32> = (0..experts * columns).map(|index: usize| (index as f32 * 0.017).cos()).collect();
+        let bias: Vec<f32> = (0..experts).map(|index: usize| (index as f32 * 0.05).sin()).collect();
+        let bias_vl: Vec<f32> = (0..experts).map(|index: usize| -(index as f32 * 0.07).cos()).collect();
+        let mask = [false, true, false, true, true, false];
+        let input_buf = DeviceBuffer::upload_f32(device_id, &input).unwrap();
+        let weight_buf = DeviceBuffer::upload_f32(device_id, &weight).unwrap();
+        let upload = |values: &[f32]| DeviceBuffer::upload(device_id, unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) }).unwrap();
+        let bias_buf = upload(&bias);
+        let bias_vl_buf = upload(&bias_vl);
+        let (ids, weights) = try_moe_route_resident_f32(device_id, &input_buf, &weight_buf, &bias_buf, Some(&bias_vl_buf), Some(&mask), rows, columns, experts, top_k, 2, scaling).expect("router");
+        for row in 0..rows {
+            let logits: Vec<f32> = (0..experts).map(|expert| input[row * columns..(row + 1) * columns].iter().zip(&weight[expert * columns..(expert + 1) * columns]).map(|(&x, &w)| x * w).sum()).collect();
+            let chosen_bias = if mask[row] { &bias_vl } else { &bias };
+            let expected = crate::moe::routing::route_sqrt_softplus_bias_logits(&logits, chosen_bias, top_k, scaling).expect("oracle");
+            let actual_ids = &ids[row * top_k..(row + 1) * top_k];
+            assert_eq!(actual_ids, expected.experts.as_slice(), "row={row} mask={} ids {actual_ids:?} != {:?}", mask[row], expected.experts);
+            for (index, (actual, expected)) in weights[row * top_k..(row + 1) * top_k].iter().zip(expected.weights.iter()).enumerate() {
+                assert!((actual - expected).abs() <= 1.0e-5 + expected.abs() * 1.0e-3, "row={row} index={index} actual={actual} expected={expected}");
             }
         }
     }

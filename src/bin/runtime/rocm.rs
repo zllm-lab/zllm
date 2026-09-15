@@ -82,6 +82,8 @@ fn rocm_kv_f16(config: &zllm::config::RuntimeProcessConfig) -> bool {
             NodeModelConfig::Ornith(model) => model.execution.kv_cache_format == KvCacheFormat::F16,
             NodeModelConfig::Glm52(model) => model.execution.kv_cache_format == KvCacheFormat::F16,
             NodeModelConfig::MinimaxH3(_) => false,
+            NodeModelConfig::Flux2Klein(_) => false,
+            NodeModelConfig::Seedvr2(_) => false,
             NodeModelConfig::DeepseekV4(_) => false,
             // 尚无 ROCm node engine,保持默认 KV 格式;真正拒绝运行由入口层负责。
             NodeModelConfig::Gemma4(_)
@@ -101,6 +103,8 @@ fn rocm_kv_f16(config: &zllm::config::RuntimeProcessConfig) -> bool {
             NodeModelConfig::Glm52(model) => model.execution.kv_cache_format == KvCacheFormat::F16,
             NodeModelConfig::Ornith(model) => model.execution.kv_cache_format == KvCacheFormat::F16,
             NodeModelConfig::MinimaxH3(_) => false,
+            NodeModelConfig::Flux2Klein(_) => false,
+            NodeModelConfig::Seedvr2(_) => false,
             NodeModelConfig::DeepseekV4(_) => false,
             NodeModelConfig::Gemma4(_)
             | NodeModelConfig::Qwen36(_)
@@ -161,6 +165,7 @@ fn configure_backend(backend: &zllm::config::RocmBackendConfig, kv_f16: bool) ->
         backend.dsa_hisa_shadow_samples,
         backend.dsa_cpu_select,
         backend.mla_cpu_hot_rows,
+        backend.mla_gpu_resident_reserve_bytes,
         backend.prefill_attention_cpu,
         backend.mla_hot_trace,
         backend.precise_router,

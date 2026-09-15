@@ -21,7 +21,9 @@ use crate::{
     },
     weight::{
         container::gguf::GgufMatrix,
-        expert_source::GgufExpertWeights,
+        expert_source::{GgufExpertWeights, Mxfp4ExpertWeights},
+        format::mxfp4::Mxfp4Matrix,
+        format::mxfp8::Mxfp8Matrix,
         format::nvfp4::{Nvfp4ExpertWeights, Nvfp4Matrix},
     },
 };
@@ -99,6 +101,24 @@ pub fn nvfp4_expert_batch(input: &CpuTensor, weights: &Nvfp4ExpertWeights, activ
     nvfp4_matmul_batch(&activated, &weights.down, &mut scratch)
 }
 
+pub fn mxfp4_expert_batch(input: &CpuTensor, weights: &Mxfp4ExpertWeights, activation: &Activation) -> Result<CpuTensor, String> {
+    let mut scratch = Vec::new();
+    let gate = mxfp4_matmul_batch(input, &weights.gate, &mut scratch)?;
+    let up = mxfp4_matmul_batch(input, &weights.up, &mut scratch)?;
+    let activated = activate(&gate, &up, activation);
+    mxfp4_matmul_batch(&activated, &weights.down, &mut scratch)
+}
+
+/// MXFP8 expert 权重没有独立 struct:source 以 `load_expert_into` 写入调用方分配的
+/// 矩阵,这里直接接收三个矩阵。
+pub fn mxfp8_expert_batch(input: &CpuTensor, gate: &Mxfp8Matrix, up: &Mxfp8Matrix, down: &Mxfp8Matrix, activation: &Activation) -> Result<CpuTensor, String> {
+    let mut scratch = Vec::new();
+    let gate = mxfp8_matmul_batch(input, gate, &mut scratch)?;
+    let up = mxfp8_matmul_batch(input, up, &mut scratch)?;
+    let activated = activate(&gate, &up, activation);
+    mxfp8_matmul_batch(&activated, down, &mut scratch)
+}
+
 pub fn gguf_expert_batch(input: &CpuTensor, weights: &GgufExpertWeights, activation: &Activation) -> Result<CpuTensor, String> {
     let gate = gguf_matmul_batch(input, &weights.gate)?;
     let up = gguf_matmul_batch(input, &weights.up)?;
@@ -130,4 +150,43 @@ fn nvfp4_matmul_batch(input: &CpuTensor, weight: &Nvfp4Matrix, scratch: &mut Vec
         matmul(&input.data, scratch, input.rows, weight.cols, weight.rows, &mut output.data);
     }
     output
+}
+
+/// 单 token 走在线 GEMV;多 token 才反量化进复用 scratch,避免 decode 阶段展开整块专家。
+fn mxfp4_matmul_batch(input: &CpuTensor, weight: &Mxfp4Matrix, scratch: &mut Vec<f32>) -> Result<CpuTensor, String> {
+    if input.cols != weight.cols() {
+        return Err(format!("MXFP4 expert input cols={}，weight=[{},{}]", input.cols, weight.rows(), weight.cols()));
+    }
+    let mut output = CpuTensor { data: vec![0.0; input.rows * weight.rows()], rows: input.rows, cols: weight.rows() };
+    if input.rows == 1 {
+        super::mxfp::matvec_mxfp4_matrix(weight.packed(), weight.scales(), weight.rows(), weight.cols(), &input.data, &mut output.data)?;
+        return Ok(output);
+    }
+
+    scratch.resize(weight.rows() * weight.cols(), 0.0);
+    for row in 0..weight.rows() {
+        weight.dequantize_row(row, &mut scratch[row * weight.cols()..(row + 1) * weight.cols()])?;
+    }
+    if !blas::sgemm_nt(input.rows, weight.rows(), weight.cols(), 1.0, &input.data, scratch, &mut output.data) {
+        matmul(&input.data, scratch, input.rows, weight.cols(), weight.rows(), &mut output.data);
+    }
+    Ok(output)
+}
+
+fn mxfp8_matmul_batch(input: &CpuTensor, weight: &Mxfp8Matrix, scratch: &mut Vec<f32>) -> Result<CpuTensor, String> {
+    if input.cols != weight.cols {
+        return Err(format!("MXFP8 expert input cols={}，weight=[{},{}]", input.cols, weight.rows, weight.cols));
+    }
+    let mut output = CpuTensor { data: vec![0.0; input.rows * weight.rows], rows: input.rows, cols: weight.rows };
+    if input.rows == 1 {
+        super::mxfp::matvec_mxfp8_matrix(weight.codes(), weight.scale_inv(), weight.rows, weight.cols, &input.data, &mut output.data)?;
+        return Ok(output);
+    }
+
+    scratch.resize(weight.rows * weight.cols, 0.0);
+    crate::weight::codec::mxfp8::decode_mxfp8_matrix(weight.codes(), weight.scale_inv(), weight.rows, weight.cols, scratch);
+    if !blas::sgemm_nt(input.rows, weight.rows, weight.cols, 1.0, &input.data, scratch, &mut output.data) {
+        matmul(&input.data, scratch, input.rows, weight.cols, weight.rows, &mut output.data);
+    }
+    Ok(output)
 }

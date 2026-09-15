@@ -14,6 +14,14 @@ enum RocmDsaOwnership {
     BlockParity,
 }
 
+/// 指逻辑 token 页；两张卡分别持有该页的 block parity，合计不翻倍。
+const DSA_GROWTH_PAGE_ROWS: usize = 4096;
+
+fn sequence_shard_page_rows(rows: usize, capacity: usize, parity: usize) -> usize {
+    let logical = rows.div_ceil(DSA_GROWTH_PAGE_ROWS).saturating_mul(DSA_GROWTH_PAGE_ROWS).min(capacity);
+    parity_rows(logical, parity).max(1).min(parity_rows(capacity, parity))
+}
+
 fn parity_rows(rows: usize, parity: usize) -> usize {
     let blocks = rows / ROCM_KV_BLOCK_SIZE;
     let tail = rows % ROCM_KV_BLOCK_SIZE;
@@ -284,6 +292,8 @@ pub struct RocmDsaState {
     cpu: CpuDsaState,
     layers: Vec<Option<RocmPagedDsaLayer>>,
     capacity: usize,
+    /// 实时准入启用后按小页增长，避免最大输出预留和几何翻倍扩容。
+    paged_growth: bool,
     head_dim: usize,
     key_group_size: usize,
     hadamard_i8: bool,
@@ -633,6 +643,14 @@ impl RocmDsaState {
         head_dim.checked_add(head_dim / group * 2).ok_or_else(|| format!("ROCm DSA head_dim={head_dim} 行宽溢出"))
     }
 
+    pub(crate) fn minimum_sequence_shard_bytes(rows: usize, capacity: usize, head_dim: usize) -> Result<[usize; 2], String> {
+        if rows == 0 || rows > capacity {
+            return Err(format!("DSA minimum reservation rows={rows} capacity={capacity} 非法"));
+        }
+        let row_bytes = Self::key_bytes_per_token(head_dim)?;
+        Ok([0, 1].map(|parity| sequence_shard_page_rows(rows, capacity, parity).saturating_mul(row_bytes)))
+    }
+
     pub fn new(layer_count: usize, capacity: usize, head_dim: usize, top_k: usize) -> Result<Self, String> {
         let key_group_size = Self::key_group_size(head_dim)?;
         let hadamard_i8 = ops::hip::options().dsa_hadamard_i8 && head_dim == 128 && key_group_size == head_dim;
@@ -641,6 +659,7 @@ impl RocmDsaState {
         let cpu_select = ops::hip::options().dsa_cpu_select && !hadamard_i8 && head_dim == 128 && key_group_size == head_dim;
         Ok(Self {
             cpu: CpuDsaState::new(layer_count, capacity, head_dim, top_k)?,
+            paged_growth: false,
             layers: (0..layer_count).map(|_| None).collect(),
             capacity,
             head_dim,
@@ -1551,9 +1570,7 @@ impl RocmDsaState {
         let kpool_probe_path = std::env::var("ZLLM_DSA_KPOOL_EXPORT").ok().filter(|path| !path.is_empty());
         let kpool_probe_layers: Option<Vec<usize>> = std::env::var("ZLLM_DSA_KPOOL_LAYERS").ok().map(|value| value.split(',').filter_map(|item| item.trim().parse().ok()).collect());
         let kpool_probe_tokens = std::env::var("ZLLM_DSA_KPOOL_TOKENS").ok().and_then(|value| value.parse().ok()).unwrap_or(3);
-        let kpool_probe_active = kpool_probe_path.is_some()
-            && kpool_probe_layers.as_ref().is_none_or(|layers| layers.contains(&layer))
-            && self.kpool_probe_counts.get(layer).copied().unwrap_or_default() < kpool_probe_tokens;
+        let kpool_probe_active = kpool_probe_path.is_some() && kpool_probe_layers.as_ref().is_none_or(|layers| layers.contains(&layer)) && self.kpool_probe_counts.get(layer).copied().unwrap_or_default() < kpool_probe_tokens;
         let sample_shadow = !hadamard && self.kpool == 0 && query.rows == 1 && (self.hadamard_shadow_counts.get(layer).copied().unwrap_or_default() < self.hadamard_shadow_samples || kpool_probe_active);
         if sample_shadow {
             // 必须在 coarse 调用覆盖同一 score workspace 前读取 exact 分数。
@@ -1592,12 +1609,24 @@ impl RocmDsaState {
                     file.write_all(&(self.head_dim as u32).to_le_bytes())?;
                     file.write_all(&(self.key_group_size as u32).to_le_bytes())?;
                     file.write_all(&(self.top_k as u32).to_le_bytes())?;
-                    for &v in &exact_selection { file.write_all(&v.to_le_bytes())?; }
-                    for &v in &exact_scores { file.write_all(&v.to_le_bytes())?; }
-                    for &v in &key_codes { file.write_all(&v.to_le_bytes())?; }
-                    for &v in &scale_bits { file.write_all(&v.to_le_bytes())?; }
-                    for &v in &query_host { file.write_all(&v.to_le_bytes())?; }
-                    for &v in &weight_host { file.write_all(&v.to_le_bytes())?; }
+                    for &v in &exact_selection {
+                        file.write_all(&v.to_le_bytes())?;
+                    }
+                    for &v in &exact_scores {
+                        file.write_all(&v.to_le_bytes())?;
+                    }
+                    for &v in &key_codes {
+                        file.write_all(&v.to_le_bytes())?;
+                    }
+                    for &v in &scale_bits {
+                        file.write_all(&v.to_le_bytes())?;
+                    }
+                    for &v in &query_host {
+                        file.write_all(&v.to_le_bytes())?;
+                    }
+                    for &v in &weight_host {
+                        file.write_all(&v.to_le_bytes())?;
+                    }
                     Ok(())
                 })();
                 match export {
@@ -1930,17 +1959,22 @@ impl RocmDsaState {
             let Some(record) = self.pending_pair_layers[index].take() else { continue };
             let owner_rows = parity_rows(record.rows, 0);
             let peer_rows = parity_rows(record.rows, 1);
-            let owner_capacity = parity_rows(reserved_rows.max(record.rows), 0).max(owner_rows);
-            let peer_capacity = parity_rows(reserved_rows.max(record.rows), 1).max(peer_rows);
+            let capacity = |parity| if self.paged_growth { sequence_shard_page_rows(reserved_rows.max(record.rows), self.capacity, parity) } else { parity_rows(reserved_rows.max(record.rows), parity).max(1) };
+            let owner_capacity = capacity(0).max(owner_rows);
+            let peer_capacity = capacity(1).max(peer_rows);
+            // 不足一个 block 的历史允许另一半为空，仍预留首行给后续 append。
+            let upload = |device_id, bytes: &[u8], capacity| {
+                if bytes.is_empty() { ops::hip::DeviceBuffer::allocate_cache(device_id, capacity).map(Arc::new).map_err(compute_error) } else { upload_cache_buffer(device_id, bytes, capacity) }
+            };
             let owner_keys = split_parity_bytes(&record.keys, record.rows, self.head_dim, 0)?;
             let peer_keys = split_parity_bytes(&record.keys, record.rows, self.head_dim, 1)?;
             let scale_row_bytes = groups * 2;
             let owner_scales = split_parity_bytes(&record.scales, record.rows, scale_row_bytes, 0)?;
             let peer_scales = split_parity_bytes(&record.scales, record.rows, scale_row_bytes, 1)?;
-            owner.activate().map_err(compute_error)?;
+            ops::hip::set_device(owner.device_id).map_err(compute_error)?;
             self.layers[index] = Some(RocmPagedDsaLayer {
-                keys: upload_cache_buffer(owner.device_id, &owner_keys, owner_capacity * self.head_dim)?,
-                scales: upload_cache_buffer(owner.device_id, &owner_scales, owner_capacity * scale_row_bytes)?,
+                keys: upload(owner.device_id, &owner_keys, owner_capacity * self.head_dim)?,
+                scales: upload(owner.device_id, &owner_scales, owner_capacity * scale_row_bytes)?,
                 cpu_keys: None,
                 cpu_mirror: None,
                 cpu_offloaded: false,
@@ -1959,14 +1993,13 @@ impl RocmDsaState {
             });
             peer.activate().map_err(compute_error)?;
             self.cooperative_peer.as_mut().expect("DSA peer 已创建").layers[index] = Some(RocmCooperativeDsaLayer {
-                keys: upload_cache_buffer(peer.device_id, &peer_keys, peer_capacity * self.head_dim)?,
-                scales: upload_cache_buffer(peer.device_id, &peer_scales, peer_capacity * scale_row_bytes)?,
+                keys: upload(peer.device_id, &peer_keys, peer_capacity * self.head_dim)?,
+                scales: upload(peer.device_id, &peer_scales, peer_capacity * scale_row_bytes)?,
                 rows: record.rows,
                 committed_rows: peer_capacity,
             });
         }
-        owner.activate().map_err(compute_error)?;
-        peer.activate().map_err(compute_error)?;
+        ops::hip::set_device(owner.device_id).map_err(compute_error)?;
         Ok(())
     }
 
@@ -1978,15 +2011,57 @@ impl RocmDsaState {
         }
     }
 
+    /// 激活时只准备已有前缀及下一小段，两份分块随后按逻辑 token 页增长。
+    pub(crate) fn reserve_sequence_shard_rows(&mut self, owner: &RocmContext, peer: &RocmContext, layers: std::ops::Range<usize>, rows: usize) -> Result<(), BackendError> {
+        if rows == 0 || rows > self.capacity {
+            return Err(compute_error(format!("DSA reserve rows={rows} capacity={} 非法", self.capacity)));
+        }
+        self.paged_growth = true;
+        self.ensure_sequence_shard_peer(owner, peer, layers.start)?;
+        for layer in layers {
+            self.ensure_sequence_shard_layer_inner(owner, layer, rows, 0, true)?;
+            self.ensure_sequence_shard_layer_inner(peer, layer, rows, 1, true)?;
+        }
+        ops::hip::set_device(owner.device_id).map_err(compute_error)
+    }
+
+    pub(crate) fn sequence_shard_reservation_bytes(&self, layers: std::ops::Range<usize>, rows: usize) -> Result<[usize; 2], BackendError> {
+        if rows == 0 || rows > self.capacity {
+            return Err(compute_error(format!("DSA reserve rows={rows} capacity={} 非法", self.capacity)));
+        }
+        let row_bytes = self.head_dim + self.head_dim / self.key_group_size * 2;
+        let mut bytes = [0usize; 2];
+        for layer in layers {
+            let current = [
+                self.layers.get(layer).and_then(Option::as_ref).map_or(0, |cached| cached.committed_rows),
+                self.cooperative_peer.as_ref().and_then(|peer| peer.layers.get(layer)).and_then(Option::as_ref).map_or(0, |cached| cached.committed_rows),
+            ];
+            for parity in 0..2 {
+                let required = sequence_shard_page_rows(rows, self.capacity, parity);
+                if current[parity] < required {
+                    bytes[parity] = bytes[parity].saturating_add(required.saturating_mul(row_bytes));
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     fn ensure_sequence_shard_layer(&mut self, context: &RocmContext, layer: usize, global_end: usize, parity: usize) -> Result<(), BackendError> {
+        self.ensure_sequence_shard_layer_inner(context, layer, global_end, parity, false)
+    }
+
+    fn ensure_sequence_shard_layer_inner(&mut self, context: &RocmContext, layer: usize, global_end: usize, parity: usize, reserve: bool) -> Result<(), BackendError> {
         let required_rows = parity_rows(global_end, parity);
         let physical_capacity = parity_rows(self.capacity, parity);
         let required_storage = required_rows.max(1);
         let groups = self.head_dim / self.key_group_size;
+        let committed = |current: usize| -> Result<usize, BackendError> {
+            if reserve || self.paged_growth { Ok(current.max(sequence_shard_page_rows(global_end, self.capacity, parity))) } else { committed_cache_rows(current, required_storage, physical_capacity) }
+        };
         if parity == 0 {
             let slot = self.layers.get_mut(layer).ok_or(BackendError::UnsupportedLayer { layer })?;
             if slot.is_none() {
-                let committed_rows = committed_cache_rows(0, required_storage, physical_capacity)?;
+                let committed_rows = committed(0)?;
                 *slot = Some(RocmPagedDsaLayer {
                     keys: Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, committed_rows * self.head_dim).map_err(compute_error)?),
                     scales: Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, committed_rows * groups * 2).map_err(compute_error)?),
@@ -2011,7 +2086,7 @@ impl RocmDsaState {
             if global_end < cached.rows {
                 return Err(compute_error(format!("L{layer} DSA owner shard end={global_end} 小于 rows={}", cached.rows)));
             }
-            let next = committed_cache_rows(cached.committed_rows, required_storage, physical_capacity)?;
+            let next = committed(cached.committed_rows)?;
             if next > cached.committed_rows {
                 let used = parity_rows(cached.rows, parity);
                 cached.keys = grow_cache_buffer(context.device_id, &cached.keys, used * self.head_dim, next * self.head_dim)?;
@@ -2023,7 +2098,7 @@ impl RocmDsaState {
             let peer = self.cooperative_peer.as_mut().expect("DSA peer shard 已创建");
             let slot = peer.layers.get_mut(layer).ok_or(BackendError::UnsupportedLayer { layer })?;
             if slot.is_none() {
-                let committed_rows = committed_cache_rows(0, required_storage, physical_capacity)?;
+                let committed_rows = committed(0)?;
                 *slot = Some(RocmCooperativeDsaLayer {
                     keys: Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, committed_rows * self.head_dim).map_err(compute_error)?),
                     scales: Arc::new(ops::hip::DeviceBuffer::allocate_cache(context.device_id, committed_rows * groups * 2).map_err(compute_error)?),
@@ -2035,7 +2110,7 @@ impl RocmDsaState {
             if global_end < cached.rows {
                 return Err(compute_error(format!("L{layer} DSA peer shard end={global_end} 小于 rows={}", cached.rows)));
             }
-            let next = committed_cache_rows(cached.committed_rows, required_storage, physical_capacity)?;
+            let next = committed(cached.committed_rows)?;
             if next > cached.committed_rows {
                 let used = parity_rows(cached.rows, parity);
                 cached.keys = grow_cache_buffer(context.device_id, &cached.keys, used * self.head_dim, next * self.head_dim)?;
@@ -2153,10 +2228,9 @@ impl RocmDsaState {
             peer.activate().map_err(compute_error)?;
             ops::hip::DeviceBuffer::copy_stable_group_into_device_ordered_async_retained_by(&sources, &targets, peer.device_id, owner.device_id)
                 .map_err(|error| compute_error(format!("L{layer} cooperative DSA append owner->peer: {error}")))?;
-            // 拷贝读 staging 源发生在 peer 流,而源缓冲的释放只由 owner 侧
-            // completion 门控(单设备 completion 不覆盖 peer 流);owner 线程在
-            // 此同步 peer 流到本次拷贝,释放才绝对安全。
-            peer.synchronize_compute_stream()?;
+            // owner 的 completion 必须覆盖 peer 对 staging 的读取；只在 GPU
+            // 上连回 owner 流，不逐层阻塞主机提交线程。
+            ops::hip::order_device_stream_after(peer.device_id, ops::hip::compute_stream_for(peer.device_id) as usize, owner.device_id, 0).map_err(compute_error)?;
         }
         trace_step("owner-to-peer");
         peer_cached.rows = end;
@@ -2201,7 +2275,8 @@ impl RocmDsaState {
             let cached = peer_state.layers[layer].as_ref().expect("DSA peer layer 已创建");
             (cached.keys.clone(), cached.scales.clone(), peer_state.block_table.get("DSA peer parity", parity_rows(self.capacity, 1), peer.device_id, parity_rows(end, 1).max(1))?, peer.device_id)
         };
-        owner.activate().map_err(compute_error)?;
+        // 保留调度器激活的流；activate() 会改回 context 默认流，越过上游 key 生产。
+        ops::hip::set_device(owner.device_id).map_err(compute_error)?;
         ops::hip::try_paged_dsa_append_layernorm_rope_q8_remote(
             owner.device_id,
             cache_device,
@@ -2334,26 +2409,13 @@ impl RocmDsaState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn select_sequence_sharded_parallel(
-        &mut self,
-        owner: &RocmContext,
-        operator: &super::expert::RocmOperatorPeer,
-        layer: usize,
-        query: &RocmTensor,
-        head_weights: &RocmTensor,
-    ) -> Result<bool, BackendError> {
+    pub(super) fn select_sequence_sharded_parallel(&mut self, owner: &RocmContext, operator: &super::expert::RocmOperatorPeer, layer: usize, query: &RocmTensor, head_weights: &RocmTensor) -> Result<bool, BackendError> {
         self.select_sequence_sharded_core(owner, &operator.context, &operator.worker, layer, query, head_weights)
     }
 
-    fn select_sequence_sharded_core(
-        &mut self,
-        owner: &RocmContext,
-        peer: &RocmContext,
-        worker: &super::RocmPairWorker,
-        layer: usize,
-        query: &RocmTensor,
-        head_weights: &RocmTensor,
-    ) -> Result<bool, BackendError> {
+    fn select_sequence_sharded_core(&mut self, owner: &RocmContext, peer: &RocmContext, worker: &super::RocmPairWorker, layer: usize, query: &RocmTensor, head_weights: &RocmTensor) -> Result<bool, BackendError> {
+        // 上游跨卡操作可能改变 current device，保持 owner 的调度流再准备选择。
+        ops::hip::set_device(owner.device_id).map_err(compute_error)?;
         let context_rows = self.layers.get(layer).and_then(Option::as_ref).ok_or_else(|| compute_error(format!("L{layer} DSA owner sequence shard 缺失")))?.rows;
         let query_rows = query.rows;
         if query.cols == 0 || !query.cols.is_multiple_of(self.head_dim) || head_weights.rows != query_rows {
@@ -2387,9 +2449,9 @@ impl RocmDsaState {
         };
         ops::hip::DeviceBuffer::copy_stable_group_into_device_ordered_async_retained_by(&sources, &[(peer_query_buf.as_ref(), 0), (peer_weights_buf.as_ref(), 0)], peer.device_id, owner.device_id)
             .map_err(|error| compute_error(format!("L{layer} DSA parallel shard query owner->peer: {error}")))?;
-        // 同 append:拷贝在 peer 流上读 owner 侧源,单设备 completion 不覆盖;
-        // 此刻 peer select 尚未提交,同步只等本次拷贝,等待极短。
-        peer.synchronize_compute_stream()?;
+        // peer select 后的候选回传已把整条 peer 流连回 owner completion，
+        // 同时覆盖 query/weights 的读取；此处不再让 owner 等一次入向拷贝。
+        ops::hip::set_device(owner.device_id).map_err(compute_error)?;
 
         let (peer_keys, peer_scales, peer_table) = {
             let peer_state = self.cooperative_peer.as_mut().expect("DSA parallel shard peer 已创建");
@@ -2429,6 +2491,16 @@ impl RocmDsaState {
         let owner_keys = cached.keys.clone();
         let owner_scales = cached.scales.clone();
         let owner_table = self.block_table.get("DSA owner parity", parity_rows(self.capacity, 0), owner.device_id, parity_rows(context_rows, 0).max(1))?;
+        if super::context::probe_sync_mask(256) {
+            let active = ops::hip::active_compute_stream();
+            eprintln!(
+                "[probe-launch] L{layer} owner select 前: active={active:p} tls_owner={:p} tls_peer={:p} owner={} peer={}",
+                ops::hip::compute_stream_for(owner.device_id),
+                ops::hip::compute_stream_for(peer.device_id),
+                owner.device_id,
+                peer.device_id
+            );
+        }
         let owner_selection = ops::hip::try_dsa_select_paged_q8_sequence_shard(
             owner.device_id,
             &owner_keys,
@@ -2455,8 +2527,14 @@ impl RocmDsaState {
         let copied = ops::hip::DeviceBuffer::copy_stable_group_to_device_ordered_async_retained_by(&[peer_tokens, peer_scores], owner.device_id, owner.device_id)
             .map_err(|error| compute_error(format!("L{layer} DSA parallel shard candidates peer->owner: {error}")))?;
         let [peer_tokens, peer_scores]: [ops::hip::DeviceBuffer; 2] = copied.try_into().map_err(|_| compute_error(format!("L{layer} DSA parallel shard candidate copy 数量异常")))?;
+        if super::context::probe_sync_mask(128) {
+            owner.synchronize_compute_stream().map_err(|error| compute_error(format!("probe-sync cand-copy L{layer}: {error:?}")))?;
+        }
         let peer_selection = ops::hip::DsaSequenceShardSelection { selection: peer_tokens, scores: peer_scores, width: self.top_k };
         let selection = ops::hip::try_dsa_merge_sequence_shard_topk(owner.device_id, &owner_selection, &peer_selection, query_rows, self.top_k).map_err(compute_error)?;
+        if super::context::probe_sync_mask(16) {
+            owner.synchronize_compute_stream().map_err(|error| compute_error(format!("probe-sync sel-owner L{layer}: {error:?}")))?;
+        }
         self.selection = Some(Arc::new(selection));
         self.selection_host = None;
         self.selection_rows = query_rows;
@@ -2914,6 +2992,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sequence_shard_growth_pages_bound_unused_rows() {
+        for capacity in [4096, 8193, 1_048_576] {
+            for rows in [1, 4095, 4096, 4097, 8192, 8193, 524_289, 1_048_576] {
+                if rows > capacity {
+                    continue;
+                }
+                let owner = sequence_shard_page_rows(rows, capacity, 0);
+                let peer = sequence_shard_page_rows(rows, capacity, 1);
+                assert!(owner >= parity_rows(rows, 0));
+                assert!(peer >= parity_rows(rows, 1));
+                assert!(owner + peer >= rows && owner + peer <= capacity);
+                assert!(owner + peer - rows < DSA_GROWTH_PAGE_ROWS);
+            }
+        }
+        assert_eq!(sequence_shard_page_rows(4096, 1_048_576, 0), 2048);
+        assert_eq!(sequence_shard_page_rows(4097, 1_048_576, 0), 4096);
+        assert_eq!(sequence_shard_page_rows(524_289, 1_048_576, 0), 264_192);
+    }
+
+    #[test]
+    #[ignore = "需要两张 ROCm GPU"]
+    fn sequence_shard_page_growth_preserves_history() {
+        let owner = RocmContext::new(0).unwrap();
+        let peer = RocmContext::new(1).unwrap();
+        ops::hip::enable_device_buffer_reuse();
+        let mut state = RocmDsaState::new(3, 1_048_576, 128, 2048).unwrap();
+        state.reserve_sequence_shard_rows(&owner, &peer, 0..1, 4096).unwrap();
+        // 逻辑上限 1M，空会话只分配一页；之后模拟实际 append 的跨页增长。
+        assert_eq!(state.layers[0].as_ref().unwrap().committed_rows, 2048);
+        assert_eq!(state.cooperative_peer.as_ref().unwrap().layers[0].as_ref().unwrap().committed_rows, 2048);
+        assert_eq!(state.sequence_shard_reservation_bytes(0..1, 4096).unwrap(), [0, 0]);
+        let mut keys = Vec::new();
+        let mut scales = Vec::new();
+        let scale_bytes = 128 / state.key_group_size * 2;
+        for end in [4095, 4096, 4097, 8192, 8193, 12289] {
+            let start = keys.len() / 128;
+            state.ensure_sequence_shard_layer(&owner, 0, end, 0).unwrap();
+            state.ensure_sequence_shard_layer(&peer, 0, end, 1).unwrap();
+            keys.extend((start * 128..end * 128).map(|index| (index * 17 + index / 128) as u8));
+            scales.extend((start * scale_bytes..end * scale_bytes).map(|index| (index * 31 + 7) as u8));
+            // 只写新增行；如果扩容丢了原字节，下面合并下载就会失败。
+            for parity in 0..2 {
+                let (key_buffer, scale_buffer) = if parity == 0 {
+                    let layer = state.layers[0].as_ref().unwrap();
+                    (&layer.keys, &layer.scales)
+                } else {
+                    let layer = state.cooperative_peer.as_ref().unwrap().layers[0].as_ref().unwrap();
+                    (&layer.keys, &layer.scales)
+                };
+                for (offset, target, rows) in parity_segments(start, end - start, parity) {
+                    let source = start + offset;
+                    let device = if parity == 0 { owner.device_id } else { peer.device_id };
+                    let new_keys = ops::hip::DeviceBuffer::allocate(device, rows * 128).unwrap();
+                    let new_scales = ops::hip::DeviceBuffer::allocate(device, rows * scale_bytes).unwrap();
+                    new_keys.copy_from_host(&keys[source * 128..(source + rows) * 128]).unwrap();
+                    new_scales.copy_from_host(&scales[source * scale_bytes..(source + rows) * scale_bytes]).unwrap();
+                    key_buffer.copy_from_device(target * 128, &new_keys, 0, rows * 128).unwrap();
+                    scale_buffer.copy_from_device(target * scale_bytes, &new_scales, 0, rows * scale_bytes).unwrap();
+                }
+            }
+            state.layers[0].as_mut().unwrap().rows = end;
+            state.cooperative_peer.as_mut().unwrap().layers[0].as_mut().unwrap().rows = end;
+            // 后两层复用 Indexer selection，没有自己的 history。首次 decode
+            // 的 truncate 必须跳过它们，同时保留两份分块的已写前缀。
+            state.truncate_rows(end).unwrap();
+            assert!(state.layers[1..].iter().all(Option::is_none));
+            assert!(state.cooperative_peer.as_ref().unwrap().layers[1..].iter().all(Option::is_none));
+            let saved = state.download_layers().unwrap();
+            let saved = saved[0].as_ref().unwrap();
+            assert_eq!(saved.keys, keys, "keys end={end}");
+            assert_eq!(saved.scales, scales, "scales end={end}");
+            assert_eq!(state.layers[0].as_ref().unwrap().committed_rows, sequence_shard_page_rows(end, state.capacity, 0));
+            assert_eq!(state.cooperative_peer.as_ref().unwrap().layers[0].as_ref().unwrap().committed_rows, sequence_shard_page_rows(end, state.capacity, 1));
+        }
+    }
+
     fn ordered(score: f32) -> u32 {
         let bits = score.to_bits();
         bits ^ if bits & 0x8000_0000 != 0 { 0xffff_ffff } else { 0x8000_0000 }
@@ -3076,6 +3231,36 @@ mod tests {
 
     #[test]
     #[ignore = "需要两张 ROCm GPU"]
+    fn sequence_shard_host_roundtrip_preserves_both_parities() {
+        let owner = RocmContext::new(0).unwrap();
+        let peer = RocmContext::new(1).unwrap();
+        ops::hip::enable_device_buffer_reuse();
+        for rows in [1, 63, 64, 65, 127, 128, 129, 4097] {
+            let mut state = RocmDsaState::new(1, 8192, 128, 2048).unwrap();
+            let record = DsaLayerSerde {
+                rows,
+                key_group_size: state.key_group_size,
+                hadamard: state.hadamard_i8,
+                keys: (0..rows * 128).map(|index| (index * 17 + index / 128) as u8).collect(),
+                scales: (0..rows * (128 / state.key_group_size) * 2).map(|index| (index * 31 + 7) as u8).collect(),
+            };
+            let records = vec![Some(record)];
+            state.upload_layers(&owner, &records, 8192, true).unwrap();
+            state.ensure_sequence_shard_peer(&owner, &peer, 0).unwrap();
+            ops::hip::synchronize_device(owner.device_id, "DSA 恢复测试 owner").unwrap();
+            ops::hip::synchronize_device(peer.device_id, "DSA 恢复测试 peer").unwrap();
+            let saved = state.download_layers().unwrap();
+            let original = records[0].as_ref().unwrap();
+            let restored = saved[0].as_ref().unwrap();
+            assert_eq!(restored.rows, rows);
+            assert_eq!(restored.keys, original.keys, "keys rows={rows}");
+            assert_eq!(restored.scales, original.scales, "scales rows={rows}");
+            assert_eq!(state.ownership, RocmDsaOwnership::BlockParity);
+        }
+    }
+
+    #[test]
+    #[ignore = "需要两张 ROCm GPU"]
     fn parallel_sequence_shard_select_matches_reference_bits() {
         // 镜像 parallel operator pair 生产形态:owner 线程持有 background stage
         // stream,DSA parity append 由内部 pin 到 legacy default stream,peer select
@@ -3091,8 +3276,10 @@ mod tests {
         const HEAD_DIM: usize = 128;
         const ROPE_DIM: usize = 64;
         const TOP_K: usize = 2048;
-        let Ok(owner) = RocmContext::new(0) else { return };
-        let Ok(peer) = RocmContext::new(1) else { return };
+        let owner = RocmContext::new(0).expect("分片回归需要 owner GPU");
+        let peer = RocmContext::new(1).expect("分片回归需要 peer GPU");
+        // 与生产一致地复用显式池，不能用 hipMallocAsync 的隐式时序掩盖竞态。
+        ops::hip::enable_device_buffer_reuse();
         let operator = super::super::expert::RocmOperatorPeer::for_tests(peer).unwrap();
         let stage_stream = ops::hip::background_stage_stream(owner.device_id).unwrap();
         ops::hip::activate_compute_stream(owner.device_id, stage_stream).unwrap();
@@ -3117,6 +3304,7 @@ mod tests {
         let mut parallel = RocmDsaState::new(1, CONTEXT_ROWS, HEAD_DIM, TOP_K).unwrap();
         let mut cooperative = RocmDsaState::new(1, CONTEXT_ROWS, HEAD_DIM, TOP_K).unwrap();
         parallel.ensure_sequence_shard_peer(&owner, &peer, 0).unwrap();
+        assert_eq!(ops::hip::compute_stream_for(owner.device_id) as usize, stage_stream, "建立分片不能覆盖 stage 流");
         cooperative.ensure_sequence_shard_peer(&owner, &peer, 0).unwrap();
         // 与生产一致:append 包装器绑定 pair worker,供 decode 侧 BlockParity select。
         parallel.bind_sequence_shard_worker(operator.worker.clone());
@@ -3162,7 +3350,9 @@ mod tests {
             }
             let single_values = (0..HEAD_DIM).map(|index| spread(mix((position * HEAD_DIM + index) as u64 ^ 0x5eed_5eed_5eed_5eed))).collect::<Vec<_>>();
             let single = owner.tensor_from_f32(single_values, 1, HEAD_DIM).unwrap();
+            ops::hip::activate_compute_stream(owner.device_id, stage_stream).unwrap();
             parallel.append_layernorm_rope(&owner, 0, position + CHUNK_ROWS, &single, &norm_weight, &norm_bias, 1.0e-6, ROPE_DIM, crate::attention::rope::RotaryLayout::SplitHalf, &cosine, &sine).unwrap();
+            assert_eq!(ops::hip::compute_stream_for(owner.device_id) as usize, stage_stream, "单行追加不能覆盖 stage 流");
             let query1_values = (0..HEAD_COUNT * HEAD_DIM).map(|index| spread(mix(((position as u64) << 24) ^ index as u64 ^ 0x1a2b_3c4d_5e6f_7081))).collect::<Vec<_>>();
             let weights1_values = (0..HEAD_COUNT).map(|index| spread(mix(index as u64 ^ 0x7081_6f5e_4d3c_2b1a))).collect::<Vec<_>>();
             let query1 = owner.tensor_from_f32(query1_values, 1, HEAD_COUNT * HEAD_DIM).unwrap();
@@ -3190,8 +3380,10 @@ mod tests {
         const TOP_K: usize = 2048;
         const CONTEXT_ROWS: usize = 24_000;
         const CHUNKS: [usize; 9] = [2048, 2048, 2048, 537, 2048, 2048, 631, 2048, 2048];
-        let Ok(owner) = RocmContext::new(0) else { return };
-        let Ok(peer) = RocmContext::new(1) else { return };
+        let owner = RocmContext::new(0).expect("分片回归需要 owner GPU");
+        let peer = RocmContext::new(1).expect("分片回归需要 peer GPU");
+        // 与生产一致地复用显式池，不能用 hipMallocAsync 的隐式时序掩盖竞态。
+        ops::hip::enable_device_buffer_reuse();
         let operator = super::super::expert::RocmOperatorPeer::for_tests(peer).unwrap();
         let stage_stream = ops::hip::background_stage_stream(owner.device_id).unwrap();
         ops::hip::activate_compute_stream(owner.device_id, stage_stream).unwrap();
@@ -3344,8 +3536,8 @@ impl RocmDsaState {
             if record.keys.len() != key_bytes || record.scales.len() != scale_bytes {
                 return Err(compute_error(format!("ROCm DSA restore L{index} keys/scales={}/{}，期望 {key_bytes}/{scale_bytes}", record.keys.len(), record.scales.len())));
             }
-            // DSA 与同一 stage 的 KV 共享物理 ownership；恢复语义来自快照，
-            // 不能依赖本次进程的性能配置。
+            // 快照保存完整逻辑历史；按当前 DSA 执行布局重分两块，不能从
+            // MLA 的 ownership 推断（operator pair 的 MLA 是完整镜像）。
             if interleaved_pair {
                 self.pending_pair_layers[index] = Some(record.clone());
                 continue;

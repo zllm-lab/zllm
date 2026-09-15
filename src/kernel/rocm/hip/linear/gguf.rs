@@ -580,9 +580,6 @@ mod tests {
         eprintln!("[gguf-grouped-wmma-oracle] types={types:?} max_abs={max_abs:.6e}");
     }
 
-
-
-
     fn assert_k4_k5_rows2_gate_up_matches_generic(tensor_type: u32, routes: &[u32]) {
         use half::bf16;
 
@@ -621,15 +618,20 @@ mod tests {
         let token_major = super::DeviceBuffer::upload(DEVICE, bytes(&vec![bf16::NAN.to_bits(); tokens * TOP_K * INTERMEDIATE])).unwrap();
         let shared = super::DeviceBuffer::upload(DEVICE, bytes(&vec![bf16::NAN.to_bits(); tokens * TOP_K * INTERMEDIATE])).unwrap();
         let functions = super::super::ct_quantized_functions(DEVICE).unwrap();
-        let (token_major_function, shared_function) =
-            match tensor_type {
-                12 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q4_k),
-                13 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q5_k),
-                21 => (functions.gguf_fused_gate_up_iq3s_wide, functions.gguf_fused_gate_up_iq3s_wide_rows2),
-                _ => (functions.gguf_fused_gate_up_iq4xs, functions.gguf_fused_gate_up_iq4xs_rows2),
-            };
+        let (token_major_function, shared_function) = match tensor_type {
+            12 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q4_k),
+            13 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q5_k),
+            21 => (functions.gguf_fused_gate_up_iq3s_wide, functions.gguf_fused_gate_up_iq3s_wide_rows2),
+            _ => (functions.gguf_fused_gate_up_iq4xs, functions.gguf_fused_gate_up_iq4xs_rows2),
+        };
         let launch = |function: usize, output: &super::DeviceBuffer| {
-            let (outputs, threads) = if function == functions.gguf_fused_gate_up_q4_k || function == functions.gguf_fused_gate_up_q5_k { (8, 64) } else if function == functions.gguf_fused_gate_up { (16, 256) } else { (32, 256) };
+            let (outputs, threads) = if function == functions.gguf_fused_gate_up_q4_k || function == functions.gguf_fused_gate_up_q5_k {
+                (8, 64)
+            } else if function == functions.gguf_fused_gate_up {
+                (16, 256)
+            } else {
+                (32, 256)
+            };
             let mut input_pointer = input.pointer;
             let mut metas_pointer = metas.buffer.pointer;
             let mut route_ids_pointer = route_ids.pointer;
@@ -679,20 +681,21 @@ mod tests {
         assert_eq!(shared_host, token_major_host, "tensor_type={tensor_type} rows2 共享权重改变 activation");
     }
 
-
     #[test]
     #[ignore = "需要 ROCm GPU"]
     fn q4_k_q5_k_adjacent_pairs_gate_up_match_generic_bits() {
         for tensor_type in [12, 13] {
             for tokens in [3, 4, 6, 8] {
                 for pattern in 0..3 {
-                    let routes = (0..tokens).flat_map(|row| {
-                        (0..4).map(move |k| match pattern {
-                            0 => ((row % 2) * 4 + k) as u32,
-                            1 => ((row * 3 + k) % 8) as u32,
-                            _ => ((row + 3 * k) % 4) as u32,
+                    let routes = (0..tokens)
+                        .flat_map(|row| {
+                            (0..4).map(move |k| match pattern {
+                                0 => ((row % 2) * 4 + k) as u32,
+                                1 => ((row * 3 + k) % 8) as u32,
+                                _ => ((row + 3 * k) % 4) as u32,
+                            })
                         })
-                    }).collect::<Vec<_>>();
+                        .collect::<Vec<_>>();
                     assert_k4_k5_rows2_gate_up_matches_generic(tensor_type, &routes);
                 }
             }
@@ -882,15 +885,20 @@ mod tests {
         let token_major = super::DeviceBuffer::upload(DEVICE, bytes(&vec![bf16::NAN.to_bits(); 2 * TOP_K * INTERMEDIATE])).unwrap();
         let shared = super::DeviceBuffer::upload(DEVICE, bytes(&vec![bf16::NAN.to_bits(); 2 * TOP_K * INTERMEDIATE])).unwrap();
         let functions = super::super::ct_quantized_functions(DEVICE).unwrap();
-        let (token_major_function, shared_function) =
-            match tensor_type {
-                12 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q4_k),
-                13 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q5_k),
-                21 => (functions.gguf_fused_gate_up_iq3s_wide, functions.gguf_fused_gate_up_iq3s_wide_rows2),
-                _ => (functions.gguf_fused_gate_up_iq4xs, functions.gguf_fused_gate_up_iq4xs_rows2),
-            };
+        let (token_major_function, shared_function) = match tensor_type {
+            12 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q4_k),
+            13 => (functions.gguf_fused_gate_up, functions.gguf_fused_gate_up_q5_k),
+            21 => (functions.gguf_fused_gate_up_iq3s_wide, functions.gguf_fused_gate_up_iq3s_wide_rows2),
+            _ => (functions.gguf_fused_gate_up_iq4xs, functions.gguf_fused_gate_up_iq4xs_rows2),
+        };
         let launch = |function: usize, output: &super::DeviceBuffer| {
-            let (outputs, threads) = if function == functions.gguf_fused_gate_up_q4_k || function == functions.gguf_fused_gate_up_q5_k { (8, 64) } else if function == functions.gguf_fused_gate_up { (16, 256) } else { (32, 256) };
+            let (outputs, threads) = if function == functions.gguf_fused_gate_up_q4_k || function == functions.gguf_fused_gate_up_q5_k {
+                (8, 64)
+            } else if function == functions.gguf_fused_gate_up {
+                (16, 256)
+            } else {
+                (32, 256)
+            };
             let mut input_pointer = input.pointer;
             let mut metas_pointer = metas.buffer.pointer;
             let mut route_ids_pointer = route_ids.pointer;
@@ -1300,7 +1308,13 @@ fn try_gguf_fused_decode_experts_with_workspace(
             (&mut intermediate as *mut u32).cast(),
             (&mut is_bf16 as *mut u32).cast(),
         ];
-        let outputs_per_block = if q4_k_gate_up || q5_k_gate_up { 8 } else if iq3s_gate_up || iq4xs_gate_up || q3_k_gate_up { 32 } else { 16 };
+        let outputs_per_block = if q4_k_gate_up || q5_k_gate_up {
+            8
+        } else if iq3s_gate_up || iq4xs_gate_up || q3_k_gate_up {
+            32
+        } else {
+            16
+        };
         let grid_x = u32::try_from(intermediate_size.div_ceil(outputs_per_block)).map_err(|_| "GGUF fused grid 超过 u32".to_owned())?;
         let grid_y = u32::try_from(route_count).map_err(|_| "GGUF fused grid 超过 u32".to_owned())?;
         let function = if iq3s_gate_up {
@@ -1337,7 +1351,19 @@ fn try_gguf_fused_decode_experts_with_workspace(
             functions.gguf_fused_gate_up
         };
         let status = unsafe {
-            module_launch(function as *mut c_void, grid_x, if q8_0_gate_up && single_expert_rows2 { 1 } else { grid_y }, 1, if q4_k_gate_up || q5_k_gate_up { 64 } else { 256 }, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut())
+            module_launch(
+                function as *mut c_void,
+                grid_x,
+                if q8_0_gate_up && single_expert_rows2 { 1 } else { grid_y },
+                1,
+                if q4_k_gate_up || q5_k_gate_up { 64 } else { 256 },
+                1,
+                1,
+                0,
+                crate::kernel::rocm::hip::active_compute_stream(),
+                arguments.as_mut_ptr(),
+                ptr::null_mut(),
+            )
         };
         if status != HIP_SUCCESS {
             return Err(runtime.hip_error(status, "hipModuleLaunchKernel GGUF fused gate_up"));
@@ -1767,7 +1793,7 @@ mod graph_replay_probe {
             crate::kernel::rocm::hip::try_add_resident_f32_into(DEVICE, &hidden, &proj, &attn_out, HIDDEN, 1.0).unwrap();
             let moe_in = super::DeviceBuffer::allocate(DEVICE, HIDDEN * 4).unwrap();
             crate::kernel::rocm::hip::try_rmsnorm_resident_weight_into(DEVICE, &attn_out, &ffn_norm, &moe_in, None, 1, HIDDEN, EPS, false, crate::kernel::rocm::hip::RmsnormOutput::F32).unwrap();
-            let route = crate::kernel::rocm::hip::try_moe_route_resident_device_f32(DEVICE, &moe_in, &router_w, &router_b, 1, HIDDEN, EXPERTS, MOE_TOP_K, 1, 2.5).unwrap();
+            let route = crate::kernel::rocm::hip::try_moe_route_resident_device_f32(DEVICE, &moe_in, &router_w, &router_b, None, None, 1, HIDDEN, EXPERTS, MOE_TOP_K, 1, 2.5).unwrap();
             let routed_out = super::DeviceBuffer::allocate(DEVICE, HIDDEN * 4).unwrap();
             crate::kernel::rocm::hip::try_gguf_fused_decode_experts_typed(DEVICE, &moe_in, 1, HIDDEN, INTER, MOE_TOP_K, &route.expert_ids, &route.weights, MOE_TOP_K, &routed_metas.buffer, &routed_out, Some([21, 21, 23])).unwrap();
             let (shared_ids, shared_weights) = super::super::ct_grouped::cooperative_single_expert_route(DEVICE, 1).unwrap();

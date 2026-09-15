@@ -136,7 +136,7 @@ pub struct VisionGrid {
     pub width: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ImageTensor {
     pub data: Vec<f32>,
     pub rows: usize,
@@ -213,6 +213,39 @@ pub fn splice_image_embeddings_bf16(hidden: &mut [u16], hidden_size: usize, chun
     Ok(())
 }
 
+/// chunked prefill 的 F32 行覆盖:把落在图像 token 区间内的文本 embedding 行
+/// 替换为 Vision Encoder 输出。区间允许跨越 chunk 边界,只覆盖与
+/// `[chunk_position, chunk_position + rows)` 相交的部分;DeepSeek-V4.1 的
+/// embedding 入口在 host F32(上传前拼接)。
+pub fn splice_image_embeddings_f32(hidden: &mut [f32], hidden_size: usize, chunk_position: usize, ranges: &[ImageTokenRange], image_embeddings: &[Vec<f32>]) -> Result<(), String> {
+    if hidden_size == 0 || !hidden.len().is_multiple_of(hidden_size) {
+        return Err(format!("F32 文本 embedding shape 无效: values={} hidden_size={hidden_size}", hidden.len()));
+    }
+    let rows = hidden.len() / hidden_size;
+    let chunk_end = chunk_position.checked_add(rows).ok_or("F32 视觉覆盖 chunk 边界溢出")?;
+    let mut previous_end = 0usize;
+    for range in ranges {
+        if range.tokens.start < previous_end || range.tokens.start > range.tokens.end {
+            return Err(format!("图像 {} token range {:?} 无序或非法", range.image_index, range.tokens));
+        }
+        let image = image_embeddings.get(range.image_index).ok_or_else(|| format!("缺少图像 {} 的 F32 视觉 embedding", range.image_index))?;
+        let expected = range.tokens.len().checked_mul(hidden_size).ok_or("F32 视觉 embedding 大小溢出")?;
+        if image.len() != expected {
+            return Err(format!("图像 {} F32 embedding values={}，期望 {expected}", range.image_index, image.len()));
+        }
+        let start = range.tokens.start.max(chunk_position);
+        let end = range.tokens.end.min(chunk_end);
+        if start < end {
+            let source = (start - range.tokens.start) * hidden_size;
+            let target = (start - chunk_position) * hidden_size;
+            let length = (end - start) * hidden_size;
+            hidden[target..target + length].copy_from_slice(&image[source..source + length]);
+        }
+        previous_end = range.tokens.end;
+    }
+    Ok(())
+}
+
 /// CPU reference：把 Vision Encoder 输出替换到文本 embedding 的 image token 行。
 pub fn scatter_image_embeddings_f32(hidden: &mut [f32], hidden_size: usize, ranges: &[ImageTokenRange], image_embeddings: &[Vec<f32>]) -> Result<(), String> {
     if hidden_size == 0 || !hidden.len().is_multiple_of(hidden_size) {
@@ -269,14 +302,27 @@ impl PatchImageProcessor {
     }
 
     pub fn target_size(&self, image: &RgbImage) -> Result<(usize, usize), String> {
-        let factor = self.config.patch_size.checked_mul(self.config.merge_size).ok_or_else(|| "视觉 resize factor 溢出".to_owned())?;
-        smart_resize(image.height, image.width, factor, self.config.min_pixels, self.config.max_pixels, self.config.max_aspect_ratio)
+        self.target_size_with_budget(image, self.config.min_pixels, self.config.max_pixels)
     }
-}
 
-impl ImageProcessor for PatchImageProcessor {
-    fn preprocess(&self, image: &RgbImage) -> Result<ImageTensor, String> {
-        let (height, width) = self.target_size(image)?;
+    pub(crate) fn target_size_with_budget(&self, image: &RgbImage, min_pixels: usize, max_pixels: usize) -> Result<(usize, usize), String> {
+        if min_pixels == 0 || min_pixels > max_pixels {
+            return Err(format!("视觉 min_pixels={min_pixels}/max_pixels={max_pixels} 无效"));
+        }
+        let factor = self.config.patch_size.checked_mul(self.config.merge_size).ok_or_else(|| "视觉 resize factor 溢出".to_owned())?;
+        smart_resize(image.height, image.width, factor, min_pixels, max_pixels, self.config.max_aspect_ratio)
+    }
+
+    pub(crate) fn pixel_budget(&self) -> (usize, usize) {
+        (self.config.min_pixels, self.config.max_pixels)
+    }
+
+    pub(crate) fn preprocess_with_pixel_budget(&self, image: &RgbImage, min_pixels: usize, max_pixels: usize) -> Result<ImageTensor, String> {
+        let (height, width) = self.target_size_with_budget(image, min_pixels, max_pixels)?;
+        self.preprocess_at_size(image, height, width)
+    }
+
+    fn preprocess_at_size(&self, image: &RgbImage, height: usize, width: usize) -> Result<ImageTensor, String> {
         let source = image::RgbImage::from_raw(image.width as u32, image.height as u32, image.pixels.clone()).ok_or_else(|| "构造 RGB 图像失败".to_owned())?;
         let resized = pillow_bicubic_resize(&source, width as u32, height as u32);
 
@@ -312,6 +358,13 @@ impl ImageProcessor for PatchImageProcessor {
         }
 
         Ok(ImageTensor { data, rows, cols, grid: VisionGrid { temporal: 1, height: grid_height, width: grid_width }, merge_size: merge })
+    }
+}
+
+impl ImageProcessor for PatchImageProcessor {
+    fn preprocess(&self, image: &RgbImage) -> Result<ImageTensor, String> {
+        let (height, width) = self.target_size(image)?;
+        self.preprocess_at_size(image, height, width)
     }
 }
 
@@ -394,16 +447,17 @@ pub(crate) fn pillow_bicubic_resize(source: &image::RgbImage, width: u32, height
     image::RgbImage::from_raw(width as u32, height as u32, output).expect("BICUBIC 输出大小已验证")
 }
 
-/// 等比缩放到目标框后居中补黑。Gemma 4 等动态分辨率视觉预处理器先按
-/// patch 预算确定目标框，再用这种 PAD_CEIL 语义避免拉伸原图。
-pub(crate) fn pillow_bicubic_resize_contain(source: &image::RgbImage, width: u32, height: u32) -> image::RgbImage {
+/// 等比缩放到目标框后居中补边。Gemma 4 等动态分辨率视觉预处理器先按
+/// patch 预算确定目标框，再用这种 PAD_CEIL 语义避免拉伸原图;
+/// `pad` 为补边颜色(Gemma 黑边,DeepSeek-V4.1 灰边 127)。
+pub(crate) fn pillow_bicubic_resize_contain(source: &image::RgbImage, width: u32, height: u32, pad: [u8; 3]) -> image::RgbImage {
     let scale = (width as f32 / source.width() as f32).min(height as f32 / source.height() as f32);
     let resized_width = ((source.width() as f32 * scale).ceil() as u32).min(width);
     let resized_height = ((source.height() as f32 * scale).ceil() as u32).min(height);
     let resized = pillow_bicubic_resize(source, resized_width, resized_height);
     let offset_x = (width - resized_width) / 2;
     let offset_y = (height - resized_height) / 2;
-    let mut output = image::RgbImage::new(width, height);
+    let mut output = image::RgbImage::from_pixel(width, height, image::Rgb(pad));
     image::imageops::replace(&mut output, &resized, i64::from(offset_x), i64::from(offset_y));
     output
 }
@@ -458,7 +512,7 @@ mod tests {
     #[test]
     fn bicubic_contain_preserves_ratio_and_centers_black_padding() {
         let image = image::RgbImage::from_pixel(4, 8, image::Rgb([255, 128, 64]));
-        let resized = pillow_bicubic_resize_contain(&image, 6, 6);
+        let resized = pillow_bicubic_resize_contain(&image, 6, 6, [0, 0, 0]);
         assert_eq!(resized.dimensions(), (6, 6));
         assert_eq!(resized.get_pixel(0, 0).0, [0, 0, 0]);
         assert_eq!(resized.get_pixel(1, 0).0, [255, 128, 64]);

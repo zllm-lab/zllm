@@ -93,6 +93,12 @@ fn bf16_gemv_functions(device_id: i32, runtime: &RocmRuntime) -> Result<Bf16Gemv
     Ok(function)
 }
 
+fn f32_gemv_token_chunks(input_rows: usize) -> impl Iterator<Item = (usize, u32)> {
+    // grid.y 保持在 HIP/CUDA 均支持的范围；常规矩阵一次提交，超大输入才分段。
+    const MAX_ROWS: usize = 8 * 65535;
+    (0..input_rows).step_by(MAX_ROWS).map(move |base| (base, (input_rows - base).min(MAX_ROWS) as u32))
+}
+
 pub fn try_f32_gemv_resident_f32(device_id: i32, input: &DeviceBuffer, weight: &DeviceBuffer, input_rows: usize, columns: usize, output_rows: usize) -> Result<DeviceBuffer, String> {
     if input.device_id != device_id || weight.device_id != device_id || input_rows == 0 || columns == 0 || output_rows == 0 {
         return Err("ROCm F32 GEMV shape 为空或 device 不一致".to_owned());
@@ -163,11 +169,9 @@ pub fn try_f32_gemv_resident_f32(device_id: i32, input: &DeviceBuffer, weight: &
             }
         }
     } else {
-        for token_base in (0..input_rows).step_by(8) {
-            let chunk_rows = (input_rows - token_base).min(8);
+        for (token_base, mut chunk_rows) in f32_gemv_token_chunks(input_rows) {
             input_pointer = unsafe { input.pointer.cast::<u8>().add(token_base * input_row_bytes).cast() };
             output_pointer = unsafe { output.pointer.cast::<u8>().add(token_base * output_row_bytes).cast() };
-            let mut chunk_rows = u32::try_from(chunk_rows).expect("F32 GEMV chunk rows <= 8");
             let mut arguments = [
                 (&mut input_pointer as *mut *mut c_void).cast(),
                 (&mut weight_pointer as *mut *mut c_void).cast(),
@@ -177,7 +181,7 @@ pub fn try_f32_gemv_resident_f32(device_id: i32, input: &DeviceBuffer, weight: &
                 (&mut chunk_rows as *mut u32).cast(),
             ];
             let stats_started = super::hip_api_stats::start();
-            let status = unsafe { launch(functions.f32_gemv_small_n as *mut c_void, rows.div_ceil(8), 1, 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
+            let status = unsafe { launch(functions.f32_gemv_small_n as *mut c_void, rows.div_ceil(8), chunk_rows.div_ceil(8), 1, 256, 1, 1, 0, crate::kernel::rocm::hip::active_compute_stream(), arguments.as_mut_ptr(), ptr::null_mut()) };
             super::hip_api_stats::counted(super::hip_api_stats::LAUNCH, stats_started);
             if status != HIP_SUCCESS {
                 return Err(runtime.hip_error(status, "F32 small-N GEMV launch"));
@@ -419,6 +423,81 @@ mod dense_tile_tests {
 
     fn f32_bytes(values: &[f32]) -> &[u8] {
         unsafe { std::slice::from_raw_parts(values.as_ptr().cast(), std::mem::size_of_val(values)) }
+    }
+
+    #[test]
+    fn f32_gemv_token_grid_covers_rows_with_bounded_launches() {
+        assert_eq!(f32_gemv_token_chunks(1792).collect::<Vec<_>>(), vec![(0, 1792)]);
+        assert_eq!(f32_gemv_token_chunks(524281).collect::<Vec<_>>(), vec![(0, 524280), (524280, 1)]);
+        for input_rows in [0, 1, 2, 8, 9, 13, 21, 1792, 524280, 524281, u32::MAX as usize] {
+            let mut covered = 0;
+            for (base, rows) in f32_gemv_token_chunks(input_rows) {
+                assert_eq!(base, covered);
+                let grid_y = rows.div_ceil(8);
+                assert!((1..=65535).contains(&grid_y));
+                let last_base = (grid_y - 1) * 8;
+                assert!((1..=8).contains(&(rows - last_base)));
+                covered += rows as usize;
+                assert!(covered <= input_rows);
+            }
+            assert_eq!(covered, input_rows);
+        }
+    }
+
+    #[test]
+    fn rocm_f32_gemv_token_grid_matches_eight_row_launches_bitwise() {
+        if !super::super::is_hip_available() {
+            eprintln!("[f32-gemv-token-grid] 跳过：本机未检测到 ROCm 运行时");
+            return;
+        }
+        set_device(0).expect("select F32 GEMV device");
+        let runtime = RocmRuntime::open().expect("open F32 GEMV runtime");
+        let functions = bf16_gemv_functions(0, runtime).expect("compile F32 GEMV kernels");
+        for (input_rows, columns, output_rows) in [(1usize, 24usize, 24usize), (2, 24, 37), (8, 24, 24), (9, 37, 37), (13, 129, 37), (21, 257, 64), (9, 2048, 24), (1792, 24, 24), (1792, 24, 2048)] {
+            let input = (0..input_rows * columns).map(|index| (index as f32 * 0.013).sin()).collect::<Vec<_>>();
+            let weight = (0..output_rows * columns).map(|index| (index as f32 * 0.019).cos()).collect::<Vec<_>>();
+            let input_device = DeviceBuffer::upload(0, f32_bytes(&input)).expect("upload F32 token-grid input");
+            let weight_device = DeviceBuffer::upload(0, f32_bytes(&weight)).expect("upload F32 token-grid weight");
+            let actual = try_f32_gemv_resident_f32(0, &input_device, &weight_device, input_rows, columns, output_rows).expect("F32 token-grid GEMV").download_f32(input_rows * output_rows).expect("download F32 token-grid GEMV");
+            let expected = DeviceBuffer::allocate_reusable(0, input_rows * output_rows * 4).expect("allocate F32 eight-row output");
+            // grid.y=1 与旧 kernel 相同；尾块只有一个 token 时也不能转入单行 split-K。
+            for base in (0..input_rows).step_by(8) {
+                let mut input_pointer = unsafe { input_device.pointer.cast::<u8>().add(base * columns * 4).cast() };
+                let mut weight_pointer = weight_device.pointer;
+                let mut output_pointer = unsafe { expected.pointer.cast::<u8>().add(base * output_rows * 4).cast() };
+                let mut columns_u32 = columns as u32;
+                let mut rows_u32 = output_rows as u32;
+                let mut chunk_rows = (input_rows - base).min(8) as u32;
+                let mut arguments = [
+                    (&mut input_pointer as *mut *mut c_void).cast(),
+                    (&mut weight_pointer as *mut *mut c_void).cast(),
+                    (&mut output_pointer as *mut *mut c_void).cast(),
+                    (&mut columns_u32 as *mut u32).cast(),
+                    (&mut rows_u32 as *mut u32).cast(),
+                    (&mut chunk_rows as *mut u32).cast(),
+                ];
+                let status = unsafe {
+                    crate::kernel::rocm::hip::kernel_launch_trampoline(
+                        functions.f32_gemv_small_n as *mut c_void,
+                        rows_u32.div_ceil(8),
+                        1,
+                        1,
+                        256,
+                        1,
+                        1,
+                        0,
+                        crate::kernel::rocm::hip::active_compute_stream(),
+                        arguments.as_mut_ptr(),
+                        ptr::null_mut(),
+                    )
+                };
+                assert_eq!(status, HIP_SUCCESS, "{}", runtime.hip_error(status, "F32 eight-row reference launch"));
+            }
+            let expected = expected.download_f32(input_rows * output_rows).expect("download F32 eight-row reference");
+            for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert_eq!(actual.to_bits(), expected.to_bits(), "M={input_rows} K={columns} N={output_rows} index={index} actual={actual} expected={expected}");
+            }
+        }
     }
 
     fn bf16(value: f32) -> u16 {

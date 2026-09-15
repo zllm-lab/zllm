@@ -1209,7 +1209,7 @@ fn moe_prefill(
 ) -> Result<RocmTensor, BackendError> {
     let (router_weight, router_bias, shared) = router;
     let shared_ref = [crate::moe::topk_moe::SharedExpertRef { gate: &shared.gate, up: &shared.up, down: &shared.down, output_gate: None }];
-    let weights = crate::moe::topk_moe::MoeFfnRef { router_weight, router_bias, shared_experts: &shared_ref, selected_experts: None };
+    let weights = crate::moe::topk_moe::MoeFfnRef { router_weight, router_bias, shared_experts: &shared_ref, selected_experts: None, router_bias_vl: None, image_rows: None };
     crate::moe::prefill::prefill_experts_untraced(context, spec, &weights, layer, experts, input, None)
 }
 
@@ -1241,7 +1241,7 @@ fn dims(config: &Glm53FlashConfig, vision: &Glm53FlashVisionConfig) -> crate::we
 mod tests {
     use super::*;
 
-    /// 8-GPU 真机 head 冒烟:加载 0..23 层到 8 卡,两轮 chunk prefill,
+    /// 8 卡 ROCm 真机 head 冒烟:加载 0..23 层到 8 卡,两轮 chunk prefill,
     /// 校验 boundary hidden 有限且非零。需要 62 片权重与 8 卡 ROCm,
     /// 仅在 --ignored 时执行。
     #[test]

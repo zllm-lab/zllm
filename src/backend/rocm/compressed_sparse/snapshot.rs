@@ -7,18 +7,22 @@ impl RocmCompressedKvStorage {
         if self.transaction.is_some() {
             return Err(compute("V4 ROCm terminal cache 仍有 speculative transaction"));
         }
-        let scale_row_bytes = self.scale_row_bytes();
-        let recent_bytes = self.recent_capacity.checked_mul(self.kv_width).ok_or_else(|| compute("V4 ROCm recent snapshot 溢出"))?;
-        let recent_scale_bytes = self.recent_capacity.checked_mul(scale_row_bytes).ok_or_else(|| compute("V4 ROCm recent scale snapshot 溢出"))?;
+        let recent_row_bytes = self.recent_row_bytes();
+        let recent_scale_row_bytes = self.recent_scale_row_bytes();
+        let recent_bytes = self.recent_capacity.checked_mul(recent_row_bytes).ok_or_else(|| compute("V4 ROCm recent snapshot 溢出"))?;
+        let recent_scale_bytes = self.recent_capacity.checked_mul(recent_scale_row_bytes).ok_or_else(|| compute("V4 ROCm recent scale snapshot 溢出"))?;
         let compressed_rows = self.compressed_positions.len();
-        let compressed_bytes = compressed_rows.checked_mul(self.kv_width).ok_or_else(|| compute("V4 ROCm compressed snapshot 溢出"))?;
-        let compressed_scale_bytes = compressed_rows.checked_mul(scale_row_bytes).ok_or_else(|| compute("V4 ROCm compressed scale snapshot 溢出"))?;
+        let compressed_row_bytes = self.compressed_row_bytes();
+        let compressed_scale_row_bytes = self.compressed_scale_row_bytes();
+        let compressed_bytes = compressed_rows.checked_mul(compressed_row_bytes).ok_or_else(|| compute("V4 ROCm compressed snapshot 溢出"))?;
+        let compressed_scale_bytes = compressed_rows.checked_mul(compressed_scale_row_bytes).ok_or_else(|| compute("V4 ROCm compressed scale snapshot 溢出"))?;
         let recent_shared = Arc::ptr_eq(&self.recent_key, &self.recent_value) && Arc::ptr_eq(&self.recent_key_scales, &self.recent_value_scales);
         let compressed_shared = Arc::ptr_eq(&self.compressed_key, &self.compressed_value) && Arc::ptr_eq(&self.compressed_key_scales, &self.compressed_value_scales);
         Ok(RocmCompressedKvSerde {
             window_size: self.window_size,
             kv_width: self.kv_width,
             q8_group_size: self.q8_group_size,
+            format: self.format,
             recent_capacity: self.recent_capacity,
             recent_start: self.recent_start,
             recent_len: self.recent_len,
@@ -40,7 +44,15 @@ impl RocmCompressedKvStorage {
                 .compressed_index_key
                 .as_ref()
                 .map(|buffer| {
-                    let bytes = compressed_rows.checked_mul(self.compressed_index_width).and_then(|value| value.checked_mul(mem::size_of::<f32>())).ok_or_else(|| compute("V4 ROCm index snapshot 溢出"))?;
+                    let bytes = compressed_rows.checked_mul(self.index_row_bytes(self.compressed_index_width)).ok_or_else(|| compute("V4 ROCm index snapshot 溢出"))?;
+                    download_buffer(buffer, bytes)
+                })
+                .transpose()?,
+            compressed_index_key_scales: self
+                .compressed_index_key_scales
+                .as_ref()
+                .map(|buffer| {
+                    let bytes = compressed_rows.checked_mul(self.index_scale_row_bytes(self.compressed_index_width)).ok_or_else(|| compute("V4 ROCm index scale snapshot 溢出"))?;
                     download_buffer(buffer, bytes)
                 })
                 .transpose()?,
@@ -50,13 +62,16 @@ impl RocmCompressedKvStorage {
     }
 
     pub fn upload_snapshot(&mut self, snapshot: RocmCompressedKvSerde) -> Result<(), BackendError> {
-        if (snapshot.window_size, snapshot.kv_width, snapshot.q8_group_size) != (self.window_size, self.kv_width, self.q8_group_size) {
-            return Err(compute(format!("V4 ROCm cache snapshot 规格不匹配: {}/{}/{} != {}/{}/{}", snapshot.window_size, snapshot.kv_width, snapshot.q8_group_size, self.window_size, self.kv_width, self.q8_group_size)));
+        if (snapshot.window_size, snapshot.kv_width, snapshot.q8_group_size, snapshot.format) != (self.window_size, self.kv_width, self.q8_group_size, self.format) {
+            return Err(compute(format!("V4 ROCm cache snapshot 规格不匹配: {}/{}/{}/{:?} != {}/{}/{}/{:?}", snapshot.window_size, snapshot.kv_width, snapshot.q8_group_size, snapshot.format, self.window_size, self.kv_width, self.q8_group_size, self.format)));
         }
         let device_id = self.recent_key.device_id();
-        let scale_row_bytes = self.scale_row_bytes();
-        validate_buffer(&snapshot.recent_key, snapshot.recent_capacity, self.kv_width, "recent key")?;
-        validate_buffer(&snapshot.recent_key_scales, snapshot.recent_capacity, scale_row_bytes, "recent scales")?;
+        let recent_row_bytes = self.recent_row_bytes();
+        let recent_scale_row_bytes = self.recent_scale_row_bytes();
+        let compressed_row_bytes = self.compressed_row_bytes();
+        let compressed_scale_row_bytes = self.compressed_scale_row_bytes();
+        validate_buffer(&snapshot.recent_key, snapshot.recent_capacity, recent_row_bytes, "recent key")?;
+        validate_buffer(&snapshot.recent_key_scales, snapshot.recent_capacity, recent_scale_row_bytes, "recent scales")?;
         if snapshot.recent_len > snapshot.recent_capacity || snapshot.recent_start >= snapshot.recent_capacity.max(1) {
             return Err(compute("V4 ROCm recent snapshot 元数据非法"));
         }
@@ -66,8 +81,8 @@ impl RocmCompressedKvStorage {
             self.recent_value = self.recent_key.clone();
             self.recent_value_scales = self.recent_key_scales.clone();
         } else {
-            validate_buffer(&snapshot.recent_value, snapshot.recent_capacity, self.kv_width, "recent value")?;
-            validate_buffer(&snapshot.recent_value_scales, snapshot.recent_capacity, scale_row_bytes, "recent value scales")?;
+            validate_buffer(&snapshot.recent_value, snapshot.recent_capacity, recent_row_bytes, "recent value")?;
+            validate_buffer(&snapshot.recent_value_scales, snapshot.recent_capacity, recent_scale_row_bytes, "recent value scales")?;
             self.recent_value = upload_bytes(device_id, &snapshot.recent_value)?;
             self.recent_value_scales = upload_bytes(device_id, &snapshot.recent_value_scales)?;
         }
@@ -80,30 +95,38 @@ impl RocmCompressedKvStorage {
         if snapshot.compressed_positions.windows(2).any(|pair| pair[0] >= pair[1]) {
             return Err(compute("V4 ROCm compressed positions 非递增"));
         }
-        let index_bytes = compressed_rows.checked_mul(snapshot.compressed_index_width).and_then(|value| value.checked_mul(mem::size_of::<f32>())).ok_or_else(|| compute("V4 ROCm compressed index 大小溢出"))?;
+        let index_bytes = compressed_rows.checked_mul(self.index_row_bytes(snapshot.compressed_index_width)).ok_or_else(|| compute("V4 ROCm compressed index 大小溢出"))?;
+        let index_scale_bytes = compressed_rows.checked_mul(self.index_scale_row_bytes(snapshot.compressed_index_width)).ok_or_else(|| compute("V4 ROCm compressed index scale 大小溢出"))?;
         match &snapshot.compressed_index_key {
             Some(bytes) if snapshot.compressed_index_width != 0 && bytes.len() == index_bytes => {}
             None if snapshot.compressed_index_width == 0 => {}
             _ => return Err(compute(format!("V4 ROCm compressed index width={} bytes={} rows={} 不一致", snapshot.compressed_index_width, snapshot.compressed_index_key.as_ref().map_or(0, Vec::len), compressed_rows))),
         }
+        match &snapshot.compressed_index_key_scales {
+            Some(bytes) if index_scale_bytes != 0 && bytes.len() == index_scale_bytes => {}
+            None if index_scale_bytes == 0 => {}
+            _ => return Err(compute(format!("V4 ROCm compressed index scales bytes={} expected={index_scale_bytes}", snapshot.compressed_index_key_scales.as_ref().map_or(0, Vec::len)))),
+        }
         if compressed_rows != 0 {
-            validate_buffer(&snapshot.compressed_key, compressed_rows, self.kv_width, "compressed key")?;
-            validate_buffer(&snapshot.compressed_key_scales, compressed_rows, scale_row_bytes, "compressed scales")?;
+            validate_buffer(&snapshot.compressed_key, compressed_rows, compressed_row_bytes, "compressed key")?;
+            validate_buffer(&snapshot.compressed_key_scales, compressed_rows, compressed_scale_row_bytes, "compressed scales")?;
             self.compressed_key = upload_bytes(device_id, &snapshot.compressed_key)?;
             self.compressed_key_scales = upload_bytes(device_id, &snapshot.compressed_key_scales)?;
             if snapshot.compressed_shared {
                 self.compressed_value = self.compressed_key.clone();
                 self.compressed_value_scales = self.compressed_key_scales.clone();
             } else {
-                validate_buffer(&snapshot.compressed_value, compressed_rows, self.kv_width, "compressed value")?;
-                validate_buffer(&snapshot.compressed_value_scales, compressed_rows, scale_row_bytes, "compressed value scales")?;
+                validate_buffer(&snapshot.compressed_value, compressed_rows, compressed_row_bytes, "compressed value")?;
+                validate_buffer(&snapshot.compressed_value_scales, compressed_rows, compressed_scale_row_bytes, "compressed value scales")?;
                 self.compressed_value = upload_bytes(device_id, &snapshot.compressed_value)?;
                 self.compressed_value_scales = upload_bytes(device_id, &snapshot.compressed_value_scales)?;
             }
             self.compressed_index_key = snapshot.compressed_index_key.as_ref().map(|bytes| upload_bytes(device_id, bytes)).transpose()?;
+            self.compressed_index_key_scales = snapshot.compressed_index_key_scales.as_ref().map(|bytes| upload_bytes(device_id, bytes)).transpose()?;
             self.compressed_capacity = compressed_rows;
         } else {
             self.compressed_index_key = None;
+            self.compressed_index_key_scales = None;
             self.compressed_capacity = self.compressed_capacity.max(1);
         }
         self.compressed_positions = snapshot.compressed_positions;

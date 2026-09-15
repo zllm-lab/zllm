@@ -11,9 +11,11 @@ use serde_json::Value;
 use crate::{
     config::{DeepSeekV4NodeModelConfig, RocmBackendConfig},
     kv_cache::terminal_cache::TerminalInfo as CacheInfo,
-    runtime::session::{AtomicCounterU64, GenerationSummary, NodeCapabilities, RuntimeStatus as NodeRuntime, TerminalResume, ToolCall, ToolFunction, request_terminal_resume, terminal_cache_id},
+    runtime::session::{
+        AtomicCounterU64, ContentPiece, GenerationSummary, NodeCapabilities, RuntimeStatus as NodeRuntime, TerminalResume, ToolCall, ToolFunction, content_pieces, request_terminal_resume, terminal_cache_id, with_content_parts,
+    },
     runtime::tool::{ParsedToolCall, ToolCallStream, ToolDialect, ToolOutput, dsml_tool_spec, request_tools, tool_argument_schemas, tool_call_id},
-    server::node::{DynError, NodeBatchRequest, NodeBatchResult, NodeConfig, NodeEngine, run_node, text_content},
+    server::node::{DynError, NodeBatchRequest, NodeBatchResult, NodeConfig, NodeEngine, run_node},
 };
 
 use super::{
@@ -42,6 +44,7 @@ fn options(model: DeepSeekV4NodeModelConfig, backend: RocmBackendConfig, cache_d
         decode_priority_prefill_chunk_size: model.execution.decode_priority_prefill_chunk_size,
         decode_priority_prefill_chunk_ceiling: model.execution.decode_priority_prefill_chunk_ceiling,
         device_pool_gib: model.execution.device_pool_gib,
+        device_arena_gib: model.execution.device_arena_gib,
         kv_reservation_page_tokens: model.execution.kv_reservation_page_tokens,
         memory_reserve_bytes: model.execution.memory_reserve_bytes,
         long_prefill_threshold_tokens: model.execution.long_prefill_threshold_tokens,
@@ -56,6 +59,7 @@ fn options(model: DeepSeekV4NodeModelConfig, backend: RocmBackendConfig, cache_d
         persist_kv_cache,
         score_expert_top_k: model.execution.score_expert_top_k,
         profile: model.execution.profile,
+        engram_enabled: model.execution.engram_enabled,
     }
 }
 
@@ -71,6 +75,7 @@ impl NodeEngine for DeepSeekV4NodeEngine {
     }
 
     fn startup_info(&self) -> (NodeCapabilities, Arc<dyn Fn() -> u64 + Send + Sync>) {
+        let input_modalities: &[&str] = if self.engine.vision_available() { &["text", "image"] } else { &["text"] };
         let mut capabilities = crate::runtime::node::text_capabilities(
             crate::runtime::node::DeviceDescriptor {
                 backend: "rocm",
@@ -83,10 +88,13 @@ impl NodeEngine for DeepSeekV4NodeEngine {
                 accelerator_memory_bytes: None,
                 recommended_working_set_bytes: None,
             },
-            crate::runtime::node::SessionDescriptor { model_format: "safetensors-mxfp4", model_bytes: 0, max_seq_len: self.engine.max_sequence_length(), kv_cache_format: "q8g64-csa", input_modalities: &["text"] },
+            crate::runtime::node::SessionDescriptor { model_format: "safetensors-mxfp4", model_bytes: 0, max_seq_len: self.engine.max_sequence_length(), kv_cache_format: "q8g64-csa", input_modalities },
         );
         capabilities.kv_cache_devices = self.engine.kv_cache_devices().to_vec();
         capabilities.kv_reservation_page_tokens = self.engine.kv_reservation_page_tokens();
+        // 引擎支持瘦身 resume(cache_id 精确恢复 + suffix 剥离);miss 与模板
+        // 对边界形态有依赖时哨兵降级。声明能力后 scheduler 命中时只发增量。
+        capabilities.terminal_resume_delta = true;
         (capabilities, Arc::new(|| 0))
     }
 
@@ -102,9 +110,9 @@ impl NodeEngine for DeepSeekV4NodeEngine {
             .into_iter()
             .map(|info| CacheInfo {
                 cache_id: info.cache_id,
-                model_key: "deepseek-v4-flash".to_owned(),
+                model_key: self.engine.cache_model_key().to_owned(),
                 cache_format: "deepseek-v4-rocm-q8-csa-v1".to_owned(),
-                last_layer: 42,
+                last_layer: self.engine.layer_count().saturating_sub(1),
                 prompt_tokens: info.prompt_tokens,
                 bytes: info.bytes,
                 modified_unix: info.modified_unix,
@@ -137,6 +145,8 @@ impl NodeEngine for DeepSeekV4NodeEngine {
         let parsed_tools = RefCell::new(HashMap::<String, Vec<ParsedToolCall>>::new());
         let on_token = RefCell::new(on_token);
         let on_result = RefCell::new(on_result);
+        // image span token 只属于 prompt;被采样出时立即截断,不外泄也不回喂。
+        let image_token_id = self.engine.image_token_id();
         for request in requests {
             let request_id = request.request_id.clone();
             request_values.borrow_mut().insert(request_id.clone(), request.request.clone());
@@ -150,6 +160,8 @@ impl NodeEngine for DeepSeekV4NodeEngine {
                 Err(message) => (on_result.borrow_mut())(NodeBatchResult { request_id, result: Err(message) }),
             }
         }
+        let cache_model_key = self.engine.cache_model_key();
+        let cache_last_layer = self.engine.layer_count().saturating_sub(1);
         let mut finish_generated = |engine: &mut RocmDeepSeekV4Engine, generated: super::rocm_engine::RocmBatchResult| {
             let request_id = generated.request_id;
             let result = match generated.result {
@@ -172,9 +184,9 @@ impl NodeEngine for DeepSeekV4NodeEngine {
                         request.and_then(|request| terminal_cache_id(&request, &response, &tool_calls)).map(|cache_id| {
                             engine.commit_cache(&request_id, cache_id).map(|info| CacheInfo {
                                 cache_id: info.cache_id,
-                                model_key: "deepseek-v4-flash".to_owned(),
+                                model_key: cache_model_key.to_owned(),
                                 cache_format: "deepseek-v4-rocm-q8-csa-v1".to_owned(),
-                                last_layer: 42,
+                                last_layer: cache_last_layer,
                                 prompt_tokens: info.prompt_tokens,
                                 bytes: info.bytes,
                                 modified_unix: info.modified_unix,
@@ -227,6 +239,9 @@ impl NodeEngine for DeepSeekV4NodeEngine {
                     .collect()
             },
             &mut |request_id, token, text| {
+                if image_token_id == Some(token) {
+                    return false;
+                }
                 let output = tool_streams.borrow_mut().get_mut(request_id).map(|stream| stream.push(&text));
                 let Some(output) = output else {
                     response_texts.borrow_mut().entry(request_id.to_owned()).or_default().push_str(&text);
@@ -257,6 +272,9 @@ impl NodeEngine for DeepSeekV4NodeEngine {
 fn prepare_one(input: NodeBatchRequest) -> Result<(RocmBatchRequest, Option<ToolCallStream>), String> {
     let request = &input.request;
     let messages = request.get("messages").and_then(Value::as_array).ok_or("messages 必须是数组")?;
+    // V4.1 多模态:image content part 在模板文本里落为官方占位符 token,
+    // 解码后的图像随请求下发,engine 侧展开 span 并做视觉编码。
+    let mut images = Vec::new();
     let tools = request_tools(request)?;
     let schemas = tool_argument_schemas(tools);
     let instructions = ToolDialect::DeepseekDsml.instructions(tools, request.get("tool_choice"))?;
@@ -268,7 +286,7 @@ fn prepare_one(input: NodeBatchRequest) -> Result<(RocmBatchRequest, Option<Tool
         if !matches!(role, "developer" | "system" | "user" | "assistant" | "tool") {
             return Err(format!("DeepSeek-V4 不支持 message.role={role}"));
         }
-        let content = text_content(message.get("content"))?;
+        let content = message_content_text(message.get("content"), &mut images)?;
         let reasoning_content = message.get("reasoning_content").and_then(Value::as_str).map(str::to_owned);
         let tool_calls = if role == "assistant" { ToolDialect::DeepseekDsml.render_history(message.get("tool_calls"))? } else { String::new() };
         let tool_call_ids = if role == "assistant" {
@@ -309,9 +327,10 @@ fn prepare_one(input: NodeBatchRequest) -> Result<(RocmBatchRequest, Option<Tool
         thinking,
         reasoning_effort,
     )?;
+    let slim_resume = request.get("_zllm_resume").is_some();
     let resume_suffix = match request_terminal_resume(request)? {
         TerminalResume::Match { assistant, .. } => {
-            let assistant_prompt = deepseek_v4_chat_prompt(
+            let assistant_prompt = match deepseek_v4_chat_prompt(
                 prompt_messages[..=assistant].iter().map(|(role, content, reasoning_content, tool_calls, tool_call_id, tool_call_ids)| DeepSeekV4ChatMessage {
                     role,
                     content,
@@ -323,8 +342,25 @@ fn prepare_one(input: NodeBatchRequest) -> Result<(RocmBatchRequest, Option<Tool
                 instructions.as_deref(),
                 thinking,
                 reasoning_effort,
-            )?;
-            Some(deepseek_v4_resume_suffix(&prompt, &assistant_prompt)?)
+            ) {
+                Ok(prompt) => prompt,
+                // 瘦身请求的 boundary 单独渲染可能缺 user 等模板前置;哨兵降级
+                // 让 server 重发完整请求走既有路径,而不是硬错误杀掉会话。
+                Err(error) if slim_resume => {
+                    eprintln!("[deepseek-v4-slim-resume] 边界渲染失败,降级重发完整请求: {error}");
+                    return Err(format!("{} <deepseek-boundary>", crate::runtime::session::TERMINAL_RESUME_MISS));
+                }
+                Err(error) => return Err(error),
+            };
+            match deepseek_v4_resume_suffix(&prompt, &assistant_prompt) {
+                Ok(suffix) => Some(suffix),
+                // 剥离失败说明模板对边界形态有输出差异,同样降级重发完整请求。
+                Err(error) if slim_resume => {
+                    eprintln!("[deepseek-v4-slim-resume] suffix 剥离失败,降级重发完整请求: {error}");
+                    return Err(format!("{} <deepseek-suffix>", crate::runtime::session::TERMINAL_RESUME_MISS));
+                }
+                Err(error) => return Err(error),
+            }
         }
         TerminalResume::None | TerminalResume::Mismatch { .. } => None,
     };
@@ -348,12 +384,51 @@ fn prepare_one(input: NodeBatchRequest) -> Result<(RocmBatchRequest, Option<Tool
             cancellation: input.cancellation,
             cache_id: request.get("cache_id").and_then(Value::as_str).map(str::to_owned),
             resume_suffix,
+            slim_resume,
             cache_namespace: request.get("_zllm_cache_namespace").and_then(Value::as_str).map(str::to_owned),
             tool_fence,
             repeat_loop_breaker,
+            vision_images: (!images.is_empty()).then_some(images),
         },
         tool_stream,
     ))
+}
+
+/// 官方 IMAGE_PLACEHOLDER(encoding.py):image content part 的模板占位符。
+const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
+
+/// message.content 的图文混合文本:image part 展开为占位符,图像收集到
+/// `images`(engine 侧按出现顺序消费);纯文本行为与 text_content 一致。
+fn message_content_text(content: Option<&Value>, images: &mut Vec<crate::vision::RgbImage>) -> Result<String, String> {
+    let pieces = content_pieces(content)?;
+    if !pieces.iter().any(|piece| matches!(piece, ContentPiece::Image { .. })) {
+        return Ok(pieces
+            .iter()
+            .map(|piece| match piece {
+                ContentPiece::Text(text) => text.as_str(),
+                ContentPiece::Image { .. } => unreachable!("上方已排除"),
+            })
+            .collect::<Vec<_>>()
+            .join(""));
+    }
+    with_content_parts(&pieces, |parts| {
+        let mut text = String::new();
+        for part in parts {
+            match part {
+                crate::vision::ContentPart::Text(value) => {
+                    if value.contains(IMAGE_PLACEHOLDER) {
+                        return Err(format!("文本包含 DeepSeek-V4.1 保留的 image 占位符 {IMAGE_PLACEHOLDER}"));
+                    }
+                    text.push_str(value);
+                }
+                crate::vision::ContentPart::Image(image) => {
+                    text.push_str(IMAGE_PLACEHOLDER);
+                    images.push((*image).clone());
+                }
+            }
+        }
+        Ok(text)
+    })
 }
 
 fn deepseek_tool_call(scope: &str, index: usize, call: ParsedToolCall) -> ToolCall {

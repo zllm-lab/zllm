@@ -16,13 +16,16 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::protocol::*;
-use super::rocm_swap::{Glm52CacheIdentity, Glm52CacheSnapshot, Glm52DsparkAuxCache, Glm52DsparkTargetCache, Glm52DsparkTargetLayerCache, Glm52DsparkTargetTensor, Glm52SwapStore, download_glm52_session, upload_glm52_session};
+use super::rocm_swap::{
+    Glm52CacheIdentity, Glm52CacheSnapshot, Glm52DsparkAuxCache, Glm52DsparkTargetCache, Glm52DsparkTargetLayerCache, Glm52DsparkTargetTensor, Glm52HotHistoryPrepare, Glm52SwapStore, take_glm52_session, upload_glm52_session,
+};
 use crate::attention::rope::RopeTable;
 use crate::attention::{AttentionSpec, mla::MlaSpec};
 use crate::backend::{BackendResources, LinearWeight, SegmentedTensorBackend, StageExecutionBackend};
@@ -30,7 +33,7 @@ use crate::backend::{
     cpu::CpuContext,
     rocm::{RocmContext, RocmPrefillExperts, RocmTensor, RocmWeight},
 };
-use crate::config::{Glm52DsparkExecutionBackend, Glm52NodeExecutionConfig, KvCacheFormat};
+use crate::config::{Glm52DsparkExecutionBackend, Glm52NodeExecutionConfig, Glm52SchedulingConfig, KvCacheFormat};
 use crate::kernel::cpu::CpuTensor;
 use crate::kv_cache::terminal_cache::TerminalInfo as CacheInfo;
 use crate::kv_cache::terminal_cache::{ResidencyBudget, ResidencyReservation, TerminalCache};
@@ -48,18 +51,215 @@ use crate::runtime::{
     speculative::{verify_samples, verify_samples_prefix},
 };
 use crate::server::iroh::IrohConfig;
-use crate::server::node::{NodeBatchRequest, NodeBatchResult, NodeEngine};
-use crate::server::stage_transport::{RequestId, StageDeviceMemory, StageMessage, StageTransport};
+use crate::server::node::{NodeBatchRequest, NodeBatchResult, NodeEngine, RuntimeConfigControl, RuntimeConfigUpdate};
+use crate::server::stage_transport::{RequestId, StageDeviceMemory, StageMessage, StageRuntimeConfig, StageTransport};
 use crate::tokenizer::{Detokenizer, Tokenizer, Utf8StreamDecoder};
 use crate::weight::Glm52Weights;
 
 use super::dspark_cpu::{CpuDsparkExecutor, CpuDsparkJob, CpuDsparkRuntime};
 use super::dspark_rocm::{RocmDsparkDraftBatch, RocmGlmDraftRuntime, attach_dspark_projections};
-use super::rocm::{RocmMtpCatchUp, RocmMtpDraftBatch, RocmMtpRuntime, RocmMtpSession, gather_embedding_rows, load_resident_embedding, mtp_catch_up_batch, mtp_draft_batch, prepare_glm52_rope_resident, prepare_head_output_runtime};
+use super::rocm::{
+    RocmMtpCatchUp, RocmMtpDraftBatch, RocmMtpRuntime, RocmMtpSession, gather_embedding_rows, load_resident_embedding, mtp_catch_up_batch, mtp_draft_batch, pair_session_reservation, prepare_glm52_rope_resident, prepare_head_output_runtime,
+    reserve_pair_session,
+};
 use crate::runtime::dspark::{DsparkTargetCache, DsparkTargetCacheSnapshot, DsparkTargetLayerSnapshot};
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 type Glm52StageState = RuntimeGlm52StageState<RocmContext>;
+
+const DEFAULT_MTP_PRESSURE_DRAFT_TOKENS: [usize; 10] = [0, 5, 5, 5, 3, 3, 1, 1, 1, 0];
+const DEFAULT_DEVICE_BUFFER_POOL_BYTES: usize = 8 * 1024 * 1024 * 1024;
+const MAXIMUM_DEVICE_BUFFER_POOL_BYTES: usize = 32 * 1024 * 1024 * 1024;
+
+/// 只包含在调度边界读取、无需重载权重或重建 KV 布局的参数。
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Glm52RuntimeTuning {
+    revision: u64,
+    max_concurrency: usize,
+    prefill_chunk_size: usize,
+    mtp_draft_tokens: usize,
+    mtp_pressure_draft_tokens: Vec<usize>,
+    device_buffer_pool_bytes: usize,
+    scheduling: Glm52SchedulingConfig,
+    request_overrides: HashMap<String, Glm52RequestRuntimeTuning>,
+}
+
+impl Glm52RuntimeTuning {
+    fn mtp_drafts(&self, decode: usize, prefill: usize) -> usize {
+        let pressure = decode.saturating_add(prefill.saturating_mul(4));
+        self.mtp_draft_tokens.min(self.mtp_pressure_draft_tokens.get(pressure).copied().unwrap_or_else(|| self.mtp_pressure_draft_tokens.last().copied().unwrap_or(0)))
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Glm52RuntimeTuningPatch {
+    max_concurrency: Option<usize>,
+    prefill_chunk_size: Option<usize>,
+    mtp_draft_tokens: Option<usize>,
+    mtp_pressure_draft_tokens: Option<Vec<usize>>,
+    device_buffer_pool_bytes: Option<usize>,
+    scheduling: Option<Glm52SchedulingPatch>,
+    request_overrides: Option<HashMap<String, Option<Glm52RequestRuntimeTuning>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Glm52RequestRuntimeTuning {
+    mtp_draft_tokens: Option<usize>,
+    prefill_chunk_size: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Glm52SchedulingPatch {
+    execution_slots: Option<usize>,
+    decode_execution_slots: Option<usize>,
+    pipeline_work_window: Option<usize>,
+    append_prefill_chunk_size: Option<usize>,
+    decode_priority_prefill_chunk_size: Option<usize>,
+    decode_priority_prefill_chunk_ceiling: Option<usize>,
+    long_prefill_threshold_tokens: Option<usize>,
+    long_prefill_chunk_size: Option<usize>,
+    profile_completion: Option<bool>,
+}
+
+struct Glm52RuntimeConfig {
+    tuning: Arc<RwLock<Glm52RuntimeTuning>>,
+    physical_max_concurrency: usize,
+    maximum_prefill_chunk_size: usize,
+    maximum_mtp_draft_tokens: usize,
+}
+
+impl Glm52RuntimeConfig {
+    fn update(config: &mut Glm52SchedulingConfig, patch: Glm52SchedulingPatch) {
+        macro_rules! set {
+            ($field:ident) => {
+                if let Some(value) = patch.$field {
+                    config.$field = value;
+                }
+            };
+        }
+        set!(execution_slots);
+        set!(decode_execution_slots);
+        set!(pipeline_work_window);
+        set!(append_prefill_chunk_size);
+        set!(decode_priority_prefill_chunk_size);
+        set!(decode_priority_prefill_chunk_ceiling);
+        set!(long_prefill_threshold_tokens);
+        set!(long_prefill_chunk_size);
+        set!(profile_completion);
+    }
+
+    fn validate(&self, tuning: &Glm52RuntimeTuning) -> Result<(), String> {
+        if tuning.max_concurrency == 0 || tuning.max_concurrency > self.physical_max_concurrency {
+            return Err(format!("max_concurrency 必须在 1..={}，实际 {}", self.physical_max_concurrency, tuning.max_concurrency));
+        }
+        if tuning.prefill_chunk_size == 0 || tuning.prefill_chunk_size > self.maximum_prefill_chunk_size {
+            return Err(format!("prefill_chunk_size 必须在 1..={}，实际 {}", self.maximum_prefill_chunk_size, tuning.prefill_chunk_size));
+        }
+        if tuning.mtp_draft_tokens > self.maximum_mtp_draft_tokens {
+            return Err(format!("mtp_draft_tokens 不能超过启动时已加载的 {}，实际 {}", self.maximum_mtp_draft_tokens, tuning.mtp_draft_tokens));
+        }
+        if tuning.mtp_pressure_draft_tokens.is_empty() || tuning.mtp_pressure_draft_tokens.len() > 65 {
+            return Err("mtp_pressure_draft_tokens 长度必须在 1..=65".to_owned());
+        }
+        if tuning.mtp_pressure_draft_tokens.iter().any(|&drafts| drafts > tuning.mtp_draft_tokens) {
+            return Err("mtp_pressure_draft_tokens 每项不能超过 mtp_draft_tokens".to_owned());
+        }
+        if tuning.device_buffer_pool_bytes == 0 || tuning.device_buffer_pool_bytes > MAXIMUM_DEVICE_BUFFER_POOL_BYTES {
+            return Err(format!("device_buffer_pool_bytes 必须在 1..={MAXIMUM_DEVICE_BUFFER_POOL_BYTES}"));
+        }
+        for (request_id, request) in &tuning.request_overrides {
+            if request_id.is_empty() {
+                return Err("request_overrides 的 request_id 不能为空".to_owned());
+            }
+            if request.mtp_draft_tokens.is_some_and(|value| value > self.maximum_mtp_draft_tokens) {
+                return Err(format!("request_overrides.{request_id}.mtp_draft_tokens 超过启动上限 {}", self.maximum_mtp_draft_tokens));
+            }
+            if request.prefill_chunk_size.is_some_and(|value| value == 0 || value > self.maximum_prefill_chunk_size) {
+                return Err(format!("request_overrides.{request_id}.prefill_chunk_size 必须在 1..={}", self.maximum_prefill_chunk_size));
+            }
+        }
+        let scheduling = tuning.scheduling;
+        for (name, value) in [
+            ("execution_slots", scheduling.execution_slots),
+            ("decode_execution_slots", scheduling.decode_execution_slots),
+            ("pipeline_work_window", scheduling.pipeline_work_window),
+            ("append_prefill_chunk_size", scheduling.append_prefill_chunk_size),
+            ("decode_priority_prefill_chunk_size", scheduling.decode_priority_prefill_chunk_size),
+            ("decode_priority_prefill_chunk_ceiling", scheduling.decode_priority_prefill_chunk_ceiling),
+            ("long_prefill_threshold_tokens", scheduling.long_prefill_threshold_tokens),
+            ("long_prefill_chunk_size", scheduling.long_prefill_chunk_size),
+        ] {
+            if value == 0 {
+                return Err(format!("scheduling.{name} 必须大于 0"));
+            }
+        }
+        if scheduling.decode_priority_prefill_chunk_size > scheduling.decode_priority_prefill_chunk_ceiling {
+            return Err("scheduling.decode_priority_prefill_chunk_size 不能超过 ceiling".to_owned());
+        }
+        if [scheduling.append_prefill_chunk_size, scheduling.decode_priority_prefill_chunk_size, scheduling.decode_priority_prefill_chunk_ceiling, scheduling.long_prefill_chunk_size]
+            .into_iter()
+            .any(|value| value > self.maximum_prefill_chunk_size)
+        {
+            return Err(format!("prefill 分块不能超过启动上限 {}", self.maximum_prefill_chunk_size));
+        }
+        Ok(())
+    }
+
+    fn snapshot_value(tuning: &Glm52RuntimeTuning) -> Value {
+        serde_json::to_value(tuning).expect("GLM runtime tuning 可序列化")
+    }
+}
+
+impl RuntimeConfigControl for Glm52RuntimeConfig {
+    fn apply(&self, patch: Value) -> Result<RuntimeConfigUpdate, String> {
+        let patch: Glm52RuntimeTuningPatch = serde_json::from_value(patch).map_err(|error| format!("GLM runtime patch 非法: {error}"))?;
+        let mut tuning = self.tuning.write().map_err(|_| "GLM runtime config 锁中毒".to_owned())?;
+        let mut next = tuning.clone();
+        if let Some(value) = patch.max_concurrency {
+            next.max_concurrency = value;
+        }
+        if let Some(value) = patch.prefill_chunk_size {
+            next.prefill_chunk_size = value;
+        }
+        if let Some(value) = patch.mtp_draft_tokens {
+            next.mtp_draft_tokens = value;
+        }
+        if let Some(value) = patch.mtp_pressure_draft_tokens {
+            next.mtp_pressure_draft_tokens = value;
+        }
+        if let Some(value) = patch.device_buffer_pool_bytes {
+            next.device_buffer_pool_bytes = value;
+        }
+        if let Some(value) = patch.scheduling {
+            Self::update(&mut next.scheduling, value);
+        }
+        if let Some(overrides) = patch.request_overrides {
+            for (request_id, request) in overrides {
+                match request {
+                    Some(request) => {
+                        next.request_overrides.insert(request_id, request);
+                    }
+                    None => {
+                        next.request_overrides.remove(&request_id);
+                    }
+                }
+            }
+        }
+        self.validate(&next)?;
+        next.revision = next.revision.checked_add(1).ok_or("GLM runtime config revision 溢出")?;
+        *tuning = next.clone();
+        Ok(RuntimeConfigUpdate { revision: next.revision, config: Self::snapshot_value(&next), max_concurrency: Some(next.max_concurrency) })
+    }
+
+    fn snapshot(&self) -> RuntimeConfigUpdate {
+        let tuning = self.tuning.read().expect("GLM runtime config 锁中毒").clone();
+        RuntimeConfigUpdate { revision: tuning.revision, config: Self::snapshot_value(&tuning), max_concurrency: Some(tuning.max_concurrency) }
+    }
+}
 
 #[path = "terminal.rs"]
 mod terminal;
@@ -161,10 +361,16 @@ pub struct Glm52Engine {
     intake_capacity: usize,
     kv_budget: ResidencyBudget,
     kv_reservation_page_tokens: usize,
+    runtime_tuning: Arc<RwLock<Glm52RuntimeTuning>>,
     options: Glm52NodeExecutionConfig,
 }
 
 impl Glm52Engine {
+    fn live_gpu_admission(&self) -> bool {
+        let hip = crate::kernel::rocm::hip::options();
+        self.options.parallel_operator_pairs && self.dspark_runtime.is_none() && hip.mla_gpu_resident_reserve_bytes.is_some() && hip.mla_cpu_hot_rows > 64 && !hip.kv_f16 && !hip.dsa_cpu_select && !hip.prefill_attention_cpu
+    }
+
     fn batch_load(slots: &[Option<Glm52BatchTask>]) -> (usize, usize, usize) {
         slots.iter().flatten().fold((0, 0, 0), |mut load, task| {
             // 链头提交完不等于整条流水线 prefill 完成，必须等到尾段水位。
@@ -181,19 +387,244 @@ impl Glm52Engine {
 
     fn can_admit_pending(&self, task: &Glm52PendingTask, (new_prefill, append_prefill, decode): (usize, usize, usize)) -> bool {
         if task.force_new {
+            if self.live_gpu_admission() {
+                return true;
+            }
             return NodeRuntime { new_prefill, append_prefill, decode, ..NodeRuntime::default() }.can_admit_prefill(false);
         }
         let namespace = task.input.request.get("_zllm_cache_namespace").and_then(Value::as_str);
-        let resume = request_terminal_resume(&task.input.request).ok();
+        let resume = &task.resume;
         let resident = self.terminal_states.entries().any(|(cache_id, cached, state)| {
-            state.cache_namespace.as_deref() == namespace && !cached.is_empty()
+            state.cache_namespace.as_deref() == namespace
+                && !cached.is_empty()
                 && (!self.options.mtp || state.mtp.is_some())
                 && (self.dspark_runtime.is_none() || self.dspark_cache_valid(state.dspark_aux_history.as_ref(), state.dspark_aux_history_start, &state.dspark_target_cache, cached.len()))
-                && (task.tokens.starts_with(cached)
-                    || state.pending_tokens.is_some() && matches!(&resume, Some(TerminalResume::Match { cache_id: requested, .. }) if requested == cache_id))
+                && (task.tokens.starts_with(cached) || state.pending_tokens.is_some() && matches!(resume, TerminalResume::Match { cache_id: requested, .. } if requested == cache_id))
         });
         let swapped = matches!(&task.swap_prefetch, Glm52SwapPrefetch::Ready(Ok(Some((snapshot, _)))) if !snapshot.tokens.is_empty() && self.swap_cache_valid(snapshot));
+        if self.live_gpu_admission() {
+            return true;
+        }
         NodeRuntime { new_prefill, append_prefill, decode, ..NodeRuntime::default() }.can_admit_prefill(resident || swapped)
+    }
+
+    fn pending_memory_cache(&self, task: &Glm52PendingTask) -> Result<(Option<String>, usize, Option<usize>), String> {
+        let namespace = task.input.request.get("_zllm_cache_namespace").and_then(Value::as_str);
+        let resume = &task.resume;
+        // 与实际 Open 的优先级一致：显式边界、显式 cache_id、最长前缀。
+        let resident = (!task.force_new)
+            .then(|| {
+                self.terminal_states
+                    .entries()
+                    .find(|(id, tokens, state)| {
+                        state.cache_namespace.as_deref() == namespace && matches!(&resume, TerminalResume::Match { cache_id, .. } if cache_id == *id) && (state.pending_tokens.is_some() || task.tokens.starts_with(tokens))
+                    })
+                    .or_else(|| {
+                        let requested = task.input.request.get("cache_id").and_then(Value::as_str)?;
+                        self.terminal_states.entries().find(|(id, tokens, state)| *id == requested && state.cache_namespace.as_deref() == namespace && task.tokens.starts_with(tokens))
+                    })
+                    .or_else(|| self.terminal_states.entries().filter(|(_, tokens, state)| state.cache_namespace.as_deref() == namespace && task.tokens.starts_with(tokens)).max_by_key(|(_, tokens, _)| tokens.len()))
+            })
+            .flatten();
+        let mut prompt_rows = task.tokens.len();
+        let mut cached_rows = None;
+        let mut cache_id = None;
+        let mut boundary = None;
+        if let Some((id, tokens, state)) = resident {
+            cache_id = Some(id.to_owned());
+            cached_rows = Some(tokens.len());
+            if let TerminalResume::Match { cache_id: requested, assistant } = &resume
+                && requested == id
+                && let Some(pending) = &state.pending_tokens
+            {
+                boundary = Some((tokens.len() + pending.len(), *assistant));
+            }
+        } else if !task.force_new
+            && let Glm52SwapPrefetch::Ready(Ok(Some((snapshot, assistant)))) = &task.swap_prefetch
+            && self.swap_cache_valid(snapshot)
+        {
+            cache_id = Some(snapshot.cache_id.clone());
+            cached_rows = Some(snapshot.tokens.len());
+            if let Some(assistant) = assistant {
+                boundary = Some((snapshot.tokens.len() + snapshot.pending_tokens.as_ref().map_or(0, Vec::len), *assistant));
+            }
+        }
+        if let Some((prefix, assistant)) = boundary {
+            let suffix = match chat_prompt_suffix_glm52(&task.input.request, assistant, self.options.diagnostics.official_chat_template) {
+                Ok(suffix) => suffix,
+                Err(_) if !boundary_has_followup(&task.input.request, assistant) => String::new(),
+                Err(error) => return Err(error),
+            };
+            prompt_rows = prefix.saturating_add(self.tokenizer.tokenize(suffix.as_bytes()).len());
+        }
+        // 显式终点恢复先重建真实 prompt 长度，不能把 SSD 瘦身请求的增量长度
+        // 减去完整历史后饱和为零，否则大 append 会被误判为短追加。
+        let suffix = cached_rows.and_then(|rows| prompt_rows.checked_sub(rows));
+        Ok((cache_id, self.request_reservation_tokens(prompt_rows, task.max_tokens), suffix))
+    }
+
+    fn pending_uses_gpu_cache(&self, task: &Glm52PendingTask) -> bool {
+        self.pending_memory_cache(task).ok().and_then(|(id, _, _)| id).is_some_and(|id| self.terminal_states.cached_tokens(&id).is_some())
+    }
+
+    /// 返回是否准入，以及尾端是否还需要物理分配。
+    fn admit_pending_memory(&mut self, task: &Glm52PendingTask, allow_tail_allocation: bool) -> Result<(bool, bool), String> {
+        if !self.live_gpu_admission() {
+            return Ok((true, false));
+        }
+        let (cache_id, rows, _) = self.pending_memory_cache(task)?;
+        let reserve = crate::kernel::rocm::hip::options().mla_gpu_resident_reserve_bytes.expect("live admission 已检查");
+        loop {
+            let fresh;
+            let mut required = if let Some(state) = cache_id.as_deref().and_then(|id| self.terminal_states.entries().find(|(key, _, _)| *key == id).map(|(_, _, state)| state)) {
+                pair_session_reservation(&state.states, rows, &self.cfg)?
+            } else {
+                fresh = self.build_fresh_states()?;
+                pair_session_reservation(&fresh, rows, &self.cfg)?
+            };
+            if let Some(runtime) = &self.mtp_runtime {
+                let resident = cache_id.as_deref().and_then(|id| self.terminal_states.entries().find(|(key, _, _)| *key == id).map(|(_, _, state)| state));
+                let fresh;
+                let session = match resident.and_then(|state| state.mtp.as_ref()) {
+                    Some(session) => session,
+                    None => {
+                        fresh = RocmMtpSession::fresh(&self.cfg, self.max_seq_len)?;
+                        &fresh
+                    }
+                };
+                let bytes = session.pair_reservation_bytes(runtime, &self.cfg, rows)?;
+                let peer = runtime.experts.operator_peer_context().ok_or("MTP GPU reservation 需要 operator pair")?;
+                for (parity, context) in [runtime.backend, peer].into_iter().enumerate() {
+                    required.push((context.device_id(), bytes[parity]));
+                }
+            }
+            // 两机使用本次请求各自的物理缓存形态核算，RAM/SSD 命中不能冒充 GPU 命中。
+            self.link.send_memory_query(cache_id.as_deref().map(RequestId::from_cache_id), rows)?;
+            let query_id = RequestId::parse("00000000000000000000000000000000")?;
+            let (tail, tail_required, tail_indexers) = match self.recv_stage(query_id)? {
+                StageMessage::MemoryRequirement { devices, required_bytes, indexer_layers } if !devices.is_empty() && devices.len() == required_bytes.len() && devices.len() == indexer_layers.len() => {
+                    (devices, required_bytes, indexer_layers)
+                }
+                message => return Err(format!("准入查询期望 MemoryRequirement，实际 {message:?}")),
+            };
+            let tail_requires_allocation = tail_required.iter().any(|&bytes| bytes != 0);
+            self.downstream_memory = tail.clone();
+            let mut devices = Vec::new();
+            let mut fits = true;
+            let mut layer_start = 0;
+            for (index, (context, &end)) in self.contexts.iter().zip(&self.layer_ends).enumerate() {
+                let mtp = self.mtp_runtime.as_ref().filter(|_| index == 0);
+                let layers = end + 1 - layer_start + usize::from(mtp.is_some());
+                let indexers = (layer_start..=end).filter(|&layer| crate::model_spec::glm52::is_indexer_layer(layer)).count() + usize::from(mtp.is_some_and(|runtime| runtime.weights.layer.indexer.is_some()));
+                layer_start = end + 1;
+                for (parity, context) in std::iter::once(context).chain(self.cooperative_peer_contexts.get(index)).enumerate() {
+                    let free = context.stage_available_bytes().map_err(|error| format!("查询当前 GPU 余量: {error:?}"))?;
+                    let need = required.iter().filter(|(id, _)| *id == context.device_id()).map(|(_, bytes)| *bytes).sum::<usize>();
+                    fits &= free >= need.saturating_add(reserve);
+                    devices.push(self.current_device_headroom(format!("local/rocm-device-{}", context.device_id()), free, layers, indexers, parity, reserve)?);
+                    if free < need.saturating_add(reserve) {
+                        eprintln!("[glm52-memory-wait] request={} device=local/{} free={free} reserve={reserve} required={need} rows={rows}", task.input.request_id, context.device_id());
+                    }
+                }
+            }
+            for (index, (device, &need)) in tail.iter().zip(&tail_required).enumerate() {
+                fits &= device.available_bytes >= need.saturating_add(reserve as u64);
+                devices.push(self.current_device_headroom(format!("downstream/rocm-device-{}", device.device), device.available_bytes as usize, device.model_units, tail_indexers[index], index % 2, reserve)?);
+                if device.available_bytes < need.saturating_add(reserve as u64) {
+                    eprintln!("[glm52-memory-wait] request={} device=downstream/{} free={} reserve={reserve} required={need} rows={rows}", task.input.request_id, device.device, device.available_bytes);
+                }
+            }
+            if let Ok(mut runtime) = self.runtime.lock() {
+                runtime.kv_cache_available_tokens = devices.iter().map(|device| device.token_capacity).min();
+                runtime.kv_cache_headroom = devices;
+                runtime.kv_cache_reserve_bytes = reserve as u64;
+                runtime.kv_cache_headroom_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+            }
+            // 第二项表示 B 仍需分配。仅 A 命中不能把 B 的 SSD 恢复误当快速命中。
+            if fits {
+                return Ok((allow_tail_allocation || !tail_requires_allocation, tail_requires_allocation));
+            }
+            if !allow_tail_allocation && tail_requires_allocation {
+                return Ok((false, true));
+            }
+            let pinned = self.pinned.lock().map_err(|_| "pin 集合锁中毒")?;
+            let victim = self.terminal_states.entries().filter(|(id, _, _)| cache_id.as_deref() != Some(*id) && !pinned.contains(*id)).min_by_key(|(_, _, state)| state.decode_finished_at).map(|(id, _, _)| id.to_owned());
+            drop(pinned);
+            if victim.is_none() {
+                return Ok((false, tail_requires_allocation));
+            }
+            // 临时 pin 本次待激活的终点，沿用两端 DSA 完整换出路径。
+            let inserted = cache_id.as_ref().is_some_and(|id| self.pinned.lock().is_ok_and(|mut pins| pins.insert(id.clone())));
+            let evicted = self.evict_oldest_terminal();
+            if inserted
+                && let Some(id) = &cache_id
+                && let Ok(mut pins) = self.pinned.lock()
+            {
+                pins.remove(id);
+            }
+            if evicted?.is_none() {
+                return Ok((false, tail_requires_allocation));
+            }
+        }
+    }
+
+    fn current_device_headroom(&self, device: String, free: usize, layers: usize, indexers: usize, parity: usize, reserve: usize) -> Result<KvCacheDeviceCapacity, String> {
+        let available = free.saturating_sub(reserve);
+        let hot = crate::kernel::rocm::hip::options().mla_cpu_hot_rows;
+        let mut low = 0;
+        let mut high = self.max_seq_len;
+        // 用分配器相同的 block 对齐、固定热窗和 map 扩容公式反解 token 上限，
+        // 不能把可用 bytes 直接除以平均行宽，漏掉每个新会话的固定成本。
+        while low < high {
+            let rows = low + (high - low).div_ceil(2);
+            let mla = crate::backend::rocm::RocmKvCache::minimum_reservation_bytes(rows, self.max_seq_len, hot, self.cfg.kv_lora_rank, self.cfg.qk_rope_head_dim).map_err(|error| format!("MLA token headroom: {error:?}"))?;
+            let dsa = crate::backend::rocm::RocmDsaState::minimum_sequence_shard_bytes(rows, self.max_seq_len, self.cfg.index_head_dim)?[parity];
+            if mla.saturating_mul(layers).saturating_add(dsa.saturating_mul(indexers)) <= available {
+                low = rows;
+            } else {
+                high = rows - 1;
+            }
+        }
+        Ok(KvCacheDeviceCapacity {
+            device,
+            available_bytes: available as u64,
+            bytes_per_token: (indexers * crate::backend::rocm::RocmDsaState::key_bytes_per_token(self.cfg.index_head_dim)?.div_ceil(2) + layers * 8) as u64,
+            token_capacity: low,
+        })
+    }
+
+    fn refresh_admission_memory(&mut self) -> Result<(), String> {
+        if !self.live_gpu_admission() {
+            return Ok(());
+        }
+        self.link.send_memory_query(None, 0)?;
+        let (tail, tail_indexers) = match self.recv_stage(RequestId::parse("00000000000000000000000000000000")?)? {
+            StageMessage::MemoryRequirement { devices, indexer_layers, .. } if !devices.is_empty() && devices.len() == indexer_layers.len() => (devices, indexer_layers),
+            message => return Err(format!("刷新 GPU 余量期望 MemoryRequirement，实际 {message:?}")),
+        };
+        let reserve = crate::kernel::rocm::hip::options().mla_gpu_resident_reserve_bytes.expect("live admission 已检查");
+        let mut result = Vec::new();
+        let mut start = 0;
+        for (index, (context, &end)) in self.contexts.iter().zip(&self.layer_ends).enumerate() {
+            let mtp = self.mtp_runtime.as_ref().filter(|_| index == 0);
+            let layers = end + 1 - start + usize::from(mtp.is_some());
+            let indexers = (start..=end).filter(|&layer| crate::model_spec::glm52::is_indexer_layer(layer)).count() + usize::from(mtp.is_some_and(|runtime| runtime.weights.layer.indexer.is_some()));
+            start = end + 1;
+            for (parity, context) in std::iter::once(context).chain(self.cooperative_peer_contexts.get(index)).enumerate() {
+                result.push(self.current_device_headroom(format!("local/rocm-device-{}", context.device_id()), context.stage_available_bytes().map_err(|error| format!("刷新 GPU 余量: {error:?}"))?, layers, indexers, parity, reserve)?);
+            }
+        }
+        for (index, device) in tail.iter().enumerate() {
+            result.push(self.current_device_headroom(format!("downstream/rocm-device-{}", device.device), device.available_bytes as usize, device.model_units, tail_indexers[index], index % 2, reserve)?);
+        }
+        self.downstream_memory = tail;
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.kv_cache_available_tokens = result.iter().map(|device| device.token_capacity).min();
+            runtime.kv_cache_headroom = result;
+            runtime.kv_cache_reserve_bytes = reserve as u64;
+            runtime.kv_cache_headroom_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        }
+        Ok(())
     }
 
     // 准入与恢复使用相同的完整性检查，避免损坏快照按 append 放行后全量重建。
@@ -661,10 +1092,23 @@ impl Glm52Engine {
         };
         let kv_f16 = options.kv_cache_format == KvCacheFormat::F16;
         let capability_contexts = contexts.iter().chain(&cooperative_peer_contexts).copied().collect::<Vec<_>>();
-        let capabilities = crate::runtime::rocm_chain::node_capabilities(&capability_contexts, max_seq_len, if kv_f16 { "f16" } else { "q8g64" }, "glm52-rocm".to_owned(), 0);
+        let mut capabilities = crate::runtime::rocm_chain::node_capabilities(&capability_contexts, max_seq_len, if kv_f16 { "f16" } else { "q8g64" }, "glm52-rocm".to_owned(), 0);
+        // 引擎支持瘦身 resume(只渲染增量,token 序列由 cache 重建),声明能力
+        // 后 scheduler 命中时只发 [边界 assistant, ...增量],不再传全文。
+        capabilities.terminal_resume_delta = true;
         // 淘汰由引擎协调 A/B 两端释放；容器不能在 insert 时静默丢掉单端状态。
         let terminal_limit = usize::MAX;
         let kv_reservation_page_tokens = options.kv_reservation_page_tokens;
+        let runtime_tuning = Arc::new(RwLock::new(Glm52RuntimeTuning {
+            revision: 1,
+            max_concurrency: 1,
+            prefill_chunk_size: options.prefill_chunk_size,
+            mtp_draft_tokens: options.mtp_draft_tokens,
+            mtp_pressure_draft_tokens: DEFAULT_MTP_PRESSURE_DRAFT_TOKENS.iter().map(|&drafts| drafts.min(options.mtp_draft_tokens)).collect(),
+            device_buffer_pool_bytes: DEFAULT_DEVICE_BUFFER_POOL_BYTES,
+            scheduling: options.scheduling,
+            request_overrides: HashMap::new(),
+        }));
         let cache_identity = Glm52CacheIdentity::new(&weights, options.kv_cache_format, 0, stage_end, options.mtp, max_seq_len, options.block_draft_directory()).with_dflash2(options.dflash2_directory.as_deref())?;
         let swap = persist_kv_cache.then(|| Glm52SwapStore::open(cache_dir.join("glm52").join(format!("stage-0-{stage_end}")), &cache_identity).map(Arc::new)).transpose()?;
         let mut engine = Self {
@@ -705,6 +1149,7 @@ impl Glm52Engine {
             intake_capacity: 1,
             kv_budget: ResidencyBudget::new(1),
             kv_reservation_page_tokens,
+            runtime_tuning,
             options,
         };
         // 分布式 decode 必须在注册调度器前准备全部 CT experts；否则首个 prompt
@@ -712,9 +1157,13 @@ impl Glm52Engine {
         engine.ensure_resident_states().map_err(|error| -> DynError { error.into() })?;
         let (intake_capacity, kv_token_capacity, kv_cache_devices) = engine.memory_capacity()?;
         engine.intake_capacity = intake_capacity.min(NodeRuntime::MAX_CONCURRENT_SESSIONS);
-        engine.kv_budget = ResidencyBudget::new(kv_token_capacity);
+        engine.runtime_tuning.write().map_err(|_| "GLM runtime config 锁中毒")?.max_concurrency = engine.intake_capacity;
+        // 实时模式的物理预算在每次激活前核算；这里仅保留逻辑序列预留的上界，
+        // 不再用启动时的空闲显存估计代替运行中的设备余量。
+        engine.kv_budget = ResidencyBudget::new(if engine.live_gpu_admission() { engine.max_seq_len.saturating_mul(engine.intake_capacity) } else { kv_token_capacity });
         engine.capabilities.kv_cache_devices = kv_cache_devices;
         engine.capabilities.kv_reservation_page_tokens = engine.kv_reservation_page_tokens;
+        engine.refresh_admission_memory()?;
         eprintln!(
             "[glm52-head] KV admission token_budget={} page_tokens={} max_active@1M={} intake_window={}",
             engine.kv_budget.capacity(),
@@ -947,6 +1396,23 @@ impl Glm52Engine {
         }
     }
 
+    fn wait_deleted(&mut self, request_id: RequestId) -> Result<(), String> {
+        match self.recv_stage(request_id)? {
+            StageMessage::Ready { .. } => Ok(()),
+            _ => Err("等待下游删除完成时收到非 Ready frame".to_owned()),
+        }
+    }
+
+    fn wait_deleted_after_cancel(&mut self, request_id: RequestId) -> Result<(), String> {
+        loop {
+            match self.recv_stage(request_id)? {
+                StageMessage::Prefill { .. } | StageMessage::Decode { .. } | StageMessage::Verify { .. } | StageMessage::Token { .. } | StageMessage::Sampled { .. } | StageMessage::Speculative { .. } => continue,
+                StageMessage::Ready { .. } => return Ok(()),
+                _ => return Err("等待下游取消删除完成时收到非法 frame".to_owned()),
+            }
+        }
+    }
+
     fn recv_stage(&mut self, request_id: RequestId) -> Result<StageMessage, String> {
         if let Some(message) = self.pending_messages.get_mut(&request_id).and_then(VecDeque::pop_front) {
             return Ok(message);
@@ -988,7 +1454,7 @@ impl Glm52Engine {
         })
     }
 
-    fn snapshot(&self, cache_id: String, tokens: Vec<u32>, state: &Glm52HeadState) -> Result<Glm52CacheSnapshot, String> {
+    fn snapshot(&self, cache_id: String, tokens: Vec<u32>, state: &mut Glm52HeadState) -> Result<Glm52CacheSnapshot, String> {
         let last_hidden = self.output_context().tensor_to_bf16_bits(&state.last_hidden).map_err(|error| format!("下载 head terminal hidden: {error:?}"))?;
         let dspark_aux = state
             .dspark_aux_history
@@ -1012,6 +1478,7 @@ impl Glm52Engine {
             (None, None) => None,
             _ => return Err("持久化 DSpark cache 时 runtime/aux 状态不一致".to_owned()),
         };
+        let mtp = state.mtp.as_ref().map(|mtp| mtp.snapshot(&self.output_context())).transpose()?;
         Ok(Glm52CacheSnapshot {
             cache_id,
             cache_namespace: state.cache_namespace.clone(),
@@ -1019,14 +1486,14 @@ impl Glm52Engine {
             tokens,
             pending_tokens: state.pending_tokens.clone(),
             last_hidden,
-            stages: download_glm52_session(&state.states)?,
-            mtp: state.mtp.as_ref().map(|mtp| mtp.snapshot(&self.output_context())).transpose()?,
+            stages: take_glm52_session(&mut state.states)?,
+            mtp,
             dspark_aux,
             dspark_target,
         })
     }
 
-    /// 只淘汰已结束且未 pin 的会话。响应优先：资源回收不等待完整快照下载或 SSD 写入。
+    /// 只回收已结束且未 pin 的 GPU 会话；两端分别保留本机主存快照。
     fn evict_oldest_terminal(&mut self) -> Result<Option<Vec<Glm52StageState>>, String> {
         let pinned = self.pinned.lock().map_err(|_| "pin 集合锁中毒".to_owned())?;
         let candidate = self.terminal_states.entries().filter(|(cache_id, _, _)| !pinned.contains(*cache_id)).min_by_key(|(_, _, state)| state.decode_finished_at).map(|(cache_id, _, _)| cache_id.to_owned());
@@ -1034,24 +1501,35 @@ impl Glm52Engine {
         let Some(cache_id) = candidate else {
             return Err("terminal cache 没有可回收且未 pin 的已结束会话".to_owned());
         };
-        let Some((_, mut state)) = self.terminal_states.take(&cache_id) else { return Ok(None) };
+        let Some((tokens, mut state)) = self.terminal_states.take(&cache_id) else { return Ok(None) };
         let request_id = RequestId::from_cache_id(&cache_id);
         let prompt_tokens = state.info.prompt_tokens;
-        let reason = if state.prompt_tokens < super::rocm_swap::MIN_PERSIST_TOKENS { "short-prompt" } else { "response-priority" };
-        // 先发下游回收，再释放本机 RAM/GPU；两端释放完成才复用预算。
-        self.link.send_delete(request_id)?;
+        if let Some(swap) = self.swap.clone() {
+            let snapshot = match self.snapshot(cache_id.clone(), tokens.clone(), &mut state) {
+                Ok(snapshot) => Arc::new(snapshot),
+                Err(error) => {
+                    self.terminal_states.insert(cache_id, tokens, state);
+                    return Err(error);
+                }
+            };
+            swap.cache_host(snapshot, state.info.modified_unix);
+            // 主存已经拥有完整快照，通信或 SSD 失败也不会丢掉本机历史。
+            self.link.send_swap_out(request_id)?;
+        } else {
+            self.link.send_delete(request_id)?;
+        }
         for stage in &mut state.states {
-            stage.reset_session(&self.cfg, self.max_seq_len).map_err(|error| format!("释放 cache={cache_id} RAM/GPU: {error:?}"))?;
+            stage.reset_session(&self.cfg, self.max_seq_len).map_err(|error| format!("释放 cache={cache_id} GPU: {error:?}"))?;
         }
         let states = state.states;
-        // state 的其余字段（MTP、DSpark、hidden）也必须在等待 ACK 前释放。
         drop((state.mtp, state.dspark_aux_history, state.dspark_target_cache, state.last_hidden));
-        let released = self.wait_ready(request_id, prompt_tokens);
+        self.wait_ready(request_id, prompt_tokens)?;
         if let Some(swap) = &self.swap {
-            swap.delete(&cache_id)?;
+            if let Err(error) = swap.spill_host(0) {
+                eprintln!("[glm52-host-spill-deferred] cache_id={cache_id}: {error}");
+            }
+            eprintln!("[glm52-cache-demote] cache_id={cache_id} tokens={prompt_tokens} destination=host");
         }
-        released?;
-        eprintln!("[glm52-cache-discard] cache_id={cache_id} tokens={prompt_tokens} decode_finished_unix={} reason={reason}", state.info.modified_unix);
         Ok(Some(states))
     }
 
@@ -1070,6 +1548,27 @@ impl Glm52Engine {
         }
     }
 
+    fn terminal_gpu_pressure(&self, rows: usize) -> Result<bool, String> {
+        if self.terminal_states.len() == 0 {
+            return Ok(false);
+        }
+        let Some(reserve) = crate::kernel::rocm::hip::options().mla_gpu_resident_reserve_bytes else { return Ok(false) };
+        let mla_bytes = self.mla.kv_lora_rank + self.mla.kv_lora_rank / crate::kv_cache::DEFAULT_GROUP_SIZE * 2 + self.mla.qk_rope_head_dim * 2;
+        let mut start = 0;
+        for (index, (context, &end)) in self.contexts.iter().zip(&self.layer_ends).enumerate() {
+            let growth = (end + 1 - start).saturating_mul(rows).saturating_mul(mla_bytes);
+            start = end + 1;
+            let required = reserve.saturating_add(growth).saturating_add(rows.saturating_mul(self.cfg.hidden_size).saturating_mul(2));
+            for device in std::iter::once(context).chain(self.cooperative_peer_contexts.get(index)) {
+                let (free, _) = crate::kernel::rocm::hip::device_memory_info(device.device_id())?;
+                if free < required && device.stage_available_bytes().map_err(|error| format!("查询 GPU 缓存回收余量: {error:?}"))? < required {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// physical_layers 已包含每份物理镜像的层数，不再重复乘 pair 数。
     fn host_mirror_token_budget(available: u64, mla_bytes: usize, physical_layers: usize) -> Result<usize, String> {
         let per_token = (mla_bytes as u64).checked_mul(physical_layers as u64).filter(|&bytes| bytes != 0).ok_or("MLA host mirror 每 token 字节为零或溢出")?;
@@ -1077,7 +1576,7 @@ impl Glm52Engine {
     }
 
     fn memory_capacity(&self) -> Result<(usize, usize, Vec<KvCacheDeviceCapacity>), String> {
-        let safety_bytes = self.options.memory_reserve_bytes;
+        let safety_bytes = self.options.memory_reserve_bytes.max(crate::kernel::rocm::hip::options().mla_gpu_resident_reserve_bytes.unwrap_or(0));
         // 链头不知道下游的物理分层，部署可以用整条流水线最大单卡层数覆盖。
         let admission_layers = self.options.kv_admission_layers_per_device;
         let latent_bytes = if self.options.kv_cache_format == KvCacheFormat::F16 { self.mla.kv_lora_rank * 2 } else { self.mla.kv_lora_rank + self.mla.kv_lora_rank / crate::kv_cache::DEFAULT_GROUP_SIZE * 2 };
@@ -1085,14 +1584,22 @@ impl Glm52Engine {
         let index_bytes = crate::backend::rocm::RocmDsaState::key_bytes_per_token(self.cfg.index_head_dim)?;
         // 诊断 shadow 会保留额外 key，不能套用只有一份 Q8 主存储的预算。
         let hip_options = crate::kernel::rocm::hip::options();
-        let index_bytes = if hip_options.dsa_hadamard_shadow_samples != 0 || hip_options.dsa_hisa_shadow_samples != 0 { index_bytes * 2 } else { index_bytes };
+        let index_bytes = if hip_options.dsa_hadamard_shadow_samples != 0 || hip_options.dsa_hisa_shadow_samples != 0 {
+            index_bytes * 2
+        } else if !self.cooperative_peer_contexts.is_empty() && !hip_options.prefill_attention_cpu && !hip_options.dsa_cpu_select {
+            // 每卡只保存一个 block parity；主存/SSD 快照合并两份，不代表 GPU 有两份。
+            index_bytes.div_ceil(2)
+        } else {
+            index_bytes
+        };
         // hot 形态下 MLA 全量驻留 CPU mirror，GPU 每层只剩固定 hot 窗 + 每 token
         // 的 DSA index key。token 项因此只记 index；热窗按并发会话数放大成固定
         // 开销从 free 里扣，覆盖允许的全部驻留会话；准入先换出已结束的旧会话。
         const HOT_WINDOW_SESSIONS: usize = NodeRuntime::MAX_CONCURRENT_SESSIONS;
         let hot_rows = crate::kernel::rocm::hip::options().mla_cpu_hot_rows;
         let (kv_bytes_per_layer_token, hot_window_layer_bytes) = if hot_rows != 0 {
-            (index_bytes, hot_rows * mla_bytes * HOT_WINDOW_SESSIONS)
+            let (metadata_per_token, metadata_fixed) = if !hip_options.kv_f16 && !hip_options.dsa_cpu_select && !hip_options.prefill_attention_cpu { crate::backend::rocm::RocmKvCache::gpu_hot_metadata_budget(hot_rows) } else { (0, 0) };
+            (index_bytes + metadata_per_token, (hot_rows * mla_bytes + metadata_fixed) * HOT_WINDOW_SESSIONS)
         } else if self.options.cooperative_expert_pairs {
             // pair 卡按固定 block parity 各持有一半 MLA KV；DSA 为按 query rows
             // 并行扫描完整历史，Indexer cache 仍各保留一份。
@@ -1109,8 +1616,7 @@ impl Glm52Engine {
             for (role, context) in std::iter::once(("owner", context)).chain(self.cooperative_peer_contexts.get(device_index).map(|peer| ("peer", peer))) {
                 let free = context.stage_available_bytes().map_err(|error| format!("查询 ROCm device {} 可用显存: {error:?}", context.device_id()))?.saturating_sub(layers.saturating_mul(hot_window_layer_bytes));
                 let total = context.stage_total_bytes().map_err(|error| format!("查询 ROCm device {} 总显存: {error:?}", context.device_id()))?;
-                // operator peer 不保存 DSA，沿用 owner 的每 token 字节数会略保守；
-                // 但必须把完整 MLA replica 与 MTP L78 计入 admission 下界。
+                // owner/peer 各保存半份 DSA，MLA 热窗则两边都有；MTP L78 也计入下界。
                 let device = crate::runtime::rocm_chain::kv_capacity_from_free(format!("local/{role}/rocm-device-{}", context.device_id()), free, total, layers, kv_bytes_per_layer_token, safety_bytes, admission_layers)?;
                 token_capacity = token_capacity.min(device.token_capacity);
                 eprintln!(
@@ -1152,9 +1658,12 @@ impl Glm52Engine {
                 // 旧端缺少主机快照时保留旧的保守估计，不凭空放大容量。
                 token_capacity = token_capacity.min(Self::host_mirror_token_budget(local_available, mla_bytes, downstream_layers * mirror_copies)?);
             }
-            // 总量再以 max_sequence_length 为窗口上界：prefill 期间 KV 仍全量在
-            // GPU，1M 窗口把最坏情况下的双卡 prefill 瞬态钉死在约 6GiB/卡。
-            token_capacity = token_capacity.min(self.max_seq_len);
+            // 兼容路径的大 append 仍恢复完整历史；延迟换出路径的选集工作区
+            // 按设备/流有界复用，因此总缓存 token 不再受单条序列长度限制。
+            let bounded_prefill = hip_options.mla_gpu_resident_reserve_bytes.is_some() && !hip_options.kv_f16 && !hip_options.dsa_cpu_select && !hip_options.prefill_attention_cpu;
+            if !bounded_prefill {
+                token_capacity = token_capacity.min(self.max_seq_len);
+            }
             eprintln!(
                 "[glm52-head] MLA host mirror admission mla_bytes={mla_bytes} copies={mirror_copies} head_layers={local_layers} tail_physical_layers={downstream_layers} head_available_bytes={local_available} tail_available_bytes={:?} prefill_window_tokens={} token_capacity={token_capacity}",
                 self.downstream_host_available_bytes, self.max_seq_len
@@ -1176,8 +1685,7 @@ impl Glm52Engine {
     }
 
     fn request_reservation_tokens(&self, prompt_tokens: usize, max_tokens: usize) -> usize {
-        let max_decode = max_tokens.min(self.max_seq_len.saturating_sub(prompt_tokens));
-        self.reservation_tokens(prompt_tokens.saturating_add(max_decode)).min(self.max_seq_len)
+        rolling_request_reservation(prompt_tokens, max_tokens, self.kv_reservation_page_tokens, self.max_seq_len)
     }
 
     fn resident_kv_cost(&self) -> usize {
@@ -1236,7 +1744,11 @@ impl NodeEngine for Glm52Engine {
         if let Ok(mut runtime) = self.runtime.lock() {
             crate::runtime::session::refresh_cache_runtime(&mut runtime, self.terminal_states.states().map(|state| &state.info), self.max_seq_len);
             runtime.memory_cache_ids = self.terminal_states.states().map(|state| state.info.cache_id.clone()).collect();
+            if let Some(swap) = &self.swap {
+                runtime.memory_cache_ids.extend(swap.host_infos().into_iter().map(|info| info.cache_id));
+            }
             runtime.memory_cache_ids.sort();
+            runtime.memory_cache_ids.dedup();
             runtime.ssd_cache_ids = self.swap.as_ref().map_or_else(Vec::new, |swap| swap.infos().into_iter().map(|info| info.cache_id).collect());
             runtime.ssd_cache_ids.sort();
         }
@@ -1246,14 +1758,23 @@ impl NodeEngine for Glm52Engine {
         Some(self.pinned.clone())
     }
 
+    fn runtime_config_control(&self) -> Option<Arc<dyn RuntimeConfigControl>> {
+        Some(Arc::new(Glm52RuntimeConfig {
+            tuning: self.runtime_tuning.clone(),
+            physical_max_concurrency: self.intake_capacity,
+            maximum_prefill_chunk_size: self.pipeline_chunk_size,
+            maximum_mtp_draft_tokens: self.options.mtp_draft_tokens,
+        }))
+    }
+
     fn terminal_cache_infos(&self) -> Vec<CacheInfo> {
         let mut infos = self.terminal_states.states().map(|state| (state.info.cache_id.clone(), state.info.clone())).collect::<HashMap<_, _>>();
         if let Some(swap) = &self.swap {
-            for swapped in swap.infos() {
+            for swapped in swap.host_infos().into_iter().chain(swap.infos()) {
                 infos.entry(swapped.cache_id.clone()).or_insert(CacheInfo {
                     cache_id: swapped.cache_id,
                     model_key: "glm-5.2".to_owned(),
-                    cache_format: "glm52-rocm-mla-fjall-v3".to_owned(),
+                    cache_format: if swapped.file_bytes == 0 { "glm52-rocm-mla-host-v1" } else { "glm52-rocm-mla-fjall-v3" }.to_owned(),
                     last_layer: self.cfg.layer_count.saturating_sub(1),
                     prompt_tokens: swapped.token_count,
                     bytes: swapped.resident_bytes,
@@ -1267,11 +1788,15 @@ impl NodeEngine for Glm52Engine {
     fn shutdown(&mut self) -> Result<(), String> {
         let shutdown_id = RequestId::from_cache_id("zllm-stage-shutdown:v1");
         let persist = self.swap.is_some();
-        self.link.send_shutdown(shutdown_id, persist).map_err(|error| format!("通知下游持久化并退出: {error}"))?;
+        // 下游断连不能跳过本机落盘；先保存通知结果，写完本机缓存后再报告。
+        let notified = self.link.send_shutdown(shutdown_id, persist).map_err(|error| format!("通知下游持久化并退出: {error}"));
         let mut local_error = None;
-        while let Some((cache_id, tokens, state)) = self.terminal_states.take_oldest() {
-            if state.prompt_tokens >= super::rocm_swap::MIN_PERSIST_TOKENS && let Some(swap) = &self.swap {
-                let result = self.snapshot(cache_id.clone(), tokens, &state).and_then(|snapshot| swap.put_completed(&snapshot, state.info.modified_unix));
+        while let Some((cache_id, tokens, mut state)) = self.terminal_states.take_oldest() {
+            if let Some(swap) = &self.swap {
+                let result = self.snapshot(cache_id.clone(), tokens, &mut state).and_then(|snapshot| {
+                    swap.cache_host(Arc::new(snapshot), state.info.modified_unix);
+                    swap.persist_host_and_release(&cache_id)
+                });
                 if let Err(error) = result {
                     eprintln!("[glm52-head] 优雅退出持久化 A cache 失败 cache_id={cache_id}: {error}");
                     if local_error.is_none() {
@@ -1282,11 +1807,18 @@ impl NodeEngine for Glm52Engine {
                 }
             }
         }
-        let downstream = self.wait_ready(shutdown_id, 0).map_err(|error| format!("等待下游持久化退出: {error}"));
+        if let Some(swap) = &self.swap
+            && let Err(error) = swap.persist_host_all()
+        {
+            local_error.get_or_insert(error);
+        }
+        let downstream = notified.and_then(|()| self.wait_ready(shutdown_id, 0).map_err(|error| format!("等待下游持久化退出: {error}")));
         self.refresh_runtime();
-        downstream?;
-        if let Some(error) = local_error {
-            return Err(format!("A cache 持久化失败: {error}"));
+        match (local_error, downstream) {
+            (Some(local), Err(remote)) => return Err(format!("A cache 持久化失败: {local}; {remote}")),
+            (Some(local), Ok(_)) => return Err(format!("A cache 持久化失败: {local}")),
+            (None, Err(remote)) => return Err(remote),
+            (None, Ok(_)) => {}
         }
         eprintln!("[glm52-head] 已收到 B 持久化退出 ACK，A 现在退出");
         Ok(())
@@ -1337,31 +1869,86 @@ impl Glm52Engine {
         }
 
         let mut slots = std::iter::repeat_with(|| None).take(capacity).collect::<Vec<Option<Glm52BatchTask>>>();
+        let mut memory_retry = Instant::now();
+        let mut memory_skipped = 0;
         loop {
+            let mut retry_open = false;
             while slots.iter().any(Option::is_none) {
+                // 冷激活期间到达的请求也应立即开始 SSD 预读。
+                let active = slots.iter().filter(|slot| slot.is_some()).count();
+                for request in intake(capacity.saturating_sub(active + pending.len())) {
+                    let request_id = request.request_id.clone();
+                    match self.prepare_batch_task(request) {
+                        Ok(task) => pending.push_back(task),
+                        Err(message) => on_result(NodeBatchResult { request_id, result: Err(message) }),
+                    }
+                }
                 let load = Self::batch_load(&slots);
                 let Some(pending_index) = pending.iter_mut().position(|task| {
                     task.swap_prefetch.poll_ready();
-                    self.can_admit_pending(task, load)
-                }) else { break };
+                    let cache_id = task.input.request.get("cache_id").and_then(Value::as_str);
+                    self.can_admit_pending(task, load) && cache_id.is_none_or(|id| !slots.iter().flatten().any(|slot| slot.request.get("cache_id").and_then(Value::as_str) == Some(id)))
+                }) else {
+                    break;
+                };
+                let tail_requires_allocation = match self.admit_pending_memory(&pending[pending_index], true) {
+                    Ok((true, needed)) => {
+                        memory_skipped = 0;
+                        needed
+                    }
+                    Ok((false, _)) => {
+                        pending.rotate_left(pending_index + 1);
+                        memory_skipped += 1;
+                        if memory_skipped >= pending.len() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(message) => {
+                        let task = pending.remove(pending_index).expect("pending 已检查");
+                        on_result(NodeBatchResult { request_id: task.input.request_id, result: Err(message) });
+                        continue;
+                    }
+                };
                 let pending_task = pending.remove(pending_index).expect("初始 pending 已检查");
                 // 不能先用 available() 拒绝；open_batch_task 会按总预算换出可驱逐的
                 // terminal cache，再为新 active session 做最终 reservation。
-                // MTP 准入手镯用加权负载(decode + 4×prefill),不含正在准入的这路。
-                let admission_load = load.2.saturating_add(load.0.saturating_add(load.1).saturating_mul(4));
                 let session = slots.iter().position(Option::is_none).expect("初始 session 数不超过 capacity");
                 let request_id = pending_task.input.request_id.clone();
-                match self.open_batch_task(pending_task, load.2, admission_load) {
-                    // 先把整批 Open 发到 B，才可能让两端 SSD restore 真正并行。
-                    Ok(task) => slots[session] = Some(task),
+                let cold_open = self.live_gpu_admission() && (!self.pending_uses_gpu_cache(&pending_task) || tail_requires_allocation);
+                match self.open_batch_task(pending_task, load.2) {
+                    Ok(mut task) => {
+                        if self.live_gpu_admission() {
+                            // 下一次显存查询必须看见 B 已分配的两份 DSA；仅发出 Open
+                            // 时 B 可能还在预读，不能重复使用尚未扣除的余量。
+                            match self.finish_batch_open(&mut task, cold_open) {
+                                Ok(None) => {}
+                                Ok(Some(retry)) => {
+                                    pending.push_front(retry);
+                                    retry_open = true;
+                                    continue;
+                                }
+                                Err(message) => {
+                                    let _ = self.link.send_delete(task.stage_id);
+                                    on_result(NodeBatchResult { request_id, result: Err(message) });
+                                    continue;
+                                }
+                            }
+                        }
+                        slots[session] = Some(task);
+                        // 冷恢复后立即启动流水线，不能把首字推迟到整批恢复结束。
+                        if cold_open {
+                            break;
+                        }
+                    }
                     Err(message) => on_result(NodeBatchResult { request_id, result: Err(message) }),
                 }
             }
             let mut opened = Vec::with_capacity(capacity);
-            let mut retry_open = false;
             for mut task in slots.iter_mut().filter_map(Option::take) {
                 let request_id = task.request_id.clone();
-                match self.finish_batch_open(&mut task) {
+                let result = if self.live_gpu_admission() { Ok(None) } else { self.finish_batch_open(&mut task, false) };
+                match result {
                     Ok(None) => opened.push(task),
                     Ok(Some(retry)) => {
                         pending.push_front(retry);
@@ -1382,7 +1969,10 @@ impl Glm52Engine {
         }
         if slots.iter().all(Option::is_none) {
             while let Some(task) = pending.pop_front() {
-                on_result(NodeBatchResult { request_id: task.input.request_id, result: Err(format!("GLM-5.2 请求需要预留 {} tokens，超过单机 KV 预算 {} tokens", task.reserved_tokens, self.kv_budget.capacity(),)) });
+                let available = self.runtime.lock().ok().and_then(|runtime| runtime.kv_cache_available_tokens).unwrap_or(self.kv_budget.capacity());
+                on_result(NodeBatchResult {
+                    request_id: task.input.request_id, result: Err(format!("GLM-5.2 当前最小设备余量不足：请求预留 {} tokens，新增会话最多可容纳 {available} tokens，已回收可换出的闲置缓存", task.reserved_tokens))
+                });
             }
             return Vec::new();
         }
@@ -1416,16 +2006,36 @@ impl Glm52Engine {
         let output_context = self.boundary_context();
         let hidden_size = self.cfg.hidden_size;
         let index_top_k = self.cfg.index_top_k;
-        let scheduler_policy = crate::runtime::glm52::stage::Glm52SchedulerPolicy {
-            execution_slots: self.options.scheduling.execution_slots,
-            decode_execution_slots: self.options.scheduling.decode_execution_slots,
-            pipeline_work_window: self.options.scheduling.pipeline_work_window,
-            prefill_admission_burst: self.options.scheduling.prefill_admission_burst,
-            decode_batch_limit: self.options.scheduling.decode_batch_limit,
-            prefill_batch_limit: self.options.scheduling.prefill_batch_limit,
-            profile_completion: self.options.scheduling.profile_completion,
+        let initial_tuning = self.runtime_tuning.read().expect("GLM runtime config 锁中毒").clone();
+        if let Err(message) = crate::kernel::rocm::hip::set_device_buffer_pool_limit(initial_tuning.device_buffer_pool_bytes) {
+            for task in slots.iter_mut().filter_map(Option::take) {
+                let _ = self.link.send_delete(task.stage_id);
+                on_result(NodeBatchResult { request_id: task.request_id, result: Err(message.clone()) });
+            }
+            return Vec::new();
+        }
+        let initial_stage_runtime = StageRuntimeConfig {
+            execution_slots: initial_tuning.scheduling.execution_slots,
+            decode_execution_slots: initial_tuning.scheduling.decode_execution_slots,
+            pipeline_work_window: initial_tuning.scheduling.pipeline_work_window,
+            device_buffer_pool_bytes: initial_tuning.device_buffer_pool_bytes,
+            profile_completion: initial_tuning.scheduling.profile_completion,
         };
-        let profile_completion = self.options.scheduling.profile_completion;
+        if let Err(message) = self.link.send_runtime_config(initial_stage_runtime) {
+            for task in slots.iter_mut().filter_map(Option::take) {
+                let _ = self.link.send_delete(task.stage_id);
+                on_result(NodeBatchResult { request_id: task.request_id, result: Err(message.clone()) });
+            }
+            return Vec::new();
+        }
+        let scheduler_policy = crate::runtime::glm52::stage::Glm52SchedulerPolicy {
+            execution_slots: initial_tuning.scheduling.execution_slots,
+            decode_execution_slots: initial_tuning.scheduling.decode_execution_slots,
+            pipeline_work_window: initial_tuning.scheduling.pipeline_work_window,
+            decode_batch_limit: capacity,
+            profile_completion: initial_tuning.scheduling.profile_completion,
+        };
+        let mut profile_completion = initial_tuning.scheduling.profile_completion;
         if self.options.diagnostics.trace_stage_events {
             crate::runtime::prefill_scheduler::enable_stage_event_trace();
         }
@@ -1436,6 +2046,8 @@ impl Glm52Engine {
         let weights = Arc::clone(&self.weights);
         let downstream_stages = if self.options.cooperative_expert_pairs || self.options.parallel_operator_pairs { self.downstream_memory.len() / 2 } else { self.downstream_memory.len() };
         let decode_pipeline_stage_count = self.contexts.len().saturating_add(downstream_stages);
+        // 未收到两端完成信号前不准入下一路，但已有 decode 必须继续收发。
+        let mut opening = None::<(Glm52BatchTask, Glm52HotHistoryPrepare)>;
         let run = drive_glm52_stream_stage_pipeline_stateful(initial_states, capacity, &cfg, &mla, &rope, scheduler_policy, |pipeline| {
             let backend_error = |msg: String| crate::backend::BackendError::Compute { msg };
             let mut request_sessions = slots.iter().enumerate().filter_map(|(session, task)| task.as_ref().map(|task| (task.stage_id, session))).collect::<HashMap<_, _>>();
@@ -1464,19 +2076,20 @@ impl Glm52Engine {
             let mut prefill_admission = OpportunisticPrefillAdmission::default();
             let mut ready_backlog = VecDeque::<Glm52TailReady>::with_capacity(capacity * 2);
             let mut coordinator_idle_trace = None::<(Instant, String)>;
-            let mut decode_scheduler = BatchScheduler::new(1, self.options.scheduling.decode_batch_limit.min(capacity)).map_err(backend_error)?;
-            decode_scheduler.align_initial_batch(initial_count);
-            let decode_active = decode_scheduler.initial_batch_released() && slots.iter().flatten().any(|task| task.prefill_position >= task.tokens.len());
+            let mut active_tuning = initial_tuning.clone();
+            let mut applied_tuning_revision = active_tuning.revision;
+            let mut decode_scheduler = BatchScheduler::new(1, capacity).map_err(backend_error)?;
+            let decode_active = slots.iter().flatten().any(|task| task.prefill_position >= task.tokens.len());
             let (mut prefill_target, prefill_work_window, prefill_chunk_limit) = prefill_admission.limits(
                 pipeline.stage_flow_snapshot(),
                 pipeline.pipeline_work_window(),
                 pipeline.stage_count(),
                 decode_active,
-                self.options.scheduling.decode_priority_prefill_chunk_size,
-                self.options.scheduling.decode_priority_prefill_chunk_ceiling,
+                active_tuning.scheduling.decode_priority_prefill_chunk_size,
+                active_tuning.scheduling.decode_priority_prefill_chunk_ceiling,
             );
             let short_only =
-                prefill_target == 0 && prefill_admission.short_request_ready() && Self::has_finishable_short_prefill(&slots, &submitted_prefill, &prefill_in_flight_by_session, self.options.scheduling.decode_priority_prefill_chunk_ceiling);
+                prefill_target == 0 && prefill_admission.short_request_ready() && Self::has_finishable_short_prefill(&slots, &submitted_prefill, &prefill_in_flight_by_session, active_tuning.scheduling.decode_priority_prefill_chunk_ceiling);
             prefill_target += usize::from(short_only);
             Self::fill_prefill_window(
                 pipeline,
@@ -1484,7 +2097,7 @@ impl Glm52Engine {
                 prefill_target,
                 prefill_work_window,
                 prefill_chunk_limit,
-                self.options.scheduling.decode_priority_prefill_chunk_ceiling,
+                active_tuning.scheduling.decode_priority_prefill_chunk_ceiling,
                 short_only,
                 &mut submitted_prefill,
                 &mut prefill_in_flight,
@@ -1497,14 +2110,67 @@ impl Glm52Engine {
             )?;
 
             let mut reported_load = None;
+            let mut memory_reported = Instant::now();
             let mut reported_mtp_drafts = None;
             let mut ssd_cache_revision = None;
             let mut ssd_cache_ids = Vec::new();
             loop {
+                let latest_tuning = self.runtime_tuning.read().map_err(|_| backend_error("GLM runtime config 锁中毒".to_owned()))?.clone();
+                if latest_tuning.revision != applied_tuning_revision {
+                    pipeline.update_runtime_policy(crate::runtime::prefill_scheduler::StageSchedulerRuntimePolicy {
+                        execution_slots: latest_tuning.scheduling.execution_slots,
+                        decode_execution_slots: latest_tuning.scheduling.decode_execution_slots,
+                        pipeline_work_window: latest_tuning.scheduling.pipeline_work_window,
+                        prefill_admission_burst: 1,
+                        decode_batch_limit: capacity,
+                    })?;
+                    profile_completion = latest_tuning.scheduling.profile_completion;
+                    pipeline.set_profile_completion(profile_completion);
+                    crate::kernel::rocm::hip::set_device_buffer_pool_limit(latest_tuning.device_buffer_pool_bytes).map_err(backend_error)?;
+                    self.link
+                        .send_runtime_config(StageRuntimeConfig {
+                            execution_slots: latest_tuning.scheduling.execution_slots,
+                            decode_execution_slots: latest_tuning.scheduling.decode_execution_slots,
+                            pipeline_work_window: latest_tuning.scheduling.pipeline_work_window,
+                            device_buffer_pool_bytes: latest_tuning.device_buffer_pool_bytes,
+                            profile_completion,
+                        })
+                        .map_err(backend_error)?;
+                    for task in slots.iter_mut().flatten() {
+                        let request_override = latest_tuning.request_overrides.get(&task.request_id).copied().unwrap_or_default();
+                        task.runtime_mtp_draft_tokens = request_override
+                            .mtp_draft_tokens
+                            .or_else(|| task.request.get("mtp_draft_tokens").and_then(Value::as_u64).and_then(|value| usize::try_from(value).ok()))
+                            .unwrap_or(latest_tuning.mtp_draft_tokens)
+                            .min(self.options.mtp_draft_tokens);
+                        if let Some(chunk) = request_override.prefill_chunk_size {
+                            task.prefill_policy = AdaptiveChunkPolicy { initial_chunk_size: chunk, append_chunk_size: chunk, long_context_threshold_tokens: usize::MAX, long_context_chunk_size: chunk };
+                        } else if task.request.get("prefill_chunk_size").is_none() {
+                            task.prefill_policy = AdaptiveChunkPolicy {
+                                initial_chunk_size: latest_tuning.prefill_chunk_size,
+                                append_chunk_size: latest_tuning.scheduling.append_prefill_chunk_size,
+                                long_context_threshold_tokens: latest_tuning.scheduling.long_prefill_threshold_tokens,
+                                long_context_chunk_size: latest_tuning.scheduling.long_prefill_chunk_size,
+                            };
+                        }
+                    }
+                    applied_tuning_revision = latest_tuning.revision;
+                    active_tuning = latest_tuning;
+                    eprintln!("[glm52-runtime-applied] revision={applied_tuning_revision} boundary=next_round");
+                }
+                if self.live_gpu_admission() && memory_reported.elapsed() >= std::time::Duration::from_secs(1) {
+                    self.refresh_admission_memory().map_err(backend_error)?;
+                    memory_reported = Instant::now();
+                    on_runtime_changed();
+                }
                 let load = Self::batch_load(&slots);
                 let dspark = crate::runtime::session::effective_dspark_draft_tokens(self.options.block_draft_tokens(), load.2);
                 let mut memory_cache_ids = self.terminal_states.states().map(|state| state.info.cache_id.clone()).collect::<Vec<_>>();
+                if let Some(swap) = &self.swap {
+                    memory_cache_ids.extend(swap.host_infos().into_iter().map(|info| info.cache_id));
+                }
                 memory_cache_ids.sort();
+                memory_cache_ids.dedup();
                 let revision = self.swap.as_ref().map(|swap| swap.cache_revision());
                 if revision != ssd_cache_revision {
                     // 主循环只在元数据改变后枚举 SSD，避免每轮读取并解码所有 manifest。
@@ -1617,8 +2283,8 @@ impl Glm52Engine {
                             if position != task.prefill_position || end > task.tokens.len() {
                                 return Err(backend_error(format!("continuous prefill 边界错误: request={} position={position} expected={} rows={rows} tokens={}", task.stage_id, task.prefill_position, task.tokens.len(),)));
                             }
-                            prefill_in_flight = prefill_in_flight.checked_sub(1).ok_or_else(|| backend_error("continuous prefill 在途计数下溢".to_owned()))?;
-                            prefill_in_flight_by_session[session] = prefill_in_flight_by_session[session].checked_sub(1).ok_or_else(|| backend_error(format!("continuous prefill session={session} 在途计数下溢")))?;
+                            // A 完成后分块仍占用 B 的输入/执行工作区；直到 B 回包才
+                            // 释放在途额度，否则长 prefill 会在较慢的后继无限堆积。
                             task.cached_tokens.extend_from_slice(&task.tokens[position..end]);
                             task.prefill_position = end;
                             if end == task.tokens.len() {
@@ -1742,7 +2408,12 @@ impl Glm52Engine {
                     }
                     progressed = true;
                     let task = slots[session].as_mut().expect("slot 已检查");
-                    ready_backlog.push_back(self.take_tail_ready(session, task).map_err(backend_error)?);
+                    let item = self.take_tail_ready(session, task).map_err(backend_error)?;
+                    if !item.cached && !item.decode && !item.verify && item.sampled_token.is_none() && item.speculative.is_none() {
+                        prefill_in_flight = prefill_in_flight.checked_sub(1).ok_or_else(|| backend_error("continuous B→A prefill 在途计数下溢".to_owned()))?;
+                        prefill_in_flight_by_session[session] = prefill_in_flight_by_session[session].checked_sub(1).ok_or_else(|| backend_error(format!("continuous B→A prefill session={session} 在途计数下溢")))?;
+                    }
+                    ready_backlog.push_back(item);
                 }
                 let phases = slots
                     .iter()
@@ -1786,13 +2457,13 @@ impl Glm52Engine {
                     let boundary_started = profile_boundaries.then(Instant::now);
                     let active_decode = slots.iter().enumerate().filter(|(session, task)| !closing[*session] && task.as_ref().is_some_and(|task| task.tail_prefill_position >= task.tokens.len())).count();
                     let active_prefill = slots.iter().enumerate().filter(|(session, task)| !closing[*session] && task.as_ref().is_some_and(|task| task.tail_prefill_position < task.tokens.len())).count();
-                    let mtp_draft_tokens = crate::runtime::session::effective_mtp_draft_tokens(self.options.mtp_draft_tokens, active_decode, active_prefill);
+                    let mtp_draft_tokens = active_tuning.mtp_drafts(active_decode, active_prefill);
                     if self.mtp_runtime.is_some() && reported_mtp_drafts != Some(mtp_draft_tokens) {
                         eprintln!(
                             "[glm52-mtp-depth] ts_us={} decode={active_decode} prefill={active_prefill} load={} configured={} drafts={mtp_draft_tokens}",
                             crate::runtime::prefill_scheduler::stage_trace_timestamp_us(),
                             active_decode.saturating_add(active_prefill.saturating_mul(4)),
-                            self.options.mtp_draft_tokens,
+                            active_tuning.mtp_draft_tokens,
                         );
                         reported_mtp_drafts = Some(mtp_draft_tokens);
                     }
@@ -1976,7 +2647,7 @@ impl Glm52Engine {
                         }
                     }
                 }
-                let active = slots.iter().filter(|task| task.is_some()).count();
+                let active = slots.iter().filter(|task| task.is_some()).count() + usize::from(opening.is_some());
                 for request in intake(capacity.saturating_sub(active.saturating_add(pending.len()))) {
                     progressed = true;
                     let request_id = request.request_id.clone();
@@ -1985,32 +2656,92 @@ impl Glm52Engine {
                         Err(message) => on_result(NodeBatchResult { request_id, result: Err(message) }),
                     }
                 }
-                while let Some(session) = slots.iter().enumerate().find_map(|(session, slot)| (slot.is_none() && (decode_scheduler.initial_batch_released() || session >= initial_count)).then_some(session)) {
-                    let load = Self::batch_load(&slots);
-                    // 同一内容 hash 只允许一个 writer。断线重试先等旧 writer 把已完成
-                    // 前缀发布为 cache，再从该水位继续，不能在另一个空 slot 从零重算。
-                    let Some(pending_index) = pending.iter_mut().position(|candidate| {
-                        if !candidate.swap_prefetch.poll_ready() || !self.can_admit_pending(candidate, load) {
-                            return false;
+                while let Some(session) = slots.iter().position(Option::is_none) {
+                    let opening_ready = opening.as_ref().is_some_and(|(task, worker)| worker.is_finished() && self.pending_messages.get(&task.stage_id).is_some_and(|messages| !messages.is_empty()));
+                    let (mut task, cold_open) = if opening_ready {
+                        // 未完成的冷 Open 不挡住 GPU 短追加；完成后优先收尾，再检查下一路。
+                        let (mut task, worker) = opening.take().expect("opening 已检查");
+                        match worker.finish() {
+                            Ok(states) => task.states = states,
+                            Err(message) => {
+                                // B 已回包，先消费其 Ready 再 Delete，避免残留激活回复。
+                                let _ = self.recv_stage(task.stage_id);
+                                let _ = self.link.send_delete(task.stage_id);
+                                on_result(NodeBatchResult { request_id: task.request_id, result: Err(message) });
+                                continue;
+                            }
                         }
-                        let cache_id = candidate.input.request.get("cache_id").and_then(Value::as_str);
-                        cache_id.is_none_or(|cache_id| !slots.iter().filter_map(Option::as_ref).any(|task| task.request.get("cache_id").and_then(Value::as_str) == Some(cache_id)))
-                    }) else {
-                        break;
-                    };
-                    // 与初始批一致，准入必须让统一 open 路径先驱逐 terminal cache。
-                    progressed = true;
-                    let pending_task = pending.remove(pending_index).expect("pending index 已检查");
-                    let request_id = pending_task.input.request_id.clone();
-                    let admission_load = load.2.saturating_add(load.0.saturating_add(load.1).saturating_mul(4));
-                    let mut task = match self.open_batch_task(pending_task, load.2, admission_load) {
-                        Ok(task) => task,
-                        Err(message) => {
-                            on_result(NodeBatchResult { request_id, result: Err(message) });
-                            continue;
+                        (task, true)
+                    } else {
+                        if Instant::now() < memory_retry {
+                            break;
                         }
+                        let mut load = Self::batch_load(&slots);
+                        // pending 也占一个业务名额，并禁止另一份大 append 穿过它。
+                        load.1 += usize::from(opening.is_some());
+                        // 同一内容 hash 只允许一个 writer。断线重试先等旧 writer 把已完成
+                        // 前缀发布为 cache，再从该水位继续，不能在另一个空 slot 从零重算。
+                        let mut find_pending = |gpu_only: bool| {
+                            pending.iter_mut().position(|candidate| {
+                                if gpu_only && !self.pending_uses_gpu_cache(candidate) {
+                                    return false;
+                                }
+                                if !candidate.swap_prefetch.poll_ready() || !self.can_admit_pending(candidate, load) {
+                                    return false;
+                                }
+                                let cache_id = candidate.input.request.get("cache_id").and_then(Value::as_str);
+                                cache_id.is_none_or(|cache_id| !slots.iter().filter_map(Option::as_ref).any(|task| task.request.get("cache_id").and_then(Value::as_str) == Some(cache_id)))
+                            })
+                        };
+                        let Some(pending_index) = find_pending(true).or_else(|| if opening.is_none() { find_pending(false) } else { None }) else {
+                            break;
+                        };
+                        let tail_requires_allocation = match self.admit_pending_memory(&pending[pending_index], opening.is_none()) {
+                            Ok((true, needed)) => needed,
+                            Ok((false, _)) => {
+                                pending.rotate_left(pending_index + 1);
+                                memory_retry = Instant::now() + std::time::Duration::from_millis(250);
+                                on_runtime_changed();
+                                break;
+                            }
+                            Err(message) => {
+                                let task = pending.remove(pending_index).expect("pending 已检查");
+                                on_result(NodeBatchResult { request_id: task.input.request_id, result: Err(message) });
+                                continue;
+                            }
+                        };
+                        // 与初始批一致，准入必须让统一 open 路径先驱逐 terminal cache。
+                        progressed = true;
+                        let pending_task = pending.remove(pending_index).expect("pending index 已检查");
+                        let cold_open = self.live_gpu_admission() && (!self.pending_uses_gpu_cache(&pending_task) || tail_requires_allocation);
+                        let request_id = pending_task.input.request_id.clone();
+                        let mut task = match self.open_batch_task(pending_task, load.2) {
+                            Ok(task) => task,
+                            Err(message) => {
+                                on_result(NodeBatchResult { request_id, result: Err(message) });
+                                continue;
+                            }
+                        };
+                        if cold_open && !task.cached_tokens.is_empty() {
+                            let rows = self.request_reservation_tokens(task.cached_tokens.len(), task.max_decode);
+                            match Glm52HotHistoryPrepare::start(std::mem::take(&mut task.states), rows) {
+                                Ok(worker) => {
+                                    opening = Some((task, worker));
+                                    break;
+                                }
+                                Err(message) => {
+                                    // 启动线程失败仅走错误收尾；仍等待已发出的 B Open。
+                                    let _ = self.recv_stage(task.stage_id);
+                                    let _ = self.link.send_delete(task.stage_id);
+                                    on_result(NodeBatchResult { request_id, result: Err(message) });
+                                    continue;
+                                }
+                            }
+                        }
+                        (task, cold_open)
                     };
-                    match self.finish_batch_open(&mut task) {
+                    let request_id = task.request_id.clone();
+                    match self.finish_batch_open(&mut task, false) {
                         Ok(None) => {}
                         Ok(Some(retry)) => {
                             pending.push_front(retry);
@@ -2041,35 +2772,51 @@ impl Glm52Engine {
                     if let Err(message) = pipeline.open(session, states) {
                         let _ = self.link.send_delete(stage_id);
                         on_result(NodeBatchResult { request_id, result: Err(format!("打开 continuous pipeline session={session}: {message:?}")) });
-                        continue;
+                        // worker 已退出，继续复用槽位会在 tail 的 Delete 完成前再次
+                        // Assign，并以二次协议错误覆盖真正的 backend 首错。
+                        return Err(message);
                     }
                     request_sessions.insert(stage_id, session);
                     submitted_prefill[session] = task.prefill_position;
                     slots[session] = Some(task);
-                    decode_scheduler.extend_initial_batch(session + 1);
+                    // 每次冷激活后先处理已返回的 token 并提交计算，与下一次加载重叠。
+                    if cold_open {
+                        break;
+                    }
                 }
-                // 初始批尚未释放时只有 ready 请求，没有在运行的 decode；此时
-                // 限流 prefill 会阻塞剩余成员，反过来让整个初始批无法释放。
-                let decode_active = decode_scheduler.initial_batch_released() && slots.iter().flatten().any(|task| task.prefill_position >= task.tokens.len());
+                let decode_active = slots.iter().flatten().any(|task| task.prefill_position >= task.tokens.len());
                 let (mut prefill_target, prefill_work_window, prefill_chunk_limit) = prefill_admission.limits(
                     pipeline.stage_flow_snapshot(),
                     pipeline.pipeline_work_window(),
                     pipeline.stage_count(),
                     decode_active,
-                    self.options.scheduling.decode_priority_prefill_chunk_size,
-                    self.options.scheduling.decode_priority_prefill_chunk_ceiling,
+                    active_tuning.scheduling.decode_priority_prefill_chunk_size,
+                    active_tuning.scheduling.decode_priority_prefill_chunk_ceiling,
                 );
                 let short_only = prefill_target == 0
                     && prefill_admission.short_request_ready()
-                    && Self::has_finishable_short_prefill(&slots, &submitted_prefill, &prefill_in_flight_by_session, self.options.scheduling.decode_priority_prefill_chunk_ceiling);
+                    && Self::has_finishable_short_prefill(&slots, &submitted_prefill, &prefill_in_flight_by_session, active_tuning.scheduling.decode_priority_prefill_chunk_ceiling);
                 prefill_target += usize::from(short_only);
+                // 长请求的后续分块也会增长，准入时的显存快照不能覆盖整次 prefill。
+                if prefill_target > prefill_in_flight && slots.iter().enumerate().any(|(session, task)| task.as_ref().is_some_and(|task| submitted_prefill[session] < task.tokens.len())) {
+                    while self.terminal_gpu_pressure(prefill_chunk_limit.unwrap_or(self.pipeline_chunk_size)).map_err(backend_error)? {
+                        match self.evict_oldest_terminal() {
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(error) => {
+                                eprintln!("[glm52-release-deferred] prefill: {error}");
+                                break;
+                            }
+                        }
+                    }
+                }
                 Self::fill_prefill_window(
                     pipeline,
                     &slots,
                     prefill_target,
                     prefill_work_window,
                     prefill_chunk_limit,
-                    self.options.scheduling.decode_priority_prefill_chunk_ceiling,
+                    active_tuning.scheduling.decode_priority_prefill_chunk_ceiling,
                     short_only,
                     &mut submitted_prefill,
                     &mut prefill_in_flight,
@@ -2081,7 +2828,7 @@ impl Glm52Engine {
                     self.embedding_table.as_ref(),
                 )?;
 
-                if slots.iter().all(Option::is_none) && pending.is_empty() {
+                if slots.iter().all(Option::is_none) && pending.is_empty() && opening.is_none() {
                     let incoming = intake(capacity);
                     if incoming.is_empty() {
                         self.link.send_continuous_stream_end(stream_control_id).map_err(backend_error)?;
@@ -2128,7 +2875,12 @@ impl Glm52Engine {
         }
 
         if let Err(error) = run {
-            let failed = slots.iter_mut().filter_map(Option::take).map(|task| (task.request_id, task.stage_id)).collect::<Vec<_>>();
+            let mut failed = slots.iter_mut().filter_map(Option::take).map(|task| (task.request_id, task.stage_id)).collect::<Vec<_>>();
+            if let Some((task, worker)) = opening.take() {
+                let _ = worker.finish();
+                let _ = self.recv_stage(task.stage_id);
+                failed.push((task.request_id, task.stage_id));
+            }
             for &(_, stage_id) in &failed {
                 let _ = self.link.send_delete(stage_id);
             }
@@ -2153,9 +2905,14 @@ impl Glm52Engine {
         Vec::new()
     }
 
-    fn finish_batch_open(&mut self, task: &mut Glm52BatchTask) -> Result<Option<Glm52PendingTask>, String> {
+    fn finish_batch_open(&mut self, task: &mut Glm52BatchTask, prepare_host: bool) -> Result<Option<Glm52PendingTask>, String> {
         let expected = task.cached_tokens.len();
-        match self.recv_stage(task.stage_id)? {
+        // Open 已发出，A 的注册与 B 的预读/恢复/注册重叠。即使 A 准备失败，
+        // 也先接收 B 的 Ready，使调用方 Delete 不会被尚在预读的 Open 复活。
+        let prepared = if prepare_host && expected != 0 { super::rocm_swap::prepare_glm52_hot_history(&mut task.states, self.request_reservation_tokens(expected, task.max_decode)) } else { Ok(()) };
+        let ready = self.recv_stage(task.stage_id)?;
+        prepared?;
+        match ready {
             StageMessage::Ready { cached_tokens } if cached_tokens == expected => {}
             StageMessage::Ready { cached_tokens: 0 } if expected > 0 => {
                 let (cache_id, sampling) = task.open_cache.take().ok_or("下游拒绝非空缓存，但 head 缺少缓存标识")?;
@@ -2179,6 +2936,7 @@ impl Glm52Engine {
                     thinking_end_token: task.thinking_end_token,
                     thinking_token_budget: task.thinking_token_budget,
                     swap_prefetch: Glm52SwapPrefetch::Ready(Ok(None)),
+                    resume: TerminalResume::None,
                     force_new: true,
                 }));
             }
@@ -2186,6 +2944,7 @@ impl Glm52Engine {
             _ => return Err("等待下游 cache ready 时收到非 Ready frame".to_owned()),
         }
         task.open_cache = None;
+        self.refresh_admission_memory()?;
         // B 的 SSD restore 完成并建立 active session 后再下发依赖该 session 的消息。
         // 这样一批 Open 可以先全部到达 B，host 读盘才能并行。
         // MTP context 由本机 A0 持有,不再向尾端下发。
@@ -2194,26 +2953,27 @@ impl Glm52Engine {
 
     fn load_swap_snapshot(swap: &Glm52SwapStore, resume: &TerminalResume, requested_cache_id: Option<&str>, cache_namespace: Option<&str>, tokens: &[u32]) -> Glm52SwapPrefetchResult {
         if let TerminalResume::Match { cache_id, assistant } = resume
-            && let Some(snapshot) = swap.get(cache_id)?
+            && let Some(snapshot) = swap.load(cache_id)?
             && snapshot.cache_namespace.as_deref() == cache_namespace
             && snapshot.pending_tokens.is_some()
         {
             return Ok(Some((snapshot, Some(*assistant))));
         }
         if let Some(cache_id) = requested_cache_id
-            && let Some(snapshot) = swap.get(cache_id)?
+            && let Some(snapshot) = swap.load(cache_id)?
+            && snapshot.cache_namespace.as_deref() == cache_namespace
             && !snapshot.tokens.is_empty()
             && tokens.starts_with(&snapshot.tokens)
         {
             return Ok(Some((snapshot, None)));
         }
         let Some(cache_id) = swap.longest_prefix_cache_id(cache_namespace, tokens)? else { return Ok(None) };
-        Ok(swap.get(&cache_id)?.map(|snapshot| (snapshot, None)))
+        Ok(swap.load(&cache_id)?.filter(|snapshot| snapshot.cache_namespace.as_deref() == cache_namespace && !snapshot.tokens.is_empty() && tokens.starts_with(&snapshot.tokens)).map(|snapshot| (snapshot, None)))
     }
 
-    fn start_swap_prefetch(&self, input: &NodeBatchRequest, tokens: &[u32]) -> Result<Glm52SwapPrefetch, String> {
+    fn start_swap_prefetch(&self, input: &NodeBatchRequest, tokens: &[u32], resume: &TerminalResume) -> Result<Glm52SwapPrefetch, String> {
         let Some(swap) = self.swap.as_ref().map(Arc::clone) else { return Ok(Glm52SwapPrefetch::Disabled) };
-        let resume = request_terminal_resume(&input.request)?;
+        let resume = resume.clone();
         let requested_cache_id = input.request.get("cache_id").and_then(Value::as_str).map(str::to_owned);
         let cache_namespace = input.request.get("_zllm_cache_namespace").and_then(Value::as_str).map(str::to_owned);
         let tokens = tokens.to_vec();
@@ -2235,19 +2995,49 @@ impl Glm52Engine {
 
     fn prepare_batch_task(&self, input: NodeBatchRequest) -> Result<Glm52PendingTask, String> {
         let reasoning_effort = request_reasoning_effort(&input.request, self.options.reasoning_effort)?;
-        let prompt = chat_prompt_glm52_with_template(&input.request, self.options.diagnostics.official_chat_template, reasoning_effort)?;
-        let tokens = self.tokenizer.tokenize(prompt.as_bytes());
-        if tokens.is_empty() {
+        // 瘦身 resume:server 已验证边界并截为 [边界 assistant, ...增量],这里
+        // 只渲染增量;token 序列从节点 cache 重建(cached + pending + suffix)。
+        // 与全量渲染 tokenize 等价——resident 命中路径本来就是这样重建 token 流。
+        // SSD 命中时先以 token_count 估算长度,open 阶段由快照重建完整序列。
+        // 两层都没有则按终态 miss 上报,让 server 重发完整请求。
+        let (tokens, prompt_tokens) = if let Some(cache_id) = input.request.get("_zllm_resume").and_then(Value::as_str) {
+            let suffix = match chat_prompt_suffix_glm52(&input.request, 0, self.options.diagnostics.official_chat_template) {
+                Ok(suffix) => suffix,
+                Err(_error) if !boundary_has_followup(&input.request, 0) => String::new(),
+                Err(error) => return Err(error),
+            };
+            let suffix_tokens = self.tokenizer.tokenize(suffix.as_bytes());
+            if let Some((_, cached, state)) = self.terminal_states.entries().find(|(id, _, _)| *id == cache_id) {
+                let mut tokens = cached.to_vec();
+                if let Some(pending) = &state.pending_tokens {
+                    tokens.extend_from_slice(pending);
+                }
+                tokens.extend(suffix_tokens);
+                let total = tokens.len();
+                (tokens, total)
+            } else if let Some(count) = self.swap.as_deref().and_then(|swap| swap.infos().iter().find(|info| info.cache_id == cache_id).map(|info| info.token_count)) {
+                let suffix_len = suffix_tokens.len();
+                (suffix_tokens, count.saturating_add(1).saturating_add(suffix_len))
+            } else {
+                return Err(format!("{} {cache_id}", crate::runtime::session::TERMINAL_RESUME_MISS));
+            }
+        } else {
+            let prompt = chat_prompt_glm52_with_template(&input.request, self.options.diagnostics.official_chat_template, reasoning_effort)?;
+            let tokens = self.tokenizer.tokenize(prompt.as_bytes());
+            let total = tokens.len();
+            (tokens, total)
+        };
+        if prompt_tokens == 0 {
             return Err("GLM-5.2 prompt 不能为空".to_owned());
         }
-        if tokens.len() > self.max_seq_len {
-            return Err(format!("GLM-5.2 prompt {} tokens 超过 max_seq_len {}", tokens.len(), self.max_seq_len));
+        if prompt_tokens > self.max_seq_len {
+            return Err(format!("GLM-5.2 prompt {prompt_tokens} tokens 超过 max_seq_len {}", self.max_seq_len));
         }
         let max_tokens = crate::runtime::session::requested_completion_tokens(&input.request);
-        if max_tokens == 0 || tokens.len() == self.max_seq_len {
+        if max_tokens == 0 || prompt_tokens == self.max_seq_len {
             return Err("GLM-5.2 max_tokens 必须大于 0，且 prompt 后必须保留生成空间".to_owned());
         }
-        let reserved_tokens = self.request_reservation_tokens(tokens.len(), max_tokens);
+        let reserved_tokens = self.request_reservation_tokens(prompt_tokens, max_tokens);
         // 未显式指定 temperature 时保持既有 greedy；显式参数必须透传到 tail。
         let temperature = input.request.get("temperature").and_then(Value::as_f64).unwrap_or(0.0) as f32;
         let top_p = input.request.get("top_p").and_then(Value::as_f64).unwrap_or(1.0) as f32;
@@ -2262,26 +3052,34 @@ impl Glm52Engine {
             return Err("DFlash2 当前只支持 temperature=0 的 greedy 请求".into());
         }
         let thinking_token_budget = if self.thinking_end_token.is_some() { request_thinking_token_budget(&input.request, self.options.thinking_token_budget)? } else { None };
-        let swap_prefetch = self.start_swap_prefetch(&input, &tokens)?;
-        Ok(Glm52PendingTask { input, tokens, max_tokens, reserved_tokens, sampling, thinking_end_token: self.thinking_end_token, thinking_token_budget, swap_prefetch, force_new: false })
+        let resume = request_terminal_resume(&input.request)?;
+        let mut task = Glm52PendingTask { input, resume, tokens, max_tokens, reserved_tokens, sampling, thinking_end_token: self.thinking_end_token, thinking_token_budget, swap_prefetch: Glm52SwapPrefetch::Disabled, force_new: false };
+        // GPU 终点已能恢复时不读 SSD；相同内容的旧检查点会白占十余秒及整份主存。
+        // 排队期间若被换出，Disabled 仍允许 Open 按当前主存/SSD 状态恢复。
+        if !self.pending_uses_gpu_cache(&task) {
+            task.swap_prefetch = self.start_swap_prefetch(&task.input, &task.tokens, &task.resume)?;
+        }
+        Ok(task)
     }
 
-    /// MTP 准入负载上限：加权负载(decode + 4×prefill,不含正在准入的这路)达到
-    /// 该值时,新加入的请求终身不建 MTP session(纯 AR,零草拟/零验证/零辅助状态)。
-    /// 高并发下 verify 的额外行在已饱和的 stage 上是净开销;前 6 路以内的请求
-    /// 仍由 effective_mtp_draft_tokens 按压力逐轮收缩深度,两条机制正交。
-    const MTP_ADMISSION_MAX_LOAD: usize = 6;
-
-    fn mtp_admission_enabled(mtp_configured: bool, admission_load: usize) -> bool {
-        mtp_configured && admission_load < Self::MTP_ADMISSION_MAX_LOAD
-    }
-
-    fn open_batch_task(&mut self, pending: Glm52PendingTask, active_decode: usize, admission_load: usize) -> Result<Glm52BatchTask, String> {
-        let Glm52PendingTask { input, mut tokens, max_tokens, reserved_tokens: _, sampling, thinking_end_token, thinking_token_budget, swap_prefetch, force_new } = pending;
+    fn open_batch_task(&mut self, pending: Glm52PendingTask, active_decode: usize) -> Result<Glm52BatchTask, String> {
+        let Glm52PendingTask { input, resume, mut tokens, max_tokens, reserved_tokens: _, sampling, thinking_end_token, thinking_token_budget, swap_prefetch, force_new } = pending;
+        if let Some(swap) = &self.swap {
+            let mla_bytes = self.mla.kv_lora_rank + self.mla.kv_lora_rank / crate::kv_cache::DEFAULT_GROUP_SIZE * 2 + self.mla.qk_rope_head_dim * 2;
+            let layers = self.layer_ends.last().copied().unwrap_or(0) + 1;
+            let copies = 1 + usize::from(!self.cooperative_peer_contexts.is_empty());
+            let required = self.request_reservation_tokens(tokens.len(), max_tokens).saturating_mul(layers).saturating_mul(copies).saturating_mul(mla_bytes);
+            // 在创建/恢复镜像之前腾出主存；落盘失败时原会话仍留在各缓存表中。
+            swap.spill_host(required as u64)?;
+        }
         let requested_cache_id = input.request.get("cache_id").and_then(Value::as_str).filter(|_| !force_new).map(str::to_owned);
         let cache_namespace = input.request.get("_zllm_cache_namespace").and_then(Value::as_str).map(str::to_owned);
         let stage_id = RequestId::from_cache_id(&input.request_id);
-        let resume = if force_new { TerminalResume::None } else { request_terminal_resume(&input.request)? };
+        let resume = if force_new { TerminalResume::None } else { resume };
+        // 瘦身请求没有完整 messages:任何不可恢复的路径都不允许退回全量渲染
+        // (占位 tokens 只有增量,渲染必残缺),一律哨兵上报让 server 重发完整请求。
+        let slim_resume = !force_new && input.request.get("_zllm_resume").is_some();
+        let slim_miss = |cache_id: Option<&str>| -> String { format!("{} {}", crate::runtime::session::TERMINAL_RESUME_MISS, cache_id.unwrap_or_default()) };
         let mut resident = None;
         match &resume {
             TerminalResume::Match { cache_id, assistant } => {
@@ -2308,20 +3106,22 @@ impl Glm52Engine {
         }
         let mut matched_cache_id = resident.as_ref().map(|(cache_id, _, _, _)| cache_id.clone());
         let mut reusable = None;
-        // 四份权重限制运行中的计算负载；闲置 cache 只按实际驻留会话和 token 预算回收。
-        while active_decode.saturating_add(1).saturating_add(self.terminal_states.len()) > NodeRuntime::MAX_CONCURRENT_SESSIONS || self.kv_budget.used().saturating_add(self.resident_kv_cost()) > self.kv_budget.capacity() {
+        // 先回收已结束会话，为下一个 chunk 留出增长空间；仍不足时 backend
+        // 才收缩活跃 MLA 历史。低负载不因超过 hot_rows 就丢掉可复用前缀。
+        loop {
+            let mut pressure = active_decode.saturating_add(1).saturating_add(self.terminal_states.len()) > NodeRuntime::MAX_CONCURRENT_SESSIONS || self.kv_budget.used().saturating_add(self.resident_kv_cost()) > self.kv_budget.capacity();
+            pressure |= self.terminal_gpu_pressure(self.pipeline_chunk_size.min(tokens.len()))?;
+            if !pressure {
+                break;
+            }
             let Some(states) = self.evict_oldest_terminal()? else { break };
             if reusable.is_none() {
                 reusable = Some(states);
             }
         }
         let mut cache_hit = false;
-        // 准入时负载已满：这路终身不建/不恢复 MTP session,避免高并发下 verify
-        // 的额外行成为饱和 stage 上的净开销。缓存是否带 MTP 状态不影响准入。
-        let head_mtp_enabled = Self::mtp_admission_enabled(self.options.mtp, admission_load);
-        if self.options.mtp && !head_mtp_enabled {
-            eprintln!("[glm52-mtp-admission-off] request_id={} load={admission_load} mode=ar-until-request-end", input.request_id);
-        }
+        // 准入时保留 MTP 状态；负载只限制下一轮草拟，避免到达顺序决定整路能力。
+        let head_mtp_enabled = self.options.mtp;
         let dspark_enabled = self.dspark_runtime.is_some();
         let (mut states, last_hidden, cached_tokens, prefill_position, mut mtp, mut dspark_aux_history, mut dspark_aux_history_start, mut dspark_target_cache) = if let Some((matched_id, cached_tokens, state, resume_assistant)) = resident {
             if let Some(assistant) = resume_assistant {
@@ -2349,9 +3149,15 @@ impl Glm52Engine {
                 }
                 tokens = resumed;
             }
+            let dspark_valid = self.dspark_cache_valid(state.dspark_aux_history.as_ref(), state.dspark_aux_history_start, &state.dspark_target_cache, cached_tokens.len());
+            let auxiliary_missing = head_mtp_enabled && state.mtp.is_none() || dspark_enabled && !dspark_valid;
+            // 先检查再拆开状态，瘦身 miss 才能完整归还缓存（包括两份 DSA）。
+            if auxiliary_missing && slim_resume {
+                self.terminal_states.insert(matched_id.clone(), cached_tokens, state);
+                return Err(slim_miss(requested_cache_id.as_deref()));
+            }
             let Glm52HeadState { states, last_hidden, pending_tokens: _, mtp, dspark_aux_history, dspark_aux_history_start, dspark_target_cache, .. } = state;
-            let dspark_valid = self.dspark_cache_valid(dspark_aux_history.as_ref(), dspark_aux_history_start, &dspark_target_cache, cached_tokens.len());
-            if head_mtp_enabled && mtp.is_none() || dspark_enabled && !dspark_valid {
+            if auxiliary_missing {
                 matched_cache_id = None;
                 eprintln!("[glm52-cache-reject] cache_id={matched_id} resident state 缺少 {}，重新 prefill", if head_mtp_enabled && mtp.is_none() { "MTP" } else { "完整 DSpark aux/target cache" });
                 (states, None, Vec::new(), 0, None, None, 0, DsparkTargetCache::new())
@@ -2377,6 +3183,9 @@ impl Glm52Engine {
                     let matched_id = snapshot.cache_id.clone();
                     matched_cache_id = Some(matched_id.clone());
                     if !self.swap_cache_valid(&snapshot) {
+                        if slim_resume {
+                            return Err(slim_miss(requested_cache_id.as_deref()));
+                        }
                         matched_cache_id = None;
                         eprintln!("[glm52-cache-reject] cache_id={matched_id} SSD state 缺少 {}，重新 prefill", if head_mtp_enabled && snapshot.mtp.is_none() { "MTP" } else { "完整 DSpark aux/target cache" });
                         let states = match reusable {
@@ -2403,16 +3212,28 @@ impl Glm52Engine {
                             Some(states) => states,
                             None => self.build_fresh_states()?,
                         };
-                        let restored_rows = self.request_reservation_tokens(tokens.len(), max_tokens);
+                        let restored_rows = self.request_reservation_tokens(snapshot.tokens.len(), max_tokens);
                         upload_glm52_session(&mut states, &snapshot.stages, &self.cfg, self.max_seq_len, restored_rows)?;
-                        let hidden = self.output_context().tensor_from_bf16_bits(snapshot.last_hidden, 1, self.cfg.hidden_size).map_err(|error| format!("恢复 head terminal hidden: {error:?}"))?;
+                        let hidden = self.output_context().tensor_from_bf16_bits(snapshot.last_hidden.clone(), 1, self.cfg.hidden_size).map_err(|error| format!("恢复 head terminal hidden: {error:?}"))?;
                         let position = snapshot.tokens.len();
                         let mtp = snapshot
                             .mtp
+                            .clone()
                             .filter(|_| head_mtp_enabled)
-                            .map(|mtp| RocmMtpSession::restore(mtp, &self.output_context(), &self.cfg, self.max_seq_len, restored_rows, self.output_head.as_ref().ok_or("恢复 MTP cache 缺少 output head")?, &hidden))
+                            .map(|mtp| {
+                                RocmMtpSession::restore(
+                                    mtp,
+                                    &self.output_context(),
+                                    &self.cfg,
+                                    self.max_seq_len,
+                                    restored_rows,
+                                    self.mtp_runtime.as_ref().ok_or("恢复 MTP cache 缺少 runtime")?.experts.dsa_sequence_sharded(),
+                                    self.output_head.as_ref().ok_or("恢复 MTP cache 缺少 output head")?,
+                                    &hidden,
+                                )
+                            })
                             .transpose()?;
-                        let (dspark_aux_history, dspark_aux_history_start) = match snapshot.dspark_aux {
+                        let (dspark_aux_history, dspark_aux_history_start) = match snapshot.dspark_aux.clone() {
                             Some(aux) => {
                                 let start = aux.start_position;
                                 let hidden = self
@@ -2424,7 +3245,7 @@ impl Glm52Engine {
                             }
                             None => (None, 0),
                         };
-                        let dspark_target_cache = match snapshot.dspark_target {
+                        let dspark_target_cache = match snapshot.dspark_target.clone() {
                             Some(target) => {
                                 let layers = target
                                     .layers
@@ -2444,16 +3265,19 @@ impl Glm52Engine {
                         }
                         cache_hit = true;
                         eprintln!(
-                            "[glm52-cache-hit] cache_id={matched_id} request_cache_id={} source=ssd tokens={position} suffix_tokens={} dspark_aux_rows={} dspark_target_layers={}",
+                            "[glm52-cache-hit] cache_id={matched_id} request_cache_id={} source=host-or-ssd tokens={position} suffix_tokens={} dspark_aux_rows={} dspark_target_layers={}",
                             requested_cache_id.as_deref().unwrap_or_default(),
                             tokens.len().saturating_sub(position),
                             dspark_aux_history.as_ref().map_or(0, |hidden| hidden.rows),
                             dspark_target_cache.warmed_layers()
                         );
-                        (states, Some(hidden), snapshot.tokens, position, mtp, dspark_aux_history, dspark_aux_history_start, dspark_target_cache)
+                        (states, Some(hidden), snapshot.tokens.clone(), position, mtp, dspark_aux_history, dspark_aux_history_start, dspark_target_cache)
                     }
                 }
                 _ => {
+                    if slim_resume {
+                        return Err(slim_miss(requested_cache_id.as_deref()));
+                    }
                     let states = match reusable {
                         Some(states) => states,
                         None => self.build_fresh_states()?,
@@ -2484,6 +3308,10 @@ impl Glm52Engine {
             for state in &mut states {
                 state.reset_session(&self.cfg, self.max_seq_len).map_err(|error| format!("重置 batch stage session: {error:?}"))?;
             }
+        }
+        if self.live_gpu_admission() {
+            let next_rows = self.request_reservation_tokens(cached_tokens.len(), max_tokens).min(reserved_tokens);
+            reserve_pair_session(&mut states, next_rows, &self.cfg)?;
         }
         eprintln!("[glm52-admit] request_id={} kind={} decode={active_decode} prompt_tokens={} cached_tokens={}", input.request_id, if cache_hit { "append" } else { "new" }, tokens.len(), cached_tokens.len());
         let tools_enabled = input.request.get("tool_choice").and_then(Value::as_str) != Some("none") && input.request.get("tools").and_then(Value::as_array).is_some_and(|tools| !tools.is_empty());
@@ -2548,7 +3376,7 @@ impl Glm52Engine {
             .with_segment_end_tokens(thinking_end_token);
         let mtp_enabled = head_mtp_enabled;
         if !mtp_enabled && mtp.is_some() {
-            // 准入已满的 K0 请求:丢弃缓存里恢复出的 MTP 辅助状态,终身纯 AR。
+            // 配置关闭 MTP 时不恢复辅助状态。
             mtp = None;
         }
         if mtp_enabled && mtp.is_none() && prefill_position == 0 {
@@ -2556,24 +3384,41 @@ impl Glm52Engine {
         }
         if let Some(mtp) = mtp.as_mut() {
             mtp.begin_request(prefill_position, tokens.clone(), max_decode, self.options.mtp_draft_tokens)?;
+            if self.live_gpu_admission() {
+                let rows = self.request_reservation_tokens(cached_tokens.len(), max_tokens).min(reserved_tokens);
+                mtp.reserve_pair_rows(self.mtp_runtime.as_ref().ok_or("MTP reservation 缺少 runtime")?, &self.cfg, rows)?;
+            }
         } else if mtp_enabled && prefill_position > 0 {
             eprintln!("[glm52-mtp-fallback] request_id={} SSD cache 没有 A0 MTP resident state，本轮退回普通 decode", input.request_id);
         }
         let sampling_state = SamplingState::new(sampling)?;
         let batch_guard = BatchTokenGuard::new(&self.runtime, tokens.len().saturating_sub(prefill_position));
-        let requested_prefill_chunk = input.request.get("prefill_chunk_size").and_then(Value::as_u64).and_then(|value| usize::try_from(value).ok()).map(|value| value.min(self.pipeline_chunk_size).min(self.max_seq_len));
+        let runtime_tuning = self.runtime_tuning.read().map_err(|_| "GLM runtime config 锁中毒")?.clone();
+        let request_override = runtime_tuning.request_overrides.get(&input.request_id).copied().unwrap_or_default();
+        let requested_prefill_chunk = request_override
+            .prefill_chunk_size
+            .or_else(|| input.request.get("prefill_chunk_size").and_then(Value::as_u64).and_then(|value| usize::try_from(value).ok()))
+            .map(|value| value.min(self.pipeline_chunk_size).min(self.max_seq_len));
+        let runtime_mtp_draft_tokens = request_override
+            .mtp_draft_tokens
+            .or_else(|| input.request.get("mtp_draft_tokens").and_then(Value::as_u64).and_then(|value| usize::try_from(value).ok()))
+            .unwrap_or(runtime_tuning.mtp_draft_tokens)
+            .min(self.options.mtp_draft_tokens);
         let prefill_policy = match requested_prefill_chunk {
             Some(chunk_size) => AdaptiveChunkPolicy { initial_chunk_size: chunk_size, append_chunk_size: chunk_size, long_context_threshold_tokens: usize::MAX, long_context_chunk_size: chunk_size },
             None => AdaptiveChunkPolicy {
-                initial_chunk_size: self.pipeline_chunk_size,
-                append_chunk_size: self.options.scheduling.append_prefill_chunk_size,
-                long_context_threshold_tokens: self.options.scheduling.long_prefill_threshold_tokens,
-                long_context_chunk_size: self.options.scheduling.long_prefill_chunk_size,
+                initial_chunk_size: runtime_tuning.prefill_chunk_size,
+                append_chunk_size: runtime_tuning.scheduling.append_prefill_chunk_size,
+                long_context_threshold_tokens: runtime_tuning.scheduling.long_prefill_threshold_tokens,
+                long_context_chunk_size: runtime_tuning.scheduling.long_prefill_chunk_size,
             },
         };
         let cache_request_id = matched_cache_id.as_deref().filter(|_| cache_hit).map(RequestId::from_cache_id);
         self.send_open_with_reconnect(stage_id, cache_request_id, cached_tokens.len(), reserved_tokens.min(self.max_seq_len), cache_hit, sampling).map_err(|error| format!("命令下游打开 cache: {error}"))?;
         let open_cache = matched_cache_id.filter(|_| cache_hit).map(|cache_id| (cache_id, sampling));
+        let prefill_prefix_last_hidden = last_hidden.clone();
+        let prefill_prefix_dspark_aux_history = dspark_aux_history.clone();
+        let prefill_prefix_dspark_aux_history_start = dspark_aux_history_start;
         let prompt_last_hidden = (prefill_position == tokens.len()).then(|| last_hidden.clone()).flatten();
         let prompt_dspark_aux_history = (prefill_position == tokens.len()).then(|| dspark_aux_history.clone()).flatten();
         let prompt_dspark_aux_history_start = dspark_aux_history_start;
@@ -2591,12 +3436,14 @@ impl Glm52Engine {
             kv_reservation,
             states,
             last_hidden,
+            prefill_prefix_last_hidden,
             prompt_last_hidden,
             cached_tokens,
             prefill_position,
             tail_prefill_position: prefill_position,
             prefill_suffix_start: prefill_position,
             prefill_policy,
+            runtime_mtp_draft_tokens,
             open_cache,
             response_text: String::new(),
             utf8: Utf8StreamDecoder::default(),
@@ -2616,6 +3463,8 @@ impl Glm52Engine {
             mtp_verify_rows: Vec::new(),
             dspark_aux_history,
             dspark_aux_history_start,
+            prefill_prefix_dspark_aux_history,
+            prefill_prefix_dspark_aux_history_start,
             prompt_dspark_aux_history,
             prompt_dspark_aux_history_start,
             dspark_target_cache,
@@ -2738,9 +3587,8 @@ impl Glm52Engine {
         Ok(())
     }
 
-    /// 取消时 A 已经送出的 prefill 必须等 B 返回 terminal hidden/DSpark aux，
-    /// 再按同一个完成水位提交 cache。单会话在途受 prefill_admission_burst 限制，
-    /// 因此这里不会退化为等待整份未完成 prompt。
+    /// 取消时 A 已经送出的 prefill 必须等 B 返回，再把两端回退到请求开始时的
+    /// cache 边界。消息中间的部分 prompt 没有可重建语义，不能覆盖原 cache。
     fn finish_cancelled_prefill(&mut self, task: &mut Glm52BatchTask) -> Result<(), String> {
         if task.completion_tokens != 0 {
             return Ok(());
@@ -2770,15 +3618,26 @@ impl Glm52Engine {
             }
             task.tail_prefill_position = end;
         }
-        if task.cached_tokens.len() < task.tail_prefill_position {
-            return Err(format!("取消 prefill cache={} 落后 B 水位={}", task.cached_tokens.len(), task.tail_prefill_position));
+        let prefix = task.prefill_suffix_start;
+        for state in &mut task.states {
+            state.cache.truncate_rows(prefix).map_err(|error| format!("取消 prefill 回退 prefix KV cache: {error:?}"))?;
+            state.dsa.truncate_rows(prefix).map_err(|error| format!("取消 prefill 回退 prefix DSA cache: {error:?}"))?;
         }
-        task.cached_tokens.truncate(task.tail_prefill_position);
-        if task.tail_prefill_position == task.tokens.len() {
-            task.prompt_last_hidden = task.last_hidden.clone();
-            task.prompt_dspark_aux_history = task.dspark_aux_history.clone();
-            task.prompt_dspark_aux_history_start = task.dspark_aux_history_start;
+        if let Some(mtp) = task.mtp.as_mut().filter(|mtp| mtp.active) {
+            mtp.truncate_to_target(prefix).map_err(|error| format!("取消 prefill 回退 prefix MTP cache: {error:?}"))?;
+            if let Some(hidden) = task.prefill_prefix_last_hidden.as_ref() {
+                mtp.set_terminal_hidden(&output_context, &self.cfg, self.output_head.as_ref().ok_or("取消 prefill 恢复 MTP 时缺少 output head")?, hidden).map_err(|error| format!("取消 prefill 恢复 prefix MTP hidden: {error:?}"))?;
+            } else {
+                mtp.pending_hidden = None;
+            }
+            mtp.prompt_tokens = task.tokens[..prefix].to_vec();
         }
+        task.cached_tokens.truncate(prefix);
+        task.prefill_position = prefix;
+        task.tail_prefill_position = prefix;
+        task.last_hidden = task.prefill_prefix_last_hidden.take();
+        task.dspark_aux_history = task.prefill_prefix_dspark_aux_history.take();
+        task.dspark_aux_history_start = task.prefill_prefix_dspark_aux_history_start;
         Ok(())
     }
 
@@ -2910,19 +3769,6 @@ impl Glm52Engine {
         let profile_mtp = crate::kernel::rocm::hip::options().kernel_profile && ready_by_session.iter().flatten().any(|item| item.verify);
         let mut mtp_phase_micros = [0_u128; 5];
 
-        if mtp_draft_tokens == 0
-            && ready_by_session.iter().enumerate().any(|(session, item)| item.is_some() && slots[session].as_ref().is_some_and(|task| task.mtp.is_some()))
-            && let Some(runtime) = self.mtp_runtime.as_mut()
-        {
-            // prefill catch-up 可能尚未经过取 token 的同步；释放缓存前必须等
-            // 已提交的 owner/peer 计算完成，关闭本身不再提交 MTP 计算。
-            if let Some(completion) = runtime.pending_pair_completion.take() {
-                runtime.backend.wait_stage_completion(&completion).map_err(|error| format!("关闭 MTP 等待在途计算: {error:?}"))?;
-            } else {
-                runtime.backend.synchronize().map_err(|error| format!("关闭 MTP 同步缓存使用: {error:?}"))?;
-            }
-        }
-
         // prefill/decode 的真实 target hidden 先补齐 MTP；verify 必须等 target
         // 接受长度确定后再补齐。
         let mut catch_up = std::iter::repeat_with(|| None).take(slots.len()).collect::<Vec<Option<(usize, Vec<u32>, RocmTensor)>>>();
@@ -2931,9 +3777,7 @@ impl Glm52Engine {
             if item.cached || item.verify || item.sampled_token.is_some() || item.speculative.is_some() {
                 continue;
             }
-            // 非 verify 行没有尚待判定的草稿；在 catch-up 前关闭，连 prefill
-            // 片段也不能继续维护已经停用的 MTP cache。
-            disable_mtp_for_request(&mut task.mtp, mtp_draft_tokens, &task.request_id);
+            // K0 仍补齐真实 target 的辅助 cache；恢复草拟不重算长上下文。
             let rows = item.hidden.rows;
             let inputs = if item.decode {
                 vec![*task.cached_tokens.get(item.position).ok_or_else(|| format!("A0 decode token position={} 越界 {}", item.position, task.cached_tokens.len()))?]
@@ -3168,11 +4012,9 @@ impl Glm52Engine {
                 }
                 let last = output_context.slice_token_rows(&item.hidden, outcome.retained_rows - 1, 1).map_err(|error| format!("取 A0 MTP terminal hidden: {error:?}"))?;
                 if let Some(mtp) = task.mtp.as_mut().filter(|mtp| mtp.active) {
-                    if mtp_draft_tokens != 0 {
-                        let retained_hidden = output_context.slice_token_rows(&item.hidden, 0, outcome.retained_rows).map_err(|error| format!("取 A0 MTP retained hidden: {error:?}"))?;
-                        mtp.truncate_to_target(item.position).map_err(|error| format!("A0 MTP rollback: {error:?}"))?;
-                        verify_catch_up[session] = Some((item.position, verify_inputs[..outcome.retained_rows].to_vec(), retained_hidden));
-                    }
+                    let retained_hidden = output_context.slice_token_rows(&item.hidden, 0, outcome.retained_rows).map_err(|error| format!("取 A0 MTP retained hidden: {error:?}"))?;
+                    mtp.truncate_to_target(item.position).map_err(|error| format!("A0 MTP rollback: {error:?}"))?;
+                    verify_catch_up[session] = Some((item.position, verify_inputs[..outcome.retained_rows].to_vec(), retained_hidden));
                 } else if self.dspark_runtime.is_some() {
                     let aux = item.aux_hidden.as_ref().ok_or("DSpark verify 缺少 aux hidden")?;
                     let normalized = self.dspark_runtime.as_ref().unwrap().normalize_aux_hidden(&output_context, aux).map_err(|error| format!("DSpark verify normalize: {error:?}"))?;
@@ -3251,15 +4093,6 @@ impl Glm52Engine {
                 outcomes[session] = Some(Glm52TailOutcome { tokens, drafts: Vec::new(), eos: forced_budget.is_none() && loop_recovery.is_none() && cfg.eos_token_ids.contains(&token), hard_loop, continue_dspark: false });
             }
         }
-        // 已发出的 verify 必须先完整接受/回退 target，随后才能丢弃它依赖的
-        // verify_inputs。当前请求不重启 MTP，终点也不保存过期辅助 cache。
-        for (slot, outcome) in slots.iter_mut().zip(&outcomes) {
-            if outcome.is_some()
-                && let Some(task) = slot.as_mut()
-            {
-                disable_mtp_for_request(&mut task.mtp, mtp_draft_tokens, &task.request_id);
-            }
-        }
         if profile_mtp {
             output_context.synchronize().map_err(|error| format!("同步 A0 MTP verify accept: {error:?}"))?;
         }
@@ -3308,7 +4141,11 @@ impl Glm52Engine {
                     let remaining = mtp.max_decode.saturating_sub(task.completion_tokens.saturating_add(outcome.tokens.len()));
                     // 已发出的 verify 按原行数完成；动态深度只约束下一轮 draft，
                     // 不重置常驻 MTP 权重、KV 或 pending hidden。
-                    let count = mtp.draft_tokens.min(mtp_draft_tokens).min(remaining.saturating_sub(1));
+                    let count = mtp.draft_tokens.min(task.runtime_mtp_draft_tokens).min(mtp_draft_tokens).min(remaining.saturating_sub(1));
+                    if count == 0 {
+                        mtp.verify_inputs.clear();
+                        return None;
+                    }
                     let hidden = mtp.pending_hidden.clone()?;
                     let fence = mtp_draft_fence(&task.token_fence, &outcome.tokens);
                     draft_sessions.push(session);
@@ -3458,12 +4295,7 @@ impl Glm52Engine {
             }
             if self.options.diagnostics.trace_token_progress && task.completion_tokens != previous_completion_tokens {
                 // 每个已接受输出批只记一次；不读 GPU、不保存文本，也不把草稿算进用户速率。
-                eprintln!(
-                    "[glm52-token-progress] request_id={} ts_us={} completion_tokens={}",
-                    request_id,
-                    crate::runtime::prefill_scheduler::stage_trace_timestamp_us(),
-                    task.completion_tokens,
-                );
+                eprintln!("[glm52-token-progress] request_id={} ts_us={} completion_tokens={}", request_id, crate::runtime::prefill_scheduler::stage_trace_timestamp_us(), task.completion_tokens,);
             }
             let next = if matches!(task.finish_reason.as_str(), "cancelled" | "stop" | "repetition") || task.completion_tokens >= task.max_decode {
                 task.decode_finished_at.get_or_insert_with(SystemTime::now);
@@ -3601,8 +4433,7 @@ impl Glm52Engine {
         let cache_id = if task.finish_reason != "cancelled" {
             Some(terminal_cache_id(&task.request, &task.response_text, &task.tool_stream.calls)?)
         } else if !task.cached_tokens.is_empty() {
-            // API 已按当前内容生成并按 API key namespace 隔离 cache_id。取消时只发布
-            // 真正走完本机 pipeline 的 token；下游 Cache ACK 再保证尾段也提交到同一位置。
+            // 取消 prefill 已回退到请求开始时的稳定边界，只把原 cache 重新发布。
             task.request.get("cache_id").and_then(Value::as_str).map(str::to_owned)
         } else {
             None
@@ -3612,7 +4443,7 @@ impl Glm52Engine {
         let cache = if preserve_existing {
             let cache_id = cache_id.as_deref().unwrap_or_default();
             let tokens = task.cached_tokens.len();
-            self.link.send_delete(task.stage_id).and_then(|()| self.wait_ready_after_cancel(task.stage_id, tokens))?;
+            self.link.send_delete(task.stage_id).and_then(|()| self.wait_deleted_after_cancel(task.stage_id))?;
             eprintln!("[glm52-prefill-checkpoint-preserve] cache_id={cache_id} rejected_tokens={tokens} existing_tokens={}", self.terminal_states.cached_tokens(cache_id).map_or(0, |existing| existing.len()));
             None
         } else if let Some(cache_id) = cache_id {
@@ -3672,7 +4503,6 @@ impl Glm52Engine {
                     cache_namespace,
                     info: info.clone(),
                     decode_finished_at,
-                    prompt_tokens: task.tokens.len(),
                 },
             );
             if inserted {
@@ -3691,22 +4521,20 @@ impl Glm52Engine {
                 self.trim_terminal_cache();
                 Some(info)
             } else {
-                self.link.send_delete(task.stage_id).and_then(|()| self.wait_ready(task.stage_id, info.prompt_tokens))?;
+                self.link.send_delete(task.stage_id).and_then(|()| if cancelled { self.wait_deleted_after_cancel(task.stage_id) } else { self.wait_deleted(task.stage_id) })?;
                 None
             }
         } else {
-            let tokens = task.cached_tokens.len();
-            self.link.send_delete(task.stage_id).and_then(|()| if cancelled { self.wait_ready_after_cancel(task.stage_id, tokens) } else { self.wait_ready(task.stage_id, tokens) })?;
+            self.link.send_delete(task.stage_id).and_then(|()| if cancelled { self.wait_deleted_after_cancel(task.stage_id) } else { self.wait_deleted(task.stage_id) })?;
             None
         };
         Ok(GenerationSummary { finish_reason: task.finish_reason, prompt_tokens: task.tokens.len(), completion_tokens: task.completion_tokens, cache, tool_calls: std::mem::take(&mut task.tool_stream.calls) })
     }
 }
 
-fn disable_mtp_for_request(mtp: &mut Option<RocmMtpSession>, depth: usize, request_id: &str) {
-    if depth == 0 && mtp.take().is_some() {
-        eprintln!("[glm52-mtp-disabled] request_id={request_id} mode=ar-until-request-end");
-    }
+fn rolling_request_reservation(prompt: usize, max_output: usize, page: usize, capacity: usize) -> usize {
+    // 最大输出只决定停止条件；仅保证下一个 token 所在页，不在对齐后再加一页。
+    prompt.saturating_add(max_output.min(1)).div_ceil(page).saturating_mul(page).min(capacity)
 }
 
 fn mtp_draft_fence(current: &GenerationGuard<Glm52ToolFence>, accepted: &[u32]) -> GenerationGuard<Glm52ToolFence> {
@@ -3725,6 +4553,52 @@ mod mtp_fence_tests {
     use crate::runtime::glm52::tool::{ARG_KEY_OPEN_TOKEN, TOOL_CALL_OPEN_TOKEN};
 
     #[test]
+    fn runtime_config_is_atomic_and_bounded_by_loaded_resources() {
+        let tuning = Arc::new(RwLock::new(Glm52RuntimeTuning {
+            revision: 1,
+            max_concurrency: 12,
+            prefill_chunk_size: 4096,
+            mtp_draft_tokens: 5,
+            mtp_pressure_draft_tokens: DEFAULT_MTP_PRESSURE_DRAFT_TOKENS.to_vec(),
+            device_buffer_pool_bytes: DEFAULT_DEVICE_BUFFER_POOL_BYTES,
+            scheduling: Glm52SchedulingConfig::default(),
+            request_overrides: HashMap::new(),
+        }));
+        let control = Glm52RuntimeConfig { tuning: tuning.clone(), physical_max_concurrency: 12, maximum_prefill_chunk_size: 4096, maximum_mtp_draft_tokens: 5 };
+        let update = control
+            .apply(serde_json::json!({
+                "max_concurrency": 6,
+                "mtp_draft_tokens": 3,
+                "mtp_pressure_draft_tokens": [0, 3, 3, 2, 1, 0],
+                "scheduling": {"profile_completion": true},
+                "request_overrides": {"req_live": {"mtp_draft_tokens": 1, "prefill_chunk_size": 2048}}
+            }))
+            .unwrap();
+        assert_eq!(update.revision, 2);
+        assert_eq!(update.max_concurrency, Some(6));
+        assert!(tuning.read().unwrap().scheduling.profile_completion);
+        assert_eq!(tuning.read().unwrap().request_overrides["req_live"].mtp_draft_tokens, Some(1));
+
+        assert!(control.apply(serde_json::json!({"mtp_draft_tokens": 6})).is_err());
+        assert_eq!(control.snapshot().revision, 2, "失败 patch 不能留下半套配置");
+        control.apply(serde_json::json!({"request_overrides": {"req_live": null}})).unwrap();
+        assert!(tuning.read().unwrap().request_overrides.is_empty());
+    }
+
+    #[test]
+    fn maximum_output_does_not_preallocate_kv() {
+        for page in [1024, 2048, 4096] {
+            for prompt in [1, 4095, 4096, 50_000, 500_000, 1_048_575] {
+                let small = rolling_request_reservation(prompt, 1, page, 1_048_576);
+                assert_eq!(small, rolling_request_reservation(prompt, 1_048_576, page, 1_048_576));
+                assert!(small > prompt && small - prompt <= page);
+            }
+        }
+        assert_eq!(rolling_request_reservation(4095, 1_048_576, 4096, 1_048_576), 4096);
+        assert_eq!(rolling_request_reservation(4096, 1_048_576, 4096, 1_048_576), 8192);
+    }
+
+    #[test]
     fn kv_accounting_uses_physical_mirrors_once() {
         let bytes = 656_u64 * 80 * 1_000_000 * 2;
         assert_eq!(Glm52Engine::host_mirror_token_budget(bytes, 656, 80).unwrap(), 1_000_000);
@@ -3741,34 +4615,6 @@ mod mtp_fence_tests {
         assert_eq!(RocmDsaState::key_bytes_per_token(64).unwrap(), 66);
         assert!(RocmDsaState::key_bytes_per_token(0).is_err());
         assert!(RocmDsaState::key_bytes_per_token(7).is_err());
-    }
-
-    #[test]
-    fn mtp_admission_disabled_at_load_six() {
-        // 加权负载 5(如 5 路 decode 或 1 decode+1 prefill)仍可准入,6 起终身 K0。
-        assert!(Glm52Engine::mtp_admission_enabled(true, 0));
-        assert!(Glm52Engine::mtp_admission_enabled(true, 5));
-        assert!(!Glm52Engine::mtp_admission_enabled(true, 6));
-        assert!(!Glm52Engine::mtp_admission_enabled(true, 14));
-        assert!(!Glm52Engine::mtp_admission_enabled(false, 0), "配置关 MTP 时与负载无关");
-    }
-
-    #[test]
-    fn zero_depth_discards_auxiliary_state_until_next_request() {
-        let mut cfg = Glm52Config::standard();
-        cfg.index_top_k = 8;
-        let mut mtp = Some(RocmMtpSession::fresh(&cfg, 16).unwrap());
-        mtp.as_mut().unwrap().active = true;
-        mtp.as_mut().unwrap().verify_inputs = vec![11, 12, 13];
-        disable_mtp_for_request(&mut mtp, 1, "test");
-        assert_eq!(mtp.as_ref().unwrap().verify_inputs, [11, 12, 13]);
-        disable_mtp_for_request(&mut mtp, 0, "test");
-        assert!(mtp.is_none());
-        disable_mtp_for_request(&mut mtp, 3, "test");
-        assert!(mtp.is_none(), "本请求负载下降不能重用过期 MTP cache");
-        mtp = Some(RocmMtpSession::fresh(&cfg, 16).unwrap());
-        disable_mtp_for_request(&mut mtp, 1, "next-request");
-        assert!(mtp.is_some());
     }
 
     #[test]

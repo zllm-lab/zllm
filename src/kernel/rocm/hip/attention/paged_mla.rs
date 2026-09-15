@@ -200,6 +200,7 @@ pub(crate) fn try_mla_gpu_hot_gather_q8(
     epoch: u32,
     selection: &DeviceBuffer,
     output: [&DeviceBuffer; 3],
+    offset: usize,
     count: usize,
     columns: [usize; 3],
     cache_rows: usize,
@@ -212,6 +213,7 @@ pub(crate) fn try_mla_gpu_hot_gather_q8(
         return Err(format!("GPU hot gather 状态非法: count={count} columns={columns:?} cache={cache_rows} recent={recent_rows} host={host_rows} context={context_rows} map={map_rows}"));
     }
     let row_bytes = [columns[0], columns[1].checked_mul(2).ok_or("GPU hot scale 行溢出")?, columns[2].checked_mul(2).ok_or("GPU hot rope 行溢出")?];
+    let end = offset.checked_add(count).ok_or("GPU hot gather range 溢出")?;
     let stored_rows = cache_rows.checked_add(recent_rows).ok_or("GPU hot cache 行数溢出")?;
     for i in 0..3 {
         let required = host_rows.checked_mul(row_bytes[i]).ok_or("GPU hot host 大小溢出")?;
@@ -219,11 +221,11 @@ pub(crate) fn try_mla_gpu_hot_gather_q8(
             return Err(format!("GPU hot host[{i}] bytes={}，期望 {required}", host[i].bytes()));
         }
         validate_resident(cache[i], device_id, stored_rows.checked_mul(row_bytes[i]).ok_or("GPU hot cache 大小溢出")?, "GPU hot cache")?;
-        validate_resident(output[i], device_id, count.checked_mul(row_bytes[i]).ok_or("GPU hot output 大小溢出")?, "GPU hot gather output")?;
+        validate_resident(output[i], device_id, end.checked_mul(row_bytes[i]).ok_or("GPU hot output 大小溢出")?, "GPU hot gather output")?;
     }
     let meta_words = cache_rows.checked_mul(2).and_then(|n| n.checked_add(map_rows)).and_then(|n| n.checked_add(1)).ok_or("GPU hot metadata 溢出")?;
     validate_resident(metadata, device_id, meta_words.checked_mul(4).ok_or("GPU hot metadata bytes 溢出")?, "GPU hot metadata")?;
-    validate_resident(selection, device_id, count.checked_mul(4).ok_or("GPU hot selection 溢出")?, "GPU hot selection")?;
+    validate_resident(selection, device_id, end.checked_mul(4).ok_or("GPU hot selection 溢出")?, "GPU hot selection")?;
     if let Some(counts) = trace_counts {
         validate_resident(counts, device_id, 12, "GPU hot trace counts")?;
     }
@@ -234,7 +236,7 @@ pub(crate) fn try_mla_gpu_hot_gather_q8(
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
     if count < cache_rows {
-        let mut pointers = [metadata.device_pointer(), selection.device_pointer()];
+        let mut pointers = [metadata.device_pointer(), selection.device_pointer() + offset * 4];
         let mut pin_dimensions = [dimensions[0], dimensions[8], dimensions[4], dimensions[6], epoch];
         let mut args = [ptr::null_mut(); 7];
         for (target, value) in args.iter_mut().zip(pointers.iter_mut()) {
@@ -253,10 +255,10 @@ pub(crate) fn try_mla_gpu_hot_gather_q8(
         cache[1].device_pointer(),
         cache[2].device_pointer(),
         metadata.device_pointer(),
-        selection.device_pointer(),
-        output[0].device_pointer(),
-        output[1].device_pointer(),
-        output[2].device_pointer(),
+        selection.device_pointer() + offset * 4,
+        output[0].device_pointer() + offset * row_bytes[0],
+        output[1].device_pointer() + offset * row_bytes[1],
+        output[2].device_pointer() + offset * row_bytes[2],
         trace_counts.map_or(0, DeviceBuffer::device_pointer),
     ];
     let mut args = [ptr::null_mut(); 22];
@@ -859,14 +861,51 @@ pub fn try_q8_cache_copy_pair(
     scale_columns: usize,
     target_capacity: usize,
 ) -> Result<(), String> {
-    if rows == 0 || columns == 0 || scale_columns == 0 || target_capacity == 0 || target_row >= target_capacity {
-        return Err(format!("Q8 cache pair copy shape 非法: source_row={source_row} target_row={target_row} rows={rows} columns={columns} scales={scale_columns} capacity={target_capacity}"));
+    try_quantized_cache_copy_pair(
+        device_id,
+        source_key,
+        source_key_scales,
+        source_value,
+        source_value_scales,
+        target_key,
+        target_key_scales,
+        target_value,
+        target_value_scales,
+        source_row,
+        target_row,
+        rows,
+        columns,
+        scale_columns.checked_mul(2).ok_or("Q8 cache pair scale row 溢出")?,
+        target_capacity,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_quantized_cache_copy_pair(
+    device_id: i32,
+    source_key: &DeviceBuffer,
+    source_key_scales: &DeviceBuffer,
+    source_value: &DeviceBuffer,
+    source_value_scales: &DeviceBuffer,
+    target_key: &DeviceBuffer,
+    target_key_scales: &DeviceBuffer,
+    target_value: &DeviceBuffer,
+    target_value_scales: &DeviceBuffer,
+    source_row: usize,
+    target_row: usize,
+    rows: usize,
+    code_row_bytes: usize,
+    scale_row_bytes: usize,
+    target_capacity: usize,
+) -> Result<(), String> {
+    if rows == 0 || code_row_bytes == 0 || scale_row_bytes == 0 || target_capacity == 0 || target_row >= target_capacity {
+        return Err(format!("quantized cache pair copy shape 非法: source_row={source_row} target_row={target_row} rows={rows} codes={code_row_bytes} scales={scale_row_bytes} capacity={target_capacity}"));
     }
     let source_rows = source_row.checked_add(rows).ok_or("Q8 cache pair source rows 溢出")?;
-    let code_source_bytes = source_rows.checked_mul(columns).ok_or("Q8 cache pair source code 大小溢出")?;
-    let scale_source_bytes = source_rows.checked_mul(scale_columns).and_then(|n| n.checked_mul(2)).ok_or("Q8 cache pair source scale 大小溢出")?;
-    let code_target_bytes = target_capacity.checked_mul(columns).ok_or("Q8 cache pair target code 大小溢出")?;
-    let scale_target_bytes = target_capacity.checked_mul(scale_columns).and_then(|n| n.checked_mul(2)).ok_or("Q8 cache pair target scale 大小溢出")?;
+    let code_source_bytes = source_rows.checked_mul(code_row_bytes).ok_or("Q8 cache pair source code 大小溢出")?;
+    let scale_source_bytes = source_rows.checked_mul(scale_row_bytes).ok_or("Q8 cache pair source scale 大小溢出")?;
+    let code_target_bytes = target_capacity.checked_mul(code_row_bytes).ok_or("Q8 cache pair target code 大小溢出")?;
+    let scale_target_bytes = target_capacity.checked_mul(scale_row_bytes).ok_or("Q8 cache pair target scale 大小溢出")?;
     for (buffer, bytes, name) in [
         (source_key, code_source_bytes, "source key"),
         (source_value, code_source_bytes, "source value"),
@@ -892,8 +931,8 @@ pub fn try_q8_cache_copy_pair(
     let mut source_row = u32::try_from(source_row).map_err(|_| "Q8 cache pair source_row 超过 u32")?;
     let mut target_row = u32::try_from(target_row).map_err(|_| "Q8 cache pair target_row 超过 u32")?;
     let mut rows = u32::try_from(rows).map_err(|_| "Q8 cache pair rows 超过 u32")?;
-    let mut columns = u32::try_from(columns).map_err(|_| "Q8 cache pair columns 超过 u32")?;
-    let mut scale_columns = u32::try_from(scale_columns).map_err(|_| "Q8 cache pair scale_columns 超过 u32")?;
+    let mut columns = u32::try_from(code_row_bytes).map_err(|_| "Q8 cache pair columns 超过 u32")?;
+    let mut scale_columns = u32::try_from(scale_row_bytes).map_err(|_| "Q8 cache pair scale bytes 超过 u32")?;
     let mut target_capacity = u32::try_from(target_capacity).map_err(|_| "Q8 cache pair target_capacity 超过 u32")?;
     let mut arguments = [
         (&mut d_source_key as *mut *mut c_void).cast(),
@@ -1502,11 +1541,36 @@ struct PagedMlaWorkspace {
     gathered_scales_bytes: usize,
     gathered_rope: Option<std::rc::Rc<DeviceBuffer>>,
     gathered_rope_bytes: usize,
+    // 选集是本轮 attention 的临时数据，不能让每个闲置会话各留一份最大 prefill。
+    hot_gather: Option<([std::sync::Arc<DeviceBuffer>; 3], std::sync::Arc<DeviceBuffer>, usize, [usize; 3])>,
 }
 
 thread_local! {
     static PAGED_MLA_WORKSPACES: std::cell::RefCell<std::collections::HashMap<(i32, usize), PagedMlaWorkspace>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+pub(crate) fn prepare_paged_mla_hot_gather(device_id: i32, rows: usize, row_bytes: [usize; 3]) -> Result<([std::sync::Arc<DeviceBuffer>; 3], std::sync::Arc<DeviceBuffer>), String> {
+    if rows == 0 || rows > u32::MAX as usize {
+        return Err(format!("MLA hot gather rows={rows} 非法"));
+    }
+    PAGED_MLA_WORKSPACES.with(|workspaces| {
+        let mut workspaces = workspaces.borrow_mut();
+        let workspace = workspaces.entry(crate::kernel::rocm::hip::compute_workspace_key(device_id)).or_default();
+        if workspace.hot_gather.as_ref().is_none_or(|(_, _, capacity, columns)| *capacity < rows || *columns != row_bytes) {
+            let buffers = row_bytes.map(|bytes| {
+                let bytes = rows.checked_mul(bytes).ok_or("MLA hot gather scratch 溢出")?;
+                DeviceBuffer::allocate_cache(device_id, bytes).map(std::sync::Arc::new)
+            });
+            let [latent, scales, rope] = buffers;
+            let identity = (0..rows as u32).flat_map(u32::to_ne_bytes).collect::<Vec<_>>();
+            let table = std::sync::Arc::new(DeviceBuffer::allocate_cache(device_id, identity.len())?);
+            table.copy_from_host(&identity)?;
+            workspace.hot_gather = Some(([latent?, scales?, rope?], table, rows, row_bytes));
+        }
+        let (buffers, identity, _, _) = workspace.hot_gather.as_ref().expect("选集工作区已分配");
+        Ok((buffers.clone(), identity.clone()))
+    })
 }
 
 #[derive(Default)]
@@ -1823,12 +1887,14 @@ fn try_dsa_select_paged_q8_impl(
     let rows2_native_wmma = use_native_wmma && query_rows == 2;
     let use_native_i8 = hadamard_i8 && head_count.is_multiple_of(16) && functions.dense_wmma && options().native_dsa_wmma;
     let compact_select = top_k <= 4096;
-    let compact_shard_scores = shard_parity <= 1 && query_rows == 1;
+    let compact_shard_scores = shard_parity <= 1;
     const PREFIX_CANDIDATE_CAPACITY: usize = 4096;
     // 128K 的 2K-row append 会因 prefix candidate overflow 重算大量 score；
     // 只在更长上下文使用压缩路径，目标档位继续走精确 compact top-k。
     const PREFIX_CONTEXT_THRESHOLD: usize = 256 * 1024;
-    let prefix_select = use_native_wmma && compact_select && query_rows >= 8 && context_rows >= PREFIX_CONTEXT_THRESHOLD;
+    // prefix candidate 使用全局连续 score 坐标；parity 分片保持有界 compact 路径，
+    // 否则跨过 256K 后会选到不支持分片的 prefix kernel。
+    let prefix_select = !compact_shard_scores && use_native_wmma && compact_select && query_rows >= 8 && context_rows >= PREFIX_CONTEXT_THRESHOLD;
     if shard_parity <= 1 && (!use_native_wmma || hadamard_i8 || prefix_select || top_k > 2048) {
         return Err(format!("paged DSA sequence shard 仅支持 raw-Q8 native WMMA、width<=2048，当前 native={use_native_wmma} hadamard={hadamard_i8} prefix={prefix_select} width={top_k}"));
     }
@@ -1836,9 +1902,9 @@ fn try_dsa_select_paged_q8_impl(
     // 中档只在 stage 已观察到至少三路 decode 时启用；C1/C2 保持 1K tile。
     // 当前 stage 不能跨 verify 行等待形成 DSA-only cohort；长上下文 decode
     // 改为单行内部按 history tile 并行，selection 集合与稳定顺序都不变。
-    // sequence-shard decode 的半片只有 1/2 行数，单 block compact select 已够快；
-    // 关掉 4-kernel tile 链后每侧少 3 次 launch 与 3 个流上间隙。
-    let parallel_select = compact_select && !prefix_select && query_rows <= 4 && context_rows >= PARALLEL_SELECT_CONTEXT_THRESHOLD && shard_parity > 1;
+    // 分片单行也按 history tile 并行，避免一整个半片在单 CTA 内串行压紧。
+    // 多行分片的可见行数跨 parity block 时不连续，仍由 compact 核处理。
+    let parallel_select = compact_select && !prefix_select && query_rows <= 4 && context_rows >= PARALLEL_SELECT_CONTEXT_THRESHOLD && (shard_parity > 1 || query_rows == 1);
     let score_histogram_shared_bytes: u32 = if compact_select {
         if single_row_native_wmma {
             256 * 4
@@ -2003,7 +2069,9 @@ fn try_dsa_select_paged_q8_impl(
         let mut current_rows_u32 = u32::try_from(current_rows).map_err(|_| "DSA batch rows 超过 u32")?;
         let mut context_u32 = u32::try_from(batch_context_rows).map_err(|_| "DSA context 超过 u32")?;
         let mut start_u32 = u32::try_from(batch_start).map_err(|_| "DSA query_start 超过 u32")?;
-        let mut selection_start_u32 = u32::try_from(if compact_shard_scores { score_context_rows - 1 } else { batch_start }).map_err(|_| "DSA selection start 超过 u32")?;
+        // 并行 selector 只接受连续物理行；单行分片使用本卡可见前缀，
+        // gather 再映射回全局 token。score 核的因果位置仍保持全局坐标。
+        let mut selection_start_u32 = u32::try_from(if parallel_select && compact_shard_scores { score_context_rows - 1 } else { batch_start }).map_err(|_| "DSA selection start 超过 u32")?;
         let mut heads_u32 = u32::try_from(head_count).map_err(|_| "DSA heads 超过 u32")?;
         let mut key_group_u32 = u32::try_from(key_group_size).map_err(|_| "DSA key_group_size 超过 u32")?;
         let mut block_u32 = u32::try_from(block_size).map_err(|_| "DSA block_size 超过 u32")?;
@@ -2073,8 +2141,8 @@ fn try_dsa_select_paged_q8_impl(
         if compact_select {
             let mut coarse_histogram_elements = current_rows_u32.checked_mul(256).ok_or("DSA coarse histogram elements 溢出")?;
             let mut clear_args = [(&mut d_coarse_histograms as *mut *mut c_void).cast(), (&mut coarse_histogram_elements as *mut u32).cast()];
-            // clear、score、select 与后续 MLA 都由 launch helper 提交到同一 legacy
-            // default stream；跨 device 复制另由 ordered P2P 的 event/wait 串接。
+            // clear、score、select 与后续 MLA 使用当前计算流；跨 device 复制
+            // 由 ordered P2P 的 event/wait 串接。
             launch_tensor_kernel(functions.dsa_clear, coarse_histogram_elements.div_ceil(256), 256, &mut clear_args, "HIP DSA clear coarse histogram")?;
             if prefix_select {
                 let mut control_elements = 2u32;
@@ -2082,11 +2150,8 @@ fn try_dsa_select_paged_q8_impl(
                 launch_tensor_kernel(functions.dsa_clear, 1, 256, &mut clear_control_args, "HIP DSA clear prefix controls")?;
             }
         }
-        if shard_parity <= 1 {
-            let mut score_elements = current_rows_u32.checked_mul(u32::try_from(batch_score_stride).map_err(|_| "DSA shard score stride 超过 u32")?).ok_or("DSA shard score clear 大小溢出")?;
-            let mut clear_score_args = [(&mut d_scores as *mut *mut c_void).cast(), (&mut score_elements as *mut u32).cast()];
-            launch_tensor_kernel(functions.dsa_clear, score_elements.div_ceil(256), 256, &mut clear_score_args, "HIP DSA clear sequence-shard scores")?;
-        }
+        // 分片 score 写满紧凑布局的可见前缀，selector 只扫描相同因果边界；
+        // 不再清零整张 score 平面，也不读取未来 token 或 padding。
         launch_moe_kernel(
             if use_native_i8 {
                 functions.dsa_score_native_wmma_i8
@@ -2160,17 +2225,22 @@ fn try_dsa_select_paged_q8_impl(
         }
 
         let mut d_selection = unsafe { selection.pointer.cast::<u8>().add(selection_offset).cast::<c_void>() };
+        // 压紧时已持有选中分数，直接输出分数和全局 token，省掉分片 gather。
+        let mut d_selected_scores = selection_scores.as_ref().map_or(ptr::null_mut(), |scores| unsafe { scores.pointer.cast::<u8>().add(selection_offset).cast::<c_void>() });
         let mut topk_u32 = u32::try_from(top_k).map_err(|_| "DSA top_k 超过 u32")?;
         let mut visibility_divisor_u32 = 1u32;
         let mut compact_args = [
             (&mut d_scores as *mut *mut c_void).cast(),
             (&mut d_coarse_histograms as *mut *mut c_void).cast(),
             (&mut d_selection as *mut *mut c_void).cast(),
+            (&mut d_selected_scores as *mut *mut c_void).cast(),
             (&mut current_rows_u32 as *mut u32).cast(),
             (&mut score_stride_u32 as *mut u32).cast(),
             (&mut selection_start_u32 as *mut u32).cast(),
             (&mut topk_u32 as *mut u32).cast(),
             (&mut visibility_divisor_u32 as *mut u32).cast(),
+            (&mut block_u32 as *mut u32).cast(),
+            (&mut shard_parity_u32 as *mut u32).cast(),
         ];
         let select_started = profile_dsa.then(std::time::Instant::now);
         if prefix_select {
@@ -2364,7 +2434,7 @@ fn try_dsa_select_paged_q8_impl(
         } else {
             super::super::try_stable_radix_topk_u32_into(device_id, &scores, None, &selection, current_rows, batch_score_stride, batch_start, top_k, query_offset)?;
         }
-        if let Some(selection_scores) = selection_scores.as_ref() {
+        if let Some(selection_scores) = selection_scores.as_ref().filter(|_| !compact_select || parallel_select || prefix_select) {
             let mut d_selected_scores = unsafe { selection_scores.pointer.cast::<u8>().add(selection_offset).cast::<c_void>() };
             let gather_elements = current_rows_u32.checked_mul(topk_u32).ok_or("DSA shard gather 元素数溢出")?;
             let mut gather_args = [
@@ -2570,16 +2640,21 @@ pub fn try_dsa_select_paged_q8_kpool(
         ];
         launch_moe_kernel(functions.dsa_score_native_wmma_kpool, u32::try_from(batch_tiles).map_err(|_| "DSA kpool tile grid 超过 u32")?, current_rows_u32.div_ceil(4), 512, 4 * 256 * 4, &mut score_args, "HIP DSA kpool score native WMMA")?;
         let mut stride_u32 = u32::try_from(batch_score_stride).map_err(|_| "DSA kpool stride 超过 u32")?;
+        let mut full_parity_u32 = 2u32;
         let mut pool_top_k_u32 = u32::try_from(pool_top_k).map_err(|_| "DSA pool top-k 超过 u32")?;
+        let mut d_selected_scores: *mut c_void = ptr::null_mut();
         let mut select_args = [
             (&mut d_scores as *mut *mut c_void).cast(),
             (&mut d_histograms as *mut *mut c_void).cast(),
             (&mut d_selection as *mut *mut c_void).cast(),
+            (&mut d_selected_scores as *mut *mut c_void).cast(),
             (&mut current_rows_u32 as *mut u32).cast(),
             (&mut stride_u32 as *mut u32).cast(),
             (&mut start_u32 as *mut u32).cast(),
             (&mut pool_top_k_u32 as *mut u32).cast(),
             (&mut kpool_u32 as *mut u32).cast(),
+            (&mut block_u32 as *mut u32).cast(),
+            (&mut full_parity_u32 as *mut u32).cast(),
         ];
         launch_tensor_kernel(functions.dsa_select_compact, current_rows_u32, 256, &mut select_args, "HIP DSA kpool compact select")?;
     }
@@ -3114,36 +3189,6 @@ fn try_paged_mla_attention_ct_inner(
     // 区分 dense / sparse / decode 路径的 profile 标签，仅用于 [mla-profile] 归因。
     let mut attention_kind = "decode_split";
     if query_rows == 1 && split_decode || batch_split_decode {
-        // selected decode 的 latent 预重排：一次散读把 top-k 行收集到连续
-        // workspace，scan 各 head-group 不再对同一批行做冗余散读。仅非分片路径
-        // （分片下 gathered 行序与 parity compact 行号不一致，不适用）。
-        if query_rows == 1 && selected_wmma_q8 && shard.is_none() && selection.is_some() && latent_scales.is_some() && latent_group_size != 0 && top_k >= 1024 {
-            let visible_rows = query_start.checked_add(1).ok_or("paged MLA decode visible rows 溢出")?.min(context_rows);
-            let gather_rows = visible_rows.min(top_k);
-            let selection = selection.expect("selected 已检查");
-            let scales_source = latent_scales.expect("Q8 scales 已检查");
-            let groups = latent_dim / latent_group_size;
-            let (gathered_latent, gathered_scales, gathered_rope) = PAGED_MLA_WORKSPACES.with(|workspaces| -> Result<_, String> {
-                let mut workspaces = workspaces.borrow_mut();
-                let workspace = workspaces.entry(crate::kernel::rocm::hip::compute_workspace_key(device_id)).or_default();
-                Ok((
-                    reserve_paged_dsa_buffer(&mut workspace.gathered_latent, &mut workspace.gathered_latent_bytes, device_id, gather_rows * latent_dim)?,
-                    reserve_paged_dsa_buffer(&mut workspace.gathered_scales, &mut workspace.gathered_scales_bytes, device_id, gather_rows * groups * 2)?,
-                    reserve_paged_dsa_buffer(&mut workspace.gathered_rope, &mut workspace.gathered_rope_bytes, device_id, gather_rows * rope_dim * 2)?,
-                ))
-            })?;
-            try_mla_gather_selected_q8(device_id, latent_cache, scales_source, rope_cache, block_table, selection, &gathered_latent, &gathered_scales, &gathered_rope, gather_rows, latent_dim, latent_group_size, rope_dim, block_size)?;
-            d_latent = gathered_latent.pointer;
-            d_latent_scales = gathered_scales.pointer;
-            d_rope = gathered_rope.pointer;
-            // gather 已完成逻辑页表映射，结果是按 selection 顺序排列的紧凑行。
-            // scan 直接读行号，不能再次套用源页表或原上下文的可见行数。
-            d_table = ptr::null_mut();
-            d_selection = ptr::null_mut();
-            selected_u32 = 0;
-            context_u32 = gather_rows as u32;
-            start_u32 = context_u32 - 1;
-        }
         let requested_tile_size = options().mla_decode_tile_size;
         let visible_rows = query_start.checked_add(query_rows).ok_or("paged MLA decode visible rows 溢出")?.min(context_rows);
         // DSA selection 按逻辑候选区间拆分，tile 内再映射到真实分页位置。
@@ -3893,11 +3938,20 @@ mod tests {
         let output = DeviceBuffer::upload(0, &vec![0xa5; elements * 4]).unwrap();
         let (mut d_input, mut d_weight, mut d_scales, mut d_output) = (input.pointer, weight.pointer, scales.pointer, output.pointer);
         let mut args = [
-            (&mut d_input as *mut *mut c_void).cast(), (&mut d_weight as *mut *mut c_void).cast(),
-            (&mut d_scales as *mut *mut c_void).cast(), (&mut d_output as *mut *mut c_void).cast(),
-            (&mut rows as *mut u32).cast(), (&mut heads as *mut u32).cast(), (&mut head_start as *mut u32).cast(),
-            (&mut q_head as *mut u32).cast(), (&mut kv_head as *mut u32).cast(), (&mut latent as *mut u32).cast(),
-            (&mut rope as *mut u32).cast(), (&mut group as *mut u32).cast(), (&mut scale_type as *mut u32).cast(), (&mut bits as *mut u32).cast(),
+            (&mut d_input as *mut *mut c_void).cast(),
+            (&mut d_weight as *mut *mut c_void).cast(),
+            (&mut d_scales as *mut *mut c_void).cast(),
+            (&mut d_output as *mut *mut c_void).cast(),
+            (&mut rows as *mut u32).cast(),
+            (&mut heads as *mut u32).cast(),
+            (&mut head_start as *mut u32).cast(),
+            (&mut q_head as *mut u32).cast(),
+            (&mut kv_head as *mut u32).cast(),
+            (&mut latent as *mut u32).cast(),
+            (&mut rope as *mut u32).cast(),
+            (&mut group as *mut u32).cast(),
+            (&mut scale_type as *mut u32).cast(),
+            (&mut bits as *mut u32).cast(),
         ];
         let functions = paged_mla_functions(0).unwrap();
         launch_moe_kernel(functions.project_value, heads, 1, 256, 0, &mut args, "MLA 双行 BF16 输出门禁").unwrap();
@@ -3908,11 +3962,13 @@ mod tests {
         for row in 0..rows as usize {
             for head in 0..heads as usize {
                 for value in 0..4 {
-                    let sum = (0..latent as usize).map(|column| {
-                        let x = f32::from_bits(u32::from(inputs[(row * heads as usize + head) * latent as usize + column]) << 16);
-                        let w = f32::from_bits(u32::from(weights[(head * kv_head as usize + 4 + value) * latent as usize + column]) << 16);
-                        x * w
-                    }).sum::<f32>();
+                    let sum = (0..latent as usize)
+                        .map(|column| {
+                            let x = f32::from_bits(u32::from(inputs[(row * heads as usize + head) * latent as usize + column]) << 16);
+                            let w = f32::from_bits(u32::from(weights[(head * kv_head as usize + 4 + value) * latent as usize + column]) << 16);
+                            x * w
+                        })
+                        .sum::<f32>();
                     expected[(row * heads as usize + head) * q_head as usize + value] = bf16(sum);
                 }
             }
@@ -4062,15 +4118,21 @@ mod tests {
             [(&mut d_scores as *mut *mut c_void).cast(), (&mut d_baseline as *mut *mut c_void).cast(), (&mut rows as *mut u32).cast(), (&mut stride as *mut u32).cast(), (&mut start as *mut u32).cast(), (&mut top_k as *mut u32).cast()];
         launch_tensor_kernel(functions.dsa_select, rows, 256, &mut baseline_args, "HIP DSA baseline oracle")?;
         let mut visibility_divisor = 1u32;
+        let mut block_size = 64u32;
+        let mut shard_parity = 2u32;
+        let mut d_selected_scores: *mut c_void = ptr::null_mut();
         let mut compact_args = [
             (&mut d_scores as *mut *mut c_void).cast(),
             (&mut d_histograms as *mut *mut c_void).cast(),
             (&mut d_compact as *mut *mut c_void).cast(),
+            (&mut d_selected_scores as *mut *mut c_void).cast(),
             (&mut rows as *mut u32).cast(),
             (&mut stride as *mut u32).cast(),
             (&mut start as *mut u32).cast(),
             (&mut top_k as *mut u32).cast(),
             (&mut visibility_divisor as *mut u32).cast(),
+            (&mut block_size as *mut u32).cast(),
+            (&mut shard_parity as *mut u32).cast(),
         ];
         launch_tensor_kernel(functions.dsa_select_compact, rows, 256, &mut compact_args, "HIP DSA compact oracle")?;
         super::super::synchronize_device(DEVICE_ID, "HIP DSA compact oracle")?;
@@ -4426,6 +4488,65 @@ mod tests {
 
     #[test]
     #[ignore = "需要 ROCm gfx11+ GPU"]
+    fn dsa_merge_sequence_shards_matches_cpu_ties_and_skew() {
+        super::super::enable_device_buffer_reuse();
+        // 同分、单侧占满、高位边界和非二次幂宽度都必须保留 token 稳定顺序。
+        let topk = |mut values: Vec<(u32, u32)>, width: usize| {
+            values.sort_unstable_by_key(|&(token, score)| (std::cmp::Reverse(score), token));
+            values.truncate(width);
+            let threshold = values.last().unwrap().1;
+            values.sort_unstable_by_key(|&(token, score)| (score == threshold, token));
+            values
+        };
+        for width in [1, 17, 513, 2048] {
+            let mut owner = Vec::new();
+            let mut peer = Vec::new();
+            let mut expected = Vec::new();
+            for case in 0..5 {
+                let values = (0..width * 4)
+                    .map(|token| {
+                        let token = token as u32;
+                        let score = match case {
+                            0 => 7,
+                            1 => token % 17,
+                            2 => {
+                                if token % 2 == 0 {
+                                    100 + token % 31
+                                } else {
+                                    1
+                                }
+                            }
+                            3 => token.wrapping_mul(0x9e37_79b9).rotate_left(13),
+                            _ => {
+                                if token % 3 == 0 {
+                                    u32::MAX
+                                } else {
+                                    0
+                                }
+                            }
+                        };
+                        (token, score)
+                    })
+                    .collect::<Vec<_>>();
+                owner.extend(topk(values.iter().copied().filter(|(token, _)| token % 2 == 0).collect(), width));
+                peer.extend(topk(values.iter().copied().filter(|(token, _)| token % 2 == 1).collect(), width));
+                expected.extend(topk(values, width).into_iter().map(|(token, _)| token));
+            }
+            let upload = |values: &[(u32, u32)]| {
+                let tokens = values.iter().map(|&(token, _)| token).collect::<Vec<_>>();
+                let scores = values.iter().map(|&(_, score)| score).collect::<Vec<_>>();
+                DsaSequenceShardSelection { selection: DeviceBuffer::upload(0, as_bytes(&tokens)).unwrap(), scores: DeviceBuffer::upload(0, as_bytes(&scores)).unwrap(), width }
+            };
+            let actual = try_dsa_merge_sequence_shard_topk(0, &upload(&owner), &upload(&peer), 5, width).unwrap();
+            let mut host = vec![0_u32; expected.len()];
+            actual.copy_to_host(as_bytes_mut(&mut host)).unwrap();
+            assert_eq!(host, expected, "merge width={width}");
+            eprintln!("[dsa-merge-cpu-oracle] width={width} rows=5 exact=true");
+        }
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm gfx11+ GPU"]
     fn dsa_compact_sequence_shards_match_full_topk_bits() {
         const DEVICE_ID: i32 = 0;
         const CONTEXT_ROWS: usize = 50_013;
@@ -4438,52 +4559,149 @@ mod tests {
         super::super::configure(super::super::RocmOptions::default()).unwrap();
         let keys = (0..CONTEXT_ROWS * HEAD_DIM).map(|index| ((index.wrapping_mul(17).wrapping_add(index / HEAD_DIM * 13)) % 255) as u8).collect::<Vec<_>>();
         let scales = vec![0x3f80_u16; CONTEXT_ROWS];
-        let query = (0..HEAD_COUNT * HEAD_DIM).map(|index| ((index.wrapping_mul(29) % 257) as f32 - 128.0) * (1.0 / 127.0)).collect::<Vec<_>>();
-        let weights = (0..HEAD_COUNT).map(|head| (head + 1) as f32 / HEAD_COUNT as f32).collect::<Vec<_>>();
-        let full_table = (0..CONTEXT_ROWS.div_ceil(BLOCK_SIZE) as u32).collect::<Vec<_>>();
-        let full_keys = DeviceBuffer::upload(DEVICE_ID, &keys).unwrap();
-        let full_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&scales)).unwrap();
-        let full_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&full_table)).unwrap();
-        let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query)).unwrap();
-        let weights = DeviceBuffer::upload(DEVICE_ID, as_bytes(&weights)).unwrap();
-        let full = try_dsa_select_paged_q8(DEVICE_ID, &full_keys, &full_scales, KEY_GROUP_SIZE, false, &full_table, &query, &weights, 1, CONTEXT_ROWS, CONTEXT_ROWS - 1, HEAD_COUNT, HEAD_DIM, TOP_K, false, BLOCK_SIZE).unwrap();
-        let score_stride = CONTEXT_ROWS.div_ceil(128) * 128;
-        let workspace_key = crate::kernel::rocm::hip::compute_workspace_key(DEVICE_ID);
-        let full_scores = PAGED_DSA_WORKSPACES.with(|workspaces| workspaces.borrow().get(&workspace_key).unwrap().scores.as_ref().unwrap().clone());
-        let mut full_score_host = vec![0_u32; score_stride];
-        full_scores.copy_to_host(as_bytes_mut(&mut full_score_host)).unwrap();
+        // 覆盖单行、两行专用 WMMA、四行通用核、奇数尾行及跨 parity block 的因果边界。
+        for query_rows in [1, 2, 3, 4, 31, 128, 256] {
+            let query = (0..query_rows * HEAD_COUNT * HEAD_DIM).map(|index| ((index.wrapping_mul(29) % 257) as f32 - 128.0) * (1.0 / 127.0)).collect::<Vec<_>>();
+            let weights = (0..query_rows * HEAD_COUNT).map(|head| (head % HEAD_COUNT + 1) as f32 / HEAD_COUNT as f32).collect::<Vec<_>>();
+            let full_table = (0..CONTEXT_ROWS.div_ceil(BLOCK_SIZE) as u32).collect::<Vec<_>>();
+            let full_keys = DeviceBuffer::upload(DEVICE_ID, &keys).unwrap();
+            let full_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&scales)).unwrap();
+            let full_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&full_table)).unwrap();
+            let query = DeviceBuffer::upload(DEVICE_ID, as_bytes(&query)).unwrap();
+            let weights = DeviceBuffer::upload(DEVICE_ID, as_bytes(&weights)).unwrap();
+            let full = try_dsa_select_paged_q8(DEVICE_ID, &full_keys, &full_scales, KEY_GROUP_SIZE, false, &full_table, &query, &weights, query_rows, CONTEXT_ROWS, CONTEXT_ROWS - query_rows, HEAD_COUNT, HEAD_DIM, TOP_K, false, BLOCK_SIZE)
+                .unwrap();
+            let tile = if query_rows == 1 { 128 } else { 256 };
+            let score_stride = CONTEXT_ROWS.div_ceil(tile) * tile;
+            let workspace_key = crate::kernel::rocm::hip::compute_workspace_key(DEVICE_ID);
+            let full_scores = PAGED_DSA_WORKSPACES.with(|workspaces| workspaces.borrow().get(&workspace_key).unwrap().scores.as_ref().unwrap().clone());
+            let mut full_score_host = vec![0_u32; query_rows * score_stride];
+            full_scores.copy_to_host(as_bytes_mut(&mut full_score_host)).unwrap();
 
-        let mut shards = Vec::with_capacity(2);
-        for parity in 0..2 {
-            let tokens = (0..CONTEXT_ROWS).filter(|token| (token / BLOCK_SIZE) % 2 == parity).collect::<Vec<_>>();
-            let shard_keys = tokens.iter().flat_map(|&token| keys[token * HEAD_DIM..(token + 1) * HEAD_DIM].iter().copied()).collect::<Vec<_>>();
-            let shard_scales = tokens.iter().map(|&token| scales[token]).collect::<Vec<_>>();
-            let shard_table = (0..tokens.len().div_ceil(BLOCK_SIZE) as u32).collect::<Vec<_>>();
-            let shard_keys = DeviceBuffer::upload(DEVICE_ID, &shard_keys).unwrap();
-            let shard_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&shard_scales)).unwrap();
-            let shard_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&shard_table)).unwrap();
-            let shard =
-                try_dsa_select_paged_q8_sequence_shard(DEVICE_ID, &shard_keys, &shard_scales, KEY_GROUP_SIZE, &shard_table, &query, &weights, 1, CONTEXT_ROWS, CONTEXT_ROWS - 1, HEAD_COUNT, HEAD_DIM, TOP_K, BLOCK_SIZE, parity).unwrap();
-            let mut shard_tokens = vec![0_u32; TOP_K];
-            let mut shard_scores = vec![0_u32; TOP_K];
-            shard.selection.copy_to_host(as_bytes_mut(&mut shard_tokens)).unwrap();
-            shard.scores.copy_to_host(as_bytes_mut(&mut shard_scores)).unwrap();
-            for rank in 0..TOP_K {
-                let token = shard_tokens[rank] as usize;
-                assert_eq!((token / BLOCK_SIZE) % 2, parity, "parity={parity} rank={rank} token={token}");
-                assert_eq!(shard_scores[rank], full_score_host[token], "parity={parity} rank={rank} token={token}");
+            let mut shards = Vec::with_capacity(2);
+            for parity in 0..2 {
+                let tokens = (0..CONTEXT_ROWS).filter(|token| (token / BLOCK_SIZE) % 2 == parity).collect::<Vec<_>>();
+                let shard_keys = tokens.iter().flat_map(|&token| keys[token * HEAD_DIM..(token + 1) * HEAD_DIM].iter().copied()).collect::<Vec<_>>();
+                let shard_scales = tokens.iter().map(|&token| scales[token]).collect::<Vec<_>>();
+                let shard_table = (0..tokens.len().div_ceil(BLOCK_SIZE) as u32).collect::<Vec<_>>();
+                let shard_keys = DeviceBuffer::upload(DEVICE_ID, &shard_keys).unwrap();
+                let shard_scales = DeviceBuffer::upload(DEVICE_ID, as_bytes(&shard_scales)).unwrap();
+                let shard_table = DeviceBuffer::upload(DEVICE_ID, as_bytes(&shard_table)).unwrap();
+                let shard = try_dsa_select_paged_q8_sequence_shard(
+                    DEVICE_ID,
+                    &shard_keys,
+                    &shard_scales,
+                    KEY_GROUP_SIZE,
+                    &shard_table,
+                    &query,
+                    &weights,
+                    query_rows,
+                    CONTEXT_ROWS,
+                    CONTEXT_ROWS - query_rows,
+                    HEAD_COUNT,
+                    HEAD_DIM,
+                    TOP_K,
+                    BLOCK_SIZE,
+                    parity,
+                )
+                .unwrap();
+                let mut shard_tokens = vec![0_u32; query_rows * TOP_K];
+                let mut shard_scores = vec![0_u32; query_rows * TOP_K];
+                shard.selection.copy_to_host(as_bytes_mut(&mut shard_tokens)).unwrap();
+                shard.scores.copy_to_host(as_bytes_mut(&mut shard_scores)).unwrap();
+                for rank in 0..query_rows * TOP_K {
+                    let row = rank / TOP_K;
+                    let token = shard_tokens[rank] as usize;
+                    assert!(token < CONTEXT_ROWS - query_rows + row + 1, "因果越界 rows={query_rows} row={row} token={token}");
+                    assert_eq!((token / BLOCK_SIZE) % 2, parity, "parity={parity} rank={rank} token={token}");
+                    assert_eq!(shard_scores[rank], full_score_host[row * score_stride + token], "parity={parity} rank={rank} token={token}");
+                }
+                shards.push(shard);
             }
-            shards.push(shard);
+            let merged = try_dsa_merge_sequence_shard_topk(DEVICE_ID, &shards[0], &shards[1], query_rows, TOP_K).unwrap();
+            super::super::synchronize_device(DEVICE_ID, "HIP DSA compact sequence shard oracle").unwrap();
+            let mut full_host = vec![0_u32; query_rows * TOP_K];
+            let mut merged_host = vec![0_u32; query_rows * TOP_K];
+            full.copy_to_host(as_bytes_mut(&mut full_host)).unwrap();
+            merged.copy_to_host(as_bytes_mut(&mut merged_host)).unwrap();
+            eprintln!("[dsa-compact-oracle] rows={query_rows} context={CONTEXT_ROWS}");
+            if merged_host != full_host {
+                let rank = merged_host.iter().zip(&full_host).position(|(merged, full)| merged != full).unwrap();
+                panic!("DSA sequence shard merge 不一致: rank={rank} merged={} full={}", merged_host[rank], full_host[rank]);
+            }
         }
-        let merged = try_dsa_merge_sequence_shard_topk(DEVICE_ID, &shards[0], &shards[1], 1, TOP_K).unwrap();
-        super::super::synchronize_device(DEVICE_ID, "HIP DSA compact sequence shard oracle").unwrap();
-        let mut full_host = vec![0_u32; TOP_K];
-        let mut merged_host = vec![0_u32; TOP_K];
-        full.copy_to_host(as_bytes_mut(&mut full_host)).unwrap();
-        merged.copy_to_host(as_bytes_mut(&mut merged_host)).unwrap();
-        if merged_host != full_host {
-            let rank = merged_host.iter().zip(&full_host).position(|(merged, full)| merged != full).unwrap();
-            panic!("DSA sequence shard merge 不一致: rank={rank} merged={} full={}", merged_host[rank], full_host[rank]);
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm gfx11+ GPU"]
+    fn dsa_sequence_shards_cross_prefix_threshold_and_scratch_batches() {
+        const DEVICE: i32 = 0;
+        const HEADS: usize = 64;
+        const DIM: usize = 128;
+        const WIDTH: usize = 2048;
+        const BLOCK: usize = 64;
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        // 最后一例跨过半片 128MiB score 的 64-row 边界，并覆盖奇数尾行。
+        for (context, rows) in [(262_143, 8), (262_144, 8), (262_145, 9), (300_001, 17), (500_013, 129), (1_048_576, 129)] {
+            let keys = (0..context * DIM).map(|index| ((index.wrapping_mul(17).wrapping_add(index / DIM * 13)) % 255) as u8).collect::<Vec<_>>();
+            let scales = vec![0x3f80_u16; context];
+            let queries = (0..rows * HEADS * DIM).map(|index| ((index.wrapping_mul(29) % 257) as f32 - 128.0) / 127.0).collect::<Vec<_>>();
+            let weights = (0..rows * HEADS).map(|head| (head % HEADS + 1) as f32 / HEADS as f32).collect::<Vec<_>>();
+            let query_gpu = DeviceBuffer::upload(DEVICE, as_bytes(&queries)).unwrap();
+            let weights_gpu = DeviceBuffer::upload(DEVICE, as_bytes(&weights)).unwrap();
+            let mut shards = Vec::new();
+            let mut shard_values = Vec::new();
+            for parity in 0..2 {
+                let tokens = (0..context).filter(|token| (token / BLOCK) % 2 == parity).collect::<Vec<_>>();
+                let shard_keys = tokens.iter().flat_map(|&token| keys[token * DIM..(token + 1) * DIM].iter().copied()).collect::<Vec<_>>();
+                let table = (0..tokens.len().div_ceil(BLOCK) as u32).collect::<Vec<_>>();
+                let key_gpu = DeviceBuffer::upload(DEVICE, &shard_keys).unwrap();
+                let scale_gpu = DeviceBuffer::upload(DEVICE, as_bytes(&scales[..tokens.len()])).unwrap();
+                let table_gpu = DeviceBuffer::upload(DEVICE, as_bytes(&table)).unwrap();
+                let shard = try_dsa_select_paged_q8_sequence_shard(DEVICE, &key_gpu, &scale_gpu, DIM, &table_gpu, &query_gpu, &weights_gpu, rows, context, context - rows, HEADS, DIM, WIDTH, BLOCK, parity).unwrap();
+                let mut selected = vec![0_u32; rows * WIDTH];
+                let mut scores = vec![0_u32; rows * WIDTH];
+                shard.selection.copy_to_host(as_bytes_mut(&mut selected)).unwrap();
+                shard.scores.copy_to_host(as_bytes_mut(&mut scores)).unwrap();
+                shard_values.push((selected, scores));
+                shards.push(shard);
+            }
+            let merged = try_dsa_merge_sequence_shard_topk(DEVICE, &shards[0], &shards[1], rows, WIDTH).unwrap();
+            let mut merged_host = vec![0_u32; rows * WIDTH];
+            merged.copy_to_host(as_bytes_mut(&mut merged_host)).unwrap();
+            let key_gpu = DeviceBuffer::upload(DEVICE, &keys).unwrap();
+            let scale_gpu = DeviceBuffer::upload(DEVICE, as_bytes(&scales)).unwrap();
+            let table = (0..context.div_ceil(BLOCK) as u32).collect::<Vec<_>>();
+            let table_gpu = DeviceBuffer::upload(DEVICE, as_bytes(&table)).unwrap();
+            // 独立完整历史参考每次只算四行，避开 prefix dispatch 与 score 分批；
+            // 同时核对分片分数、全局因果坐标及合并后的稳定 Top-K 顺序。
+            for offset in (0..rows).step_by(4) {
+                let count = (rows - offset).min(4);
+                let end = context - rows + offset + count;
+                let query = DeviceBuffer::upload(DEVICE, as_bytes(&queries[offset * HEADS * DIM..(offset + count) * HEADS * DIM])).unwrap();
+                let weight = DeviceBuffer::upload(DEVICE, as_bytes(&weights[offset * HEADS..(offset + count) * HEADS])).unwrap();
+                let full = try_dsa_select_paged_q8(DEVICE, &key_gpu, &scale_gpu, DIM, false, &table_gpu, &query, &weight, count, end, end - count, HEADS, DIM, WIDTH, false, BLOCK).unwrap();
+                let stride = end.div_ceil(if count == 1 { 128 } else { 256 }) * if count == 1 { 128 } else { 256 };
+                let workspace_key = crate::kernel::rocm::hip::compute_workspace_key(DEVICE);
+                let full_scores = PAGED_DSA_WORKSPACES.with(|workspaces| workspaces.borrow().get(&workspace_key).unwrap().scores.as_ref().unwrap().clone());
+                let mut score_host = vec![0_u32; count * stride];
+                full_scores.copy_to_host(as_bytes_mut(&mut score_host)).unwrap();
+                let mut full_host = vec![0_u32; count * WIDTH];
+                full.copy_to_host(as_bytes_mut(&mut full_host)).unwrap();
+                assert_eq!(full_host, merged_host[offset * WIDTH..(offset + count) * WIDTH], "context={context} rows={rows} offset={offset}");
+                for (parity, (selected, scores)) in shard_values.iter().enumerate() {
+                    for row in 0..count {
+                        for rank in 0..WIDTH {
+                            let index = (offset + row) * WIDTH + rank;
+                            let token = selected[index] as usize;
+                            assert!(token < context - rows + offset + row + 1, "因果越界 context={context} token={token}");
+                            assert_eq!((token / BLOCK) % 2, parity);
+                            assert_eq!(scores[index], score_host[row * stride + token], "context={context} parity={parity} row={} rank={rank}", offset + row);
+                        }
+                    }
+                }
+            }
+            eprintln!("[dsa-long-shard-oracle] context={context} rows={rows} scores_and_selection_exact=true");
         }
     }
 
@@ -5895,6 +6113,24 @@ mod tests {
         }
         println!("[mla-project-f32-oracle] project_ms={project_ms:.3} max_abs={max_abs:.6e} max_index={max_index}");
         assert!(max_abs <= 1.0e-3, "max_abs={max_abs} index={max_index}");
+    }
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn hot_gather_workspace_reuses_across_sessions_and_preserves_growing_readers() {
+        super::super::configure(super::super::RocmOptions::default()).unwrap();
+        let (first, _) = prepare_paged_mla_hot_gather(0, 2048, [512, 16, 128]).unwrap();
+        first[0].copy_from_host(&[17, 29, 61, 101]).unwrap();
+        let (same, _) = prepare_paged_mla_hot_gather(0, 1024, [512, 16, 128]).unwrap();
+        assert_eq!(same[0].device_pointer(), first[0].device_pointer());
+        let (larger, _) = prepare_paged_mla_hot_gather(0, 4096, [512, 16, 128]).unwrap();
+        assert_ne!(larger[0].device_pointer(), first[0].device_pointer());
+        let mut bytes = [0; 4];
+        first[0].copy_to_host(&mut bytes).unwrap();
+        assert_eq!(bytes, [17, 29, 61, 101], "扩容不能提前回收仍由上一轮持有的源");
+        release_paged_mla_workspaces(0);
+        first[0].copy_to_host(&mut bytes).unwrap();
+        assert_eq!(bytes, [17, 29, 61, 101]);
     }
 
     #[test]

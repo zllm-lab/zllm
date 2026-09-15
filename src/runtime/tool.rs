@@ -29,10 +29,8 @@ pub fn decode_output_token(detokenizer: &crate::tokenizer::Detokenizer, token: u
         return Ok(visible);
     }
     let raw = detokenizer.decode_bytes(&[token], false)?;
-    let protocol = std::str::from_utf8(&raw).is_ok_and(|text| {
-        matches!(text, "<tool_call>" | "</tool_call>" | "<arg_key>" | "</arg_key>" | "<arg_value>" | "</arg_value>" | "<think>" | "</think>")
-            || text.starts_with("<｜DSML｜") || text.starts_with("</｜DSML｜")
-    });
+    let protocol = std::str::from_utf8(&raw)
+        .is_ok_and(|text| matches!(text, "<tool_call>" | "</tool_call>" | "<arg_key>" | "</arg_key>" | "<arg_value>" | "</arg_value>" | "<think>" | "</think>") || text.starts_with("<｜DSML｜") || text.starts_with("</｜DSML｜"));
     Ok(if protocol { raw } else { visible })
 }
 
@@ -1334,7 +1332,18 @@ mod tests {
         for (dialect, pieces) in [ToolDialect::GlmXml, ToolDialect::ChatmlJson, ToolDialect::DeepseekDsml].into_iter().zip([
             vec![("<tool_call>", true), ("Read", false), ("<arg_key>", true), ("file_path", false), ("</arg_key>", true), ("<arg_value>", true), ("/tmp/test.txt", false), ("</arg_value>", true), ("</tool_call>", true)],
             vec![("<tool_call>", true), (r#"{"name":"Read","arguments":{"file_path":"/tmp/test.txt"}}"#, false), ("</tool_call>", true)],
-            vec![("<｜DSML｜", true), ("tool_calls>", false), ("<｜DSML｜", true), (r#"invoke name="Read">"#, false), ("<｜DSML｜", true), (r#"parameter name="file_path" string="true">"#, false), ("/tmp/test.txt", false), ("</｜DSML｜parameter>", true), ("</｜DSML｜invoke>", true), ("</｜DSML｜tool_calls>", true)],
+            vec![
+                ("<｜DSML｜", true),
+                ("tool_calls>", false),
+                ("<｜DSML｜", true),
+                (r#"invoke name="Read">"#, false),
+                ("<｜DSML｜", true),
+                (r#"parameter name="file_path" string="true">"#, false),
+                ("/tmp/test.txt", false),
+                ("</｜DSML｜parameter>", true),
+                ("</｜DSML｜invoke>", true),
+                ("</｜DSML｜tool_calls>", true),
+            ],
         ]) {
             let words = pieces.iter().map(|(text, special)| if *special { text.to_string() } else { text.replace(' ', "Ġ") }).collect::<Vec<_>>();
             let special = pieces.iter().map(|(_, special)| *special).collect::<Vec<_>>();
@@ -1345,11 +1354,17 @@ mod tests {
             for token in 0..pieces.len() as u32 {
                 let decoded = decode_output_token(&decoder, token).unwrap();
                 for event in stream.push(std::str::from_utf8(&decoded).unwrap()) {
-                    match event { ToolOutput::Text(text) => visible.push_str(&text), ToolOutput::ToolCall(call) => calls.push(call) }
+                    match event {
+                        ToolOutput::Text(text) => visible.push_str(&text),
+                        ToolOutput::ToolCall(call) => calls.push(call),
+                    }
                 }
             }
             for event in stream.finish() {
-                match event { ToolOutput::Text(text) => visible.push_str(&text), ToolOutput::ToolCall(call) => calls.push(call) }
+                match event {
+                    ToolOutput::Text(text) => visible.push_str(&text),
+                    ToolOutput::ToolCall(call) => calls.push(call),
+                }
             }
             assert!(visible.trim().is_empty(), "{visible}");
             assert_eq!(calls.len(), 1);
@@ -1358,8 +1373,12 @@ mod tests {
         }
         let words = ["<|assistant|>", "<|endoftext|>", "[gMASK]", "<think>", "</think>"];
         let decoder = crate::tokenizer::Detokenizer::from_bpe_tokens(&words.map(str::to_owned), &[true; 5]).unwrap();
-        for token in 0..3 { assert!(decode_output_token(&decoder, token).unwrap().is_empty()); }
-        for token in 3..5 { assert_eq!(decode_output_token(&decoder, token).unwrap(), words[token as usize].as_bytes()); }
+        for token in 0..3 {
+            assert!(decode_output_token(&decoder, token).unwrap().is_empty());
+        }
+        for token in 3..5 {
+            assert_eq!(decode_output_token(&decoder, token).unwrap(), words[token as usize].as_bytes());
+        }
     }
     use super::*;
 
@@ -1577,7 +1596,7 @@ mod tests {
     fn deepseek_dsml不把畸形标签修补成工具调用() {
         let malformed = r#"Let me先看一下。<｜DSML｜tool\_c优化化 <｜DSML｜tool\_calls>
 <｜DSML｜invrule name="Read">
-<｜DSML｜parameter name="file\_path" string="true">/path/to/example.md\</｜DSML｜parameter>
+<｜DSML｜parameter name="file\_path" string="true">/path/to/document.md\</｜DSML｜parameter>
 \</｜DSML｜inv>
 \</｜DSML｜tool\_calls>"#;
         let (visible, calls) = ToolDialect::DeepseekDsml.split_output(malformed, &schemas());

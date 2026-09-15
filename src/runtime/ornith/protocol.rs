@@ -70,3 +70,25 @@ fn tool_instructions(request: &Value) -> Result<Option<String>, String> {
     let tools = crate::runtime::tool::request_tools(request)?;
     crate::runtime::tool::ToolDialect::ChatmlJson.instructions(tools, request.get("tool_choice"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 瘦身请求的suffix与完整请求一致() {
+        // server 把命中请求截为 [边界 assistant, ...增量];assistant=0 的 suffix
+        // 渲染必须与完整请求按真实边界渲染逐字节一致,否则恢复后的 token 流
+        // 与全量路径分叉。
+        let full = serde_json::json!({"messages": [
+            {"role": "user", "content": "旧问题"},
+            {"role": "assistant", "content": "答案"},
+            {"role": "user", "content": "继续"}
+        ]});
+        let slim = serde_json::json!({"messages": [
+            {"role": "assistant", "content": "答案"},
+            {"role": "user", "content": "继续"}
+        ], "_zllm_resume": "cache", "_zllm_resume_hash": "anchor"});
+        assert_eq!(chat_prompt_suffix(&slim, 0).unwrap(), chat_prompt_suffix(&full, 1).unwrap());
+    }
+}

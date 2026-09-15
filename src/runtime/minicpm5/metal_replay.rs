@@ -9,7 +9,6 @@
 //! 异步路径语义对齐（首 token 由普通输出步产出后 prime 进对侧 readback）。
 
 use super::metal_session::{EmbeddingSource, MiniCpm5MetalSequence};
-use crate::runtime::minicpm5::{MiniCpm5Config, MiniCpm5OutputHead, MiniCpm5TextLayer};
 use crate::attention::gqa::{CausalWindow, GqaSpec};
 use crate::attention::rope::RopeTable;
 use crate::backend::metal::api::Buffer;
@@ -17,6 +16,7 @@ use crate::backend::metal::replay::{DualReplay, ReplayStep};
 use crate::backend::metal::{MetalContext, MetalKvCache, MetalTensor, MetalWeight};
 use crate::backend::{Backend, BackendError};
 use crate::moe::Activation;
+use crate::runtime::minicpm5::{MiniCpm5Config, MiniCpm5OutputHead, MiniCpm5TextLayer};
 use crate::runtime::output::{OutputNorm, OutputPlan};
 use half::f16;
 

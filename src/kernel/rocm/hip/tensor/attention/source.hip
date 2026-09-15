@@ -22,6 +22,8 @@ extern "C" __global__ void prepare_attention_qkv_bf16(
     unsigned short* packed_value,
     unsigned int rows,
     unsigned int packed_rows,
+    unsigned int table_row_start,
+    unsigned int output_row_stride,
     unsigned int total_head_count,
     unsigned int head_start,
     unsigned int head_count,
@@ -36,7 +38,7 @@ extern "C" __global__ void prepare_attention_qkv_bf16(
     const unsigned int lane = threadIdx.x;
     const unsigned int total_columns = total_head_count * head_dim;
     const unsigned int columns = head_count * head_dim;
-    const unsigned long long output_base = (unsigned long long)row * columns + local_head * head_dim;
+    const unsigned long long output_base = (unsigned long long)row * output_row_stride + local_head * head_dim;
     if (row >= packed_rows || local_head >= head_count || input_head >= total_head_count) return;
     if (row >= rows) {
         if (lane < head_dim) {
@@ -94,8 +96,8 @@ extern "C" __global__ void prepare_attention_qkv_bf16(
     if (lane < head_dim) {
         const unsigned int half = rotary_dim / 2u;
         if (lane < half) {
-            const float c = cosine[(unsigned long long)row * half + lane];
-            const float s = sine[(unsigned long long)row * half + lane];
+            const float c = cosine[(unsigned long long)(table_row_start + row) * half + lane];
+            const float s = sine[(unsigned long long)(table_row_start + row) * half + lane];
             const float query_real = query_values[lane];
             const float query_imaginary = query_values[half + lane];
             const float key_real = key_values[lane];
@@ -116,6 +118,58 @@ extern "C" __global__ void prepare_attention_qkv_bf16(
         }
         packed_value[output_base + lane] = zllm_attention_f32_to_bf16(value_value);
     }
+}
+
+// A2A 使用逐行 [Q|K|V] 保持单段连续传输；目标端只拆平面，不再做数值计算。
+extern "C" __global__ void unpack_prepared_attention_qkv_bf16(
+    const unsigned short* qkv,
+    unsigned short* query,
+    unsigned short* key,
+    unsigned short* value,
+    unsigned int rows,
+    unsigned int packed_rows,
+    unsigned int columns)
+{
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int elements = packed_rows * columns;
+    if (index >= elements) return;
+    const unsigned int row = index / columns;
+    const unsigned int column = index - row * columns;
+    if (row >= rows) {
+        query[index] = 0;
+        key[index] = 0;
+        value[index] = 0;
+        return;
+    }
+    const unsigned long long input_base = (unsigned long long)row * (columns * 3u) + column;
+    query[index] = qkv[input_base];
+    key[index] = qkv[input_base + columns];
+    value[index] = qkv[input_base + columns * 2u];
+}
+
+// source 先一次准备全部 heads，再按目标 rank 切 BF16，避免 U8 把 prepare
+// 拆成八个小 kernel。输入输出都保持逐行 [Q|K|V]。
+extern "C" __global__ void compact_prepared_attention_qkv_bf16(
+    const unsigned short* input,
+    unsigned short* output,
+    unsigned int rows,
+    unsigned int total_head_count,
+    unsigned int head_start,
+    unsigned int head_count,
+    unsigned int head_dim)
+{
+    const unsigned int local_columns = head_count * head_dim;
+    const unsigned int output_columns = local_columns * 3u;
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int elements = rows * output_columns;
+    if (index >= elements) return;
+    const unsigned int row = index / output_columns;
+    const unsigned int column = index - row * output_columns;
+    const unsigned int section = column / local_columns;
+    const unsigned int local_column = column - section * local_columns;
+    const unsigned int total_columns = total_head_count * head_dim;
+    output[index] = input[(unsigned long long)row * (total_columns * 3u)
+        + section * total_columns + head_start * head_dim + local_column];
 }
 
 // 每个 CTA 独占一个 16x128 head tile：先完整载入 fragment，再把 native
@@ -231,7 +285,7 @@ extern "C" __global__ void pack_gqa_bf16(
 // 首个 key tile 为每个 query 建立指数原点，避免全负 logits 在 BF16 概率中下溢。
 // 后续 tile 先用 ballot 走固定原点快路，仅在 logit 接近原点时归约 max 并重标定历史累加器。
 // head_dim=128 将下一块 K/V 预取到线程寄存器，当前 QK/PV 完成后再提交备用 LDS。
-template <unsigned int HeadDim, bool Causal, unsigned int QueryRows = 128, unsigned int KeyRows = 16>
+template <unsigned int HeadDim, bool Causal, unsigned int QueryRows = 128, unsigned int KeyRows = 16, unsigned int RecenterMargin = 80>
 __device__ __forceinline__ void zllm_full_attention_f32(
     const unsigned short* query,
     const unsigned short* key,
@@ -446,7 +500,7 @@ __device__ __forceinline__ void zllm_full_attention_f32(
                 for (unsigned int offset = 1; offset < 16; offset <<= 1) {
                     tile_maximum = fmaxf(tile_maximum, __shfl_xor(tile_maximum, offset));
                 }
-                const float new_maximum = fmaxf(maximum[element], tile_maximum + 80.0f);
+                const float new_maximum = fmaxf(maximum[element], tile_maximum + (float)RecenterMargin);
                 if (key_base_row != 0) {
                     previous_scale = __builtin_amdgcn_exp2f(
                         (maximum[element] - new_maximum) * 1.4426950408889634f);
@@ -554,7 +608,8 @@ extern "C" __global__ void full_attention_f32(
     __shared__ unsigned short shared_key[16 * 128];
     __shared__ unsigned short shared_value[16 * 128];
     __shared__ unsigned short shared_probability[8][16 * 16];
-    zllm_full_attention_f32<0, false>(query, key, value, output, rows, head_count, head_count, head_dim, score_scale, blockIdx.x,
+    // 概率进入 subnormal 后被 WMMA 清零;RecenterMargin=0 等价 PyTorch SDPA 标准 online softmax。
+    zllm_full_attention_f32<0, false, 128, 16, 0>(query, key, value, output, rows, head_count, head_count, head_dim, score_scale, blockIdx.x,
         shared_key, shared_value, shared_probability);
 }
 
@@ -581,7 +636,7 @@ extern "C" __global__ void block_attention_f32(
     const unsigned int kv_columns = kv_head_count * head_dim;
     const unsigned int start = visible_ranges[query_row * 2];
     const unsigned int end = visible_ranges[query_row * 2 + 1];
-    __shared__ float reduction[256];
+    __shared__ float reduction[512];
     __shared__ float maximum;
     __shared__ float denominator;
 
@@ -627,6 +682,85 @@ extern "C" __global__ void block_attention_f32(
     }
     for (unsigned int column = threadIdx.x; column < head_dim; column += blockDim.x) {
         output[(unsigned long long)query_row * query_columns + head * head_dim + column] = accumulator / denominator;
+    }
+}
+
+// 宽 head 的全 attention 不把每个 KV 的归约扩展成 block barrier。
+// 每个 wave 独立拥有一个 query，先求真实 max，再按原 KV 顺序累加概率与 V；
+// 保留 F32 Q/K/V 和完整 head 点积，不物化 N×N，也不把一个 head 拆成多个 head。
+extern "C" __global__ void full_attention_wide_f32(
+    const float* query,
+    const float* key,
+    const float* value,
+    float* output,
+    unsigned int rows,
+    unsigned int head_count,
+    unsigned int head_dim,
+    float score_scale)
+{
+    constexpr unsigned int QueriesPerBlock = 8;
+    constexpr unsigned int MaxParts = 512 / 32;
+    const unsigned int lane = threadIdx.x % warpSize;
+    const unsigned int wave = threadIdx.x / warpSize;
+    const unsigned int waves = blockDim.x / warpSize;
+    const unsigned int blocks_per_head = rows / QueriesPerBlock + (rows % QueriesPerBlock != 0);
+    const unsigned int head = blockIdx.x / blocks_per_head;
+    const unsigned int query_base = (blockIdx.x % blocks_per_head) * QueriesPerBlock;
+    const unsigned long long columns = (unsigned long long)head_count * head_dim;
+    const unsigned long long head_offset = (unsigned long long)head * head_dim;
+    const unsigned int parts = (head_dim + warpSize - 1) / warpSize;
+    // gfx11 wave32 每个 lane 最多16维；wave64 每个 lane 最多8维并分两轮query。
+    for (unsigned int slot = wave; slot < QueriesPerBlock; slot += waves) {
+        const unsigned int query_row = query_base + slot;
+        if (query_row >= rows) continue;
+        float q[MaxParts];
+        float accumulated[MaxParts];
+        #pragma unroll
+        for (unsigned int part = 0; part < MaxParts; ++part) {
+            const unsigned int column = part * warpSize + lane;
+            q[part] = column < head_dim ? query[(unsigned long long)query_row * columns + head_offset + column] : 0.0f;
+            accumulated[part] = 0.0f;
+        }
+        float maximum = -3.402823466e+38F;
+        for (unsigned int row = 0; row < rows; ++row) {
+            float score = 0.0f;
+            #pragma unroll
+            for (unsigned int part = 0; part < MaxParts; ++part) {
+                const unsigned int column = part * warpSize + lane;
+                if (part < parts && column < head_dim)
+                    score = fmaf(q[part], key[(unsigned long long)row * columns + head_offset + column], score);
+            }
+            for (unsigned int stride = warpSize / 2; stride > 0; stride >>= 1)
+                score += __shfl_down(score, stride, warpSize);
+            score = __shfl(score, 0, warpSize) * score_scale;
+            maximum = fmaxf(maximum, score);
+        }
+        float denominator = 0.0f;
+        for (unsigned int row = 0; row < rows; ++row) {
+            float score = 0.0f;
+            #pragma unroll
+            for (unsigned int part = 0; part < MaxParts; ++part) {
+                const unsigned int column = part * warpSize + lane;
+                if (part < parts && column < head_dim)
+                    score = fmaf(q[part], key[(unsigned long long)row * columns + head_offset + column], score);
+            }
+            for (unsigned int stride = warpSize / 2; stride > 0; stride >>= 1)
+                score += __shfl_down(score, stride, warpSize);
+            const float probability = expf(__shfl(score, 0, warpSize) * score_scale - maximum);
+            denominator += probability;
+            #pragma unroll
+            for (unsigned int part = 0; part < MaxParts; ++part) {
+                const unsigned int column = part * warpSize + lane;
+                if (part < parts && column < head_dim)
+                    accumulated[part] = fmaf(probability, value[(unsigned long long)row * columns + head_offset + column], accumulated[part]);
+            }
+        }
+        #pragma unroll
+        for (unsigned int part = 0; part < MaxParts; ++part) {
+            const unsigned int column = part * warpSize + lane;
+            if (part < parts && column < head_dim)
+                output[(unsigned long long)query_row * columns + head_offset + column] = accumulated[part] / denominator;
+        }
     }
 }
 
@@ -1077,6 +1211,23 @@ extern "C" __global__ void full_attention_batched_f32_64(
         rows, head_count, head_count, head_dim, score_scale, attention_block, shared_key, shared_value, shared_probability);
 }
 
+// 变长窗口可能有大幅 logit 差。使用真实 max，避免 exp(-80) 附近的 BF16
+// 概率进入 subnormal 后被 WMMA 清零；原 full-attention 符号保留原参数。
+extern "C" __global__ void full_attention_batched_f32_128_zero_margin(
+    const unsigned short* query, const unsigned short* key, const unsigned short* value,
+    float* output, unsigned int rows, unsigned int head_count, unsigned int head_dim, float score_scale)
+{
+    const unsigned int blocks_per_sample = ((rows + 127) / 128) * head_count;
+    const unsigned int sample = blockIdx.x / blocks_per_sample;
+    const unsigned int attention_block = blockIdx.x - sample * blocks_per_sample;
+    const unsigned long long offset = (unsigned long long)sample * rows * head_count * head_dim;
+    __shared__ unsigned short shared_key[3][16 * 128];
+    __shared__ unsigned short shared_value[3][16 * 128];
+    __shared__ unsigned short shared_probability[8][16 * 16];
+    zllm_full_attention_f32<128, false, 128, 16, 0>(query + offset, key + offset, value + offset, output + offset,
+        rows, head_count, head_count, head_dim, score_scale, attention_block, shared_key[0], shared_value[0], shared_probability);
+}
+
 extern "C" __global__ void concat_weight_rows_batched_f32(
     const float* input, const float* weight, float* output,
     unsigned int batch, unsigned int input_rows, unsigned int weight_rows, unsigned int columns)
@@ -1209,3 +1360,108 @@ extern "C" __global__ void gqa_decode_merge_f32(
     }
     output[(unsigned long long)head * head_dim + d] = l > 0.0f ? acc / l : 0.0f;
 }
+
+#if !defined(__HIP_DEVICE_COMPILE__) || (defined(__gfx1100__) && ROCWMMA_WAVE32_MODE)
+
+// 先检查转换范围。任一非finite或超F16范围使调用方回退F32，不提交WMMA。
+extern "C" __global__ void pack_attention_f16_checked(
+    const float* q, const float* k, const float* v,
+    _Float16* qh, _Float16* kh, _Float16* vh, unsigned int* invalid,
+    unsigned long long elements)
+{
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= elements) return;
+    const float a=q[i],b=k[i],c=v[i];
+    if (!isfinite(a)||!isfinite(b)||!isfinite(c)||fabsf(a)>65504.0f||fabsf(b)>65504.0f||fabsf(c)>65504.0f)
+        atomicOr(invalid, 1u);
+    qh[i]=(_Float16)a;kh[i]=(_Float16)b;vh[i]=(_Float16)c;
+}
+
+// 每CTA拥有16query与128输出维；完整QK始终包含全部dim。
+// 输出切片可重复QK，避免把512列accumulator同时留在寄存器中。
+// 只在已验证的 gfx1100 wave32 架构使用。
+extern "C" __global__ void full_attention_wmma_wide_f16(
+    const _Float16* query,const _Float16* key,const _Float16* value,float* output,
+    unsigned int rows,unsigned int heads,unsigned int dim,float scale)
+{
+    using namespace rocwmma;
+    using A=fragment<matrix_a,16,16,16,float16_t,row_major>;
+    using B=fragment<matrix_b,16,16,16,float16_t,col_major>;
+    using BR=fragment<matrix_b,16,16,16,float16_t,row_major>;
+    using C=fragment<accumulator,16,16,16,float>;
+    __shared__ _Float16 sq[16*512];
+    __shared__ _Float16 sk[16*512];
+    __shared__ _Float16 sv[16*128];
+    __shared__ float partials[4][16*16];
+    __shared__ _Float16 probabilities[16*16];
+    const unsigned int wave=threadIdx.x/32,lane=threadIdx.x%32;
+    const unsigned int column16=lane&15,half=lane>>4;
+    const unsigned int query_blocks=(rows+15)/16;
+    const unsigned int output_tiles=(dim+127)/128;
+    const unsigned int query_block=blockIdx.x%query_blocks;
+    const unsigned int output_tile=(blockIdx.x/query_blocks)%output_tiles;
+    const unsigned int head=blockIdx.x/(query_blocks*output_tiles);
+    const unsigned int query_base=query_block*16;
+    const unsigned int output_base=output_tile*128;
+    const unsigned long long stride=(unsigned long long)heads*dim;
+    const unsigned long long head_offset=(unsigned long long)head*dim;
+    for(unsigned int i=threadIdx.x;i<16*512;i+=256){
+        const unsigned int row=i/512,col=i%512;
+        sq[i]=query_base+row<rows&&col<dim?query[(unsigned long long)(query_base+row)*stride+head_offset+col]:(_Float16)0;
+    }
+    C accumulated,maximum,denominator;
+    fill_fragment(accumulated,0.0f);fill_fragment(maximum,-3.402823466e38F);fill_fragment(denominator,0.0f);
+    __syncthreads();
+    for(unsigned int key_base=0;key_base<rows;key_base+=16){
+        for(unsigned int i=threadIdx.x;i<16*512;i+=256){
+            const unsigned int row=i/512,col=i%512;
+            sk[i]=key_base+row<rows&&col<dim?key[(unsigned long long)(key_base+row)*stride+head_offset+col]:(_Float16)0;
+        }
+        for(unsigned int i=threadIdx.x;i<16*128;i+=256){
+            const unsigned int row=i/128,col=i%128+output_base;
+            sv[i]=key_base+row<rows&&col<dim?value[(unsigned long long)(key_base+row)*stride+head_offset+col]:(_Float16)0;
+        }
+        __syncthreads();
+        // 四wave各算128个feature，固定次序合并F32 partial。
+        if(wave<4){
+            C score;fill_fragment(score,0.0f);
+            #pragma unroll
+            for(unsigned int part=0;part<8;part++){
+                const unsigned int feature=wave*128+part*16;
+                A q;B k;load_matrix_sync(q,(const float16_t*)(sq+feature),512);
+                load_matrix_sync(k,(const float16_t*)(sk+feature),512);mma_sync(score,q,k,score);
+            }
+            #pragma unroll
+            for(unsigned int e=0;e<C::num_elements;e++)partials[wave][(e*2+half)*16+column16]=score[e];
+        }
+        __syncthreads();
+        #pragma unroll
+        for(unsigned int e=0;e<C::num_elements;e++){
+            const unsigned int local_query=e*2+half,index=local_query*16+column16;
+            const bool valid=query_base+local_query<rows&&key_base+column16<rows;
+            float score=((partials[0][index]+partials[1][index])+partials[2][index])+partials[3][index];
+            score=valid?score*scale:-3.402823466e38F;
+            float tile_max=score;
+            #pragma unroll
+            for(unsigned int offset=1;offset<16;offset<<=1)tile_max=fmaxf(tile_max,__shfl_xor(tile_max,offset));
+            const float next=fmaxf(maximum[e],tile_max);
+            const float alpha=key_base==0?0.0f:expf(maximum[e]-next);
+            accumulated[e]*=alpha;
+            float p=valid?expf(score-next):0.0f;
+            if(wave==0)probabilities[index]=(_Float16)p;
+            #pragma unroll
+            for(unsigned int offset=1;offset<16;offset<<=1)p+=__shfl_xor(p,offset);
+            denominator[e]=denominator[e]*alpha+p;maximum[e]=next;
+        }
+        __syncthreads();
+        A p;BR v;load_matrix_sync(p,(const float16_t*)probabilities,16);
+        load_matrix_sync(v,(const float16_t*)(sv+wave*16),128);mma_sync(accumulated,p,v,accumulated);
+        __syncthreads();
+    }
+    #pragma unroll
+    for(unsigned int e=0;e<C::num_elements;e++){
+        const unsigned int row=query_base+e*2+half,col=output_base+wave*16+column16;
+        if(row<rows&&col<dim)output[(unsigned long long)row*stride+head_offset+col]=accumulated[e]/denominator[e];
+    }
+}
+#endif

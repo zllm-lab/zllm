@@ -4,6 +4,7 @@
 
 pub mod deepseek_v4;
 pub mod dflash2;
+pub mod flux2_klein;
 pub mod gemma4;
 pub mod glm52;
 pub mod glm53_flash;
@@ -16,4 +17,5 @@ pub mod ornith;
 pub mod qwen36;
 pub mod qwen3_vl;
 pub mod qwen4exp;
+pub mod seedvr2;
 pub mod sensevoice;

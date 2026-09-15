@@ -12,6 +12,7 @@ pub mod gemma4;
 pub(crate) mod generation;
 // generation_guard 供所有平台的 embedded 通用循环围栏接线（linux rocm node
 // 另有 fence 采样联动）；不再是 linux 专属
+pub mod flux2_klein;
 pub(crate) mod generation_guard;
 pub mod glm52;
 pub mod glm53_flash;
@@ -45,6 +46,7 @@ pub mod qwen3_vl;
 pub mod qwen4exp;
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
 pub mod rocm_chain;
+pub mod seedvr2;
 pub mod sensevoice;
 pub mod session;
 pub mod speculative;

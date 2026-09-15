@@ -177,7 +177,7 @@ fn preprocess_image(image: &RgbImage, config: &Gemma4VisionConfig, max_soft_toke
         height = ((image.height / image.width).max(1) * side).min(max_side);
     }
     let source = image::RgbImage::from_raw(image.width as u32, image.height as u32, image.pixels.clone()).ok_or("构造 Gemma 4 RGB 图像失败")?;
-    let resized = pillow_bicubic_resize_contain(&source, width as u32, height as u32);
+    let resized = pillow_bicubic_resize_contain(&source, width as u32, height as u32, [0, 0, 0]);
     let patch = if config.encoder.is_some() { config.patch_size } else { side };
     let grid_height = height / patch;
     let grid_width = width / patch;

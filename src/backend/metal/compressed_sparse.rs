@@ -231,6 +231,7 @@ impl MetalCompressedKvStorage {
 }
 
 impl CompressedSparseKernel for MetalContext {
+    type SharedSelection = Vec<Vec<usize>>;
     type CompressedKvStorage = MetalCompressedKvStorage;
 
     fn allocate_compressed_kv(&self, spec: &CompressedSparseAttentionSpec) -> Result<Self::CompressedKvStorage, BackendError> {
@@ -564,6 +565,7 @@ mod tests {
             rope: RopeSpec::Default { rotary_dim: 2, theta: 10_000.0 },
             compression,
             attention_sink: true,
+            kv_format: crate::attention::compressed_sparse::CompressedKvFormat::Q8,
         }
     }
 

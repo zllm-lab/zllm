@@ -7,12 +7,16 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     time::Instant,
 };
 
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
-use crate::artifact::{write_wav, write_y4m};
+use crate::artifact::{pipe_y4m, video_preview_jpeg, write_wav};
+
+#[cfg(all(target_os = "linux", feature = "with-rocm"))]
+use base64::Engine;
 
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
 use serde::{Deserialize, Serialize};
@@ -21,18 +25,25 @@ use serde_json::Value;
 
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
 use crate::{
-    backend::{BackendError, BackendResources, rocm::RocmTensor},
+    backend::{
+        BackendError, BackendResources,
+        rocm::{RocmContext, RocmKvCache, RocmTensor},
+    },
     config::{H3NodeExecutionConfig, RocmBackendConfig},
     kv_cache::terminal_cache::TerminalInfo as CacheInfo,
     runtime::{
         Model,
+        chat_template::ChatTemplate,
         h3::{
-            H3BlockCacheSpec, H3ConditionInput, H3Config, H3DenoiseLatents, H3GaussianNoise, H3PackedReferenceCondition, H3PreparedStage, H3QwenVisual, H3ReferenceKind, H3RocmUlyssesGroup, VISUAL_CONDITION_TIMESTEP,
-            build_h3_reference_layout, decode_audio_vae, decode_video_vae_tiled_temporal, denoise_staged_conditioned, denoise_streamed_conditioned, denoise_ulysses_conditioned, h3_qwen_text_condition_resident, pack_audio, patchify_video,
-            prepare_audio_vae, prepare_cached_dit_blocks, prepare_dit_final, prepare_dit_global, prepare_h3_audio_encoder, prepare_h3_video_encoder, prepare_video_vae, unpatchify_video, video_vae_latent_frames,
+            H3BlockCacheSpec, H3ConditionInput, H3Config, H3DenoiseLatents, H3GaussianNoise, H3KeyframeAnchor, H3PackedReferenceCondition, H3PreparedStage, H3QwenVisual, H3ReferenceKind, H3RocmUlyssesGroup, VISUAL_CONDITION_TIMESTEP,
+            build_h3_reference_layout, build_packed_layout, decode_audio_vae, decode_video_vae_tiled_temporal, denoise_staged_conditioned, denoise_streamed_conditioned, denoise_ulysses_conditioned, h3_qwen_text_condition_resident,
+            pack_audio, patchify_video, prepare_audio_vae, prepare_cached_dit_blocks, prepare_dit_final, prepare_dit_global, prepare_h3_audio_encoder, prepare_h3_video_encoder, prepare_video_vae, unpatchify_video, video_vae_latent_frames,
         },
-        qwen3_vl::{Qwen3Vl, Qwen3VlImageProcessor, prepare_qwen3_vl_text_layer, qwen3_vl_encode_image, qwen3_vl_encode_video},
-        session::NodeCapabilities,
+        qwen3_vl::{
+            Qwen3Vl, Qwen3VlImageProcessor, prepare_qwen3_vl_output_head, prepare_qwen3_vl_text_layer, qwen3_vl_decode_rope_table, qwen3_vl_decode_round_resident, qwen3_vl_encode_image, qwen3_vl_encode_video, qwen3_vl_last_token_output,
+            qwen3_vl_mrope_table, qwen3_vl_text_prefill, qwen3_vl_token_output,
+        },
+        session::{GenerationOutput, GenerationSummary, NodeCapabilities, parse_stops, requested_completion_tokens},
     },
     server::node::{DynError, GeneratedArtifact, NodeEngine},
     server::scheduler::TaskProgress,
@@ -47,11 +58,15 @@ use crate::{
 };
 
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
-type H3TaskRunner = Box<dyn FnMut(&H3ControlMessage, usize, usize, usize, &Path, &AtomicBool, &mut dyn FnMut(TaskProgress)) -> Result<Vec<GeneratedArtifact>, String>>;
+type H3TaskRunner = Box<dyn FnMut(&H3ControlMessage, usize, usize, usize, &Path, &AtomicBool, mpsc::Sender<TaskProgress>) -> Result<Vec<GeneratedArtifact>, String> + Send>;
+
+#[cfg(all(target_os = "linux", feature = "with-rocm"))]
+type H3PromptRunner = Box<dyn FnMut(&Value, &AtomicBool, &mut dyn FnMut(u32, String) -> bool) -> Result<GenerationSummary, String>>;
 
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
 pub struct H3Engine {
     capabilities: NodeCapabilities,
+    run_prompt: H3PromptRunner,
     run_task: H3TaskRunner,
 }
 
@@ -190,6 +205,17 @@ impl H3ControlMessage {
     fn has_media(&self) -> bool {
         self.content.iter().any(|item| !matches!(item, H3Content::Text { .. }))
     }
+
+    fn keyframes(&self) -> Vec<H3KeyframeAnchor> {
+        self.content
+            .iter()
+            .filter_map(|item| match item {
+                H3Content::ImageUrl { role, .. } if role.as_deref().unwrap_or("first_frame") == "first_frame" => Some(H3KeyframeAnchor::First),
+                H3Content::ImageUrl { role, .. } if role.as_deref() == Some("last_frame") => Some(H3KeyframeAnchor::Last),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
@@ -200,6 +226,93 @@ fn validate_media_url(url: &str) -> Result<(), String> {
     } else {
         Err("H3 媒体必须是 http(s) URL、data URI、原始 base64 或 mm_file://".to_owned())
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "with-rocm"))]
+fn build_prompt_runner(qwen_root: &Path, device: i32, allow_cpu_reference_fallback: bool, prepare_threads: usize) -> Result<H3PromptRunner, String> {
+    const MAX_SEQUENCE_LENGTH: usize = 4096;
+
+    let config = Qwen3Vl::instruct_32b().config().clone();
+    let context = RocmContext::configured(device, allow_cpu_reference_fallback)?.with_independent_stream()?;
+    let weights = Qwen3VlWeights::open(qwen_root, config.clone())?;
+    let (tokenizer, detokenizer) = crate::tokenizer::load_bpe_directory(qwen_root).map_err(|error| format!("加载 H3 Qwen tokenizer: {error}"))?;
+    let template_source = fs::read_to_string(qwen_root.join("chat_template.jinja")).map_err(|error| format!("读取 H3 Qwen chat template: {error}"))?;
+    let template = ChatTemplate::new(&template_source)?;
+
+    Ok(Box::new(move |request, cancellation, on_token| {
+        let started = Instant::now();
+        context.activate()?;
+        let prompt = template.render(request)?;
+        let token_ids = tokenizer.tokenize(prompt.as_bytes());
+        let max_tokens = requested_completion_tokens(request).min(512);
+        if token_ids.is_empty() || max_tokens == 0 || token_ids.len().saturating_add(max_tokens) > MAX_SEQUENCE_LENGTH {
+            return Err(format!("H3 Qwen prompt tokens={} + completion {} 必须位于 1..={MAX_SEQUENCE_LENGTH}", token_ids.len(), max_tokens));
+        }
+
+        let prepare_started = Instant::now();
+        let resident = std::thread::scope(|scope| {
+            let handles = (0..prepare_threads)
+                .map(|worker| {
+                    let first = config.layer_count * worker / prepare_threads;
+                    let end = config.layer_count * (worker + 1) / prepare_threads;
+                    let weights = &weights;
+                    scope.spawn(move || {
+                        context.activate()?;
+                        (first..end).map(|layer| prepare_qwen3_vl_text_layer(&context, weights, layer).map_err(|error| format!("准备 H3 Qwen L{layer}: {error:?}"))).collect::<Result<Vec<_>, _>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut layers = Vec::with_capacity(config.layer_count);
+            for handle in handles {
+                layers.extend(handle.join().map_err(|_| "H3 Qwen prepare 线程 panic".to_owned())??);
+            }
+            Ok::<_, String>(layers)
+        })?;
+        let output_head = prepare_qwen3_vl_output_head(&context, &config, &weights).map_err(|error| format!("准备 H3 Qwen output head: {error:?}"))?;
+        eprintln!("[h3-node] prompt Qwen resident_layers={} prepare={:.3}s", resident.len(), prepare_started.elapsed().as_secs_f64());
+
+        let mut cache = RocmKvCache::with_capacity(config.layer_count, MAX_SEQUENCE_LENGTH);
+        let embedding = weights.embedding_rows_f32(&token_ids)?;
+        let hidden = context.tensor_from_f32(embedding, token_ids.len(), config.hidden_size).map_err(|error| format!("上传 H3 Qwen embedding: {error}"))?;
+        let positions: [Vec<usize>; 3] = std::array::from_fn(|_| (0..token_ids.len()).collect());
+        let rope = qwen3_vl_mrope_table(&config, &positions)?;
+        let hidden = qwen3_vl_text_prefill(&context, &config, &weights, &resident, &mut cache, hidden, &rope, 0).map_err(|error| format!("H3 Qwen prefill: {error:?}"))?;
+        let mut state = qwen3_vl_last_token_output(&context, &config, &output_head, &hidden).map_err(|error| format!("H3 Qwen first token: {error:?}"))?;
+        let stops = parse_stops(request.get("stop"))?;
+        let mut output = GenerationOutput::new(&stops);
+
+        for step in 0..max_tokens {
+            if cancellation.load(Ordering::Acquire) {
+                output.cancel();
+                break;
+            }
+            let token = state.token_id;
+            if config.eos_token_ids.contains(&token) {
+                output.stop();
+                break;
+            }
+            let bytes = crate::runtime::tool::decode_output_token(&detokenizer, token).map_err(|error| format!("H3 Qwen detokenize {token}: {error}"))?;
+            if !output.push(&bytes, |chunk| on_token(token, chunk)) || step + 1 == max_tokens {
+                break;
+            }
+            let position = token_ids.len() + step;
+            let embedding = weights.embedding_rows_f32(&[token])?;
+            let hidden = context.tensor_from_f32(embedding, 1, config.hidden_size).map_err(|error| format!("上传 H3 Qwen decode embedding: {error}"))?;
+            let rope = qwen3_vl_decode_rope_table(&config, position, 0)?;
+            let hidden = qwen3_vl_decode_round_resident(&context, &config, &weights, &resident, &mut cache, hidden, &rope, position).map_err(|error| format!("H3 Qwen decode position={position}: {error:?}"))?;
+            state = qwen3_vl_token_output(&context, &config, &output_head, &hidden).map_err(|error| format!("H3 Qwen output position={position}: {error:?}"))?;
+        }
+        output.finish(|chunk| on_token(0, chunk));
+        let summary = output.summary(token_ids.len());
+        context.finish_batch();
+        drop(state);
+        drop(output_head);
+        drop(resident);
+        drop(cache);
+        context.finish_batch();
+        eprintln!("[h3-node] prompt Qwen prompt_tokens={} completion_tokens={} wall={:.3}s", summary.prompt_tokens, summary.completion_tokens, started.elapsed().as_secs_f64());
+        Ok(summary)
+    }))
 }
 
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
@@ -215,6 +328,8 @@ impl H3Engine {
             return Err(format!("H3 Qwen tokenizer 目录不存在: {}", qwen_tokenizer_root.display()).into());
         }
         let devices = backend.devices.clone();
+        let primary = *devices.first().ok_or("H3 ROCm devices 不能为空")?;
+        let run_prompt = build_prompt_runner(qwen_root, primary, backend.allow_cpu_reference_fallback, execution.qwen_prepare_threads).map_err(|error| -> DynError { error.into() })?;
         let run_task = build_runner(model_root, qwen_root, qwen_tokenizer_root, devices.clone(), backend.allow_cpu_reference_fallback, execution).map_err(|error| -> DynError { error.into() })?;
         Ok(Self {
             capabilities: NodeCapabilities {
@@ -231,15 +346,18 @@ impl H3Engine {
                 recommended_working_set_bytes: backend.recommended_working_set_bytes,
                 model_format: "safetensors".to_owned(),
                 model_bytes: directory_bytes(model_root).saturating_add(directory_bytes(qwen_root)),
-                max_seq_len: 0,
+                max_seq_len: 4096,
                 kv_cache_format: "none".to_owned(),
                 kv_cache_devices: Vec::new(),
                 kv_reservation_page_tokens: 0,
                 task_kinds: vec!["video_generation".to_owned()],
+                task_models: Default::default(),
                 input_modalities: vec!["text".to_owned(), "image".to_owned(), "video".to_owned(), "audio".to_owned()],
-                output_modalities: vec!["video".to_owned(), "audio".to_owned()],
+                output_modalities: vec!["text".to_owned(), "video".to_owned(), "audio".to_owned()],
                 artifact_streaming: true,
+                terminal_resume_delta: false,
             },
+            run_prompt,
             run_task,
         })
     }
@@ -265,23 +383,8 @@ impl NodeEngine for H3Engine {
         1
     }
 
-    fn generate_batch(
-        &mut self,
-        requests: Vec<crate::server::node::NodeBatchRequest>,
-        _intake: &mut dyn FnMut(usize) -> Vec<crate::server::node::NodeBatchRequest>,
-        _on_token: &mut dyn FnMut(&str, u32, String) -> bool,
-        _on_tool_call_delta: &mut dyn FnMut(&str, crate::runtime::session::ToolCallDelta) -> bool,
-        _on_runtime_changed: &mut dyn FnMut(),
-        _on_result: &mut dyn FnMut(crate::server::node::NodeBatchResult),
-    ) -> Vec<crate::server::node::NodeBatchResult> {
-        requests
-            .into_iter()
-            .map(|request| {
-                let request_id = request.request_id;
-                let result = Err("MiniMax-H3 节点不执行 text_generation".to_owned());
-                crate::server::node::NodeBatchResult { request_id, result }
-            })
-            .collect()
+    fn generate_one(&mut self, _request_id: &str, request: &Value, cancellation: &AtomicBool, on_token: &mut dyn FnMut(u32, String) -> bool) -> Result<GenerationSummary, String> {
+        (self.run_prompt)(request, cancellation, on_token)
     }
 
     fn execute_task(&mut self, task_kind: &str, request: &Value, output_dir: &Path, cancellation: &AtomicBool, on_progress: &mut dyn FnMut(TaskProgress)) -> Result<Vec<GeneratedArtifact>, String> {
@@ -300,7 +403,15 @@ impl NodeEngine for H3Engine {
         let clip_length = u64::try_from(H3VideoVaeSpec::standard().temporal_clip_length).map_err(|_| "H3 temporal clip length 超过 u64")?;
         let frames = target_frames.saturating_sub(5).div_ceil(clip_length).saturating_mul(clip_length).saturating_add(5);
         let frames = usize::try_from(frames).map_err(|_| "H3 frames 超过 usize")?;
-        (self.run_task)(&control, width, height, frames, output_dir, cancellation, on_progress)
+        std::thread::scope(|scope| {
+            let (progress_tx, progress_rx) = mpsc::channel();
+            let run_task = &mut self.run_task;
+            let worker = scope.spawn(move || (run_task)(&control, width, height, frames, output_dir, cancellation, progress_tx));
+            for progress in progress_rx {
+                on_progress(progress);
+            }
+            worker.join().map_err(|_| "H3 task worker 线程 panic".to_owned())?
+        })
     }
 }
 
@@ -320,6 +431,12 @@ fn adaptive_ratio_for_media(control: &H3ControlMessage) -> Result<String, String
     let ratio = width as f64 / height as f64;
     let candidates: [(&str, f64); 6] = [("21:9", 21.0 / 9.0), ("16:9", 16.0 / 9.0), ("4:3", 4.0 / 3.0), ("1:1", 1.0), ("3:4", 3.0 / 4.0), ("9:16", 9.0 / 16.0)];
     Ok(candidates.into_iter().min_by(|(_, left), (_, right)| (ratio.ln() - left.ln()).abs().total_cmp(&(ratio.ln() - right.ln()).abs())).expect("adaptive ratio candidates 非空").0.to_owned())
+}
+
+#[cfg(any(test, all(target_os = "linux", feature = "with-rocm")))]
+fn h3_checkpoint_steps(grid_points: usize, shift: f32) -> Result<usize, String> {
+    // checkpoint 与进度记录实际 forward 次数，不包含 sigma 网格的终点。
+    Ok(super::h3_sigma_schedule(grid_points, shift)?.len() - 1)
 }
 
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
@@ -404,17 +521,53 @@ fn build_runner(model_root: &Path, qwen_root: &Path, qwen_tokenizer_root: &Path,
         std::env::set_var("OPENBLAS_NUM_THREADS", "1");
     }
     let config = H3Config::standard();
+    // 显存池/arena 行为配置（yaml 为准；hip 进程级全局，本 runner 独占进程）。
+    const GIB: usize = 1024 * 1024 * 1024;
+    if let Some(gib) = execution.device_pool_gib {
+        crate::kernel::rocm::hip::set_device_buffer_pool_limit(gib.checked_mul(GIB).ok_or("device_pool_gib 溢出")?)?;
+    }
+    if let Some(gib) = execution.device_arena_gib {
+        crate::kernel::rocm::hip::set_arena_bound_bytes(gib.checked_mul(GIB).ok_or("device_arena_gib 溢出")?);
+    }
+    if let Some(gib) = execution.device_pool_max_block_gib {
+        crate::kernel::rocm::hip::set_device_pool_max_block_bytes(gib.checked_mul(GIB).ok_or("device_pool_max_block_gib 溢出")?)?;
+    }
+    // 显式池会消灭 denoise/VAE 的 hipMallocAsync churn（实测 2.48 TiB/任务），
+    // 但 15s/1MP U8 负载在其 hipMalloc 路径下早期 OOM；由 yaml 决定是否启用。
+    if execution.device_buffer_reuse {
+        crate::kernel::rocm::hip::enable_device_buffer_reuse();
+    }
     let group = H3RocmUlyssesGroup::new(&devices, allow_cpu_reference_fallback)?;
+    // H3 runner 独占 node；准备队列与 Ulysses 队列分开，避免逐张量 H2D
+    // 的同步等待排到长 attention 后面。两类 stream 都由进程级注册表持有。
+    let video_prepare_contexts = execution
+        .overlap_decoder_prepare
+        .then(|| {
+            let ranks = if execution.parallel_video_vae { group.contexts() } else { &group.contexts()[..1] };
+            ranks.iter().map(|rank| rank.with_background_stream()).collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?;
     let qwen_model = Qwen3Vl::instruct_32b();
     let qwen_config = qwen_model.config().clone();
     // MiniMax-H3 使用 hidden_states[50]（embedding 后执行 50 层），且不经过最终 RMSNorm。
     const H3_TEXT_ENCODER_LAYERS: usize = 50;
     let text_encoder_layers = H3_TEXT_ENCODER_LAYERS;
+    if !(1..=text_encoder_layers).contains(&execution.qwen_prepare_threads) {
+        return Err(format!("H3 qwen_prepare_threads={} 必须在 1..={text_encoder_layers}", execution.qwen_prepare_threads));
+    }
     if qwen_config.layer_count < text_encoder_layers {
         return Err(format!("H3 文本编码器只有 {} 层，无法取得 hidden_states[{text_encoder_layers}]", qwen_config.layer_count));
     }
     let qwen_vision = qwen_config.vision.clone().ok_or_else(|| "H3 node 需要 Qwen3-VL vision 配置".to_owned())?;
-    let qwen_processor = Qwen3VlImageProcessor::new(&qwen_vision)?;
+    let mut qwen_processor_config = qwen_vision.clone();
+    if let Some(max_pixels) = execution.qwen_image_max_pixels {
+        if max_pixels < qwen_processor_config.min_pixels {
+            return Err(format!("H3 qwen_image_max_pixels={max_pixels} 小于 Qwen min_pixels={}", qwen_processor_config.min_pixels));
+        }
+        qwen_processor_config.max_pixels = max_pixels;
+    }
+    let qwen_image_processor = Qwen3VlImageProcessor::new(&qwen_processor_config)?;
+    let qwen_processor = Qwen3VlImageProcessor::new(&qwen_processor_config)?;
     let tokenizer = Tokenizer::new(qwen_tokenizer_root.join("tokenizer.json")).map_err(|error| format!("打开 H3 Qwen tokenizer: {error}"))?;
     let qwen_weights = Qwen3VlWeights::open(qwen_root, qwen_config.clone())?;
     let source = H3DitSource::open(model_root, config.clone())?;
@@ -443,30 +596,46 @@ fn build_runner(model_root: &Path, qwen_root: &Path, qwen_tokenizer_root: &Path,
         return Err("H3 block cache 当前只接入 ROCm Ulysses 多卡路径，单卡配置必须关闭".to_owned());
     }
     let mut reference_cache = None;
-    Ok(Box::new(move |control, width, height, frames, output_dir, cancellation, on_progress| {
+    let mut qwen_visual_cache = None;
+    let mut text_cache = None;
+    Ok(Box::new(move |control, width, height, frames, output_dir, cancellation, progress_tx| {
+        let output_frames = control.duration.checked_mul(24).and_then(|value| usize::try_from(value).ok()).ok_or("H3 output frames 溢出")?;
+        if output_frames > frames {
+            return Err(format!("H3 output frames={output_frames} 超过 padded frames={frames}"));
+        }
         group.activate_all().map_err(|error| format!("激活 H3 ROCm streams: {error:?}"))?;
         let context = group.primary();
         let task_started = Instant::now();
-        let mut report = |phase: &str, completed: usize, total: usize, phase_eta_seconds: Option<f64>| {
-            on_progress(TaskProgress { phase: phase.to_owned(), completed, total, elapsed_seconds: task_started.elapsed().as_secs_f64(), phase_eta_seconds });
-        };
-        report("conditioning", 0, 1, None);
+        report_progress(&progress_tx, &task_started, "conditioning", 0, 1, None);
         if cancellation.load(Ordering::Acquire) {
             return Err("H3 任务已取消".to_owned());
         }
         let seed = control.seed.unwrap_or(42);
         // 媒体 content 内联完整 base64，可能上百 MB，不能直接作为 cache key 持有；
         // key 只用于本进程单槽命中判断，对序列化内容取 blake3 摘要（已是仓库依赖）。
-        let reference_material = serde_json::to_vec(&(seed, control.content.iter().filter(|item| !matches!(item, H3Content::Text { .. })).collect::<Vec<_>>())).map_err(|error| format!("序列化 H3 reference cache key: {error}"))?;
+        let media_content = control.content.iter().filter(|item| !matches!(item, H3Content::Text { .. })).collect::<Vec<_>>();
+        // Qwen 特征没有随机采样，换 seed 只使加噪的 Ref2VA 条件失效。
+        let qwen_material = serde_json::to_vec(&(execution.qwen_image_max_pixels, &media_content)).map_err(|error| format!("序列化 H3 Qwen cache key: {error}"))?;
+        let qwen_key = blake3::hash(&qwen_material);
+        let keyframes = control.keyframes();
+        let keyframe_size = (!keyframes.is_empty()).then_some((width, height));
+        let reference_material = serde_json::to_vec(&(seed, execution.reference_image_max_pixels, keyframe_size, qwen_key.as_bytes())).map_err(|error| format!("序列化 H3 reference cache key: {error}"))?;
         let reference_key = blake3::hash(&reference_material);
         let reference_count = control.content.iter().filter(|item| !matches!(item, H3Content::Text { .. })).count();
         let started = Instant::now();
         let cache_hit = reference_cache.as_ref().is_some_and(|(key, _, _)| key == &reference_key);
         if !cache_hit {
             reference_cache = None;
-            let media = media::prepare_conditioning_media(media::decode_control_references(control)?)?;
+            let media = media::prepare_conditioning_media(media::decode_control_references(control, execution.reference_image_max_pixels)?, execution.reference_image_max_pixels, keyframe_size)?;
             let needs_video_encoder = media.iter().any(|item| matches!(item, media::ConditioningMedia::Image { .. } | media::ConditioningMedia::Video { .. }));
             let needs_audio_encoder = media.iter().any(|item| matches!(item, media::ConditioningMedia::Audio { .. } | media::ConditioningMedia::Video { audio: Some(_), .. }));
+            if qwen_visual_cache.as_ref().is_some_and(|(key, _)| key != &qwen_key) {
+                qwen_visual_cache = None;
+                text_cache = None;
+            }
+            let cached_qwen = qwen_visual_cache.as_ref();
+            let mut cached_images = cached_qwen.into_iter().flat_map(|(_, visuals): &(_, Vec<(usize, H3QwenVisual<RocmTensor>)>)| visuals.iter()).filter(|(_, visual)| visual.kind == H3ReferenceKind::Image);
+            let mut cached_videos = cached_qwen.into_iter().flat_map(|(_, visuals)| visuals.iter()).filter(|(_, visual)| visual.kind == H3ReferenceKind::Video);
             let (qwen_visuals, references) = {
                 let encoder_started = Instant::now();
                 let video_encoder = if needs_video_encoder {
@@ -494,7 +663,11 @@ fn build_runner(model_root: &Path, qwen_root: &Path, qwen_tokenizer_root: &Path,
                     seed,
                     VISUAL_CONDITION_TIMESTEP,
                     |image| {
-                        let image = qwen_processor.preprocess(image)?;
+                        if let Some((_, visual)) = cached_images.next() {
+                            eprintln!("[h3-node] Qwen reference image cache=hit");
+                            return Ok(visual.clone());
+                        }
+                        let image = qwen_image_processor.preprocess(image)?;
                         let grid = image.grid;
                         let merge_size = image.merge_size;
                         let qwen_started = Instant::now();
@@ -503,6 +676,10 @@ fn build_runner(model_root: &Path, qwen_root: &Path, qwen_tokenizer_root: &Path,
                         H3QwenVisual::new(output, H3ReferenceKind::Image, grid, merge_size).map_err(|error| format!("Qwen reference image output: {error:?}"))
                     },
                     |frames, _timestamps| {
+                        if let Some((_, visual)) = cached_videos.next() {
+                            eprintln!("[h3-node] Qwen reference video cache=hit");
+                            return Ok(visual.clone());
+                        }
                         let video = qwen_processor.preprocess_video(frames)?;
                         let grid = video.grid;
                         let merge_size = video.merge_size;
@@ -516,6 +693,7 @@ fn build_runner(model_root: &Path, qwen_root: &Path, qwen_tokenizer_root: &Path,
                 context.finish_batch();
                 encoded
             };
+            qwen_visual_cache = Some((qwen_key, qwen_visuals.clone()));
             reference_cache = Some((reference_key, qwen_visuals, references));
         }
         let (_, qwen_visuals, references) = reference_cache.as_ref().ok_or("H3 reference cache 未初始化")?;
@@ -527,193 +705,331 @@ fn build_runner(model_root: &Path, qwen_root: &Path, qwen_tokenizer_root: &Path,
             started.elapsed().as_secs_f64()
         );
         let prompt = control.prompt();
-        let started = Instant::now();
-        let prepare_started = Instant::now();
-        let qwen_text_layers = (0..text_encoder_layers).map(|layer| prepare_qwen3_vl_text_layer(context, &qwen_weights, layer).map_err(|error| format!("准备 Qwen GPU L{layer}: {error:?}"))).collect::<Result<Vec<_>, _>>()?;
-        eprintln!("[h3-node] Qwen text weights prepare wall={:.3}s", prepare_started.elapsed().as_secs_f64());
-        let execute_started = Instant::now();
-        let text_condition =
-            h3_qwen_text_condition_resident(context, &qwen_config, &qwen_weights, &tokenizer, &prompt, qwen_visuals, text_encoder_layers, &qwen_text_layers).map_err(|error| format!("Qwen GPU H3 multimodal hidden: {error:?}"))?;
-        eprintln!("[h3-node] Qwen text execute wall={:.3}s", execute_started.elapsed().as_secs_f64());
-        let token_count = text_condition.token_ids.len();
-        let text = text_condition.hidden;
-        context.finish_batch();
-        drop(qwen_text_layers);
-        context.finish_batch();
-        eprintln!("[h3-node] Qwen GPU tokens={token_count} layers={} weights_released wall={:.3}s", text_encoder_layers, started.elapsed().as_secs_f64());
-        report("conditioning", 1, 1, Some(0.0));
+        let text_material = serde_json::to_vec(&(qwen_key.as_bytes(), &prompt)).map_err(|error| format!("序列化 H3 text cache key: {error}"))?;
+        let text_key = blake3::hash(&text_material);
+        let text = if let Some((_, cached)) = text_cache.as_ref().filter(|(key, _)| key == &text_key) {
+            eprintln!("[h3-node] Qwen text cache=hit tokens={}", context.token_rows(cached));
+            cached.clone()
+        } else {
+            text_cache = None;
+            let started = Instant::now();
+            let prepare_started = Instant::now();
+            let qwen_text_layers = std::thread::scope(|scope| {
+                let handles = (0..execution.qwen_prepare_threads)
+                    .map(|worker| {
+                        let weights = &qwen_weights;
+                        let first = text_encoder_layers * worker / execution.qwen_prepare_threads;
+                        let end = text_encoder_layers * (worker + 1) / execution.qwen_prepare_threads;
+                        scope.spawn(move || {
+                            context.activate()?;
+                            (first..end).map(|layer| prepare_qwen3_vl_text_layer(context, weights, layer).map_err(|error| format!("准备 Qwen GPU L{layer}: {error:?}"))).collect::<Result<Vec<_>, _>>()
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let mut layers = Vec::with_capacity(text_encoder_layers);
+                for handle in handles {
+                    layers.extend(handle.join().map_err(|_| "H3 Qwen prepare 线程 panic".to_owned())??);
+                }
+                Ok::<_, String>(layers)
+            })?;
+            eprintln!("[h3-node] Qwen text weights prepare wall={:.3}s", prepare_started.elapsed().as_secs_f64());
+            let execute_started = Instant::now();
+            let text_condition =
+                h3_qwen_text_condition_resident(context, &qwen_config, &qwen_weights, &tokenizer, &prompt, qwen_visuals, text_encoder_layers, &qwen_text_layers).map_err(|error| format!("Qwen GPU H3 multimodal hidden: {error:?}"))?;
+            eprintln!("[h3-node] Qwen text execute wall={:.3}s", execute_started.elapsed().as_secs_f64());
+            let token_count = text_condition.token_ids.len();
+            let text = text_condition.hidden;
+            context.finish_batch();
+            drop(qwen_text_layers);
+            context.finish_batch();
+            eprintln!("[h3-node] Qwen GPU tokens={token_count} layers={} weights_released wall={:.3}s", text_encoder_layers, started.elapsed().as_secs_f64());
+            text_cache = Some((text_key, text.clone()));
+            text
+        };
+        report_progress(&progress_tx, &task_started, "conditioning", 1, 1, Some(0.0));
         if cancellation.load(Ordering::Acquire) {
             return Err("H3 任务已取消".to_owned());
         }
 
-        let started = Instant::now();
-        let globals = group.contexts().iter().map(|rank| prepare_dit_global(rank, &global_source)).collect::<Result<Vec<_>, _>>().map_err(|error| format!("准备 H3 rank globals: {error:?}"))?;
-        let final_weights = prepare_dit_final(context, &source).map_err(|error| format!("准备 H3 final layer: {error:?}"))?;
-        let resident_blocks = if stream_chunk_layers == config.num_layers {
-            Some(group.contexts().iter().map(|rank| prepare_cached_dit_blocks(rank, &block_sources)).collect::<Result<Vec<_>, _>>().map_err(|error| format!("准备 H3 rank resident blocks: {error:?}"))?)
-        } else {
-            None
-        };
-        eprintln!(
-            "[h3-node] DiT prepared ranks={} resident_layers_per_rank={} chunk_layers={stream_chunk_layers} wall={:.3}s",
-            group.contexts().len(),
-            resident_blocks.as_ref().and_then(|ranks| ranks.first()).map_or(0, Vec::len),
-            started.elapsed().as_secs_f64()
-        );
-
-        let latent_t = video_vae_latent_frames(frames, &video_spec)?;
-        let latent_h = height / 16;
-        let latent_w = width / 16;
-        let audio_t = (frames * 40).div_ceil(24);
-        let patch = config.patch_size;
-        let layout = build_h3_reference_layout(context.token_rows(&text), latent_t, latent_h, latent_w, audio_t, patch, &references)?;
-        let conditions = references
-            .conditions
-            .iter()
-            .map(|condition| match condition {
-                H3PackedReferenceCondition::Video { condition, .. } => H3ConditionInput::Video(&condition.tensor),
-                H3PackedReferenceCondition::Audio { condition, .. } => H3ConditionInput::Audio(&condition.tensor),
-            })
-            .collect::<Vec<_>>();
-        let video_shape = [1, config.video_latent_channels, latent_t, latent_h, latent_w];
-        let checkpoint_path = output_dir.join("denoise-checkpoint.bin");
-        let total_steps = steps;
-        let checkpoint = load_h3_denoise_checkpoint(&checkpoint_path, total_steps, (layout.video_rows.len(), config.video_patch_dim()), (layout.audio_rows.len(), config.audio_latent_channels))?;
-        let (video, audio, start_step) = if let Some(checkpoint) = checkpoint {
-            let video = context.tensor_from_f32(checkpoint.video, layout.video_rows.len(), config.video_patch_dim()).map_err(|error| format!("恢复 H3 video latent: {error:?}"))?;
-            let audio = context.tensor_from_f32(checkpoint.audio, layout.audio_rows.len(), config.audio_latent_channels).map_err(|error| format!("恢复 H3 audio latent: {error:?}"))?;
-            eprintln!("[h3-node] denoise checkpoint 恢复 step={}/{} path={}", checkpoint.completed_steps, total_steps, checkpoint_path.display());
-            (video, audio, checkpoint.completed_steps)
-        } else {
-            let mut random = H3GaussianNoise::new(seed);
-            let video_rows = patchify_video(&random.values(video_shape.iter().product()), video_shape, patch)?;
-            let audio_rows = pack_audio(&random.values(2 * config.audio_latent_channels * audio_t), config.audio_latent_channels, 2, audio_t)?;
-            let video = context.tensor_from_f32(video_rows, layout.video_rows.len(), config.video_patch_dim()).map_err(|error| format!("上传 H3 video latent: {error:?}"))?;
-            let audio = context.tensor_from_f32(audio_rows, layout.audio_rows.len(), config.audio_latent_channels).map_err(|error| format!("上传 H3 audio latent: {error:?}"))?;
-            (video, audio, 0)
-        };
-        let denoise_started = Instant::now();
-        report("denoise", start_step, total_steps, None);
-        let mut report_step = |completed: usize, total: usize, latents: &H3DenoiseLatents<RocmTensor>| -> Result<bool, BackendError> {
-            let checkpoint_started = Instant::now();
-            let video = context.tensor_to_f32(&latents.video)?;
-            let audio = context.tensor_to_f32(&latents.audio)?;
-            write_h3_denoise_checkpoint(&checkpoint_path, completed, total, (latents.video.rows, latents.video.cols), (latents.audio.rows, latents.audio.cols), &video, &audio).map_err(|msg| BackendError::Compute { msg })?;
-            eprintln!("[h3-node] denoise checkpoint step={completed}/{total} wall={:.3}s", checkpoint_started.elapsed().as_secs_f64());
-            let completed_this_run = completed - start_step;
-            let average = denoise_started.elapsed().as_secs_f64() / completed_this_run as f64;
-            report("denoise", completed, total, Some(average * (total - completed) as f64));
-            Ok(!cancellation.load(Ordering::Acquire))
-        };
-        let latents = if group.contexts().len() > 1 {
-            denoise_ulysses_conditioned(
-                &group,
-                &source,
-                &globals,
-                resident_blocks.as_ref().expect("H3 Ulysses resident blocks 已在配置期强制"),
-                &final_weights,
-                &text,
-                &conditions,
-                H3DenoiseLatents { video, audio },
-                &layout,
-                steps,
-                start_step,
-                block_cache,
-                &mut report_step,
-            )
-        } else if let Some(blocks) = resident_blocks.as_ref() {
-            let stages = [H3PreparedStage { backend: context, global: &globals[0], first_layer: 0, blocks: &blocks[0] }];
-            denoise_staged_conditioned(context, &source, &globals[0], &stages, &final_weights, &text, &conditions, H3DenoiseLatents { video, audio }, &layout, steps, start_step, &mut report_step)
-        } else {
-            let mut streamed_blocks = crate::runtime::h3::HostStreamedLayers::new(config.num_layers, |layer| source.load_block(layer));
-            denoise_streamed_conditioned(context, &source, &globals[0], &mut streamed_blocks, stream_chunk_layers, &final_weights, &text, &conditions, H3DenoiseLatents { video, audio }, &layout, steps, start_step, &mut report_step)
-        }
-        .map_err(|error| format!("H3 denoise: {error:?}"))?;
-        drop(report_step);
-        eprintln!("[h3-node] denoise wall={:.3}s", denoise_started.elapsed().as_secs_f64());
-        drop(conditions);
-        drop(text);
-        context.finish_batch();
-        drop(resident_blocks);
-        drop(final_weights);
-        drop(globals);
-        context.finish_batch();
-        eprintln!("[h3-node] denoise temporary buffers and streamed DiT weights released");
-        if cancellation.load(Ordering::Acquire) {
-            return Err("H3 任务已取消".to_owned());
-        }
-
-        let H3DenoiseLatents { video, audio } = latents;
-        let video_rows = context.tensor_to_f32(&video).map_err(|error| format!("读取 H3 video latent: {error:?}"))?;
-        validate_finite("去噪 video latent", &video_rows, Some(config.video_patch_dim()))?;
-        let audio_shape = (audio.rows, audio.cols);
-        let audio_rows = context.tensor_to_f32(&audio).map_err(|error| format!("读取 H3 audio latent: {error:?}"))?;
-        drop(video);
-        drop(audio);
-        context.finish_batch();
-        if execution.save_latent {
-            let latent_path = output_dir.join("video-latent.f32");
-            let mut output = BufWriter::new(File::create(&latent_path).map_err(|error| format!("创建 {}: {error}", latent_path.display()))?);
-            for value in &video_rows {
-                output.write_all(&value.to_le_bytes()).map_err(|error| format!("写入 {}: {error}", latent_path.display()))?;
+        std::thread::scope(|prepare_scope| {
+            let video_contexts = if execution.parallel_video_vae { group.contexts() } else { &group.contexts()[..1] };
+            let prepare_contexts = video_prepare_contexts.as_deref().unwrap_or(video_contexts);
+            let prepare_source = &video_source;
+            let prepare_video_globals = move || {
+                let started = Instant::now();
+                let prepared = std::thread::scope(|scope| {
+                    let handles = prepare_contexts
+                        .iter()
+                        .map(|rank| {
+                            let video_source = prepare_source;
+                            scope.spawn(move || {
+                                rank.activate()?;
+                                prepare_video_vae(rank, video_source).map_err(|error| format!("准备 H3 video VAE device {}: {error:?}", rank.device_id()))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    handles.into_iter().map(|handle| handle.join().map_err(|_| "H3 video VAE prepare 线程 panic".to_owned())?).collect::<Result<Vec<_>, String>>()
+                });
+                eprintln!("[h3-node] video decoder weights prepare ranks={} wall={:.3}s", video_contexts.len(), started.elapsed().as_secs_f64());
+                prepared
+            };
+            let started = Instant::now();
+            let prepare_rank = |rank: &crate::backend::rocm::RocmContext| {
+                rank.activate()?;
+                let global = prepare_dit_global(rank, &global_source).map_err(|error| format!("准备 H3 rank global: {error:?}"))?;
+                let blocks = if stream_chunk_layers == config.num_layers { prepare_cached_dit_blocks(rank, &block_sources).map_err(|error| format!("准备 H3 rank resident blocks: {error:?}"))? } else { Vec::new() };
+                Ok::<_, String>((global, blocks))
+            };
+            let prepared = if execution.parallel_prepare {
+                std::thread::scope(|scope| {
+                    let handles = group
+                        .contexts()
+                        .iter()
+                        .map(|rank| {
+                            let prepare_rank = &prepare_rank;
+                            scope.spawn(move || prepare_rank(rank))
+                        })
+                        .collect::<Vec<_>>();
+                    handles.into_iter().map(|handle| handle.join().map_err(|_| "H3 DiT prepare 线程 panic".to_owned())?).collect::<Result<Vec<_>, String>>()
+                })?
+            } else {
+                group.contexts().iter().map(prepare_rank).collect::<Result<Vec<_>, _>>()?
+            };
+            let (globals, blocks): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
+            let resident_blocks = (stream_chunk_layers == config.num_layers).then_some(blocks);
+            let final_weights = prepare_dit_final(context, &source).map_err(|error| format!("准备 H3 final layer: {error:?}"))?;
+            eprintln!(
+                "[h3-node] DiT prepared ranks={} resident_layers_per_rank={} chunk_layers={stream_chunk_layers} wall={:.3}s",
+                group.contexts().len(),
+                resident_blocks.as_ref().and_then(|ranks| ranks.first()).map_or(0, Vec::len),
+                started.elapsed().as_secs_f64()
+            );
+            let latent_t = video_vae_latent_frames(frames, &video_spec)?;
+            let latent_h = height / 16;
+            let latent_w = width / 16;
+            let audio_t = (frames * 40).div_ceil(24);
+            let patch = config.patch_size;
+            // Video VAE 权重准备仍与 DiT 去噪重叠；去噪中间 latent
+            // 不是可信的视频帧，不再为了预览抢占 GPU 解码。
+            let decoder_preparation = execution.overlap_decoder_prepare.then(|| prepare_scope.spawn(prepare_video_globals));
+            let layout = if keyframes.is_empty() {
+                build_h3_reference_layout(context.token_rows(&text), latent_t, latent_h, latent_w, audio_t, patch, &references)?
+            } else {
+                if references.conditions.len() != keyframes.len()
+                    || references.conditions.iter().any(|reference| match reference {
+                        H3PackedReferenceCondition::Video { condition, .. } => condition.latent_shape != [1, latent_h, latent_w] || condition.patch_shape != patch,
+                        H3PackedReferenceCondition::Audio { .. } => true,
+                    })
+                {
+                    return Err(format!("H3 keyframe conditions={} 与 anchors={} 或目标 latent=[1,{latent_h},{latent_w}] 不匹配", references.conditions.len(), keyframes.len()));
+                }
+                build_packed_layout(context.token_rows(&text), latent_t, latent_h, latent_w, audio_t, patch, &keyframes)?
+            };
+            let conditions = references
+                .conditions
+                .iter()
+                .map(|condition| match condition {
+                    H3PackedReferenceCondition::Video { condition, .. } => H3ConditionInput::Video(&condition.tensor),
+                    H3PackedReferenceCondition::Audio { condition, .. } => H3ConditionInput::Audio(&condition.tensor),
+                })
+                .collect::<Vec<_>>();
+            let video_shape = [1, config.video_latent_channels, latent_t, latent_h, latent_w];
+            let checkpoint_path = output_dir.join("denoise-checkpoint.bin");
+            let total_steps = h3_checkpoint_steps(steps, config.sigma_shift_video)?;
+            let checkpoint = load_h3_denoise_checkpoint(&checkpoint_path, total_steps, (layout.video_rows.len(), config.video_patch_dim()), (layout.audio_rows.len(), config.audio_latent_channels))?;
+            let (video, audio, start_step) = if let Some(checkpoint) = checkpoint {
+                let video = context.tensor_from_f32(checkpoint.video, layout.video_rows.len(), config.video_patch_dim()).map_err(|error| format!("恢复 H3 video latent: {error:?}"))?;
+                let audio = context.tensor_from_f32(checkpoint.audio, layout.audio_rows.len(), config.audio_latent_channels).map_err(|error| format!("恢复 H3 audio latent: {error:?}"))?;
+                eprintln!("[h3-node] denoise checkpoint 恢复 step={}/{} path={}", checkpoint.completed_steps, total_steps, checkpoint_path.display());
+                (video, audio, checkpoint.completed_steps)
+            } else {
+                let mut random = H3GaussianNoise::new(seed);
+                let video_rows = patchify_video(&random.values(video_shape.iter().product()), video_shape, patch)?;
+                let audio_rows = pack_audio(&random.values(2 * config.audio_latent_channels * audio_t), config.audio_latent_channels, 2, audio_t)?;
+                let video = context.tensor_from_f32(video_rows, layout.video_rows.len(), config.video_patch_dim()).map_err(|error| format!("上传 H3 video latent: {error:?}"))?;
+                let audio = context.tensor_from_f32(audio_rows, layout.audio_rows.len(), config.audio_latent_channels).map_err(|error| format!("上传 H3 audio latent: {error:?}"))?;
+                (video, audio, 0)
+            };
+            let denoise_started = Instant::now();
+            report_progress(&progress_tx, &task_started, "denoise", start_step, total_steps, None);
+            if execution.profile_boundaries {
+                crate::kernel::rocm::hip::enable_device_profile();
             }
-            output.flush().map_err(|error| format!("刷新 {}: {error}", latent_path.display()))?;
-        }
-        let video_latent = unpatchify_video(&video_rows, [1, config.video_latent_channels, latent_t, latent_h, latent_w], patch)?;
-        report("video_vae", 0, 1, None);
-        let decoder_started = Instant::now();
-        let video_global = prepare_video_vae(context, &video_source).map_err(|error| format!("准备 H3 video VAE: {error:?}"))?;
-        let audio_global = prepare_audio_vae(context, &audio_source).map_err(|error| format!("准备 H3 audio VAE: {error:?}"))?;
-        let audio = context.tensor_from_f32(audio_rows, audio_shape.0, audio_shape.1).map_err(|error| format!("恢复 H3 audio latent: {error}"))?;
-        eprintln!("[h3-node] decoders prepared wall={:.3}s", decoder_started.elapsed().as_secs_f64());
-        let started = Instant::now();
-        let decode_started = Instant::now();
-        let video_values = decode_video_vae_tiled_temporal(context, &video_source, &video_global, &video_latent, latent_t, latent_h, latent_w, frames, patch)?;
-        validate_finite("Video VAE 输出", &video_values, None)?;
-        eprintln!("[h3-node] Video VAE decode wall={:.3}s", decode_started.elapsed().as_secs_f64());
-        report("video_vae", 1, 1, Some(0.0));
-        let decoded_height = latent_h * video_spec.spatial_compression;
-        let decoded_width = latent_w * video_spec.spatial_compression;
-        let y4m = output_dir.join("video.y4m");
-        let y4m_started = Instant::now();
-        write_y4m(&y4m, &video_values, frames, frames, decoded_height, decoded_width)?;
-        eprintln!("[h3-node] Y4M encode wall={:.3}s", y4m_started.elapsed().as_secs_f64());
-        eprintln!("[h3-node] video VAE+Y4M wall={:.3}s", started.elapsed().as_secs_f64());
+            let mut report_step = |completed: usize, total: usize, latents: &H3DenoiseLatents<RocmTensor>| -> Result<bool, BackendError> {
+                let checkpoint_started = Instant::now();
+                let video = context.tensor_to_f32(&latents.video)?;
+                let audio = context.tensor_to_f32(&latents.audio)?;
+                write_h3_denoise_checkpoint(&checkpoint_path, completed, total, (latents.video.rows, latents.video.cols), (latents.audio.rows, latents.audio.cols), &video, &audio).map_err(|msg| BackendError::Compute { msg })?;
+                eprintln!("[h3-node] denoise checkpoint step={completed}/{total} wall={:.3}s", checkpoint_started.elapsed().as_secs_f64());
+                let completed_this_run = completed - start_step;
+                let average = denoise_started.elapsed().as_secs_f64() / completed_this_run as f64;
+                report_progress(&progress_tx, &task_started, "denoise", completed, total, Some(average * (total - completed) as f64));
+                Ok(!cancellation.load(Ordering::Acquire))
+            };
+            let latents = if group.contexts().len() > 1 {
+                denoise_ulysses_conditioned(
+                    &group,
+                    &source,
+                    &globals,
+                    resident_blocks.as_ref().expect("H3 Ulysses resident blocks 已在配置期强制"),
+                    &final_weights,
+                    &text,
+                    &conditions,
+                    H3DenoiseLatents { video, audio },
+                    &layout,
+                    steps,
+                    start_step,
+                    block_cache,
+                    &mut report_step,
+                )
+            } else if let Some(blocks) = resident_blocks.as_ref() {
+                let stages = [H3PreparedStage { backend: context, global: &globals[0], first_layer: 0, blocks: &blocks[0] }];
+                denoise_staged_conditioned(context, &source, &globals[0], &stages, &final_weights, &text, &conditions, H3DenoiseLatents { video, audio }, &layout, steps, start_step, &mut report_step)
+            } else {
+                let mut streamed_blocks = crate::runtime::h3::HostStreamedLayers::new(config.num_layers, |layer| source.load_block(layer));
+                denoise_streamed_conditioned(context, &source, &globals[0], &mut streamed_blocks, stream_chunk_layers, &final_weights, &text, &conditions, H3DenoiseLatents { video, audio }, &layout, steps, start_step, &mut report_step)
+            }
+            .map_err(|error| format!("H3 denoise: {error:?}"))?;
+            drop(report_step);
+            if execution.profile_boundaries {
+                crate::kernel::rocm::hip::report_device_profiles(total_steps - start_step, group.contexts().len());
+            }
+            eprintln!("[h3-node] denoise wall={:.3}s", denoise_started.elapsed().as_secs_f64());
+            drop(conditions);
+            drop(text);
+            context.finish_batch();
+            drop(resident_blocks);
+            drop(final_weights);
+            drop(globals);
+            context.finish_batch();
+            eprintln!("[h3-node] denoise temporary buffers and streamed DiT weights released");
+            if cancellation.load(Ordering::Acquire) {
+                return Err("H3 任务已取消".to_owned());
+            }
 
-        report("audio_vae", 0, 1, None);
-        let started = Instant::now();
-        let samples = decode_audio_vae(context, &audio_source, &audio_global, &audio, audio_t).map_err(|error| format!("H3 audio VAE: {error:?}"))?;
-        let samples = context.tensor_to_f32(&samples).map_err(|error| format!("读取 H3 audio samples: {error:?}"))?;
-        drop(audio);
-        let available_samples = audio_t * audio_spec.sample_rate / audio_spec.latent_rate;
-        let output_samples = frames.checked_mul(audio_spec.sample_rate).and_then(|value| value.checked_add(12)).map(|value| value / 24).ok_or("H3 audio sample 数溢出")?;
-        let wav = output_dir.join("audio.wav");
-        write_wav(&wav, &samples, audio_spec.output_channels, available_samples, output_samples, audio_spec.sample_rate)?;
-        eprintln!("[h3-node] audio VAE+WAV wall={:.3}s", started.elapsed().as_secs_f64());
-        report("audio_vae", 1, 1, Some(0.0));
+            let H3DenoiseLatents { video, audio } = latents;
+            let video_rows = context.tensor_to_f32(&video).map_err(|error| format!("读取 H3 video latent: {error:?}"))?;
+            validate_finite("去噪 video latent", &video_rows, Some(config.video_patch_dim()))?;
+            let audio_shape = (audio.rows, audio.cols);
+            let audio_rows = context.tensor_to_f32(&audio).map_err(|error| format!("读取 H3 audio latent: {error:?}"))?;
+            drop(video);
+            drop(audio);
+            context.finish_batch();
+            if execution.save_latent {
+                let latent_path = output_dir.join("video-latent.f32");
+                let mut output = BufWriter::new(File::create(&latent_path).map_err(|error| format!("创建 {}: {error}", latent_path.display()))?);
+                for value in &video_rows {
+                    output.write_all(&value.to_le_bytes()).map_err(|error| format!("写入 {}: {error}", latent_path.display()))?;
+                }
+                output.flush().map_err(|error| format!("刷新 {}: {error}", latent_path.display()))?;
+            }
+            let video_latent = unpatchify_video(&video_rows, [1, config.video_latent_channels, latent_t, latent_h, latent_w], patch)?;
+            report_progress(&progress_tx, &task_started, "video_vae", 0, 1, None);
+            let decoder_started = Instant::now();
+            let video_globals = if let Some(handle) = decoder_preparation { handle.join().map_err(|_| "H3 decoder prepare 线程 panic".to_owned())?? } else { prepare_video_globals()? };
+            let audio_global = prepare_audio_vae(context, &audio_source).map_err(|error| format!("准备 H3 audio VAE: {error:?}"))?;
+            let audio = context.tensor_from_f32(audio_rows, audio_shape.0, audio_shape.1).map_err(|error| format!("恢复 H3 audio latent: {error}"))?;
+            eprintln!("[h3-node] decoders prepared wall={:.3}s", decoder_started.elapsed().as_secs_f64());
+            let decode_started = Instant::now();
+            let decoded_height = latent_h * video_spec.spatial_compression;
+            let decoded_width = latent_w * video_spec.spatial_compression;
+            let preview_frames = preview_frame_indices(output_frames, 24);
+            let preview_count = preview_frames.len();
+            let mut next_preview = 0;
+            let mut emit_previews = |video_values: &[f32], decoded_frames: usize| -> Result<(), String> {
+                while let Some(&frame) = preview_frames.get(next_preview) {
+                    if frame >= decoded_frames {
+                        break;
+                    }
+                    // VAE 可能保留时间对齐尾帧，通道跨度取实际缓冲区，成片仍按请求时长裁切。
+                    let frame_stride = video_values.len() / (3 * decoded_height * decoded_width);
+                    let jpeg = video_preview_jpeg(video_values, frame, decoded_frames, frame_stride, decoded_height, decoded_width)?;
+                    let _ = progress_tx.send(TaskProgress {
+                        phase: "video_vae".to_owned(),
+                        completed: next_preview + 1,
+                        total: preview_count,
+                        elapsed_seconds: task_started.elapsed().as_secs_f64(),
+                        phase_eta_seconds: None,
+                        preview: Some(crate::server::scheduler::TaskPreview {
+                            index: next_preview,
+                            timestamp_seconds: frame as f64 / 24.0,
+                            content_type: "image/jpeg".to_owned(),
+                            data_base64: base64::engine::general_purpose::STANDARD.encode(jpeg),
+                        }),
+                    });
+                    next_preview += 1;
+                }
+                Ok(())
+            };
+            let video_values = if execution.parallel_video_vae {
+                crate::runtime::h3::rocm::decode_video_vae_tiled_rocm_cancellable(video_contexts, &video_source, &video_globals, &video_latent, [latent_t, latent_h, latent_w], output_frames, patch, cancellation, &mut emit_previews)?
+            } else {
+                decode_video_vae_tiled_temporal(context, &video_source, &video_globals[0], &video_latent, latent_t, latent_h, latent_w, output_frames, patch)?
+            };
+            emit_previews(&video_values, output_frames)?;
+            drop(emit_previews);
+            validate_finite("Video VAE 输出", &video_values, None)?;
+            eprintln!("[h3-node] Video VAE decode wall={:.3}s", decode_started.elapsed().as_secs_f64());
+            report_progress(&progress_tx, &task_started, "video_vae", 1, 1, Some(0.0));
+            report_progress(&progress_tx, &task_started, "audio_vae", 0, 1, None);
+            let started = Instant::now();
+            let samples = decode_audio_vae(context, &audio_source, &audio_global, &audio, audio_t).map_err(|error| format!("H3 audio VAE: {error:?}"))?;
+            let samples = context.tensor_to_f32(&samples).map_err(|error| format!("读取 H3 audio samples: {error:?}"))?;
+            drop(audio);
+            let available_samples = audio_t * audio_spec.sample_rate / audio_spec.latent_rate;
+            // VAE 使用对齐后的时间网格，成片只输出用户请求的帧数和对应音频。
+            let output_samples = output_frames.checked_mul(audio_spec.sample_rate).and_then(|value| value.checked_add(12)).map(|value| value / 24).ok_or("H3 audio sample 数溢出")?;
+            let wav = output_dir.join("audio.wav");
+            write_wav(&wav, &samples, audio_spec.output_channels, available_samples, output_samples, audio_spec.sample_rate)?;
+            eprintln!("[h3-node] audio VAE+WAV wall={:.3}s", started.elapsed().as_secs_f64());
+            report_progress(&progress_tx, &task_started, "audio_vae", 1, 1, Some(0.0));
 
-        report("muxing", 0, 1, None);
-        let mp4 = output_dir.join("output.mp4");
-        let status = Command::new(&execution.ffmpeg)
-            .args(["-y", "-i", y4m.to_string_lossy().as_ref(), "-i", wav.to_string_lossy().as_ref(), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", mp4.to_string_lossy().as_ref()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .status()
-            .map_err(|error| format!("启动 ffmpeg: {error}"))?;
-        if !status.success() {
-            return Err(format!("ffmpeg 退出状态 {status}"));
-        }
-        match fs::remove_file(&checkpoint_path) {
-            Ok(()) => eprintln!("[h3-node] denoise checkpoint 已清理 path={}", checkpoint_path.display()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("清理 {}: {error}", checkpoint_path.display())),
-        }
-        report("completed", 1, 1, Some(0.0));
-        drop(video_global);
-        drop(audio_global);
-        context.finish_batch();
-        Ok(vec![GeneratedArtifact { id: "video".to_owned(), file_name: "output.mp4".to_owned(), content_type: "video/mp4".to_owned(), path: mp4 }])
+            report_progress(&progress_tx, &task_started, "muxing", 0, 1, None);
+            let mp4 = output_dir.join("output.mp4");
+            let mux_started = Instant::now();
+            let mut command = Command::new(&execution.ffmpeg);
+            command
+                .args(["-y", "-nostdin", "-f", "yuv4mpegpipe", "-i", "pipe:0", "-i"])
+                .arg(&wav)
+                // 索引必须在文件头，否则网页播放器需要先回源读取 MP4 尾部才开始播放。
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart", "-shortest", "-t"])
+                .arg(control.duration.to_string())
+                .arg(&mp4)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit());
+            let frame_stride = video_values.len() / (3 * decoded_height * decoded_width);
+            let result = pipe_y4m(&mut command, &video_values, output_frames, frame_stride, decoded_height, decoded_width, cancellation);
+            drop(video_values);
+            if let Err(error) = result {
+                let _ = fs::remove_file(&mp4);
+                return Err(error);
+            }
+            eprintln!("[h3-node] Y4M+H.264/AAC mux wall={:.3}s", mux_started.elapsed().as_secs_f64());
+            match fs::remove_file(&checkpoint_path) {
+                Ok(()) => eprintln!("[h3-node] denoise checkpoint 已清理 path={}", checkpoint_path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("清理 {}: {error}", checkpoint_path.display())),
+            }
+            report_progress(&progress_tx, &task_started, "completed", 1, 1, Some(0.0));
+            drop(video_globals);
+            drop(audio_global);
+            context.finish_batch();
+            Ok(vec![GeneratedArtifact { id: "video".to_owned(), file_name: "output.mp4".to_owned(), content_type: "video/mp4".to_owned(), path: mp4 }])
+        })
     }))
+}
+
+fn preview_frame_indices(output_frames: usize, frames_per_second: usize) -> Vec<usize> {
+    if output_frames == 0 || frames_per_second == 0 {
+        return Vec::new();
+    }
+    let final_frame = output_frames - 1;
+    (0..=output_frames.div_ceil(frames_per_second)).map(|second| (second * frames_per_second).min(final_frame)).collect()
+}
+
+#[cfg(all(target_os = "linux", feature = "with-rocm"))]
+fn report_progress(progress_tx: &mpsc::Sender<TaskProgress>, task_started: &Instant, phase: &str, completed: usize, total: usize, phase_eta_seconds: Option<f64>) {
+    let _ = progress_tx.send(TaskProgress { phase: phase.to_owned(), completed, total, elapsed_seconds: task_started.elapsed().as_secs_f64(), phase_eta_seconds, preview: None });
 }
 
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
@@ -797,6 +1113,42 @@ fn directory_bytes(root: &Path) -> u64 {
 }
 
 mod media;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn previews_cover_every_video_second() {
+        assert_eq!(super::preview_frame_indices(96, 24), [0, 24, 48, 72, 95]);
+        let fifteen_seconds = super::preview_frame_indices(360, 24);
+        assert_eq!(fifteen_seconds.len(), 16);
+        assert_eq!(fifteen_seconds[0], 0);
+        assert_eq!(fifteen_seconds[15], 359);
+    }
+
+    #[test]
+    fn checkpoint_total_matches_denoise_forward_count() {
+        let shift = crate::runtime::h3::H3Config::standard().sigma_shift_video;
+        for (grid_points, forwards) in [(2, 1), (5, 4), (9, 8), (20, 19)] {
+            assert_eq!(super::h3_checkpoint_steps(grid_points, shift).unwrap(), forwards);
+        }
+        assert!(super::h3_checkpoint_steps(1, shift).is_err());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "with-rocm"))]
+    #[test]
+    fn checkpoint_resumes_five_point_schedule_after_four_forwards() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("zllm-h3-checkpoint-{}-{nonce}.bin", std::process::id()));
+        let total = super::h3_checkpoint_steps(5, crate::runtime::h3::H3Config::standard().sigma_shift_video).unwrap();
+        super::write_h3_denoise_checkpoint(&path, 4, 4, (1, 2), (1, 1), &[0.25, -0.5], &[0.75]).unwrap();
+        let restored = super::load_h3_denoise_checkpoint(&path, total, (1, 2), (1, 1)).unwrap().unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(restored.completed_steps, 4);
+        assert_eq!(restored.video, [0.25, -0.5]);
+        assert_eq!(restored.audio, [0.75]);
+    }
+}
+
 #[cfg(all(target_os = "linux", feature = "with-rocm"))]
 pub async fn run(model: crate::config::H3NodeModelConfig, backend: crate::config::RocmBackendConfig, config: crate::server::node::NodeConfig) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let model_path = model.weights_directory;

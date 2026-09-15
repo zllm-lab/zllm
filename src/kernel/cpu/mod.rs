@@ -11,6 +11,7 @@ pub mod kda;
 pub mod matmul;
 pub mod mla;
 pub mod moe;
+pub mod mxfp;
 pub mod nvfp4;
 pub mod rmsnorm;
 pub mod silu;

@@ -2,8 +2,8 @@
 
 use crate::{
     attention::compressed_sparse::{
-        CompressedBatch, CompressedGatedSegment, CompressedKvState, CompressedSelection, CompressedSparseAttentionSpec, CompressedSparseKernel, CompressedSparsePrefillSegment, CompressionStream, GatedPoolState, KvCompressionSpec,
-        normalize_rope_compressed_f32,
+        CandidateSpec, CompressedBatch, CompressedGatedSegment, CompressedKvState, CompressedSelection, CompressedSparseAttentionSpec, CompressedSparseKernel, CompressedSparsePrefillSegment, CompressionStream, GatedPoolState,
+        KvCompressionSpec, SharedCompressedBatch, SharedCsaOutput, V41Compressed, normalize_rope_compressed_f32,
     },
     backend::{
         BackendError, compute_error as compute,
@@ -34,6 +34,7 @@ fn slice_rows(tensor: &CpuTensor, start: usize, rows: usize) -> Result<CpuTensor
 }
 
 impl CompressedSparseKernel for CpuContext {
+    type SharedSelection = Vec<Vec<usize>>;
     type CompressedKvStorage = CpuCompressedKvStorage;
 
     fn allocate_compressed_kv(&self, spec: &CompressedSparseAttentionSpec) -> Result<Self::CompressedKvStorage, BackendError> {
@@ -294,4 +295,270 @@ impl CompressedSparseKernel for CpuContext {
         }
         Ok(CpuTensor { data, rows: offset, cols: spec.num_heads * spec.head_dim })
     }
+
+    fn compress_v41(
+        &self,
+        storage: &mut CpuCompressedKvStorage,
+        positions: &[usize],
+        kv: &CpuTensor,
+        gate: Option<&CpuTensor>,
+        norm: &CpuWeight,
+        index_key_projection: Option<(&CpuWeight, &CpuWeight)>,
+        compression: KvCompressionSpec,
+        width: usize,
+        rotary_dim: usize,
+        index_rope_dim: usize,
+        cos: &[f32],
+        sin: &[f32],
+        eps: f32,
+    ) -> Result<V41Compressed<CpuTensor>, BackendError> {
+        let ratio = compression.ratio;
+        // ratio=1 官方无 gate:池化退化为逐行直通,不经过 pending 状态。
+        let (visible_positions, pooled) = if ratio == 1 {
+            if kv.rows != positions.len() || kv.cols != width {
+                return Err(compute(format!("CPU V4.1 compressor(ratio=1) shape 非法: positions={} kv=[{},{}] width={width}", positions.len(), kv.rows, kv.cols)));
+            }
+            (positions.to_vec(), kv.data.clone())
+        } else {
+            let gate = gate.ok_or_else(|| compute("CPU V4.1 compressor ratio>1 缺少 gate"))?;
+            if kv.rows != positions.len() || gate.rows != kv.rows || gate.cols != kv.cols || kv.cols != width {
+                return Err(compute(format!("CPU V4.1 compressor shape 非法: positions={} kv=[{},{}] gate=[{},{}] width={width}", positions.len(), kv.rows, kv.cols, gate.rows, gate.cols)));
+            }
+            // V4.1 无 ape:位置偏置恒为 0。
+            let bias = vec![0.0; ratio * width];
+            storage.compressor.push_f32(positions, &kv.data, &gate.data, &bias, ratio, width, compression.overlap).map_err(compute)?
+        };
+        let attention_values = normalize_rope_compressed_f32(&pooled, &visible_positions, ratio, width, norm.data(), eps, rotary_dim, cos, sin).map_err(compute)?;
+        let rows = visible_positions.len();
+        let attention = CompressedBatch { visible_positions: visible_positions.clone(), values: CpuTensor { data: attention_values, rows, cols: width } };
+        let index_key = index_key_projection
+            .map(|(wk, k_norm)| {
+                let (index_dim, data) = crate::attention::compressed_sparse::index_key_compressed_f32(&pooled, &visible_positions, ratio, width, wk.data(), k_norm.data(), eps, index_rope_dim, cos, sin).map_err(compute)?;
+                Ok::<_, BackendError>(CompressedBatch { visible_positions: visible_positions.clone(), values: CpuTensor { data, rows, cols: index_dim } })
+            })
+            .transpose()?;
+        Ok(V41Compressed { attention, index_key })
+    }
+
+    fn compressed_sparse_prefill_shared(
+        &self,
+        recent: &mut CpuCompressedKvStorage,
+        shared: Option<&CpuCompressedKvStorage>,
+        positions: &[usize],
+        causal_batch: bool,
+        query: &CpuTensor,
+        key: &CpuTensor,
+        value: &CpuTensor,
+        batch: Option<SharedCompressedBatch<'_, CpuTensor>>,
+        index_query: Option<&CpuTensor>,
+        index_head_weights: Option<&CpuTensor>,
+        preset_selection: Option<&Self::SharedSelection>,
+        candidate: Option<CandidateSpec>,
+        sink: Option<&CpuWeight>,
+        spec: &CompressedSparseAttentionSpec,
+    ) -> Result<SharedCsaOutput<CpuTensor, Self::SharedSelection>, BackendError> {
+        let rows = query.rows;
+        if rows == 0 || query.cols != spec.num_heads * spec.head_dim || key.rows != rows || value.rows != rows || key.cols != spec.num_kv_heads * spec.head_dim || value.cols != key.cols {
+            return Err(compute(format!("CPU V4.1 CSA prefill 维度非法: rows={rows} query=[{},{}] key=[{},{}] heads={}/{} head_dim={}", query.rows, query.cols, key.rows, key.cols, spec.num_heads, spec.num_kv_heads, spec.head_dim)));
+        }
+        let indexer = match spec.compression.map(|compression| compression.selection) {
+            Some(CompressedSelection::LearnedIndexer(dsa)) => Some(dsa),
+            _ => None,
+        };
+        // 压缩历史权威:非源层读 shared,源层(shared=None)的 history 就在自己的 storage。
+        let (all_positions, all_keys, all_values, all_index_keys) = shared_compressed_parts(shared.unwrap_or(recent), batch.as_ref(), spec, indexer.is_some())?;
+        // selection:preset 复用;index 层在可见行上自算并发布(候选两阶段可选)。
+        let mut published = None;
+        let preset = if indexer.is_some() && preset_selection.is_some() {
+            Some(preset_selection.expect("上方已校验").clone())
+        } else if let Some(dsa) = indexer {
+            let index_query = index_query.ok_or_else(|| compute("CPU V4.1 index 层缺少 index_query"))?;
+            let index_head_weights = index_head_weights.ok_or_else(|| compute("CPU V4.1 index 层缺少 index head weights"))?;
+            let index_keys = all_index_keys.as_deref().ok_or_else(|| compute("CPU V4.1 压缩历史缺少 index key"))?;
+            let mut per_row = Vec::with_capacity(rows);
+            for row in 0..rows {
+                let query_position = if causal_batch { positions[row] } else { *positions.last().ok_or_else(|| compute("CPU V4.1 CSA 空 positions"))? };
+                let visible: Vec<usize> = all_positions.iter().enumerate().filter(|entry| *entry.1 <= query_position).map(|(index, _)| index).collect();
+                let query_width = dsa.num_heads * dsa.head_dim;
+                let iq = &index_query.data[row * query_width..(row + 1) * query_width];
+                let weights = &index_head_weights.data[row * dsa.num_heads..(row + 1) * dsa.num_heads];
+                let mut visible_keys = Vec::with_capacity(visible.len() * dsa.head_dim);
+                for &index in &visible {
+                    visible_keys.extend_from_slice(&index_keys[index * dsa.head_dim..(index + 1) * dsa.head_dim]);
+                }
+                let local = match candidate {
+                    Some(candidate) => crate::attention::compressed_sparse::topk_indexer_candidate_f32(iq, &visible_keys, weights, &dsa, dsa.top_k, candidate).map_err(compute)?,
+                    None => crate::attention::compressed_sparse::topk_indexer_f32(iq, &visible_keys, weights, &dsa, dsa.top_k).map_err(compute)?,
+                };
+                per_row.push(local.into_iter().map(|local| visible[local]).collect());
+            }
+            published = Some(per_row.clone());
+            Some(per_row)
+        } else {
+            None
+        };
+        let sink_data = sink.map(|weight| weight.data());
+        let data = recent
+            .state
+            .attend_batch_preset_f32(
+                &query.data,
+                rows,
+                positions,
+                causal_batch,
+                &key.data,
+                &value.data,
+                &all_positions,
+                &all_keys,
+                &all_values,
+                all_index_keys.as_deref(),
+                index_query.map(|tensor| tensor.data.as_slice()),
+                index_head_weights.map(|tensor| tensor.data.as_slice()),
+                spec.num_heads,
+                spec.num_kv_heads,
+                spec.head_dim,
+                indexer,
+                preset.as_deref(),
+                sink_data,
+            )
+            .map_err(compute)?;
+        // 写入:滑窗永远写本层;压缩历史只写源层(shared=None 时 recent 即源)。
+        if shared.is_none()
+            && let Some(batch) = &batch
+        {
+            let kv_width = spec.num_kv_heads * spec.head_dim;
+            match batch.index_key {
+                Some(index_key) => recent.state.push_compressed_indexed_batch(batch.visible_positions, &batch.key.data, &batch.value.data, &index_key.data, kv_width).map_err(compute)?,
+                None => recent.state.push_compressed_batch(batch.visible_positions, &batch.key.data, &batch.value.data, kv_width).map_err(compute)?,
+            }
+        }
+        let kv_width = spec.num_kv_heads * spec.head_dim;
+        recent.state.push_recent_batch(positions, &key.data, &value.data, kv_width).map_err(compute)?;
+        Ok(SharedCsaOutput { attended: CpuTensor { rows, cols: spec.num_heads * spec.head_dim, data }, selection: published })
+    }
+
+    fn compressed_sparse_decode_shared(
+        &self,
+        recent: &mut CpuCompressedKvStorage,
+        shared: Option<&CpuCompressedKvStorage>,
+        position: usize,
+        query: &CpuTensor,
+        key: &CpuTensor,
+        value: &CpuTensor,
+        batch: Option<SharedCompressedBatch<'_, CpuTensor>>,
+        index_query: Option<&CpuTensor>,
+        index_head_weights: Option<&CpuTensor>,
+        preset_selection: Option<&Self::SharedSelection>,
+        candidate: Option<CandidateSpec>,
+        sink: Option<&CpuWeight>,
+        spec: &CompressedSparseAttentionSpec,
+    ) -> Result<SharedCsaOutput<CpuTensor, Self::SharedSelection>, BackendError> {
+        let indexer = match spec.compression.map(|compression| compression.selection) {
+            Some(CompressedSelection::LearnedIndexer(dsa)) => Some(dsa),
+            _ => None,
+        };
+        let (all_positions, all_keys, all_values, all_index_keys) = shared_compressed_parts(shared.unwrap_or(recent), batch.as_ref(), spec, indexer.is_some())?;
+        let mut published = None;
+        let preset = if indexer.is_some() && preset_selection.is_some() {
+            Some(preset_selection.expect("上方已校验").clone())
+        } else if let Some(dsa) = indexer {
+            let index_query = one_row(index_query.ok_or_else(|| compute("CPU V4.1 index 层缺少 index_query"))?, "index_query")?;
+            let weights = one_row(index_head_weights.ok_or_else(|| compute("CPU V4.1 index 层缺少 index head weights"))?, "index_head_weights")?;
+            let index_keys = all_index_keys.as_deref().ok_or_else(|| compute("CPU V4.1 压缩历史缺少 index key"))?;
+            let visible: Vec<usize> = all_positions.iter().enumerate().filter(|entry| *entry.1 <= position).map(|(index, _)| index).collect();
+            let mut visible_keys = Vec::with_capacity(visible.len() * dsa.head_dim);
+            for &index in &visible {
+                visible_keys.extend_from_slice(&index_keys[index * dsa.head_dim..(index + 1) * dsa.head_dim]);
+            }
+            let local = match candidate {
+                Some(candidate) => crate::attention::compressed_sparse::topk_indexer_candidate_f32(index_query, &visible_keys, weights, &dsa, dsa.top_k, candidate).map_err(compute)?,
+                None => crate::attention::compressed_sparse::topk_indexer_f32(index_query, &visible_keys, weights, &dsa, dsa.top_k).map_err(compute)?,
+            };
+            let row: Vec<usize> = local.into_iter().map(|local| visible[local]).collect();
+            published = Some(vec![row.clone()]);
+            Some(vec![row])
+        } else {
+            None
+        };
+        let query_row = one_row(query, "query")?;
+        let key_row = one_row(key, "key")?;
+        let value_row = one_row(value, "value")?;
+        let sink_data = sink.map(|weight| weight.data());
+        let data = recent
+            .state
+            .attend_batch_preset_f32(
+                query_row,
+                1,
+                &[position],
+                true,
+                key_row,
+                value_row,
+                &all_positions,
+                &all_keys,
+                &all_values,
+                all_index_keys.as_deref(),
+                index_query.map(|tensor| &tensor.data[..]),
+                index_head_weights.map(|tensor| &tensor.data[..]),
+                spec.num_heads,
+                spec.num_kv_heads,
+                spec.head_dim,
+                indexer,
+                preset.as_deref(),
+                sink_data,
+            )
+            .map_err(compute)?;
+        if shared.is_none()
+            && let Some(batch) = &batch
+            && batch.visible_positions.len() == 1
+        {
+            let kv_width = spec.num_kv_heads * spec.head_dim;
+            let key_row = one_row(&batch.key, "shared compressed key")?;
+            let value_row = one_row(&batch.value, "shared compressed value")?;
+            match batch.index_key {
+                Some(index_key) => recent.state.push_compressed_indexed(batch.visible_positions[0], key_row, value_row, one_row(index_key, "shared compressed index key")?).map_err(compute)?,
+                None => recent.state.push_compressed(batch.visible_positions[0], key_row, value_row).map_err(compute)?,
+            }
+        }
+        recent.state.push_recent(position, key_row, value_row).map_err(compute)?;
+        Ok(SharedCsaOutput { attended: CpuTensor { rows: 1, cols: data.len(), data }, selection: published })
+    }
+}
+
+/// 合并压缩历史(源层 storage)与本批广播压缩项,返回行优先的 positions/keys/values
+/// 与(需要时)index keys。
+fn shared_compressed_parts(
+    source: &CpuCompressedKvStorage,
+    batch: Option<&SharedCompressedBatch<'_, CpuTensor>>,
+    spec: &CompressedSparseAttentionSpec,
+    need_index: bool,
+) -> Result<(Vec<usize>, Vec<f32>, Vec<f32>, Option<Vec<f32>>), BackendError> {
+    let history = &source.state;
+    let kv_width = spec.num_kv_heads * spec.head_dim;
+    let mut positions = Vec::with_capacity(history.compressed_len());
+    let mut keys = Vec::with_capacity(history.compressed_len() * kv_width);
+    let mut values = Vec::with_capacity(history.compressed_len() * kv_width);
+    let mut index_keys = need_index.then(Vec::new);
+    for row in 0..history.compressed_len() {
+        positions.push(history.compressed_position(row));
+        keys.extend_from_slice(history.compressed_key(row));
+        values.extend_from_slice(history.compressed_value(row));
+        if let Some(index_keys) = index_keys.as_mut() {
+            let key = history.compressed_index_key(row).ok_or_else(|| compute(format!("CPU V4.1 压缩历史 row {row} 缺少 index key")))?;
+            index_keys.extend_from_slice(key);
+        }
+    }
+    if let Some(batch) = batch {
+        if batch.key.rows != batch.visible_positions.len() || batch.value.rows != batch.visible_positions.len() || batch.key.cols != kv_width || batch.value.cols != kv_width {
+            return Err(compute(format!("CPU V4.1 共享压缩批维度非法: positions={} key=[{},{}] value=[{},{}] kv_width={kv_width}", batch.visible_positions.len(), batch.key.rows, batch.key.cols, batch.value.rows, batch.value.cols)));
+        }
+        positions.extend_from_slice(batch.visible_positions);
+        keys.extend_from_slice(&batch.key.data);
+        values.extend_from_slice(&batch.value.data);
+        if let Some(batch_index_key) = batch.index_key {
+            if batch_index_key.rows != batch.visible_positions.len() {
+                return Err(compute(format!("CPU V4.1 共享压缩批 index_key 行数={} 与 positions={} 不一致", batch_index_key.rows, batch.visible_positions.len())));
+            }
+            index_keys.get_or_insert_with(Vec::new).extend_from_slice(&batch_index_key.data);
+        }
+    }
+    Ok((positions, keys, values, index_keys))
 }

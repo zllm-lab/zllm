@@ -8,7 +8,9 @@ mod reference;
 use reference::{f32_expert as reference_f32_expert_batch, nvfp4_expert as reference_nvfp4_expert_batch, route_cpu};
 
 // 中等 route 批次优先保留逐 route F32 累加；更大的并发批次才用 WMMA grouped。
-const MXFP4_DIRECT_ROUTE_LIMIT: usize = 4 * 1024;
+// 单路 prefill 会为八级流水切成约 256 行，超过 1K route 后改走 WMMA；
+// decode-priority 的 32 行小块仍保留低延迟 direct kernel。
+const MXFP4_DIRECT_ROUTE_LIMIT: usize = 1024;
 static GGUF_MOE_PREFLIGHT_LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
 
 struct RocmCooperativeMoeReplicaInput {
@@ -22,8 +24,25 @@ impl MoePrefillBackend for RocmContext {
     type MoeAccumulator = RocmTensor;
 
     fn moe_route(&self, input: &Self::Tensor, router_weight: &Self::Weight, router_bias: &Self::Weight, spec: &crate::moe::topk_moe::TopkMoeSpec) -> Result<MoePrefillRouting, BackendError> {
+        self.moe_route_rows(input, router_weight, router_bias, None, None, spec)
+    }
+
+    fn moe_route_rows(
+        &self,
+        input: &Self::Tensor,
+        router_weight: &Self::Weight,
+        router_bias: &Self::Weight,
+        router_bias_vl: Option<&Self::Weight>,
+        image_rows: Option<&[bool]>,
+        spec: &crate::moe::topk_moe::TopkMoeSpec,
+    ) -> Result<MoePrefillRouting, BackendError> {
         if router_weight.rows != spec.num_experts || router_weight.cols != input.cols || router_bias.data().len() != spec.num_experts {
             return Err(compute_error(format!("Rocm MoE router shape 异常: input=[{},{}], weight=[{},{}], bias={}, experts={}", input.rows, input.cols, router_weight.rows, router_weight.cols, router_bias.data().len(), spec.num_experts)));
+        }
+        if let (Some(bias_vl), Some(mask)) = (router_bias_vl, image_rows)
+            && (bias_vl.data().len() != spec.num_experts || mask.len() != input.rows)
+        {
+            return Err(compute_error(format!("Rocm MoE VL 路由 shape 异常: bias_vl={}, mask={}, rows={}", bias_vl.data().len(), mask.len(), input.rows)));
         }
         if let Some(input_device) = input.device.as_deref() {
             let scoring = match spec.scoring_func {
@@ -33,8 +52,10 @@ impl MoePrefillBackend for RocmContext {
             };
             let weight_device = router_weight.router_resident(self.device_id, ops::hip::options().precise_router)?;
             let bias_device = resident_weight(router_bias, "router bias")?;
+            let bias_vl_device = router_bias_vl.map(|bias| resident_weight(bias, "router bias_vl")).transpose()?;
             let (expert_ids, weights) =
-                ops::hip::try_moe_route_resident_f32(self.device_id, input_device, weight_device, bias_device, input.rows, input.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor).map_err(compute_error)?;
+                ops::hip::try_moe_route_resident_f32(self.device_id, input_device, weight_device, bias_device, bias_vl_device, image_rows, input.rows, input.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor)
+                    .map_err(compute_error)?;
             return Ok(MoePrefillRouting { expert_ids, weights, rows: input.rows, top_k: spec.top_k });
         }
         self.require_cpu_reference_fallback("host MoE router")?;
@@ -230,7 +251,7 @@ impl RocmContext {
                 Ok::<_, BackendError>((shared_stream, output.map_err(compute_error)?))
             })
             .transpose()?;
-        let routed_output = ops::hip::with_moe_route_resident_device_f32(self.device_id, route_input, router, bias, rows, hidden, expert_count, top_k, scoring, scaling, |route_ids, route_weights, route_len| {
+        let routed_output = ops::hip::with_moe_route_resident_device_f32(self.device_id, route_input, router, bias, None, None, rows, hidden, expert_count, top_k, scoring, scaling, |route_ids, route_weights, route_len| {
             if route_len != route_count {
                 return Err(format!("L{layer} operator route 数异常: {route_len}/{route_count}"));
             }
@@ -266,6 +287,7 @@ impl RocmContext {
     ) -> Result<Option<RocmTensor>, BackendError> {
         let router_weight = weights.router;
         let router_bias = weights.bias;
+        let bias_vl_device = weights.bias_vl.map(|bias| resident_weight(bias, "router bias_vl")).transpose()?;
         let route_input = inputs.route;
         let expert_input = inputs.expert;
         if ops::hip::options().trace_moe_segment_rows.is_some() {
@@ -315,6 +337,8 @@ impl RocmContext {
                 route_device,
                 weight_device,
                 bias_device,
+                bias_vl_device.as_deref(),
+                weights.image_rows,
                 route_input.rows,
                 route_input.cols,
                 spec.num_experts,
@@ -424,7 +448,21 @@ impl RocmContext {
                         crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
                         crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
                     };
-                    ops::hip::with_moe_route_resident_device_f32(self.device_id, route_device, weight_device, bias_device, route_input.rows, route_input.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor, run)
+                    ops::hip::with_moe_route_resident_device_f32(
+                        self.device_id,
+                        route_device,
+                        weight_device,
+                        bias_device,
+                        bias_vl_device.as_deref(),
+                        weights.image_rows,
+                        route_input.rows,
+                        route_input.cols,
+                        spec.num_experts,
+                        spec.top_k,
+                        scoring,
+                        spec.routed_scaling_factor,
+                        run,
+                    )
                 }
             }
             .map_err(|error| compute_error(format!("MXFP4 resident routed experts L{layer}: {error}")))?;
@@ -473,6 +511,8 @@ impl RocmContext {
                     route_device,
                     weight_device,
                     bias_device,
+                    bias_vl_device.as_deref(),
+                    weights.image_rows,
                     route_input.rows,
                     route_input.cols,
                     spec.num_experts,
@@ -492,6 +532,8 @@ impl RocmContext {
                     route_device,
                     weight_device,
                     bias_device,
+                    bias_vl_device.as_deref(),
+                    weights.image_rows,
                     route_input.rows,
                     route_input.cols,
                     spec.num_experts,
@@ -544,6 +586,8 @@ impl RocmContext {
             route_device,
             weight_device,
             bias_device,
+            bias_vl_device.as_deref(),
+            weights.image_rows,
             route_input.rows,
             route_input.cols,
             spec.num_experts,
@@ -647,7 +691,7 @@ impl RocmContext {
                     crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
                     crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
                 };
-                ops::hip::try_moe_route_resident_device_f32(self.device_id, route_device, weight_device, bias_device, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor)
+                ops::hip::try_moe_route_resident_device_f32(self.device_id, route_device, weight_device, bias_device, None, None, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor)
             }
         }
         .map_err(|error| compute_error(format!("ROCm cooperative device route L{layer}: {error}")))?;
@@ -720,7 +764,7 @@ impl RocmContext {
                     crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
                     crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
                 };
-                ops::hip::try_moe_route_resident_device_f32(self.device_id, route_device, weight_device, bias_device, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor)
+                ops::hip::try_moe_route_resident_device_f32(self.device_id, route_device, weight_device, bias_device, None, None, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor)
             }
         }
         .map_err(|error| compute_error(format!("ROCm operator pair route L{layer}: {error}")))?;
@@ -1059,8 +1103,9 @@ impl RocmContext {
             crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
             crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
         };
-        let route = ops::hip::try_moe_route_resident_device_f32(self.device_id, route_input_device, weight_device, bias_device, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor)
-            .map_err(|error| compute_error(format!("L{layer} MoE route eager: {error}")))?;
+        let route =
+            ops::hip::try_moe_route_resident_device_f32(self.device_id, route_input_device, weight_device, bias_device, None, None, inputs.route.rows, inputs.route.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor)
+                .map_err(|error| compute_error(format!("L{layer} MoE route eager: {error}")))?;
         graph.launch_owner(expert_input_device, &route.expert_ids, &route.weights).map_err(|error| compute_error(format!("L{layer} integrated MoE graph replay: {error}")))?;
         let output = ops::hip::try_add_resident_f32(self.device_id, residual_device, &graph.combined, inputs.expert.rows * inputs.expert.cols, 1.0).map_err(compute_error)?;
         Ok(Some(device_tensor_f32(output, inputs.expert.rows, inputs.expert.cols)))
@@ -1203,11 +1248,11 @@ impl ExpertPrefillBackend for RocmContext {
             let peer_cache = cache.ensure_operator_peer(self, &operator.context)?;
             let selection = selection.clone();
             let layers = layers.clone();
-            Some(operator.worker.submit(move |peer| peer_cache.lock().map_err(|_| compute_error("ROCm peer KV 预取锁中毒"))?.prefetch_selected_layers(&peer, layers, &selection, position, rows))?)
+            Some(operator.worker.submit(move |peer| peer_cache.lock().map_err(|_| compute_error("ROCm peer KV 预取锁中毒"))?.prefetch_selected_layers(&peer, layers, &selection, position, rows, false))?)
         } else {
             None
         };
-        let owner = cache.prefetch_selected_layers(self, layers, &selection, position, rows);
+        let owner = cache.prefetch_selected_layers(self, layers, &selection, position, rows, true);
         let peer = ticket.map(|ticket| ticket.wait()).transpose();
         owner?;
         peer?;
@@ -1516,7 +1561,7 @@ impl ExpertPrefillBackend for RocmContext {
             let expert_input = expert_input.device.as_ref().ok_or_else(|| compute_error(format!("L{layer} operator owner expert input 缺失")))?.clone();
             let router = weights.router.router_resident(self.device_id, ops::hip::options().precise_router)?;
             let bias = resident_weight(weights.bias, "operator router bias")?;
-            let route = ops::hip::try_moe_route_resident_device_f32(self.device_id, route_input, router, bias, rows, cols, num_experts, top_k, scoring, scaling)
+            let route = ops::hip::try_moe_route_resident_device_f32(self.device_id, route_input, router, bias, None, None, rows, cols, num_experts, top_k, scoring, scaling)
                 .map_err(|error| compute_error(format!("L{layer} operator owner GGUF route: {error}")))?;
             let route_count = rows.checked_mul(top_k).ok_or_else(|| compute_error(format!("L{layer} operator route 数溢出")))?;
             if route.len != route_count {
@@ -1552,6 +1597,9 @@ impl ExpertPrefillBackend for RocmContext {
                 ops::hip::order_stream_after(peer.device_id, peer_shared_stream, peer_main_stream).map_err(compute_error)?;
                 let combined = ops::hip::try_add_resident_f32(peer.device_id, &routed, &peer_shared, rows * cols, 1.0).map_err(compute_error)?;
                 let combined = if combined.is_async_allocated() { combined.copy_to_stable_deferred().map_err(compute_error)? } else { combined };
+                if super::context::probe_sync_mask(8) {
+                    peer.synchronize_compute_stream().map_err(|error| compute_error(format!("probe-sync moe-peer L{layer}: {error:?}")))?;
+                }
                 Ok(Arc::new(combined))
             })?;
             let local_output = if route_count <= 64 {
@@ -1601,9 +1649,11 @@ impl ExpertPrefillBackend for RocmContext {
             ops::hip::activate_compute_stream(self.device_id, owner_stream).map_err(compute_error)?;
             // 两边 producer 都已提交；沿用双向 event 保序，直接读对端 partial，
             // 不再物化 P2P 副本，也不为归并再往返一次 peer worker。
-            let (owner_output, peer_output) = ops::hip::DeviceBuffer::join_peer_partials_residual_ordered_async_retained_by(
-                &local_partial, &peer_partial, residual, &peer_residual, rows * cols, self.device_id,
-            ).map_err(|error| compute_error(format!("L{layer} operator MoE direct join: {error}")))?;
+            let (owner_output, peer_output) = ops::hip::DeviceBuffer::join_peer_partials_residual_ordered_async_retained_by(&local_partial, &peer_partial, residual, &peer_residual, rows * cols, self.device_id)
+                .map_err(|error| compute_error(format!("L{layer} operator MoE direct join: {error}")))?;
+            if super::context::probe_sync_mask(4) {
+                self.synchronize_compute_stream().map_err(|error| compute_error(format!("probe-sync moe-owner L{layer}: {error:?}")))?;
+            }
             worker.retain_for_stage(vec![local_partial, peer_partial])?;
             let mut output = device_tensor_f32(owner_output, rows, cols);
             output.replica = Some(RocmTensorReplica { device_id: peer_device, dtype: RocmTensorDType::F32, device: Arc::new(peer_output) });
@@ -1667,6 +1717,9 @@ impl ExpertPrefillBackend for RocmContext {
             // 注入 pair worker:decode 侧 BlockParity select 需要它提交 peer kernel。
             state.bind_sequence_shard_worker(operator.worker.clone());
             state.append_cooperative_layernorm_rope(self, &peer, layer, position, keys, norm_weight, norm_bias, eps, spec.rope_dim, spec.rotary_layout, cosine, sine)?;
+            if super::context::probe_sync_mask(64) {
+                self.synchronize_compute_stream().map_err(|error| compute_error(format!("probe-sync dsa-append L{layer}: {error:?}")))?;
+            }
             return Ok(true);
         }
         Ok(false)
@@ -1802,7 +1855,7 @@ impl ExpertPrefillBackend for RocmContext {
                 crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
                 crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
             };
-            let route = ops::hip::try_moe_route_resident_device_f32(context.device_id, input, router, bias, 1, hidden.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor).map_err(compute_error)?;
+            let route = ops::hip::try_moe_route_resident_device_f32(context.device_id, input, router, bias, None, None, 1, hidden.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor).map_err(compute_error)?;
             Ok((Arc::new(route.expert_ids), Arc::new(route.weights), route.len))
         };
         let (peer_route_ids, peer_route_weights, peer_route_count) = route(&peer, &peer_route_input, &peer_weights.router, &peer_weights.bias)?;
@@ -1837,6 +1890,7 @@ impl ExpertPrefillBackend for RocmContext {
     ) -> Result<Option<Self::Tensor>, BackendError> {
         let route_input = inputs.route;
         let expert_input = inputs.expert;
+        let bias_vl_device = weights.bias_vl.map(|bias| resident_weight(bias, "router bias_vl")).transpose()?;
         if experts.operator_peer.is_some() {
             return self.operator_moe_add(spec, weights, shared_experts, layer, experts, inputs, residual).map(Some);
         }
@@ -1931,6 +1985,8 @@ impl ExpertPrefillBackend for RocmContext {
                 route_device,
                 weight_device,
                 bias_device,
+                bias_vl_device.as_deref(),
+                weights.image_rows,
                 route_input.rows,
                 route_input.cols,
                 spec.num_experts,
@@ -2053,7 +2109,21 @@ impl ExpertPrefillBackend for RocmContext {
                     crate::moe::topk_moe::ScoringFunc::SigmoidBias => 1,
                     crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias => 2,
                 };
-                ops::hip::with_moe_route_resident_device_f32(self.device_id, route_device, weight_device, bias_device, route_input.rows, route_input.cols, spec.num_experts, spec.top_k, scoring, spec.routed_scaling_factor, run)
+                ops::hip::with_moe_route_resident_device_f32(
+                    self.device_id,
+                    route_device,
+                    weight_device,
+                    bias_device,
+                    bias_vl_device.as_deref(),
+                    weights.image_rows,
+                    route_input.rows,
+                    route_input.cols,
+                    spec.num_experts,
+                    spec.top_k,
+                    scoring,
+                    spec.routed_scaling_factor,
+                    run,
+                )
             }
         }
         .map_err(|error| compute_error(format!("ROCm integrated shared expert L{layer}: {error}")))?;
@@ -3177,6 +3247,15 @@ impl RocmPrefillExperts {
 
     pub(super) fn operator_peer(&self) -> Result<&RocmOperatorPeer, BackendError> {
         self.operator_peer.as_ref().ok_or_else(|| compute_error("ROCm operator pair peer 缺失"))
+    }
+
+    pub(crate) fn operator_peer_context(&self) -> Option<RocmContext> {
+        self.operator_peer.as_ref().map(|peer| peer.context)
+    }
+
+    /// DSA 的历史分块独立于 MLA 是否保留完整镜像。
+    pub fn dsa_sequence_sharded(&self) -> bool {
+        !ops::hip::options().prefill_attention_cpu && (self.operator_peer.is_some() || self.cooperative_peer.is_some())
     }
 
     pub(super) fn store_operator_mla_query(&self, layer: usize, position: usize, pending: RocmOperatorPendingQuery) -> Result<(), BackendError> {

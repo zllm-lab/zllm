@@ -12,7 +12,8 @@ use crate::{
         routing::{execute_routed_experts, route_sqrt_softplus_selected},
         topk_moe::{ScoringFunc, TopkMoeSpec},
     },
-    weight::expert_source::{GgufExpertSource, Nvfp4ExpertSource},
+    weight::expert_source::{GgufExpertSource, Mxfp8ExpertSource, Nvfp4ExpertSource},
+    weight::format::mxfp8::{Mxfp8Matrix, Mxfp8MatrixBufferMut, mxfp8_storage_lengths},
 };
 
 use super::context::{CpuContext, CpuWeight};
@@ -29,10 +30,30 @@ impl MoePrefillBackend for CpuContext {
     type MoeAccumulator = CpuTensor;
 
     fn moe_route(&self, input: &CpuTensor, router_weight: &CpuWeight, router_bias: &CpuWeight, spec: &TopkMoeSpec) -> Result<MoePrefillRouting, BackendError> {
+        self.moe_route_rows(input, router_weight, router_bias, None, None, spec)
+    }
+
+    fn moe_route_rows(&self, input: &CpuTensor, router_weight: &CpuWeight, router_bias: &CpuWeight, router_bias_vl: Option<&CpuWeight>, image_rows: Option<&[bool]>, spec: &TopkMoeSpec) -> Result<MoePrefillRouting, BackendError> {
         if router_weight.rows != spec.num_experts || router_weight.cols != input.cols || router_bias.data.len() != spec.num_experts {
             return Err(compute(format!("MoE router shape 异常: input=[{},{}], weight=[{},{}], bias={}, experts={}", input.rows, input.cols, router_weight.rows, router_weight.cols, router_bias.data.len(), spec.num_experts)));
         }
-        let routes: Vec<_> = input.data.par_chunks_exact(input.cols).map(|row| route_cpu(row, &router_weight.data, &router_bias.data, spec)).collect();
+        if let (Some(bias_vl), Some(rows)) = (router_bias_vl, image_rows)
+            && (bias_vl.data.len() != spec.num_experts || rows.len() != input.rows)
+        {
+            return Err(compute(format!("MoE VL 路由 shape 异常: bias_vl={}, mask={}, rows={}", bias_vl.data.len(), rows.len(), input.rows)));
+        }
+        let routes: Vec<_> = input
+            .data
+            .par_chunks_exact(input.cols)
+            .enumerate()
+            .map(|(row, values)| {
+                let bias = match (router_bias_vl, image_rows) {
+                    (Some(bias_vl), Some(rows)) if rows[row] => &bias_vl.data,
+                    _ => &router_bias.data,
+                };
+                route_cpu(values, &router_weight.data, bias, spec)
+            })
+            .collect();
         let mut expert_ids = Vec::with_capacity(input.rows * spec.top_k);
         let mut weights = Vec::with_capacity(input.rows * spec.top_k);
         for routing in routes {
@@ -166,15 +187,14 @@ impl ExpertDecodeBackend for CpuContext {
             }),
             crate::weight::expert_source::ExpertSource::Nvfp4(source) => decode_nvfp4_routed(self, spec, layer, source, input, assignments),
             crate::weight::expert_source::ExpertSource::Gguf(source) => decode_gguf_routed(self, spec, layer, source, input, assignments),
-            crate::weight::expert_source::ExpertSource::Mxfp8(_) => Err(BackendError::ExpertLoad("CPU decode 尚未实现 MXFP8 expert kernel".to_owned())),
+            crate::weight::expert_source::ExpertSource::Mxfp8(source) => decode_mxfp8_routed(self, spec, layer, source, input, assignments),
             crate::weight::expert_source::ExpertSource::Mxfp4(source) => {
                 if source.hidden() != input.cols || source.intermediate() != spec.intermediate_size {
                     return Err(BackendError::ExpertLoad(format!("MXFP4 expert shape hidden={}/{} intermediate={}/{}", source.hidden(), input.cols, source.intermediate(), spec.intermediate_size,)));
                 }
-                decode_f32_routed(self, spec, input, assignments, |expert| {
+                execute_routed_experts(self, input, assignments, input.rows, input.cols, |expert, expert_input| {
                     let weights = source.load_expert_mxfp4(layer, expert).map_err(BackendError::ExpertLoad)?;
-                    let decode = |matrix: &crate::weight::format::mxfp4::Mxfp4Matrix| matrix.decode().map_err(BackendError::ExpertLoad);
-                    Ok((decode(&weights.gate)?, decode(&weights.up)?, decode(&weights.down)?))
+                    crate::kernel::cpu::moe::mxfp4_expert_batch(expert_input, &weights, &spec.activation).map_err(BackendError::ExpertLoad)
                 })
             }
             crate::weight::expert_source::ExpertSource::W4A16(source) => decode_f32_routed(self, spec, input, assignments, |expert| {
@@ -212,6 +232,35 @@ fn decode_nvfp4_routed(ctx: &CpuContext, spec: &TopkMoeSpec, layer: usize, sourc
     })
 }
 
+fn decode_mxfp8_routed(ctx: &CpuContext, spec: &TopkMoeSpec, layer: usize, source: &dyn Mxfp8ExpertSource, input: &CpuTensor, assignments: &crate::moe::routing::ExpertAssignments) -> Result<CpuTensor, BackendError> {
+    // Mxfp8ExpertSource 不暴露 shape,分配尺寸由 MoE spec 推导
+    let hidden = input.cols;
+    let intermediate = spec.intermediate_size;
+    execute_routed_experts(ctx, input, assignments, input.rows, input.cols, |expert, expert_input| {
+        let (gate, up, down) = load_mxfp8_expert(source, layer, expert, hidden, intermediate).map_err(BackendError::ExpertLoad)?;
+        crate::kernel::cpu::moe::mxfp8_expert_batch(expert_input, &gate, &up, &down, &spec.activation).map_err(BackendError::ExpertLoad)
+    })
+}
+
+/// 按 `load_expert_into` 契约分配 gate/up/down 三个矩阵并加载。
+fn load_mxfp8_expert(source: &dyn Mxfp8ExpertSource, layer: usize, expert: usize, hidden: usize, intermediate: usize) -> Result<(Mxfp8Matrix, Mxfp8Matrix, Mxfp8Matrix), String> {
+    let alloc = |rows: usize, cols: usize| -> Result<(Vec<u8>, Vec<u8>), String> {
+        let (code_bytes, scale_bytes) = mxfp8_storage_lengths(rows, cols)?;
+        Ok((vec![0; code_bytes], vec![0; scale_bytes]))
+    };
+    let mut gate = alloc(intermediate, hidden)?;
+    let mut up = alloc(intermediate, hidden)?;
+    let mut down = alloc(hidden, intermediate)?;
+    source.load_expert_into(
+        layer,
+        expert,
+        Mxfp8MatrixBufferMut { codes: &mut gate.0, scale_inv: &mut gate.1, rows: intermediate, cols: hidden },
+        Mxfp8MatrixBufferMut { codes: &mut up.0, scale_inv: &mut up.1, rows: intermediate, cols: hidden },
+        Mxfp8MatrixBufferMut { codes: &mut down.0, scale_inv: &mut down.1, rows: hidden, cols: intermediate },
+    )?;
+    Ok((Mxfp8Matrix::new(gate.0, gate.1, intermediate, hidden)?, Mxfp8Matrix::new(up.0, up.1, intermediate, hidden)?, Mxfp8Matrix::new(down.0, down.1, hidden, intermediate)?))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_gguf_routed(ctx: &CpuContext, spec: &TopkMoeSpec, layer: usize, source: &dyn GgufExpertSource, input: &CpuTensor, assignments: &crate::moe::routing::ExpertAssignments) -> Result<CpuTensor, BackendError> {
     if source.hidden() != input.cols || source.intermediate() != spec.intermediate_size {
@@ -221,4 +270,41 @@ fn decode_gguf_routed(ctx: &CpuContext, spec: &TopkMoeSpec, layer: usize, source
         let weights = source.load_expert_gguf(layer, expert).map_err(BackendError::ExpertLoad)?;
         crate::kernel::cpu::moe::gguf_expert_batch(expert_input, &weights, &spec.activation).map_err(BackendError::ExpertLoad)
     })
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    use crate::backend::{BackendResources, LinearWeight, MoePrefillBackend};
+
+    fn dense(values: &[f32], rows: usize, cols: usize) -> CpuWeight {
+        CpuContext::default().prepare_weight(LinearWeight::F32(values), rows, cols).unwrap()
+    }
+
+    /// DeepSeek-V4.1 VL 双偏置:image 行按 bias_vl 选专家,文本行按 bias。
+    #[test]
+    fn moe_route_rows双偏置按行选bias() {
+        let (rows, columns, experts) = (4usize, 16usize, 8usize);
+        let spec = TopkMoeSpec { num_experts: experts, top_k: 2, num_shared_experts: 0, scoring_func: crate::moe::topk_moe::ScoringFunc::SqrtSoftplusBias, normalize_selected: true, routed_scaling_factor: 1.5, intermediate_size: 4, shared_intermediate_size: 0, activation: crate::moe::Activation::Silu };
+        let row: Vec<f32> = (0..columns).map(|index| (index as f32 * 0.37).sin()).collect();
+        let input = CpuTensor { data: row.repeat(rows), rows, cols: columns };
+        // bias 把 top-1 强推到专家 0;bias_vl 强推到专家 7。
+        let bias = vec![100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0];
+        let bias_vl = vec![-100.0, -100.0, -100.0, -100.0, -100.0, -100.0, -100.0, 100.0];
+        let router = dense(&(0..experts * columns).map(|index| (index as f32 * 0.11).cos()).collect::<Vec<_>>(), experts, columns);
+        let bias_weight = dense(&bias, 1, experts);
+        let bias_vl_weight = dense(&bias_vl, 1, experts);
+        let mask = vec![false, true, false, true];
+
+        let routing = CpuContext::default().moe_route_rows(&input, &router, &bias_weight, Some(&bias_vl_weight), Some(&mask), &spec).unwrap();
+        for row in 0..rows {
+            let first = routing.expert_ids[row * spec.top_k];
+            assert_eq!(first, if mask[row] { 7 } else { 0 }, "row={row} 首选专家应由 {} 决定", if mask[row] { "bias_vl" } else { "bias" });
+        }
+        // 文本行为 None 时与 moe_route 逐位一致。
+        let plain = CpuContext::default().moe_route(&input, &router, &bias_weight, &spec).unwrap();
+        for row in [0usize, 2] {
+            assert_eq!(routing.expert_ids[row * spec.top_k..(row + 1) * spec.top_k], plain.expert_ids[row * spec.top_k..(row + 1) * spec.top_k]);
+        }
+    }
 }

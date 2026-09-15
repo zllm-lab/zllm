@@ -82,6 +82,9 @@ impl Gemma4Engine {
             crate::runtime::node::SessionDescriptor { model_format: session.model_format(), model_bytes: session.model_bytes(), max_seq_len, kv_cache_format: "f16", input_modalities: modalities },
         );
         residency.configure(&mut capabilities, &runtime);
+        // 引擎走 activate_terminal_append 通用路径,瘦身后只渲染 suffix;miss 由
+        // 通用层哨兵上报。声明能力后 scheduler 命中时只发增量消息。
+        capabilities.terminal_resume_delta = true;
         eprintln!("[gemma4-kv-admission] available={:.1} MiB session={:.1} MiB", available as f64 / 1048576.0, session_residency_bytes as f64 / 1048576.0);
         Ok(Self { session, snapshot_resources, terminal_states, residency, capabilities, runtime, compute_steps })
     }
@@ -118,6 +121,11 @@ impl Gemma4Engine {
         let request_started = std::time::Instant::now();
         let segments = chat_segments(request)?;
         let has_images = segments.iter().any(|segment| matches!(segment, ContentPiece::Image { .. }));
+        // 瘦身请求的 messages 只有 [边界 assistant, ...增量]:图文请求不走终点
+        // 缓存且无法全量重建,直接哨兵让 server 重发完整请求走多模态 prefill。
+        if has_images && request.get("_zllm_resume").is_some() {
+            return Err(format!("{} <gemma4-multimodal>", crate::runtime::session::TERMINAL_RESUME_MISS));
+        }
         // 图文请求:parts 保序展开,图像就地展开为 soft-token 段(GGUF Jinja 模板无法表达
         // soft-token 展开,图文一律走硬编码 thought 模板)。纯文本保持原模板路径。
         let (tokens, multimodal) = if has_images {
@@ -159,7 +167,7 @@ impl Gemma4Engine {
                 |assistant| Ok(self.session.tokenize(&chat_prompt_suffix(request, assistant)?)),
                 &self.snapshot_resources,
             )
-            .map_err(|error| format!("Gemma4 {error}; 请重新开始会话"))?
+            .map_err(|error| if error.starts_with(crate::runtime::session::TERMINAL_RESUME_MISS) { error } else { format!("Gemma4 {error}; 请重新开始会话") })?
         };
         // resume 命中时只对 suffix 计费
         let batch_tokens = resumed.as_ref().map_or(tokens.len(), |(state, suffix)| state.pending.len().saturating_add(suffix.len()));

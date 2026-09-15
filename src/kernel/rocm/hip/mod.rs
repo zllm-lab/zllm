@@ -64,6 +64,7 @@ pub(super) fn compute_workspace_key(device_id: i32) -> (i32, usize) {
     (device_id, stream)
 }
 
+mod arena;
 mod device_buffer;
 mod device_profile;
 #[allow(dead_code)] // 动态 HIP 表覆盖诊断与 graph API，调用点按已启用能力逐步接入。
@@ -82,6 +83,7 @@ mod attn_res;
 mod audio;
 mod block_fp8;
 mod compressed_sparse;
+mod engram;
 mod gated_delta_net;
 mod hyper_connection;
 mod kda;
@@ -98,6 +100,7 @@ pub(crate) use attn_res::*;
 pub use audio::*;
 pub use block_fp8::*;
 pub use compressed_sparse::*;
+pub use engram::*;
 pub(crate) use gated_delta_net::*;
 pub use hyper_connection::*;
 pub(crate) use kda::*;
@@ -106,6 +109,7 @@ pub use moe::*;
 pub use radix_topk::*;
 pub use tensor::*;
 
+pub(crate) use arena::set_arena_bound_bytes;
 pub use device_buffer::*;
 pub(crate) use device_profile::*;
 pub use ffi::*;

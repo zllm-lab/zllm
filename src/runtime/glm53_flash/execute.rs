@@ -244,7 +244,7 @@ fn dense_ffn<B: Backend>(backend: &B, weights: &DenseFfn<B::Weight>, input: &B::
 fn prefill_moe<B: ExpertPrefillBackend>(backend: &B, model: &Glm53Flash, prepared: &Glm53MoeLayer<B::Weight>, layer: usize, experts: &mut B::PrefillExperts, input: &B::Tensor) -> Result<B::Tensor, BackendError> {
     let spec = Glm53Flash::moe_spec(model.config());
     let shared = [SharedExpertRef { gate: &prepared.shared.gate, up: &prepared.shared.up, down: &prepared.shared.down, output_gate: None }];
-    let weights = MoeFfnRef { router_weight: &prepared.router_weight, router_bias: &prepared.router_bias, shared_experts: &shared, selected_experts: None };
+    let weights = MoeFfnRef { router_weight: &prepared.router_weight, router_bias: &prepared.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
     crate::moe::prefill::prefill_experts_untraced(backend, &spec, &weights, layer, experts, input, None)
 }
 
@@ -255,10 +255,10 @@ where
 {
     let spec = Glm53Flash::moe_spec(model.config());
     let shared = [SharedExpertRef { gate: &prepared.shared.gate, up: &prepared.shared.up, down: &prepared.shared.down, output_gate: None }];
-    let weights = MoeFfnRef { router_weight: &prepared.router_weight, router_bias: &prepared.router_bias, shared_experts: &shared, selected_experts: None };
+    let weights = MoeFfnRef { router_weight: &prepared.router_weight, router_bias: &prepared.router_bias, shared_experts: &shared, selected_experts: None, router_bias_vl: None, image_rows: None };
     let shared_output = decode_shared_experts(backend, &spec, &weights, input)?;
     let expert = source.source(layer).map_err(BackendError::ExpertLoad)?;
-    let routed_weights = RoutedMoeWeightsRef { router: &prepared.router_weight, bias: &prepared.router_bias, selected_experts: None };
+    let routed_weights = RoutedMoeWeightsRef { router: &prepared.router_weight, bias: &prepared.router_bias, selected_experts: None, bias_vl: None, image_rows: None };
     let (mut output, _) = decode_routed_topk_moe(backend, &spec, routed_weights, layer, expert, state, RoutedMoeInputs { route: input, expert: input }, |_, _| Ok(None))?;
     if let Some(shared_output) = shared_output {
         output = backend.add(&output, &shared_output)?;

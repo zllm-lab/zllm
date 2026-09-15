@@ -145,7 +145,7 @@ where
     if backend.token_rows(route_input) != backend.token_rows(expert_input) {
         return Err(BackendError::Compute { msg: "MoE prefill route input 与 expert input 行数不一致".to_owned() });
     }
-    let routed_weights = || RoutedMoeWeightsRef { router: weights.router_weight, bias: weights.router_bias, selected_experts: weights.selected_experts };
+    let routed_weights = || RoutedMoeWeightsRef { router: weights.router_weight, bias: weights.router_bias, selected_experts: weights.selected_experts, bias_vl: weights.router_bias_vl, image_rows: weights.image_rows };
     let routed_inputs = || RoutedMoeInputs { route: route_input, expert: expert_input };
     if allow_resident_route
         && let Some(residual) = residual
@@ -186,7 +186,7 @@ where
     }
 
     let routing = match weights.selected_experts {
-        None => route(backend, spec, weights.router_weight, weights.router_bias, route_input)?,
+        None => route(backend, spec, weights.router_weight, weights.router_bias, weights.router_bias_vl, weights.image_rows, route_input)?,
         Some(selected) => route_selected(backend, spec, weights.router_weight, selected, route_input)?,
     };
     backend.profile_device_operator("moe_experts")?;
@@ -263,15 +263,24 @@ pub fn prefill_routed_experts<B: ExpertPrefillBackend>(
         return Err(BackendError::Compute { msg: "MoE prefill route input 与 expert input 行数不一致".to_owned() });
     }
     let routing = match weights.selected_experts {
-        None => route(backend, spec, weights.router, weights.bias, inputs.route)?,
+        None => route(backend, spec, weights.router, weights.bias, weights.bias_vl, weights.image_rows, inputs.route)?,
         Some(selected) => route_selected(backend, spec, weights.router, selected, inputs.route)?,
     };
     let tensor = execute_routed(backend, spec, layer, experts, inputs.expert, &routing, expert_batch_size)?;
     Ok(ExpertPrefillOutput { tensor, routing })
 }
 
-fn route<B: MoePrefillBackend>(backend: &B, spec: &TopkMoeSpec, router_weight: &B::Weight, router_bias: &B::Weight, input: &B::Tensor) -> Result<MoePrefillRouting, BackendError> {
-    backend.moe_route(input, router_weight, router_bias, spec)
+#[allow(clippy::too_many_arguments)]
+fn route<B: MoePrefillBackend>(
+    backend: &B,
+    spec: &TopkMoeSpec,
+    router_weight: &B::Weight,
+    router_bias: &B::Weight,
+    router_bias_vl: Option<&B::Weight>,
+    image_rows: Option<&[bool]>,
+    input: &B::Tensor,
+) -> Result<MoePrefillRouting, BackendError> {
+    backend.moe_route_rows(input, router_weight, router_bias, router_bias_vl, image_rows, spec)
 }
 
 /// 固定专家路由：专家集合由调用方预先决定（如 hash 路由），router weight 只算权重。

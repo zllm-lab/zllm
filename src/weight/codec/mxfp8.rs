@@ -10,13 +10,15 @@ pub fn decode_e8m0(bits: u8) -> f32 {
 }
 
 pub fn decode_mxfp8_matrix(codes: &[u8], scale_inv: &[u8], rows: usize, cols: usize, output: &mut [f32]) {
+    let values = std::array::from_fn::<_, 256, _>(|bits| decode_f8_e4m3(bits as u8));
+    let scales = std::array::from_fn::<_, 256, _>(|bits| decode_e8m0(bits as u8));
     let scale_cols = cols / MXFP8_BLOCK;
     for row in 0..rows {
         for block in 0..scale_cols {
-            let scale = decode_e8m0(scale_inv[row * scale_cols + block]);
+            let scale = scales[scale_inv[row * scale_cols + block] as usize];
             let start = row * cols + block * MXFP8_BLOCK;
             for column in 0..MXFP8_BLOCK {
-                output[start + column] = decode_f8_e4m3(codes[start + column]) * scale;
+                output[start + column] = values[codes[start + column] as usize] * scale;
             }
         }
     }

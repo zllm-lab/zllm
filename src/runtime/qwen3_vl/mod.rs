@@ -61,14 +61,20 @@ impl Qwen3VlImageProcessor {
         if frames.is_empty() || !frames.len().is_multiple_of(2) {
             return Err(format!("Qwen3-VL video frames={}，必须是非零偶数", frames.len()));
         }
+        // Qwen3-VL 的视频预算是所有采样帧的总像素数，不是每帧各用一次图片预算。
+        // 否则短视频也会把视觉序列放大到数万行，朴素 attention 直接申请数十 GiB。
+        let (min_pixels, max_pixels) = self.patch.pixel_budget();
+        let frame_count = frames.len();
+        let min_frame_pixels = min_pixels.div_ceil(frame_count).max(1);
+        let max_frame_pixels = max_pixels.checked_div(frame_count).filter(|value| *value >= min_frame_pixels).ok_or_else(|| format!("Qwen3-VL video 总像素预算 {max_pixels} 无法容纳 {frame_count} 帧"))?;
         let mut data = Vec::new();
         let mut grid = None;
         let mut merge_size = 0usize;
         let mut rows_per_pair = 0usize;
         let mut columns = 0usize;
         for (pair_index, pair) in frames.chunks_exact(2).enumerate() {
-            let first = self.patch.preprocess(&pair[0])?;
-            let second = self.patch.preprocess(&pair[1])?;
+            let first = self.patch.preprocess_with_pixel_budget(&pair[0], min_frame_pixels, max_frame_pixels)?;
+            let second = self.patch.preprocess_with_pixel_budget(&pair[1], min_frame_pixels, max_frame_pixels)?;
             if first.grid.temporal != 1
                 || second.grid.temporal != 1
                 || first.grid.height != second.grid.height
@@ -591,7 +597,7 @@ where
             &streamed
         };
         let result = (|| {
-            let mut hidden = text_layer(backend, config, Some(cache), layer, prepared, &hidden, rope, 0)?;
+            let mut hidden = text_layer(backend, config, Some(cache), layer, prepared, &hidden, rope, 0, None)?;
             if let Some(feature) = deepstack.get(layer) {
                 let rows = backend.token_rows(&hidden);
                 let mut addition = backend.vision_tensor_zeros(rows, config.hidden_size)?;
@@ -665,7 +671,7 @@ where
         };
         backend.begin_batch();
         let result = (|| {
-            let mut hidden = text_layer(backend, config, None, layer, prepared, &hidden, rope, 0)?;
+            let mut hidden = text_layer(backend, config, None, layer, prepared, &hidden, rope, 0, None)?;
             if layer < vision.deepstack_visual_indexes.len() && !visuals.is_empty() {
                 let mut addition = backend.vision_tensor_zeros(rows, config.hidden_size)?;
                 for visual in visuals {
@@ -724,7 +730,7 @@ where
                 streamed = prepare_text_layer(backend, &streamed_source)?;
                 &streamed
             };
-            let result = text_layer(backend, config, Some(cache), layer, prepared, &hidden, rope, position);
+            let result = text_layer(backend, config, Some(cache), layer, prepared, &hidden, rope, position, None);
             if layer >= resident.len() || result.is_err() {
                 backend.finish_batch();
             } else {
@@ -753,11 +759,74 @@ where
         let _scope = backend.layer_scope();
         let source = weights.text_layer(layer).map_err(BackendError::ExpertLoad)?;
         let prepared = prepare_text_layer(backend, &source)?;
-        let result = text_layer(backend, config, None, layer, &prepared, &hidden, rope, 0);
+        let result = text_layer(backend, config, None, layer, &prepared, &hidden, rope, 0, None);
         backend.finish_batch();
         hidden = result?;
     }
     Ok(hidden)
+}
+
+/// 一次前向收集多个 `hidden_states[k]` 并按列拼接；FLUX.2 Klein 使用 9/18/27 层。
+pub fn qwen3_text_hidden_concat<B, W: Qwen3TextSource>(backend: &B, config: &Qwen3VlConfig, weights: &W, mut hidden: B::Tensor, rope: &Qwen3VlRopeTable, output_layers: &[usize]) -> Result<B::Tensor, BackendError>
+where
+    B: GqaPrefillBackend,
+    B::Tensor: Clone,
+{
+    if output_layers.is_empty() || output_layers.windows(2).any(|pair| pair[0] >= pair[1]) || output_layers[0] == 0 || output_layers.last().copied().unwrap_or_default() > config.layer_count {
+        return Err(crate::runtime::compute_error(format!("Qwen3 hidden output layers={output_layers:?} 必须严格递增且位于 1..={}", config.layer_count)));
+    }
+    if backend.token_rows(&hidden) == 0 || backend.token_cols(&hidden) != config.hidden_size {
+        return Err(crate::runtime::compute_error(format!("Qwen3 hidden concat input=[{},{}]，期望非空且 columns={}", backend.token_rows(&hidden), backend.token_cols(&hidden), config.hidden_size)));
+    }
+    let mut outputs = Vec::with_capacity(output_layers.len());
+    let last = *output_layers.last().expect("output_layers 非空已检查");
+    for layer in 0..last {
+        let _scope = backend.layer_scope();
+        let source = weights.text_layer(layer).map_err(BackendError::ExpertLoad)?;
+        let prepared = prepare_text_layer(backend, &source)?;
+        let result = text_layer(backend, config, None, layer, &prepared, &hidden, rope, 0, None);
+        backend.finish_batch();
+        hidden = result?;
+        if output_layers.binary_search(&(layer + 1)).is_ok() {
+            outputs.push(hidden.clone());
+        }
+    }
+    let mut output = outputs.remove(0);
+    for hidden in outputs {
+        output = backend.concat_columns(&output, &hidden)?;
+    }
+    Ok(output)
+}
+
+/// 与 Qwen3 `attention_mask` 对齐的 right-padding 编码；padding query 只能看到有效 token 前缀。
+pub fn qwen3_text_hidden_concat_padded<B, W: Qwen3TextSource>(backend: &B, config: &Qwen3VlConfig, weights: &W, mut hidden: B::Tensor, rope: &Qwen3VlRopeTable, output_layers: &[usize], valid_tokens: usize) -> Result<B::Tensor, BackendError>
+where
+    B: GqaPrefillBackend,
+    B::Tensor: Clone,
+{
+    let rows = backend.token_rows(&hidden);
+    if valid_tokens == 0 || valid_tokens > rows || output_layers.is_empty() || output_layers.windows(2).any(|pair| pair[0] >= pair[1]) || output_layers[0] == 0 || output_layers.last().copied().unwrap_or_default() > config.layer_count {
+        return Err(crate::runtime::compute_error(format!("Qwen3 padded hidden rows={rows} valid={valid_tokens} output_layers={output_layers:?} 非法")));
+    }
+    let visible_ends = (0..rows).map(|row| u32::try_from((row + 1).min(valid_tokens)).map_err(|_| crate::runtime::compute_error("Qwen3 visible end 超出 u32"))).collect::<Result<Vec<_>, _>>()?;
+    let mut outputs = Vec::with_capacity(output_layers.len());
+    let last = *output_layers.last().expect("output_layers 非空已检查");
+    for layer in 0..last {
+        let _scope = backend.layer_scope();
+        let source = weights.text_layer(layer).map_err(BackendError::ExpertLoad)?;
+        let prepared = prepare_text_layer(backend, &source)?;
+        let result = text_layer(backend, config, None, layer, &prepared, &hidden, rope, 0, Some(&visible_ends));
+        backend.finish_batch();
+        hidden = result?;
+        if output_layers.binary_search(&(layer + 1)).is_ok() {
+            outputs.push(hidden.clone());
+        }
+    }
+    let mut output = outputs.remove(0);
+    for hidden in outputs {
+        output = backend.concat_columns(&output, &hidden)?;
+    }
+    Ok(output)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -792,7 +861,7 @@ where
                 streamed = prepare_text_layer(backend, &streamed_source)?;
                 &streamed
             };
-            let result = text_layer(backend, config, Some(cache), layer, prepared, &hidden, rope, position);
+            let result = text_layer(backend, config, Some(cache), layer, prepared, &hidden, rope, position, None);
             if layer >= resident.len() || result.is_err() {
                 backend.finish_batch();
             } else {
@@ -816,6 +885,7 @@ fn text_layer<B: GqaPrefillBackend>(
     hidden: &B::Tensor,
     rope: &Qwen3VlRopeTable,
     position: usize,
+    visible_ends: Option<&[u32]>,
 ) -> Result<B::Tensor, BackendError> {
     if backend.token_rows(hidden) == 1 {
         backend.begin_decode_batch();
@@ -840,9 +910,11 @@ fn text_layer<B: GqaPrefillBackend>(
         score_scale: 1.0 / (config.head_dim as f32).sqrt(),
         output_gate: false,
     };
-    let attention = match cache {
-        Some(cache) => backend.gqa_prefill_attention_cached(cache, layer, position, &query, &key, &value, &spec, false)?,
-        None => backend.gqa_prefill_attention(&query, &key, &value, &spec)?,
+    let attention = match (cache, visible_ends) {
+        (Some(_), Some(_)) => return Err(crate::runtime::compute_error("Qwen3 cached attention 与 visible_ends 不能同时使用")),
+        (Some(cache), None) => backend.gqa_prefill_attention_cached(cache, layer, position, &query, &key, &value, &spec, false)?,
+        (None, Some(visible_ends)) => backend.gqa_prefill_attention_visible(&query, &key, &value, &spec, visible_ends)?,
+        (None, None) => backend.gqa_prefill_attention(&query, &key, &value, &spec)?,
     };
     let attention_residual = backend.linear_add(&attention, &weights.output, hidden)?;
     let normed = backend.rmsnorm(&attention_residual, &weights.post_attention_norm, config.rms_eps)?;
@@ -992,6 +1064,19 @@ mod tests {
     }
 
     #[test]
+    fn video_processor_shares_pixel_budget_across_frames() {
+        let mut config = Qwen3VlConfig::instruct_32b().vision.unwrap();
+        config.min_pixels = 4 * 32 * 32;
+        config.max_pixels = 64 * 32 * 32;
+        let processor = Qwen3VlImageProcessor::new(&config).unwrap();
+        let frames = (0..8).map(|_| RgbImage::new(640, 360, vec![0; 640 * 360 * 3]).unwrap()).collect::<Vec<_>>();
+        let tensor = processor.preprocess_video(&frames).unwrap();
+        let frame_pixels = tensor.grid.height * config.patch_size * tensor.grid.width * config.patch_size;
+        assert!(frame_pixels * frames.len() <= config.max_pixels);
+        assert_eq!(tensor.grid.temporal, frames.len() / config.temporal_patch_size);
+    }
+
+    #[test]
     fn dense_14b_validates_without_vision() {
         let config = Qwen3VlConfig::dense_14b();
         config.validate().unwrap();
@@ -1101,6 +1186,30 @@ impl Qwen3VlConfig {
             max_position_embeddings: 40_960,
             bos_token_id: 151_643,
             eos_token_ids: vec![151_645, 151_643],
+            image_token_id: 151_655,
+            video_token_id: 151_656,
+            vision_start_token_id: 151_652,
+            vision_end_token_id: 151_653,
+            vision: None,
+        }
+    }
+
+    /// FLUX.2 Klein 4B 随附的 Qwen3-4B 文本编码器。
+    pub fn dense_4b_flux2() -> Self {
+        Self {
+            vocab_size: 151_936,
+            hidden_size: 2_560,
+            intermediate_size: 9_728,
+            layer_count: 36,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            rope_theta: 1_000_000.0,
+            mrope_section: [32, 32, 0],
+            rms_eps: 1.0e-6,
+            max_position_embeddings: 40_960,
+            bos_token_id: 151_643,
+            eos_token_ids: vec![151_645],
             image_token_id: 151_655,
             video_token_id: 151_656,
             vision_start_token_id: 151_652,

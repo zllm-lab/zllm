@@ -3,6 +3,87 @@
 use super::*;
 
 impl RocmContext {
+    pub(crate) fn allocate_f32_tensor(&self, rows: usize, columns: usize) -> Result<RocmTensor, BackendError> {
+        let bytes = checked_elements(rows, columns, "ROCm F32 tensor allocation")?.checked_mul(4).ok_or_else(|| compute_error("ROCm F32 tensor allocation bytes 溢出"))?;
+        let buffer = ops::hip::DeviceBuffer::allocate_reusable(self.device_id, bytes).map_err(compute_error)?;
+        Ok(device_tensor_f32(buffer, rows, columns))
+    }
+
+    /// P2P 读写端使用的 F32 分配：经 force 显式池路径，永不落到
+    /// hipMallocAsync（stream-ordered 分配不能作为 peer 端）。
+    pub(crate) fn allocate_peer_f32_tensor(&self, rows: usize, columns: usize) -> Result<RocmTensor, BackendError> {
+        let bytes = checked_elements(rows, columns, "ROCm peer F32 tensor allocation")?.checked_mul(4).ok_or_else(|| compute_error("ROCm peer F32 tensor allocation bytes 溢出"))?;
+        let buffer = ops::hip::DeviceBuffer::allocate_peer(self.device_id, bytes).map_err(compute_error)?;
+        Ok(device_tensor_f32(buffer, rows, columns))
+    }
+
+    pub(crate) fn copy_columns_into(&self, source: &RocmTensor, target: &RocmTensor, target_column_start: usize) -> Result<(), BackendError> {
+        if source.rows != target.rows
+            || source.dtype != RocmTensorDType::F32
+            || target.dtype != RocmTensorDType::F32
+            || source.layout != RocmTensorLayout::RowMajor
+            || target.layout != RocmTensorLayout::RowMajor
+            || target_column_start.checked_add(source.cols).is_none_or(|end| end > target.cols)
+        {
+            return Err(compute_error(format!("ROCm copy columns source=[{},{}] target=[{},{}] start={target_column_start} 非法", source.rows, source.cols, target.rows, target.cols)));
+        }
+        let (rows, source_columns, target_columns) = (source.rows, source.cols, target.cols);
+        let source = source.device.as_deref().ok_or_else(|| compute_error("ROCm copy columns source 缺少 device buffer"))?;
+        let target = target.device.as_deref().ok_or_else(|| compute_error("ROCm copy columns target 缺少 device buffer"))?;
+        if source.device_id() != self.device_id || target.device_id() != self.device_id {
+            return Err(compute_error(format!("ROCm copy columns device={}/{}，当前 device={}", source.device_id(), target.device_id(), self.device_id)));
+        }
+        source.copy_columns_into_ordered_f32(target, rows, source_columns, target_columns, target_column_start).map_err(compute_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn exchange_stable_columns_into_ordered(
+        left: &RocmTensor,
+        left_target: &RocmTensor,
+        left_target_column_start: usize,
+        right: &RocmTensor,
+        right_target: &RocmTensor,
+        right_target_column_start: usize,
+        completion_device_id: i32,
+    ) -> Result<(), BackendError> {
+        if left.dtype != RocmTensorDType::F32
+            || right.dtype != RocmTensorDType::F32
+            || left_target.dtype != RocmTensorDType::F32
+            || right_target.dtype != RocmTensorDType::F32
+            || left.layout != RocmTensorLayout::RowMajor
+            || right.layout != RocmTensorLayout::RowMajor
+            || left_target.layout != RocmTensorLayout::RowMajor
+            || right_target.layout != RocmTensorLayout::RowMajor
+            || left.rows != left_target.rows
+            || right.rows != right_target.rows
+            || left_target.cols != right_target.cols
+            || left_target_column_start.checked_add(left.cols).is_none_or(|end| end > left_target.cols)
+            || right_target_column_start.checked_add(right.cols).is_none_or(|end| end > right_target.cols)
+        {
+            return Err(compute_error("ROCm ordered column exchange dtype/layout/shape 不兼容"));
+        }
+        let (left_rows, left_columns, right_rows, right_columns, target_columns) = (left.rows, left.cols, right.rows, right.cols, left_target.cols);
+        let left = left.device.as_ref().ok_or_else(|| compute_error("ROCm ordered column exchange 缺少 left source"))?;
+        let right = right.device.as_ref().ok_or_else(|| compute_error("ROCm ordered column exchange 缺少 right source"))?;
+        let left_target = left_target.device.as_ref().ok_or_else(|| compute_error("ROCm ordered column exchange 缺少 left target"))?;
+        let right_target = right_target.device.as_ref().ok_or_else(|| compute_error("ROCm ordered column exchange 缺少 right target"))?;
+        ops::hip::DeviceBuffer::exchange_stable_columns_into_ordered_async_retained_by(
+            left,
+            left_target,
+            left_rows,
+            left_columns,
+            left_target_column_start,
+            right,
+            right_target,
+            right_rows,
+            right_columns,
+            right_target_column_start,
+            target_columns,
+            completion_device_id,
+        )
+        .map_err(compute_error)
+    }
+
     /// H3 block cache 等 ROCm 模型组合使用的 resident 差值；不扩展所有 backend
     /// 的公共 capability，因为 cache 判据本身仍是平台组合策略。
     pub(crate) fn subtract_resident(&self, left: &RocmTensor, right: &RocmTensor) -> Result<RocmTensor, BackendError> {
@@ -464,6 +545,17 @@ impl Backend for RocmContext {
         Ok((self.tensor_from_f32(left, input.rows, left_columns).map_err(compute_error)?, self.tensor_from_f32(right, input.rows, right_columns).map_err(compute_error)?))
     }
 
+    fn slice_columns_range(&self, input: &Self::Tensor, range: std::ops::Range<usize>) -> Result<Self::Tensor, BackendError> {
+        if input.rows == 0 || range.start >= range.end || range.end > input.cols {
+            return Err(compute_error(format!("ROCm column slice input=[{},{}] range={range:?} 非法", input.rows, input.cols)));
+        }
+        let columns = range.end - range.start;
+        let input = f32_tensor(self, input)?;
+        let device = input.device.as_deref().ok_or_else(|| compute_error("ROCm column slice 缺少 device buffer"))?;
+        let output = ops::hip::try_slice_columns_resident_f32(self.device_id, device, input.rows, input.cols, range).map_err(compute_error)?;
+        Ok(device_tensor_f32(output, input.rows, columns))
+    }
+
     fn split_interleaved_columns(&self, input: &Self::Tensor, block_columns: usize) -> Result<(Self::Tensor, Self::Tensor), BackendError> {
         if let Some(device) = input.device.as_deref() {
             let (left, right) = ops::hip::try_split_interleaved_columns_resident_f32(self.device_id, device, input.rows, input.cols, block_columns).map_err(compute_error)?;
@@ -475,16 +567,19 @@ impl Backend for RocmContext {
     }
 
     fn concat_columns(&self, left: &Self::Tensor, right: &Self::Tensor) -> Result<Self::Tensor, BackendError> {
-        if left.rows != right.rows || left.dtype != right.dtype {
-            return Err(compute_error(format!("ROCm concat shape/dtype [{},{},{:?}] 与 [{},{},{:?}] 不一致", left.rows, left.cols, left.dtype, right.rows, right.cols, right.dtype)));
+        if left.rows != right.rows {
+            return Err(compute_error(format!("ROCm concat rows {} 与 {} 不一致", left.rows, right.rows)));
         }
         let columns = left.cols.checked_add(right.cols).ok_or_else(|| compute_error("ROCm concat 列数溢出".to_owned()))?;
+        // concat kernel 固定消费 F32；先显式提升，既支持混合 F32/BF16，也避免把同为 BF16 的 buffer 误按 F32 读取。
+        let left = self.tensor_as_f32(left.clone())?;
+        let right = self.tensor_as_f32(right.clone())?;
         if let (Some(left_device), Some(right_device)) = (left.device.as_deref(), right.device.as_deref()) {
             let output = ops::hip::try_concat_columns_resident_f32(self.device_id, left_device, right_device, left.rows, left.cols, right.cols).map_err(compute_error)?;
             return Ok(device_tensor_f32(output, left.rows, columns));
         }
-        let left_data = tensor_data(left)?;
-        let right_data = tensor_data(right)?;
+        let left_data = tensor_data(&left)?;
+        let right_data = tensor_data(&right)?;
         let output = ops::hip::try_concat_columns_f32(&left_data, &right_data, left.rows, left.cols, right.cols).map_err(compute_error)?;
         self.upload_cpu_reference("host concat columns", output, left.rows, columns)
     }

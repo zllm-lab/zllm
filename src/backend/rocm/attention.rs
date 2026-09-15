@@ -227,6 +227,45 @@ fn gpu_hot_attention_into(
         return Ok(false);
     }
     let selection = selection.ok_or_else(|| compute_error("GPU hot MLA 缺少 device selection"))?;
+    // 大批 query/输出投影仍只算一次；仅选集 gather/scan 分段，限制
+    // query_rows × top_k 的临时 MLA 副本，并尽量让选集可填入已有 hot 槽。
+    // 小于 16 行会切换到 decode 的 8 头扫描，改变大 prefill 的舍入路径。
+    // gather 可直接输出放不进热槽的行，因此允许最多 32 行的有界临时区。
+    let tile_limit = ((cached.committed_rows.saturating_sub(65)) / width.max(1)).clamp(16, MLA_HOT_PREFILL_TILE_ROWS);
+    if super::kv_cache::gpu_hot_prefill_enabled() && query.rows > tile_limit {
+        let mut start = 0;
+        while start < query.rows {
+            let remaining = query.rows - start;
+            // 尾块也至少 16 行，避免 32 头扫描和 BF16 输出随切分边界改变。
+            let rows = if remaining <= MLA_HOT_PREFILL_TILE_ROWS { remaining } else { tile_limit.min(remaining - 16) };
+            let query_tile = tensor_row_view(query, start, rows, "GPU hot prefill query")?;
+            let ids_bytes = rows * width * std::mem::size_of::<u32>();
+            let ids = ops::hip::DeviceBuffer::allocate_reusable(context.device_id, ids_bytes).map_err(compute_error)?;
+            ids.copy_from_device(0, selection, start * width * 4, ids_bytes).map_err(compute_error)?;
+            let bytes = rows * spec.q_projection_size * std::mem::size_of::<u16>();
+            let tile_output = ops::hip::DeviceBuffer::allocate_reusable(context.device_id, bytes).map_err(compute_error)?;
+            gpu_hot_attention_tile_into(context, &query_tile, cached, hot, kv_b, spec, Some(&ids), width, &tile_output)?;
+            output.copy_from_device(start * spec.q_projection_size * 2, &tile_output, 0, bytes).map_err(compute_error)?;
+            start += rows;
+        }
+        return Ok(true);
+    }
+    gpu_hot_attention_tile_into(context, query, cached, hot, kv_b, spec, Some(selection), width, output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gpu_hot_attention_tile_into(
+    context: &RocmContext,
+    query: &RocmTensor,
+    cached: &super::kv_cache::RocmPagedMlaLayer,
+    hot: &mut super::kv_cache::RocmMlaCpuHotLayer,
+    kv_b: &RocmWeight,
+    spec: &crate::attention::mla::MlaSpec,
+    selection: Option<&ops::hip::DeviceBuffer>,
+    width: usize,
+    output: &ops::hip::DeviceBuffer,
+) -> Result<bool, BackendError> {
+    let selection = selection.ok_or_else(|| compute_error("GPU hot MLA 缺少 device selection"))?;
     let query_device = query.device.as_deref().ok_or_else(|| compute_error("GPU hot query 缺少 device"))?;
     let kv_weight = ct_mla_weight(kv_b)?;
     if ops::hip::options().mla_hot_trace && query.rows > 1 {
@@ -886,12 +925,6 @@ impl RocmContext {
                 let stable = if source.is_async_allocated() { Arc::new(source.copy_to_stable_deferred().map_err(compute_error)?) } else { source.clone() };
                 let copied = Arc::new(stable.copy_stable_to_device_ordered_async_retained_by(peer.device_id, self.device_id).map_err(|error| compute_error(format!("L{layer} operator selection owner->peer: {error}")))?);
                 cache.cache_operator_selection(peer.device_id, source.clone(), copied.clone())?;
-                // 拷贝在 peer 流上读 owner 侧 selection；owner completion 与下一次
-                // select 的 invalidate 都只按 owner 流记账，不覆盖 peer 流。DSA
-                // 分片把扫描搬到 peer 后两流完成顺序反转，owner 先退休会让池提前
-                // 复用/trim 源显存——由 pair worker 的 stage completion 保活到
-                // peer 流排空。与 7617c4a1 两处补丁同类，此处为第三个漏网调用点。
-                worker.retain_for_stage(vec![stable])?;
                 Some(copied)
             }
         } else {
@@ -1007,6 +1040,9 @@ impl RocmContext {
                 cache.feed_peer_mirror_layer(&peer, layer)?;
             }
             let attention = paged_mla_attention_with_selection(&peer, &peer_query, &cache, &peer_kv_b, layer, &peer_mla, peer_selection.as_deref(), peer_host_selection.as_deref().map(Vec::as_slice), selection_width)?;
+            if super::context::probe_sync_mask(2) {
+                peer.synchronize_compute_stream().map_err(|error| compute_error(format!("probe-sync attn-peer L{layer}: {error:?}")))?;
+            }
             drop(cache);
             let partial = peer.tensor_to_stable_deferred(peer.tensor_as_f32(peer.linear(&attention, &peer_o)?)?)?;
             let partial = partial.device.ok_or_else(|| compute_error(format!("L{layer} operator peer partial 缺少 device buffer")))?;
@@ -1050,7 +1086,13 @@ impl RocmContext {
                 }
             }
         };
+        if super::context::probe_sync_mask(32) {
+            self.synchronize_compute_stream().map_err(|error| compute_error(format!("probe-sync mla-append L{layer}: {error:?}")))?;
+        }
         let owner_attention = paged_mla_attention_with_selection(self, &owner_query, cache, &weights.owner_kv_b, layer, &owner_mla, selection.as_deref(), host_selection, selection_width)?;
+        if super::context::probe_sync_mask(1) {
+            self.synchronize_compute_stream().map_err(|error| compute_error(format!("probe-sync attn-owner L{layer}: {error:?}")))?;
+        }
         let owner_partial = self.tensor_to_stable_deferred(self.tensor_as_f32(self.linear(&owner_attention, &weights.owner_o)?)?)?;
         let owner_partial = owner_partial.device.ok_or_else(|| compute_error("operator MLA owner partial 缺少 device buffer"))?;
         let (peer_partial, peer_residual) = ticket.wait()?;
@@ -2127,6 +2169,36 @@ impl GqaPrefillBackend for RocmContext {
         Ok(device_tensor_f32(output, query.rows, query.cols))
     }
 
+    fn gqa_prefill_attention_visible(&self, query: &Self::Tensor, key: &Self::Tensor, value: &Self::Tensor, spec: &crate::attention::gqa::GqaSpec, visible_ends: &[u32]) -> Result<Self::Tensor, BackendError> {
+        let query_cols = spec.num_heads.checked_mul(spec.head_dim).ok_or_else(|| compute_error("Rocm GQA query 维度溢出"))?;
+        let kv_cols = spec.num_kv_heads.checked_mul(spec.head_dim).ok_or_else(|| compute_error("Rocm GQA KV 维度溢出"))?;
+        if query.rows != key.rows || query.rows != value.rows || query.cols != query_cols || key.cols != kv_cols || value.cols != kv_cols || visible_ends.len() != query.rows {
+            return Err(compute_error(format!("Rocm GQA visible prefill shape 异常: Q=[{},{}] K=[{},{}] V=[{},{}] visible={}", query.rows, query.cols, key.rows, key.cols, value.rows, value.cols, visible_ends.len())));
+        }
+        let query = self.tensor_as_f32(query.clone())?;
+        let key = self.tensor_as_f32(key.clone())?;
+        let value = self.tensor_as_f32(value.clone())?;
+        let mut ranges = Vec::with_capacity(visible_ends.len() * 2);
+        for &end in visible_ends {
+            ranges.extend_from_slice(&[0, end]);
+        }
+        let output = ops::hip::try_block_attention_resident_f32(
+            self.device_id,
+            query.device.as_deref().ok_or_else(|| compute_error("Rocm GQA visible query 缺少 device buffer"))?,
+            key.device.as_deref().ok_or_else(|| compute_error("Rocm GQA visible key 缺少 device buffer"))?,
+            value.device.as_deref().ok_or_else(|| compute_error("Rocm GQA visible value 缺少 device buffer"))?,
+            &ranges,
+            query.rows,
+            key.rows,
+            spec.num_heads,
+            spec.num_kv_heads,
+            spec.head_dim,
+            spec.score_scale,
+        )
+        .map_err(compute_error)?;
+        Ok(device_tensor_f32(output, query.rows, query.cols))
+    }
+
     fn gqa_prefill_attention_cached(
         &self,
         cache: &mut Self::Cache,
@@ -2245,7 +2317,118 @@ impl GqaPrefillBackend for RocmContext {
 
 #[cfg(test)]
 mod tests {
-    use super::common_mla_output_element_bytes;
+    use super::*;
+
+    #[test]
+    #[ignore = "需要 ROCm GPU"]
+    fn mla_hot_prefill_matches_full_history_without_restoring_prefix() {
+        const HOT: usize = 32768;
+        const LATENT: usize = 512;
+        const ROPE: usize = 64;
+        const WIDTH: usize = 2048;
+        ops::hip::configure(ops::hip::RocmOptions { mla_cpu_hot_rows: HOT, mla_gpu_resident_reserve_bytes: Some(usize::MAX), mla_decode_tile_size: 64, mla_decode_split_threshold: 128, memory_pool: true, ..Default::default() }).unwrap();
+        ops::hip::enable_device_buffer_reuse();
+        let context = RocmContext::new(0).unwrap();
+        let spec = crate::attention::mla::MlaSpec {
+            q_lora_rank: 128,
+            kv_lora_rank: LATENT,
+            qk_rope_head_dim: ROPE,
+            q_projection_size: 32 * 256,
+            kv_projection_size: 32 * 448,
+            num_heads: 32,
+            rope_theta: 10000.0,
+            rotary_layout: crate::attention::rope::RotaryLayout::SplitHalf,
+        };
+        let packed = (0..spec.kv_projection_size * LATENT).map(|i| ((i * 17 % 63) + 97) as u8).collect::<Vec<_>>();
+        let scales = vec![half::f16::from_f32(0.002).to_bits(); spec.kv_projection_size * LATENT / 32];
+        let scales = scales.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+        let weights = RocmWeight {
+            rows: spec.kv_projection_size,
+            cols: LATENT,
+            inner: RocmWeightInner::Quantized(RocmQuantizedWeight::W8A16 {
+                packed: Arc::new(ops::hip::DeviceBuffer::upload(0, &packed).unwrap()),
+                scales: Arc::new(ops::hip::DeviceBuffer::upload(0, &scales).unwrap()),
+                scale_dtype: ScaleDType::F16,
+                group_size: 32,
+            }),
+            expert_gguf: None,
+            cpu_mla_data: None,
+        };
+        let mut cache = RocmKvCache::with_capacity(1, 131072);
+        cache.set_stage_decode(false).unwrap();
+        let mut position = 0;
+        // 覆盖跨热窗、大块 append、分段边界及尾部单行；选集必须含新增 KV。
+        for rows in [81921, 1, 3, 14, 15, 16, 17, 31, 32, 33, 47, 128, 257] {
+            context.activate().unwrap();
+            let latent = context.tensor_from_f32((0..rows * LATENT).map(|i| (((i + position * LATENT) * 29 % 127) as f32 - 63.0) / 64.0).collect(), rows, LATENT).unwrap();
+            let rope = context.tensor_from_f32((0..rows * ROPE).map(|i| (((i + position * ROPE) * 13 % 127) as f32 - 63.0) / 128.0).collect(), rows, ROPE).unwrap();
+            cache.append_mla(&context, 0, &latent, &rope).unwrap();
+            if position == 0 {
+                position += rows;
+                // 冷恢复并提前注册后，后续 append 仍须与完整历史逐位一致。
+                let snapshot = cache.download_layers().unwrap();
+                cache = RocmKvCache::with_capacity(1, 131072);
+                cache.upload_layers(&context, &snapshot, position + 4096).unwrap();
+                cache.prepare_restored_hot_history(&context, None, position + 4096).unwrap();
+                continue;
+            }
+            let cached = cache.paged_layers[0].as_ref().unwrap();
+            assert!(cached.cpu_hot.is_some());
+            assert_eq!(cached.committed_rows, HOT);
+            assert_eq!(cache.allocated_bytes(), (HOT * 656) as u64);
+            let query = context.tensor_from_f32((0..rows * spec.q_projection_size).map(|i| ((i * 7 % 31) as f32 - 15.0) / 32.0).collect(), rows, spec.q_projection_size).unwrap();
+            let selection = (0..rows).flat_map(|r| (0..WIDTH).map(move |i| if i == 0 { (position + r) as u32 } else { ((i * 251 + r * 17) % (position + r + 1)) as u32 })).collect::<Vec<_>>();
+            let selection_bytes = selection.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+            let selection = ops::hip::DeviceBuffer::upload(0, &selection_bytes).unwrap();
+            let actual = paged_mla_attention_with_selection(&context, &query, &cache, &weights, 0, &spec, Some(&selection), None, WIDTH).unwrap();
+            // 绕开缓存策略，直接扫描完整量化历史，独立验证选集 gather 与分段边界。
+            let record = cache.download_layers().unwrap().remove(0).unwrap();
+            let full_latent = ops::hip::DeviceBuffer::upload(0, &record.latent).unwrap();
+            let full_scales = ops::hip::DeviceBuffer::upload(0, record.latent_scales.as_deref().unwrap()).unwrap();
+            let full_rope = ops::hip::DeviceBuffer::upload(0, &record.rope).unwrap();
+            let table = (0..record.rows as u32).flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>();
+            let table = ops::hip::DeviceBuffer::upload(0, &table).unwrap();
+            let element_bytes = mla_output_element_bytes(rows);
+            let expected = ops::hip::DeviceBuffer::allocate(0, rows * spec.q_projection_size * element_bytes).unwrap();
+            ops::hip::try_paged_mla_attention_ct_into(
+                0,
+                query.device.as_deref().unwrap(),
+                &full_latent,
+                Some(&full_scales),
+                record.latent_group_size,
+                &full_rope,
+                &table,
+                Some(&selection),
+                ct_mla_weight(&weights).unwrap(),
+                rows,
+                record.rows,
+                position,
+                spec.q_projection_size,
+                spec.num_heads,
+                ROPE,
+                WIDTH,
+                1,
+                &expected,
+                None,
+            )
+            .unwrap();
+            let mut actual_bytes = vec![0; rows * spec.q_projection_size * element_bytes];
+            let mut expected_bytes = actual_bytes.clone();
+            actual.device.as_ref().unwrap().copy_to_host(&mut actual_bytes).unwrap();
+            expected.copy_to_host(&mut expected_bytes).unwrap();
+            let value = |bytes: &[u8]| if element_bytes == 4 { f32::from_le_bytes(bytes.try_into().unwrap()) } else { half::bf16::from_le_bytes(bytes.try_into().unwrap()).to_f32() };
+            let mut max_abs = 0.0_f32;
+            for (i, (a, b)) in actual_bytes.chunks_exact(element_bytes).zip(expected_bytes.chunks_exact(element_bytes)).enumerate() {
+                let actual = value(a);
+                let expected = value(b);
+                max_abs = max_abs.max((actual - expected).abs());
+                assert!(actual.is_finite() && expected.is_finite() && (actual - expected).abs() <= 1e-2 + 1e-2 * expected.abs(), "rows={rows} element={i} actual={actual} expected={expected}");
+            }
+            eprintln!("[mla-hot-full-oracle] rows={rows} position={position} max_abs={max_abs}");
+            assert!(actual_bytes == expected_bytes, "rows={rows} max_abs={max_abs} 分段必须保持完整历史的计算路径与逐位输出");
+            position += rows;
+        }
+    }
 
     #[test]
     fn segmented_mla输出精度按每个session的query_rows确定() {

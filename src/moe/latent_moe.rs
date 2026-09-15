@@ -78,7 +78,7 @@ pub fn prefill<B: ExpertPrefillBackend>(
 ) -> Result<ExpertPrefillOutput<B::Tensor>, BackendError> {
     validate(spec)?;
     let expert_input = backend.linear(input, &weights.routed_down_projection)?;
-    let routed_weights = super::topk_moe::RoutedMoeWeightsRef { router: &weights.router_weight, bias: &weights.router_bias, selected_experts: None };
+    let routed_weights = super::topk_moe::RoutedMoeWeightsRef { router: &weights.router_weight, bias: &weights.router_bias, selected_experts: None, bias_vl: None, image_rows: None };
     let routed_inputs = super::topk_moe::RoutedMoeInputs { route: input, expert: &expert_input };
     let routed = prefill_routed_experts(backend, &spec.routed, routed_weights, layer, experts, routed_inputs, None)?;
     let tensor = merge_shared(backend, spec, weights, input, &routed.tensor)?;
@@ -93,7 +93,7 @@ where
 {
     validate(spec)?;
     let expert_input = backend.linear(input, &weights.routed_down_projection)?;
-    let routed_weights = RoutedMoeWeightsRef { router: &weights.router_weight, bias: &weights.router_bias, selected_experts: None };
+    let routed_weights = RoutedMoeWeightsRef { router: &weights.router_weight, bias: &weights.router_bias, selected_experts: None, bias_vl: None, image_rows: None };
     let inputs = RoutedMoeInputs { route: input, expert: &expert_input };
     // LatentMoE 的 shared MLP 由 merge_shared 无条件执行，不依赖回调触发标志。
     let (routed, _) = decode_routed_topk_moe(backend, &spec.routed, routed_weights, layer, source, state, inputs, on_routed)?;

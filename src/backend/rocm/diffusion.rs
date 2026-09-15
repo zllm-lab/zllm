@@ -8,7 +8,84 @@ use crate::{
     kernel::rocm::hip,
 };
 
-use super::{RocmContext, RocmTensor, compute_error, device_tensor_f32, f32_tensor, resident_weight};
+use super::{RocmContext, RocmTensor, RocmTensorDType, compute_error, device_tensor_bf16, device_tensor_f32, f32_tensor, resident_weight};
+
+impl RocmContext {
+    /// Ulysses source shard 在传输前完成 Q/K norm、RoPE 与 BF16 round。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_compact_qkv_heads_bf16(
+        &self,
+        tensor: &RocmTensor,
+        query_norm: &super::RocmWeight,
+        key_norm: &super::RocmWeight,
+        total_heads: usize,
+        heads: std::ops::Range<usize>,
+        head_dim: usize,
+        rotary_dim: usize,
+        eps: f32,
+        table_row_start: usize,
+        cosine: &[f32],
+        sine: &[f32],
+    ) -> Result<RocmTensor, BackendError> {
+        if tensor.dtype != RocmTensorDType::F32 || heads.start >= heads.end || heads.end > total_heads {
+            return Err(compute_error(format!("ROCm prepare compact QKV dtype={:?} heads={heads:?}/{total_heads} 非法", tensor.dtype)));
+        }
+        let expected_cols = total_heads.checked_mul(head_dim).and_then(|value| value.checked_mul(3)).ok_or_else(|| compute_error("ROCm prepare compact QKV cols 溢出"))?;
+        if tensor.cols != expected_cols {
+            return Err(compute_error(format!("ROCm prepare compact QKV cols={}，期望 {expected_cols}", tensor.cols)));
+        }
+        let source = tensor.device.as_deref().ok_or_else(|| compute_error("ROCm prepare compact QKV 缺少 device buffer"))?;
+        if source.device_id() != self.device_id {
+            return Err(compute_error(format!("ROCm prepare compact QKV device={}，当前 device={}", source.device_id(), self.device_id)));
+        }
+        let query_norm = query_norm.resident().map(Arc::as_ref).filter(|_| !query_norm.resident_bf16()).ok_or_else(|| compute_error("ROCm prepare compact QKV query norm 缺少 F32 resident weight"))?;
+        let key_norm = key_norm.resident().map(Arc::as_ref).filter(|_| !key_norm.resident_bf16()).ok_or_else(|| compute_error("ROCm prepare compact QKV key norm 缺少 F32 resident weight"))?;
+        let local_heads = heads.len();
+        let output = hip::try_prepare_compact_attention_qkv_range_resident_bf16(
+            self.device_id,
+            source,
+            query_norm,
+            key_norm,
+            tensor.rows,
+            table_row_start,
+            total_heads,
+            heads.start,
+            local_heads,
+            head_dim,
+            rotary_dim,
+            eps,
+            cosine,
+            sine,
+        )
+        .map_err(compute_error)?;
+        Ok(device_tensor_bf16(output, tensor.rows, local_heads * head_dim * 3))
+    }
+
+    pub(crate) fn full_attention_prepared_qkv_bf16(&self, qkv: RocmTensor, head_count: usize, head_dim: usize, score_scale: f32) -> Result<RocmTensor, BackendError> {
+        let columns = head_count.checked_mul(head_dim).ok_or_else(|| compute_error("ROCm prepared QKV attention columns 溢出"))?;
+        if qkv.dtype != RocmTensorDType::Bf16 || qkv.cols != columns.checked_mul(3).ok_or_else(|| compute_error("ROCm prepared QKV attention input columns 溢出"))? {
+            return Err(compute_error(format!("ROCm prepared QKV attention input=[{},{}] dtype={:?} heads={head_count} head_dim={head_dim}", qkv.rows, qkv.cols, qkv.dtype)));
+        }
+        let rows = qkv.rows;
+        let qkv = qkv.device.ok_or_else(|| compute_error("ROCm prepared QKV attention 缺少 device buffer"))?;
+        let qkv = Arc::try_unwrap(qkv).map_err(|_| compute_error("ROCm prepared QKV attention device buffer 仍被共享"))?;
+        let output = hip::try_full_attention_prepared_qkv_resident_bf16(self.device_id, qkv, rows, head_count, head_dim, score_scale).map_err(compute_error)?;
+        Ok(device_tensor_f32(output, rows, columns))
+    }
+
+    pub(crate) fn compact_prepared_qkv_heads_bf16(&self, tensor: &RocmTensor, total_heads: usize, heads: std::ops::Range<usize>, head_dim: usize) -> Result<RocmTensor, BackendError> {
+        if tensor.dtype != RocmTensorDType::Bf16 || heads.start >= heads.end || heads.end > total_heads {
+            return Err(compute_error(format!("ROCm compact prepared QKV dtype={:?} heads={heads:?}/{total_heads} 非法", tensor.dtype)));
+        }
+        let expected_cols = total_heads.checked_mul(head_dim).and_then(|value| value.checked_mul(3)).ok_or_else(|| compute_error("ROCm compact prepared QKV cols 溢出"))?;
+        if tensor.cols != expected_cols {
+            return Err(compute_error(format!("ROCm compact prepared QKV cols={}，期望 {expected_cols}", tensor.cols)));
+        }
+        let source = tensor.device.as_deref().ok_or_else(|| compute_error("ROCm compact prepared QKV 缺少 device buffer"))?;
+        let output = hip::try_compact_prepared_attention_qkv_range_resident_bf16(self.device_id, source, tensor.rows, total_heads, heads.start, heads.len(), head_dim).map_err(compute_error)?;
+        Ok(device_tensor_bf16(output, tensor.rows, heads.len() * head_dim * 3))
+    }
+}
 
 impl DiffusionBackend for RocmContext {
     fn transfer_tensor(&self, tensor: Self::Tensor) -> Result<Self::Tensor, BackendError> {
@@ -177,10 +254,22 @@ impl DiffusionBackend for RocmContext {
         let query = self.tensor_as_f32(query)?.device.ok_or_else(|| compute_error("ROCm full attention query 缺少 device buffer"))?;
         let key = self.tensor_as_f32(key)?.device.ok_or_else(|| compute_error("ROCm full attention key 缺少 device buffer"))?;
         let value = self.tensor_as_f32(value)?.device.ok_or_else(|| compute_error("ROCm full attention value 缺少 device buffer"))?;
-        let query = std::sync::Arc::try_unwrap(query).map_err(|_| compute_error("ROCm full attention query device buffer 仍被共享"))?;
-        let key = std::sync::Arc::try_unwrap(key).map_err(|_| compute_error("ROCm full attention key device buffer 仍被共享"))?;
-        let value = std::sync::Arc::try_unwrap(value).map_err(|_| compute_error("ROCm full attention value device buffer 仍被共享"))?;
-        let output = hip::try_full_attention_resident_f32(self.device_id, query, key, value, rows, head_count, head_dim, score_scale).map_err(compute_error)?;
+        // 宽 head 的长序列用 wave 归约；短序列保留低寄存器的 block 路径。
+        let output = if head_dim <= 128 {
+            let query = std::sync::Arc::try_unwrap(query).map_err(|_| compute_error("ROCm full attention query device buffer 仍被共享"))?;
+            let key = std::sync::Arc::try_unwrap(key).map_err(|_| compute_error("ROCm full attention key device buffer 仍被共享"))?;
+            let value = std::sync::Arc::try_unwrap(value).map_err(|_| compute_error("ROCm full attention value device buffer 仍被共享"))?;
+            hip::try_full_attention_resident_f32(self.device_id, query, key, value, rows, head_count, head_dim, score_scale)
+        } else if head_dim == 512 && rows >= 4096 {
+            hip::try_full_attention_wide_resident_f32(self.device_id, &query, &key, &value, rows, head_count, head_dim, score_scale)
+        } else {
+            let mut visible = Vec::with_capacity(rows * 2);
+            for _ in 0..rows {
+                visible.extend_from_slice(&[0, u32::try_from(rows).map_err(|_| compute_error("ROCm full attention rows 超过 u32"))?]);
+            }
+            hip::try_block_attention_resident_f32(self.device_id, &query, &key, &value, &visible, rows, rows, head_count, head_count, head_dim, score_scale)
+        }
+        .map_err(compute_error)?;
         Ok(device_tensor_f32(output, rows, cols))
     }
 
@@ -205,6 +294,46 @@ impl DiffusionBackend for RocmContext {
         let value = std::sync::Arc::try_unwrap(value).map_err(|_| compute_error("ROCm batched full attention value device buffer 仍被共享"))?;
         let output = hip::try_full_attention_batched_resident_f32(self.device_id, query, key, value, batch, rows, head_count, head_dim, score_scale).map_err(compute_error)?;
         Ok(device_tensor_f32(output, total_rows, cols))
+    }
+
+    fn varlen_attention(&self, query: Self::Tensor, key: Self::Tensor, value: Self::Tensor, query_offsets: &[usize], kv_offsets: &[usize], head_count: usize, head_dim: usize, score_scale: f32) -> Result<Self::Tensor, BackendError> {
+        use crate::backend::{BlockAttentionBackend, SegmentedTensorBackend};
+        let geometry = crate::attention::gqa::GqaGeometry { num_heads: head_count, num_kv_heads: head_count, head_dim };
+        let spec = crate::attention::block::BlockAttentionSpec::varlen(geometry, query.rows, key.rows, query_offsets, kv_offsets, score_scale).map_err(compute_error)?;
+        let columns = geometry.query_columns().map_err(compute_error)?;
+        if query.cols != columns || key.cols != columns || value.cols != columns || key.rows != value.rows {
+            return Err(compute_error(format!("ROCm varlen attention shape 不一致: Q=[{},{}] K=[{},{}] V=[{},{}] heads={head_count} dim={head_dim}", query.rows, query.cols, key.rows, key.cols, value.rows, value.cols)));
+        }
+        if query_offsets != kv_offsets || head_dim > 128 || !head_dim.is_multiple_of(16) {
+            return self.block_attention(&query, &key, &value, &spec);
+        }
+        // 相邻等长窗口共享一次 WMMA attention；边缘窗口保持各自边界，不做 padding 扩窗。
+        let mut outputs = Vec::new();
+        let mut first = 0;
+        while first + 1 < query_offsets.len() {
+            let rows = query_offsets[first + 1] - query_offsets[first];
+            let mut end = first + 1;
+            while end + 1 < query_offsets.len() && query_offsets[end + 1] - query_offsets[end] == rows {
+                end += 1;
+            }
+            let total = query_offsets[end] - query_offsets[first];
+            let q = self.slice_token_rows(&query, query_offsets[first], total)?;
+            let k = self.slice_token_rows(&key, query_offsets[first], total)?;
+            let v = self.slice_token_rows(&value, query_offsets[first], total)?;
+            let output = if head_dim == 128 {
+                let take = |tensor| -> Result<hip::DeviceBuffer, BackendError> {
+                    let buffer = self.tensor_as_f32(tensor)?.device.ok_or_else(|| compute_error("ROCm varlen attention 缺少 device buffer"))?;
+                    Arc::try_unwrap(buffer).map_err(|_| compute_error("ROCm varlen attention view 仍被共享"))
+                };
+                let output = hip::try_full_attention_batched_zero_margin_resident_f32(self.device_id, take(q)?, take(k)?, take(v)?, end - first, rows, head_count, score_scale).map_err(compute_error)?;
+                device_tensor_f32(output, total, columns)
+            } else {
+                self.full_attention_batched(q, k, v, end - first, rows, head_count, head_dim, score_scale)?
+            };
+            outputs.push(output);
+            first = end;
+        }
+        self.concat_token_rows(&outputs.iter().collect::<Vec<_>>())
     }
 
     fn adaln_modulate(&self, input: &Self::Tensor, shift: &Self::Tensor, scale: &Self::Tensor) -> Result<Self::Tensor, BackendError> {
@@ -316,9 +445,34 @@ impl DiffusionBackend for RocmContext {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::{Backend, BackendResources, DiffusionBackend, LinearWeight};
+    use crate::backend::{Backend, BackendResources, DiffusionBackend, LinearWeight, SegmentedTensorBackend};
 
     use super::RocmContext;
+
+    #[test]
+    #[ignore = "需要 ROCm device 0"]
+    fn wide_full_attention_matches_cpu() {
+        let context = RocmContext::new(0).unwrap();
+        let cpu = crate::backend::cpu::CpuContext;
+        for (rows, heads, dim) in [(1, 1, 129), (7, 3, 193), (8, 1, 256), (9, 1, 511), (33, 3, 512)] {
+            let columns = heads * dim;
+            let query = (0..rows * columns).map(|i| ((i * 17 % 251) as f32 - 125.0) / 31.0).collect::<Vec<_>>();
+            let key = (0..rows * columns).map(|i| ((i * 29 % 257) as f32 - 128.0) / 43.0).collect::<Vec<_>>();
+            let value = (0..rows * columns).map(|i| ((i * 11 % 263) as f32 - 131.0) / 67.0).collect::<Vec<_>>();
+            let scale = (dim as f32).sqrt().recip();
+            let expected = cpu
+                .full_attention(cpu.diffusion_tensor_from_f32(&query, rows, columns).unwrap(), cpu.diffusion_tensor_from_f32(&key, rows, columns).unwrap(), cpu.diffusion_tensor_from_f32(&value, rows, columns).unwrap(), heads, dim, scale)
+                .unwrap();
+            let query = context.diffusion_tensor_from_f32(&query, rows, columns).unwrap();
+            let key = context.diffusion_tensor_from_f32(&key, rows, columns).unwrap();
+            let value = context.diffusion_tensor_from_f32(&value, rows, columns).unwrap();
+            let actual = super::hip::try_full_attention_wide_resident_f32(0, query.device.as_deref().unwrap(), key.device.as_deref().unwrap(), value.device.as_deref().unwrap(), rows, heads, dim, scale).unwrap();
+            let actual = actual.download_f32(rows * columns).unwrap();
+            for (i, (&actual, &expected)) in actual.iter().zip(&expected.data).enumerate() {
+                assert!(actual.is_finite() && (actual - expected).abs() <= 0.01 + 0.01 * expected.abs(), "wide attention rows={rows} heads={heads} dim={dim} index={i}: actual={actual} expected={expected}");
+            }
+        }
+    }
 
     #[test]
     #[ignore = "需要 ROCm device 0"]
@@ -331,14 +485,15 @@ mod tests {
         let norm = vec![1.0; head_dim];
         let query_norm = context.prepare_weight(LinearWeight::F32(&norm), 1, head_dim).unwrap();
         let key_norm = context.prepare_weight(LinearWeight::F32(&norm), 1, head_dim).unwrap();
-        let cosine = vec![1.0; rows * head_dim / 2];
-        let sine = vec![0.0; rows * head_dim / 2];
+        let angles = (0..rows * head_dim / 2).map(|index| (index % 97) as f32 * 0.0078125).collect::<Vec<_>>();
+        let cosine = angles.iter().map(|angle| angle.cos()).collect::<Vec<_>>();
+        let sine = angles.iter().map(|angle| angle.sin()).collect::<Vec<_>>();
 
         let full_qkv = context.tensor_from_f32(values.clone(), rows, heads * head_dim * 3).unwrap();
         let full = context.full_attention_qkv(full_qkv, &query_norm, &key_norm, heads, head_dim, head_dim, 1e-6, &cosine, &sine, (head_dim as f32).sqrt().recip()).unwrap();
         let full = context.tensor_to_f32(&full).unwrap();
 
-        let source = context.tensor_from_f32(values, rows, heads * head_dim * 3).unwrap();
+        let source = context.tensor_from_f32(values.clone(), rows, heads * head_dim * 3).unwrap();
         let mut parts = Vec::new();
         for start in (0..heads).step_by(14) {
             let qkv = context.compact_qkv_heads(&source, heads, start..start + 14, head_dim).unwrap();
@@ -351,5 +506,40 @@ mod tests {
         let partitioned = context.tensor_to_f32(&partitioned).unwrap();
         let max_error = full.iter().zip(&partitioned).map(|(left, right)| (left - right).abs()).fold(0.0f32, f32::max);
         assert!(max_error <= 1e-6, "H3 attention head partition max_error={max_error}");
+
+        let source = context.tensor_from_f32(values, rows, heads * head_dim * 3).unwrap();
+        let mut prepared_parts = Vec::new();
+        for head_start in (0..heads).step_by(14) {
+            let mut sequence_parts = Vec::new();
+            for sequence in [0..113, 113..rows] {
+                let qkv = context.slice_token_rows(&source, sequence.start, sequence.len()).unwrap();
+                sequence_parts.push(
+                    context
+                        .prepare_compact_qkv_heads_bf16(
+                            &qkv,
+                            &query_norm,
+                            &key_norm,
+                            heads,
+                            head_start..head_start + 14,
+                            head_dim,
+                            head_dim,
+                            1e-6,
+                            sequence.start,
+                            &cosine,
+                            &sine,
+                        )
+                        .unwrap(),
+                );
+            }
+            let sequence_refs = sequence_parts.iter().collect::<Vec<_>>();
+            let qkv = context.concat_token_rows(&sequence_refs).unwrap();
+            prepared_parts.push(context.full_attention_prepared_qkv_bf16(qkv, 14, head_dim, (head_dim as f32).sqrt().recip()).unwrap());
+        }
+        let mut prepared = prepared_parts.remove(0);
+        for part in prepared_parts {
+            prepared = context.concat_columns(&prepared, &part).unwrap();
+        }
+        let prepared = context.tensor_to_f32(&prepared).unwrap();
+        assert_eq!(full, prepared, "source BF16 QKV preparation 必须与目标端 preparation 逐位一致");
     }
 }

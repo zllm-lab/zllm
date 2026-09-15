@@ -64,6 +64,11 @@ pub trait NodeEngine {
     fn startup_info(&self) -> (NodeCapabilities, Arc<dyn Fn() -> u64 + Send + Sync>);
     fn refresh_runtime(&self) {}
     fn terminal_cache_infos(&self) -> Vec<CacheInfo>;
+    /// 模型运行参数的并发控制面。句柄独立于 engine 执行线程，才能在长 decode
+    /// 期间于下一轮调度边界生效，而不是排在整个 batch 之后。
+    fn runtime_config_control(&self) -> Option<Arc<dyn RuntimeConfigControl>> {
+        None
+    }
     fn shutdown(&mut self) -> Result<(), String> {
         Ok(())
     }
@@ -107,6 +112,18 @@ pub trait NodeEngine {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct RuntimeConfigUpdate {
+    pub revision: u64,
+    pub config: Value,
+    pub max_concurrency: Option<usize>,
+}
+
+pub trait RuntimeConfigControl: Send + Sync {
+    fn apply(&self, patch: Value) -> Result<RuntimeConfigUpdate, String>;
+    fn snapshot(&self) -> RuntimeConfigUpdate;
+}
+
 pub struct NodeBatchRequest {
     pub request_id: String,
     pub request: Value,
@@ -136,7 +153,9 @@ struct NodeExecutor {
     runtime: Arc<Mutex<NodeRuntime>>,
     compute_steps: Arc<AtomicCounterU64>,
     accelerator_allocated: Arc<dyn Fn() -> u64 + Send + Sync>,
-    max_concurrency: usize,
+    max_concurrency: Arc<std::sync::atomic::AtomicUsize>,
+    physical_max_concurrency: usize,
+    runtime_config: Option<Arc<dyn RuntimeConfigControl>>,
     /// engine 终点 cache 的 pin 共享句柄;None = 模型没有换出路径(如无 swap)。
     pins: Option<Arc<Mutex<HashSet<String>>>>,
 }
@@ -260,10 +279,12 @@ struct PersistedTask {
 impl NodeExecutor {
     fn start(factory: NodeEngineFactory, configured_max_concurrency: Option<usize>) -> Result<Self, DynError> {
         let (command_tx, command_rx) = std::sync::mpsc::channel::<EngineCommand>();
-        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(String, NodeCapabilities, Arc<dyn Fn() -> u64 + Send + Sync>, usize, Option<Arc<Mutex<HashSet<String>>>>), String>>(1);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(String, NodeCapabilities, Arc<dyn Fn() -> u64 + Send + Sync>, usize, Option<Arc<Mutex<HashSet<String>>>>, Option<Arc<dyn RuntimeConfigControl>>), String>>(1);
         let runtime_caches = Arc::new(Mutex::new(Vec::new()));
         let runtime = Arc::new(Mutex::new(NodeRuntime::default()));
         let compute_steps = Arc::new(AtomicCounterU64::new(0));
+        let dynamic_max = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+        let engine_dynamic_max = dynamic_max.clone();
         let engine_runtime = runtime.clone();
         let engine_compute_steps = compute_steps.clone();
         let engine_caches = runtime_caches.clone();
@@ -277,7 +298,8 @@ impl NodeExecutor {
                         *caches = engine.terminal_cache_infos();
                     }
                     max_concurrency = node_max_concurrency(engine.max_concurrency(), configured_max_concurrency);
-                    let _ = ready_tx.send(Ok((model_key, capabilities, accelerator_allocated, max_concurrency, engine.terminal_cache_pins())));
+                    engine_dynamic_max.store(max_concurrency, Ordering::Release);
+                    let _ = ready_tx.send(Ok((model_key, capabilities, accelerator_allocated, max_concurrency, engine.terminal_cache_pins(), engine.runtime_config_control())));
                     engine
                 }
                 Err(error) => {
@@ -296,7 +318,7 @@ impl NodeExecutor {
                 };
                 match command {
                     EngineCommand::Inference(command) => {
-                        ExecutionCommand::execute_batch(vec![command], engine.as_mut(), &command_rx, &mut deferred, max_concurrency);
+                        ExecutionCommand::execute_batch(vec![command], engine.as_mut(), &command_rx, &mut deferred, &engine_dynamic_max);
                     }
                     EngineCommand::Task(command) => command.execute(engine.as_mut()),
                     EngineCommand::Shutdown(reply) => {
@@ -310,7 +332,19 @@ impl NodeExecutor {
             }
         })?;
         match ready_rx.recv()? {
-            Ok((model_key, capabilities, accelerator_allocated, max_concurrency, pins)) => Ok(Self { commands: command_tx, runtime_caches, model_key, capabilities, runtime, compute_steps, accelerator_allocated, max_concurrency, pins }),
+            Ok((model_key, capabilities, accelerator_allocated, max_concurrency, pins, runtime_config)) => {
+                if let Some(control) = &runtime_config {
+                    let snapshot = control.snapshot();
+                    let effective = snapshot.max_concurrency.unwrap_or(max_concurrency).min(max_concurrency);
+                    dynamic_max.store(effective, Ordering::Release);
+                    if let Ok(mut status) = runtime.lock() {
+                        status.runtime_config_revision = snapshot.revision;
+                        status.runtime_config = Some(snapshot.config);
+                        status.runtime_max_concurrency = Some(effective);
+                    }
+                }
+                Ok(Self { commands: command_tx, runtime_caches, model_key, capabilities, runtime, compute_steps, accelerator_allocated, max_concurrency: dynamic_max, physical_max_concurrency: max_concurrency, runtime_config, pins })
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -355,6 +389,27 @@ impl NodeExecutor {
     fn runtime_status(&self) -> NodeRuntime {
         runtime_status(&self.runtime, &self.compute_steps, &self.accelerator_allocated)
     }
+
+    fn apply_runtime_config(&self, patch: Value) {
+        let result = self.runtime_config.as_ref().ok_or_else(|| format!("模型 {} 不支持运行时配置", self.model_key)).and_then(|control| control.apply(patch));
+        if let Ok(mut runtime) = self.runtime.lock() {
+            match result {
+                Ok(update) => {
+                    let limit = update.max_concurrency.unwrap_or(self.physical_max_concurrency).clamp(1, self.physical_max_concurrency);
+                    self.max_concurrency.store(limit, Ordering::Release);
+                    runtime.runtime_config_revision = update.revision;
+                    runtime.runtime_config = Some(update.config);
+                    runtime.runtime_config_error = None;
+                    runtime.runtime_max_concurrency = Some(limit);
+                    eprintln!("[runtime-config] model={} revision={} max_concurrency={limit}", self.model_key, update.revision);
+                }
+                Err(error) => {
+                    eprintln!("[runtime-config-error] model={} {error}", self.model_key);
+                    runtime.runtime_config_error = Some(error);
+                }
+            }
+        }
+    }
 }
 
 fn runtime_status(runtime: &Arc<Mutex<NodeRuntime>>, compute_steps: &Arc<AtomicCounterU64>, accelerator_allocated: &Arc<dyn Fn() -> u64 + Send + Sync>) -> NodeRuntime {
@@ -387,11 +442,25 @@ impl ExecutionCommand {
                         break;
                     }
                 }
-                self.events.send_event_reliable(&self.request_id, InferenceEvent::Completed { finish_reason: summary.finish_reason, prompt_tokens: summary.prompt_tokens, completion_tokens: summary.completion_tokens });
+                if !self.events.send_event_reliable(&self.request_id, InferenceEvent::Completed { finish_reason: summary.finish_reason, prompt_tokens: summary.prompt_tokens, completion_tokens: summary.completion_tokens }) {
+                    eprintln!("[inference-terminal-send-failed] request_id={} event=completed", self.request_id);
+                }
             }
             Err(message) => {
-                eprintln!("[inference-error] request_id={} message={message}", self.request_id);
-                self.events.send_event_reliable(&self.request_id, InferenceEvent::Error { message });
+                // 瘦身 resume 请求的终态 miss 不是会话错误:scheduler 会用完整
+                // 请求重发,上报 CacheMiss 而不是 Error,订阅者对 miss 无感。
+                if let Some(cache_id) = message.strip_prefix(crate::runtime::session::TERMINAL_RESUME_MISS) {
+                    let cache_id = cache_id.trim();
+                    eprintln!("[inference-cache-miss] request_id={} cache_id={cache_id}", self.request_id);
+                    if !self.events.send_control_reliable(NodeMessage::CacheMiss { request_id: self.request_id.clone(), cache_id: cache_id.to_owned() }) {
+                        eprintln!("[inference-terminal-send-failed] request_id={} event=cache_miss", self.request_id);
+                    }
+                } else {
+                    eprintln!("[inference-error] request_id={} message={message}", self.request_id);
+                    if !self.events.send_event_reliable(&self.request_id, InferenceEvent::Error { message }) {
+                        eprintln!("[inference-terminal-send-failed] request_id={} event=error", self.request_id);
+                    }
+                }
             }
         }
         if let Ok(mut active) = self.active_requests.lock() {
@@ -399,7 +468,7 @@ impl ExecutionCommand {
         }
     }
 
-    fn execute_batch(commands: Vec<Self>, engine: &mut dyn NodeEngine, receiver: &std::sync::mpsc::Receiver<EngineCommand>, deferred: &mut VecDeque<EngineCommand>, max_concurrency: usize) {
+    fn execute_batch(commands: Vec<Self>, engine: &mut dyn NodeEngine, receiver: &std::sync::mpsc::Receiver<EngineCommand>, deferred: &mut VecDeque<EngineCommand>, max_concurrency: &std::sync::atomic::AtomicUsize) {
         let requests = commands.iter().map(|command| NodeBatchRequest { request_id: command.request_id.clone(), request: command.request.clone(), cancellation: command.cancellation.clone() }).collect();
         let commands = RefCell::new(commands);
         let completed = RefCell::new(HashSet::new());
@@ -407,7 +476,7 @@ impl ExecutionCommand {
             requests,
             &mut |available| {
                 let mut requests = Vec::new();
-                for _ in 0..available.min(max_concurrency) {
+                for _ in 0..available.min(max_concurrency.load(Ordering::Acquire)) {
                     match receiver.try_recv() {
                         Ok(EngineCommand::Inference(command)) => {
                             requests.push(NodeBatchRequest { request_id: command.request_id.clone(), request: command.request.clone(), cancellation: command.cancellation.clone() });
@@ -698,7 +767,7 @@ impl NodeSession {
                 }
             }
             SchedulerMessage::NewTask { task_id, model, task_kind, request } => {
-                if model != executor.model_key || !executor.capabilities.task_kinds.iter().any(|kind| kind == &task_kind) {
+                if !executor.capabilities.supports_task(&executor.model_key, &model, &task_kind) {
                     outgoing
                         .send(NodeMessage::TaskStatus { task_id, status: "failed".to_owned(), error: Some(format!("节点模型 {} 不支持 {model}/{task_kind}", executor.model_key)), outputs: Vec::new() })
                         .await
@@ -729,6 +798,10 @@ impl NodeSession {
             }
             SchedulerMessage::PinCache { cache_id } => executor.set_pin(&cache_id, true),
             SchedulerMessage::UnpinCache { cache_id } => executor.set_pin(&cache_id, false),
+            SchedulerMessage::UpdateRuntimeConfig { patch } => {
+                executor.apply_runtime_config(patch);
+                outgoing.send(NodeMessage::RuntimeChanged { runtime: executor.runtime_status() }).await.map_err(|_| "scheduler writer 已关闭")?;
+            }
             SchedulerMessage::ArtifactCommitted { task_id, artifact_id } => {
                 artifact_acks.send((task_id, artifact_id)).await.map_err(|_| "artifact ACK 队列已经关闭")?;
             }
@@ -776,7 +849,7 @@ fn register_message(executor: &NodeExecutor, cache_dir: &Path, api_key: Option<S
         protocol_version: SCHEDULER_PROTOCOL_VERSION,
         api_key,
         model: executor.model_key.clone(),
-        max_concurrency: executor.max_concurrency,
+        max_concurrency: executor.max_concurrency.load(Ordering::Acquire),
         caches: available_caches(cache_dir, &executor.runtime_caches),
         capabilities: executor.capabilities.clone(),
         runtime: executor.runtime_status(),
@@ -797,8 +870,7 @@ fn spawn_heartbeat(outgoing: mpsc::Sender<NodeMessage>, cache_dir: PathBuf, exec
 }
 
 /// standalone 同进程会话：与 scheduler 之间走内存通道，无 iroh/JSON。
-/// 本地节点只声明 text_generation，dispatch_task 不会向它派发带产物的任务；
-/// artifact 通道保留只为让共享的 task 路径可编译，收到上传即报错（不可达）。
+/// 生成产物从本地文件提交到 scheduler，沿用清单校验与终态释放规则。
 async fn serve_local(scheduler: Scheduler, executor: NodeExecutor, cache_dir: PathBuf, cancellations: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>, task_store: Arc<FjallValueStore>, interruption: Arc<AtomicBool>) -> Result<(), DynError> {
     let channels = scheduler.attach_local_node("local".to_owned());
     let outgoing_tx = channels.messages;
@@ -807,12 +879,50 @@ async fn serve_local(scheduler: Scheduler, executor: NodeExecutor, cache_dir: Pa
 
     let (artifact_tx, mut artifact_rx) = mpsc::channel::<ArtifactUpload>(8);
     let (artifact_ack_tx, mut artifact_ack_rx) = mpsc::channel::<(String, String)>(32);
+    let artifact_store = task_store.clone();
+    let artifact_events = outgoing_tx.clone();
     let artifact_writer = tokio::spawn(async move {
-        while let Some(upload) = artifact_rx.recv().await {
-            eprintln!("[zllm-node] task={} standalone 本地节点不支持 artifact 上传", upload.task_id);
+        let mut pending = HashMap::<String, Vec<ArtifactUpload>>::new();
+        loop {
+            tokio::select! {
+                upload = artifact_rx.recv() => {
+                    let Some(upload) = upload else { break };
+                    let task_id = upload.task_id.clone();
+                    let count = upload.output_count;
+                    let group = pending.entry(task_id.clone()).or_default();
+                    group.push(upload);
+                    if group.len() < count && group.iter().all(|item| item.output_count == count) {
+                        continue;
+                    }
+                    let group = pending.remove(&task_id).expect("本地产物已加入 pending");
+                    let result: Result<(), DynError> = async {
+                        if group.len() != count || group.iter().any(|item| item.output_count != count) {
+                            return Err("本地产物 output_count 不一致".into());
+                        }
+                        let mut outputs = Vec::with_capacity(count);
+                        for upload in group {
+                            let artifact = upload.artifact;
+                            let bytes = tokio::fs::metadata(&artifact.path).await?.len();
+                            outputs.push((ArtifactDescriptor { id: artifact.id, file_name: artifact.file_name, content_type: artifact.content_type, bytes }, artifact.path));
+                        }
+                        scheduler.receive_local_artifacts("local", &task_id, outputs).await
+                    }.await;
+                    match result {
+                        Ok(()) => {
+                            if let Err(error) = artifact_store.remove(&task_id) {
+                                eprintln!("[zllm-node] task={task_id} 清理本地产物持久化状态失败: {error}");
+                            }
+                        }
+                        Err(error) => {
+                            let _ = artifact_events.send(NodeMessage::TaskStatus { task_id, status: "failed".to_owned(), error: Some(format!("本地产物提交失败: {error}")), outputs: Vec::new() }).await;
+                        }
+                    }
+                }
+                ack = artifact_ack_rx.recv() => {
+                    if ack.is_none() { break; }
+                }
+            }
         }
-        // 保持 ACK 接收端存活，避免共享路径的 send 报错。
-        let _ = artifact_ack_rx.recv().await;
     });
     let heartbeat = spawn_heartbeat(outgoing_tx.clone(), cache_dir.clone(), executor.clone());
 
